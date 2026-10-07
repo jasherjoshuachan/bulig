@@ -1,0 +1,19 @@
+{
+  "name": "@bulig/cli",
+  "version": "0.1.0",
+  "type": "module",
+  "license": "MIT",
+  "bin": { "bulig": "./bin/bulig.mjs" },
+  "exports": { ".": "./src/index.ts" },
+  "dependencies": {
+    "@bulig/channel-cli": "workspace:*",
+    "@bulig/channel-telegram": "workspace:*",
+    "@bulig/core": "workspace:*",
+    "@bulig/github": "workspace:*",
+    "@bulig/pipeline-dev": "workspace:*",
+    "@bulig/plugin-sdk": "workspace:*",
+    "@bulig/worker-claude-code": "workspace:*",
+    "tsx": "^4.20.0",
+    "zod": "^4.1.0"
+  }
+}

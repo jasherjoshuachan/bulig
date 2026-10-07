@@ -1,0 +1,34 @@
+{
+  "dbPath": "~/.bulig/bulig.sqlite",
+  "enabled": ["channel-cli", "channel-telegram", "worker-claude-code", "github", "pipeline-dev"],
+  "grants": {
+    "channel-cli": ["channel.send:terminal", "approval.grant"],
+    "channel-telegram": ["channel.send:telegram", "approval.grant"],
+    "worker-claude-code": ["claude.run", "fs.worktree"],
+    "github": ["git.push", "gh.pr"],
+    "pipeline-dev": ["merge.request"]
+  },
+  "pluginConfig": {
+    "channel-telegram": {
+      "tokenEnv": "BULIG_TELEGRAM_TOKEN",
+      "allowedChatIds": [123456789],
+      "repos": { "my-project": "~/Projects/my-project" },
+      "pollTimeoutSec": 30
+    },
+    "worker-claude-code": {
+      "claudeBin": "claude",
+      "timeoutMs": 1200000,
+      "extraArgs": ["--setting-sources", "project,local"]
+    },
+    "github": {
+      "tokenEnv": "BULIG_GH_TOKEN",
+      "allowNoChecks": false
+    },
+    "pipeline-dev": {
+      "models": { "strong": "opus", "standard": "sonnet" },
+      "maxBuildAttempts": 2,
+      "branchPrefix": "bulig",
+      "keepFailedWorktrees": false
+    }
+  }
+}

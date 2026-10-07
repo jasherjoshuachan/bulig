@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Keeps `bulig serve` running on a Mac and restarts it if it dies.
+
+  1. Copy this file to ~/Library/LaunchAgents/dev.bulig.serve.plist
+  2. Replace /Users/YOU/path/to/bulig with the folder you cloned Bulig into.
+  3. Replace /Users/YOU with your home folder, and check the PATH line (it needs node, pnpm, git, gh, claude).
+  4. Load it:   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.bulig.serve.plist
+  5. Stop it:   launchctl bootout gui/$(id -u)/dev.bulig.serve
+
+  The token is not in this file. The wrapper script reads it from the Keychain item "bulig-telegram-bot".
+  The Keychain must be unlocked, so use a LaunchAgent (runs when you are logged in), not a LaunchDaemon.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>dev.bulig.serve</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/YOU/path/to/bulig/scripts/serve-with-keychain.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/YOU/path/to/bulig</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/Users/YOU/.local/bin</string>
+    <key>HOME</key>
+    <string>/Users/YOU</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+
+  <key>StandardOutPath</key>
+  <string>/Users/YOU/.bulig/serve.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/YOU/.bulig/serve.log</string>
+</dict>
+</plist>

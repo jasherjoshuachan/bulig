@@ -1,0 +1,9 @@
+{
+  "name": "@bulig/worker-claude-code",
+  "version": "0.1.0",
+  "type": "module",
+  "license": "MIT",
+  "exports": { ".": "./src/index.ts" },
+  "dependencies": { "@bulig/plugin-sdk": "workspace:*" },
+  "devDependencies": { "@bulig/core": "workspace:*" }
+}

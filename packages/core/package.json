@@ -1,0 +1,11 @@
+{
+  "name": "@bulig/core",
+  "version": "0.0.0",
+  "type": "module",
+  "license": "MIT",
+  "exports": { ".": "./src/index.ts" },
+  "dependencies": {
+    "@bulig/plugin-sdk": "workspace:*",
+    "better-sqlite3": "^12.4.0"
+  }
+}

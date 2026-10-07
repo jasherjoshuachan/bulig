@@ -62,6 +62,7 @@ export function createKernel(options: KernelOptions) {
         pluginConfig: options.pluginConfig ?? {},
         bus,
         jobs,
+        stageName: (id: string) => store.getStage(id)?.name,
         state: { get: (p: string, k: string) => store.getState(p, k), set: (p: string, k: string, v: unknown) => store.setState(p, k, v) },
         logger,
       };

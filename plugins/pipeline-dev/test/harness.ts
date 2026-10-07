@@ -161,7 +161,7 @@ export function boot(dbPath: string, plugins: Plugin[], config: PipelineConfig =
     dbPath,
     plugins: [pipeline, ...plugins],
     enabled: ['pipeline-dev', ...plugins.map((p) => p.manifest.name)],
-    grants: { 'pipeline-dev': ['merge.request'], 'fake-human': ['approval.grant'] },
+    grants: { 'pipeline-dev': ['merge.request', 'jobs.write'], 'fake-human': ['approval.grant'] },
     pluginConfig: { 'pipeline-dev': config as Record<string, unknown> },
     logger,
   });

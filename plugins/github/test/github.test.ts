@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -605,5 +605,82 @@ describe('token and grants', () => {
 
   it('will not start without both grants', async () => {
     await expect(setup({}, ['git.push'])).rejects.toThrow(/gh\.pr/);
+  });
+});
+
+describe('a planted symlink never redirects a reset or a cleanup', () => {
+  /** A second repo with uncommitted work that must survive. `home` is where the job-id folder sits in it. */
+  function victim(root: string) {
+    const other = join(root, 'other');
+    mkdirSync(other);
+    git(other, 'init', '-b', 'main');
+    git(other, 'config', 'user.email', 'test@example.com');
+    git(other, 'config', 'user.name', 'Test');
+    writeFileSync(join(other, 'precious.txt'), 'committed\n');
+    git(other, 'add', '-A');
+    git(other, 'commit', '-m', 'init');
+    writeFileSync(join(other, 'precious.txt'), 'uncommitted work\n');
+    writeFileSync(join(other, 'untracked.txt'), 'also precious\n');
+    return other;
+  }
+  const intact = (other: string) => {
+    expect(readFileSync(join(other, 'precious.txt'), 'utf8')).toBe('uncommitted work\n');
+    expect(readFileSync(join(other, 'untracked.txt'), 'utf8')).toBe('also precious\n');
+  };
+  const errorOf = (e: BuligEvent) => (e.payload as { error: string }).error;
+
+  it('.worktrees itself is a symlink to another place that holds a repo named after the job', async () => {
+    const h = await setup();
+    const store = join(h.root, 'store');
+    mkdirSync(store);
+    const other = victim(h.root);
+    // <store>/<jobId> is a whole repo with uncommitted work, so git itself sees a valid worktree root there.
+    execFileSync('mv', [other, join(store, h.job.id)]);
+    symlinkSync(store, join(h.repo, '.worktrees'));
+    const cwd = join(h.repo, '.worktrees', h.job.id);
+    const real = join(store, h.job.id);
+
+    h.fire('worktree.reset.requested', { cwd });
+    expect(errorOf(await h.waitFor('worktree.reset.failed'))).toMatch(/symlink/);
+    intact(real);
+
+    h.fire('worktree.cleanup.requested', { repoPath: h.repo, branch: 'bulig/x' });
+    expect(errorOf(await h.waitFor('worktree.cleanup.failed'))).toMatch(/symlink/);
+    expect(existsSync(real)).toBe(true);
+    intact(real);
+
+    h.fire('worktree.requested', { repoPath: h.repo, branch: 'bulig/y' });
+    expect(errorOf(await h.waitFor('worktree.failed'))).toMatch(/symlink/);
+    expect(existsSync(join(store, h.job.id, '.git'))).toBe(true);
+  });
+
+  it('.worktrees/<jobId> is a symlink to another repo', async () => {
+    const h = await setup();
+    const other = victim(h.root);
+    mkdirSync(join(h.repo, '.worktrees'));
+    symlinkSync(other, join(h.repo, '.worktrees', h.job.id));
+    const cwd = join(h.repo, '.worktrees', h.job.id);
+
+    h.fire('worktree.reset.requested', { cwd });
+    expect(errorOf(await h.waitFor('worktree.reset.failed'))).toMatch(/symlink/);
+    intact(other);
+
+    h.fire('worktree.cleanup.requested', { repoPath: h.repo, branch: 'bulig/x' });
+    expect(errorOf(await h.waitFor('worktree.cleanup.failed'))).toMatch(/symlink/);
+    expect(existsSync(other)).toBe(true);
+    intact(other);
+  });
+
+  it('a real worktree still resets and cleans up as before', async () => {
+    const h = await setup();
+    h.fire('worktree.requested', { repoPath: h.repo, branch: 'bulig/ok-1' });
+    const { cwd } = (await h.waitFor('worktree.ready')).payload as { cwd: string };
+    writeFileSync(join(cwd, 'stray.txt'), 'x\n');
+    h.fire('worktree.reset.requested', { cwd });
+    await h.waitFor('worktree.reset.done');
+    expect(existsSync(join(cwd, 'stray.txt'))).toBe(false);
+    h.fire('worktree.cleanup.requested', { repoPath: h.repo, branch: 'bulig/ok-1' });
+    await h.waitFor('worktree.cleaned');
+    expect(existsSync(cwd)).toBe(false);
   });
 });

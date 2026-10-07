@@ -47,13 +47,16 @@ export function driver() {
       version: '0.1.0',
       sdk: '0',
       description: 'test driver',
-      subscribes: ['approval.granted', 'approval.denied'],
+      subscribes: ['approval.granted', 'approval.denied', 'cancel.requested'],
+      needs: ['jobs.write'],
       emits: ['approval.requested', 'stage.completed', 'stage.failed', 'pr.opened', 'pr.merged', 'merge.refused', 'pipeline.failed'],
     },
     register(ctx) {
       box.ctx = ctx;
       ctx.on('approval.granted', (e) => void seen.push(e));
       ctx.on('approval.denied', (e) => void seen.push(e));
+      // Plays the pipeline, which is the one plugin allowed to end a job.
+      ctx.on('cancel.requested', (e) => void (e.jobId && ctx.jobs.setStatus(e.jobId, 'cancelled')));
     },
   });
   return {
@@ -96,7 +99,7 @@ export async function boot(
     dbPath,
     plugins: [d.plugin, plugin],
     enabled: ['driver', 'channel-telegram'],
-    grants: opts.grants === false ? {} : { 'channel-telegram': ['channel.send:telegram', 'approval.grant'] },
+    grants: opts.grants === false ? {} : { 'channel-telegram': ['channel.send:telegram', 'approval.grant'], driver: ['jobs.write'] },
     pluginConfig: {
       'channel-telegram': {
         tokenEnv: TOKEN_ENV,

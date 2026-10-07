@@ -418,3 +418,83 @@ describe('restarts', () => {
     expect(b.d.ctx.jobs.list()).toEqual([]);
   });
 });
+
+describe('per-user approvals in a group chat', () => {
+  const MEMBER = 222; // in the chat, not in allowedUserIds
+  const OWNER = 111;
+
+  it('warns at start when allowedUserIds is not set', async () => {
+    const fake = await startFake();
+    const b = await boot(fake);
+    expect(b.warnings.some((w) => /allowedUserIds is not set/.test(w))).toBe(true);
+  });
+
+  it('does not warn when allowedUserIds is set, and rejects an empty list', async () => {
+    const fake = await startFake();
+    const b = await boot(fake, { allowedUserIds: [OWNER] });
+    expect(b.warnings.some((w) => /allowedUserIds/.test(w))).toBe(false);
+    await expect(boot(fake, { allowedUserIds: [] })).rejects.toThrow(/allowedUserIds/);
+  });
+
+  it('a chat member who is not allowed taps Approve: rejected with a message, nothing emitted, buttons left alone', async () => {
+    const fake = await startFake();
+    const b = await boot(fake, { allowedUserIds: [OWNER] });
+    const job = b.d.waitForApproval('plan');
+    await until(() => fake.of('sendMessage').length === 1, 'approval message');
+    const sent = fake.of('sendMessage')[0]!.params;
+    fake.press(CHAT, sent.__id, sent.text, `ap:${job.id}:plan`, { id: MEMBER, username: 'member' });
+    await until(() => fake.of('answerCallbackQuery').length === 1, 'answer');
+    expect(fake.of('answerCallbackQuery')[0]!.params.text).toMatch(/not allowed/);
+    expect(fake.of('editMessageText')).toEqual([]);
+    expect(b.d.seen).toEqual([]);
+    expect(b.d.ctx.jobs.get(job.id)!.status).toBe('awaiting_approval');
+    expect(b.warnings.some((w) => w.includes(`user ${MEMBER}`))).toBe(true);
+  });
+
+  it('Deny from a member who is not allowed is rejected the same way', async () => {
+    const fake = await startFake();
+    const b = await boot(fake, { allowedUserIds: [OWNER] });
+    const job = b.d.waitForApproval('merge');
+    await until(() => fake.of('sendMessage').length === 1, 'approval message');
+    const sent = fake.of('sendMessage')[0]!.params;
+    fake.press(CHAT, sent.__id, sent.text, `dn:${job.id}:merge`, { id: MEMBER });
+    await until(() => fake.of('answerCallbackQuery').length === 1, 'answer');
+    expect(fake.of('answerCallbackQuery')[0]!.params.text).toMatch(/not allowed/);
+    expect(b.d.seen).toEqual([]);
+  });
+
+  it('an allowed user can still approve in the same chat', async () => {
+    const fake = await startFake();
+    const b = await boot(fake, { allowedUserIds: [OWNER] });
+    const job = b.d.waitForApproval('plan');
+    await until(() => fake.of('sendMessage').length === 1, 'approval message');
+    const sent = fake.of('sendMessage')[0]!.params;
+    fake.press(CHAT, sent.__id, sent.text, `ap:${job.id}:plan`, { id: OWNER, username: 'owner' });
+    await until(() => fake.of('editMessageText').length === 1, 'edit');
+    expect(fake.of('answerCallbackQuery')[0]!.params.text).toBe('Approved');
+    expect(b.d.seen.map((e) => e.type)).toEqual(['approval.granted']);
+  });
+
+  it('commands from a member who is not allowed are ignored, including /cancel', async () => {
+    const fake = await startFake();
+    const b = await boot(fake, { allowedUserIds: [OWNER] });
+    const job = b.d.waitForApproval('plan');
+    await until(() => fake.of('sendMessage').length === 1, 'approval message');
+    fake.say(CHAT, `/cancel ${job.id}`, MEMBER);
+    fake.say(CHAT, '/help', OWNER);
+    await until(() => fake.texts().length === 2, 'help for the owner');
+    expect(b.d.seen).toEqual([]);
+    expect(b.d.ctx.jobs.get(job.id)!.status).toBe('awaiting_approval');
+  });
+
+  it('without allowedUserIds, any member of an allowed chat can still approve (the fallback)', async () => {
+    const fake = await startFake();
+    const b = await boot(fake);
+    const job = b.d.waitForApproval('plan');
+    await until(() => fake.of('sendMessage').length === 1, 'approval message');
+    const sent = fake.of('sendMessage')[0]!.params;
+    fake.press(CHAT, sent.__id, sent.text, `ap:${job.id}:plan`, { id: MEMBER });
+    await until(() => fake.of('editMessageText').length === 1, 'edit');
+    expect(b.d.seen.map((e) => e.type)).toEqual(['approval.granted']);
+  });
+});

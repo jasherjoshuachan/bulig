@@ -19,3 +19,12 @@ export function effectiveCapabilities(
   const granted = new Set(grants[manifest.name] ?? []);
   return new Set(manifest.needs.filter((cap) => granted.has(cap)));
 }
+
+/** Capability that lets a plugin close an approval stage or end a job. Only the pipeline holds it by default. */
+export const JOBS_WRITE = 'jobs.write';
+
+/** Statuses that end a job. Setting one of these ends the work, so it needs jobs.write. */
+export const TERMINAL_STATUSES: readonly string[] = ['done', 'failed', 'cancelled'];
+
+/** Stages that stand for a person's yes: approve-plan and approve-merge. Opening or closing one needs jobs.write. */
+export const isApprovalStage = (name: string | undefined): boolean => name !== undefined && name.startsWith('approve-');

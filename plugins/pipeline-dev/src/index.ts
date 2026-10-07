@@ -43,6 +43,7 @@ export default definePlugin({
       'commit.done',
       'commit.failed',
       'job.status',
+      'cancel.requested',
       'stage.completed',
       'stage.failed',
       'approval.granted',
@@ -54,10 +55,11 @@ export default definePlugin({
       'merge.failed',
     ],
     emits: ['worktree.requested', 'worktree.reset.requested', 'worktree.cleanup.requested', 'commit.requested', 'stage.requested', 'approval.requested', 'pr.requested', 'merge.requested', 'pipeline.failed'],
-    needs: ['merge.request'],
+    needs: ['merge.request', 'jobs.write'],
   },
   register(ctx: PluginContext) {
     ctx.require('merge.request');
+    ctx.require('jobs.write');
     const cfg = ctx.config as PipelineConfig;
     const strong = cfg.models?.strong ?? 'opus';
     const standard = cfg.models?.standard ?? 'sonnet';
@@ -70,6 +72,35 @@ export default definePlugin({
     const lastOf = (stages: Stage[], name: string) => [...stages].reverse().find((s) => s.name === name);
     const runningStage = (jobId: string, name: string) => ctx.jobs.stages(jobId).find((s) => s.name === name && s.status === 'running');
     const textOf = (stages: Stage[], name: string) => outputOf(lastOf(stages, name) ?? ({ output: null } as Stage)).result ?? '';
+
+    /** Jobs whose worktree cleanup was already asked for, so it is asked for once. */
+    const cleanupAsked = new Set<string>();
+
+    /**
+     * A job that ends without merging leaves nothing behind, unless the config says to keep it. But the cleanup
+     * waits until no stage of the job is still running: a Claude that is being stopped would otherwise write into,
+     * or recreate, a worktree that was just removed. Every stage that closes calls this again.
+     */
+    function cleanupIfIdle(jobId: string): void {
+      if (cfg.keepFailedWorktrees || cleanupAsked.has(jobId)) return;
+      const job = ctx.jobs.get(jobId);
+      if (!job || (job.status !== 'failed' && job.status !== 'cancelled')) return;
+      const stages = ctx.jobs.stages(jobId);
+      // A stage waiting for a person has no process behind it, so it does not hold the cleanup up.
+      if (stages.some((s) => s.status === 'running' && !s.name.startsWith('approve-'))) return;
+      const wt = lastOf(stages.filter((s) => !outputOf(s).interrupted), 'worktree');
+      const branch = wt?.status === 'passed' ? outputOf(wt).branch : undefined;
+      if (typeof branch !== 'string' || !branch) return;
+      cleanupAsked.add(jobId);
+      for (const s of stages) if (s.status === 'running') ctx.jobs.finishStage(s.id, 'failed', { cancelled: true });
+      ctx.emit('worktree.cleanup.requested', { repoPath: job.repo, branch }, jobId);
+    }
+
+    /** Close a stage, then see whether that was the last thing holding up a cleanup. */
+    function finish(s: Stage, status: 'passed' | 'failed', output?: unknown): void {
+      ctx.jobs.finishStage(s.id, status, output);
+      cleanupIfIdle(s.jobId);
+    }
 
     function fail(jobId: string, reason: string): void {
       const job = ctx.jobs.get(jobId);
@@ -195,13 +226,23 @@ export default definePlugin({
       if (cfg.resume === false) return;
       for (const job of ctx.jobs.list()) {
         if (Array.isArray(cfg.resume) && !cfg.resume.includes(job.id)) continue;
+        if (job.status === 'failed' || job.status === 'cancelled') {
+          // The job ended while a stage was running and the process died before the stage closed. Close it, and
+          // the cleanup that was waiting for it can go ahead.
+          guard(job.id, () => {
+            for (const s of ctx.jobs.stages(job.id)) {
+              if (s.status === 'running') finish(s, 'failed', { interrupted: true, reason: 'interrupted', error: 'process stopped mid-stage' });
+            }
+          });
+          continue;
+        }
         if (job.status !== 'queued' && job.status !== 'running') continue;
         guard(job.id, () => {
           // A stage still marked running belongs to a process that is gone. Mark it, and it runs again.
           let mayHaveHalfDoneEdits = false;
           for (const s of ctx.jobs.stages(job.id)) {
             if (s.status !== 'running') continue;
-            ctx.jobs.finishStage(s.id, 'failed', { interrupted: true, reason: 'interrupted', error: 'process stopped mid-stage' });
+            finish(s, 'failed', { interrupted: true, reason: 'interrupted', error: 'process stopped mid-stage' });
             if (EDITING.has(s.name)) mayHaveHalfDoneEdits = true;
           }
           if (job.status === 'queued') ctx.jobs.setStatus(job.id, 'running');
@@ -232,7 +273,7 @@ export default definePlugin({
         const s = e.jobId && runningStage(e.jobId, 'worktree');
         if (!e.jobId || !s) return;
         const p = e.payload as { cwd: string; branch: string };
-        ctx.jobs.finishStage(s.id, 'passed', { cwd: p.cwd, branch: p.branch });
+        finish(s, 'passed', { cwd: p.cwd, branch: p.branch });
         advance(e.jobId);
       });
     });
@@ -242,7 +283,7 @@ export default definePlugin({
         const s = e.jobId && runningStage(e.jobId, 'worktree');
         if (!e.jobId || !s) return;
         const error = (e.payload as { error?: string }).error ?? 'unknown';
-        ctx.jobs.finishStage(s.id, 'failed', { error });
+        finish(s, 'failed', { error });
         fail(e.jobId, `worktree failed: ${error}`);
       });
     });
@@ -253,7 +294,7 @@ export default definePlugin({
       guard(e.jobId, () => {
         const s = e.jobId && runningStage(e.jobId, 'reset');
         if (!e.jobId || !s) return;
-        ctx.jobs.finishStage(s.id, 'passed', e.payload);
+        finish(s, 'passed', e.payload);
         advance(e.jobId);
       });
     });
@@ -263,20 +304,26 @@ export default definePlugin({
         const s = e.jobId && runningStage(e.jobId, 'reset');
         if (!e.jobId || !s) return;
         const error = (e.payload as { error?: string }).error ?? 'unknown';
-        ctx.jobs.finishStage(s.id, 'failed', { error });
+        finish(s, 'failed', { error });
         fail(e.jobId, `could not reset the worktree after the restart: ${error}`);
       });
     });
 
-    // A job that ends without merging leaves nothing behind, unless the config says to keep it.
+    // The job ended. If nothing is running for it, clean up now; otherwise the last stage to close does it.
     ctx.on('job.status', (e) => {
       const to = (e.payload as { to?: string } | null)?.to;
-      if (!e.jobId || (to !== 'failed' && to !== 'cancelled') || cfg.keepFailedWorktrees) return;
+      if (!e.jobId || (to !== 'failed' && to !== 'cancelled')) return;
+      guard(e.jobId, () => cleanupIfIdle(e.jobId!));
+    });
+
+    // A channel asks to stop a job. Ending a job needs jobs.write, which only this plugin holds.
+    ctx.on('cancel.requested', (e) => {
       guard(e.jobId, () => {
-        const job = ctx.jobs.get(e.jobId!);
-        const wt = lastOf(stagesOf(e.jobId!), 'worktree');
-        const branch = wt?.status === 'passed' ? outputOf(wt).branch : undefined;
-        if (job && typeof branch === 'string' && branch) ctx.emit('worktree.cleanup.requested', { repoPath: job.repo, branch }, e.jobId);
+        const job = e.jobId ? ctx.jobs.get(e.jobId) : undefined;
+        if (!job || job.status === 'done' || job.status === 'failed' || job.status === 'cancelled') return;
+        // A stage waiting for a person is closed here. A running Claude is stopped by the worker, which also hears job.status.
+        for (const s of ctx.jobs.stages(job.id)) if (s.status === 'running' && s.name.startsWith('approve-')) finish(s, 'failed', { cancelled: true });
+        ctx.jobs.setStatus(job.id, 'cancelled');
       });
     });
 
@@ -287,7 +334,7 @@ export default definePlugin({
         if (!e.jobId || !wait || !s) return;
         committing.delete(e.jobId);
         const p = e.payload as { sha: string; base: string };
-        ctx.jobs.finishStage(s.id, wait.status, { ...wait.out, sha: p.sha, base: p.base });
+        finish(s, wait.status, { ...wait.out, sha: p.sha, base: p.base });
         advance(e.jobId);
       });
     });
@@ -299,7 +346,7 @@ export default definePlugin({
         if (!e.jobId || !wait || !s) return;
         committing.delete(e.jobId);
         const error = (e.payload as { error?: string }).error ?? 'unknown';
-        ctx.jobs.finishStage(s.id, 'failed', { error: `commit failed: ${error}` });
+        finish(s, 'failed', { error: `commit failed: ${error}` });
         fail(e.jobId, `${wait.stage} could not be committed: ${error}`);
       });
     });
@@ -330,7 +377,7 @@ export default definePlugin({
           ctx.emit('commit.requested', { cwd: String(wt.cwd), message: `${job?.title ?? 'work'} (${p.stage})` }, e.jobId);
           return;
         }
-        ctx.jobs.finishStage(s.id, status, out);
+        finish(s, status, out);
         advance(e.jobId);
       });
     });
@@ -341,7 +388,7 @@ export default definePlugin({
         const s = e.jobId && runningStage(e.jobId, p.stage);
         if (!e.jobId || !s) return;
         const error = p.error ?? 'unknown';
-        ctx.jobs.finishStage(s.id, 'failed', { error });
+        finish(s, 'failed', { error });
         fail(e.jobId, `${p.stage} failed: ${error}`);
       });
     });
@@ -352,7 +399,7 @@ export default definePlugin({
         const jobId = e.jobId ?? p.jobId;
         const s = jobId && p.kind && runningStage(jobId, `approve-${p.kind}`);
         if (!jobId || !s) return;
-        ctx.jobs.finishStage(s.id, 'passed', { grantedBy: e.source });
+        finish(s, 'passed', { grantedBy: e.source });
         ctx.jobs.setStatus(jobId, 'running');
         advance(jobId);
       });
@@ -364,7 +411,7 @@ export default definePlugin({
         const jobId = e.jobId ?? p.jobId;
         const s = jobId && ctx.jobs.stages(jobId).find((x) => x.name.startsWith('approve-') && x.status === 'running');
         if (!jobId || !s) return;
-        ctx.jobs.finishStage(s.id, 'failed', { deniedBy: e.source });
+        finish(s, 'failed', { deniedBy: e.source });
         ctx.jobs.setStatus(jobId, 'cancelled');
       });
     });
@@ -374,7 +421,7 @@ export default definePlugin({
         const s = e.jobId && runningStage(e.jobId, 'pr');
         if (!e.jobId || !s) return;
         const p = e.payload as { url: string; number: number; headSha: string };
-        ctx.jobs.finishStage(s.id, 'passed', { url: p.url, number: p.number, headSha: p.headSha });
+        finish(s, 'passed', { url: p.url, number: p.number, headSha: p.headSha });
         advance(e.jobId);
       });
     });
@@ -384,7 +431,7 @@ export default definePlugin({
         const s = e.jobId && runningStage(e.jobId, 'pr');
         if (!e.jobId || !s) return;
         const error = (e.payload as { error?: string }).error ?? 'unknown';
-        ctx.jobs.finishStage(s.id, 'failed', { error });
+        finish(s, 'failed', { error });
         fail(e.jobId, `pr failed: ${error}`);
       });
     });
@@ -394,7 +441,7 @@ export default definePlugin({
         const s = e.jobId && runningStage(e.jobId, 'merge');
         if (!e.jobId || !s) return;
         const reason = (e.payload as { reason?: string }).reason ?? 'unknown';
-        ctx.jobs.finishStage(s.id, 'failed', { refused: reason });
+        finish(s, 'failed', { refused: reason });
         advance(e.jobId);
       });
     });
@@ -405,7 +452,7 @@ export default definePlugin({
         const s = e.jobId && runningStage(e.jobId, 'merge');
         if (!e.jobId || !s) return;
         const reason = (e.payload as { reason?: string }).reason ?? 'unknown';
-        ctx.jobs.finishStage(s.id, 'failed', { error: reason });
+        finish(s, 'failed', { error: reason });
         fail(e.jobId, `merge failed: ${reason}`);
       });
     });
@@ -414,7 +461,7 @@ export default definePlugin({
       guard(e.jobId, () => {
         const s = e.jobId && runningStage(e.jobId, 'merge');
         if (!e.jobId || !s) return;
-        ctx.jobs.finishStage(s.id, 'passed', e.payload);
+        finish(s, 'passed', e.payload);
         advance(e.jobId);
       });
     });

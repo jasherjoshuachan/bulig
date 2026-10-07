@@ -330,3 +330,54 @@ describe('loader', () => {
     expect(again.box.ctx!.state.get<number>('offset')).toBe(7);
   });
 });
+
+describe('jobs.write gates the writes that decide an outcome', () => {
+  async function setup(grants: Record<string, string[]>, needs: string[]) {
+    const { plugin, box } = probe({ needs });
+    const k = kernelWith({ plugins: [plugin], grants });
+    await k.start();
+    const job = k.jobs.create({ repo: 'r', title: 't' });
+    k.jobs.setStatus(job.id, 'running');
+    return { k, ctx: box.ctx!, job };
+  }
+
+  it('a rogue plugin cannot approve: it cannot finish or open an approval stage, or move a job out of awaiting_approval', async () => {
+    const { k, ctx, job } = await setup({}, []);
+    // The pipeline's side of the story, done with the kernel's own ungated API.
+    const stage = k.jobs.startStage(job.id, 'approve-plan');
+    k.jobs.setStatus(job.id, 'awaiting_approval');
+    expect(() => ctx.jobs.finishStage(stage.id, 'passed')).toThrow(CapabilityDeniedError);
+    expect(() => ctx.jobs.finishStage(stage.id, 'passed')).toThrow(/jobs\.write/);
+    expect(() => ctx.jobs.setStatus(job.id, 'running')).toThrow(/jobs\.write/);
+    expect(() => ctx.jobs.startStage(job.id, 'approve-merge')).toThrow(/jobs\.write/);
+    expect(k.jobs.get(job.id)!.status).toBe('awaiting_approval');
+    expect(k.jobs.stages(job.id).find((s) => s.id === stage.id)!.status).toBe('running');
+  });
+
+  it('a rogue plugin cannot end a job with any terminal status', async () => {
+    const { k, ctx, job } = await setup({}, []);
+    for (const status of ['done', 'failed', 'cancelled'] as const) {
+      expect(() => ctx.jobs.setStatus(job.id, status)).toThrow(CapabilityDeniedError);
+    }
+    expect(k.jobs.get(job.id)!.status).toBe('running');
+  });
+
+  it('declared but not granted is refused too, and ordinary work stays open', async () => {
+    const { k, ctx, job } = await setup({ demo: [] }, ['jobs.write']);
+    expect(() => ctx.jobs.setStatus(job.id, 'done')).toThrow(/jobs\.write/);
+    const stage = ctx.jobs.startStage(job.id, 'build');
+    expect(() => ctx.jobs.finishStage(stage.id, 'passed')).not.toThrow();
+    expect(ctx.jobs.get(job.id)!.id).toBe(job.id);
+    expect(k.jobs.get(job.id)!.status).toBe('running');
+  });
+
+  it('a plugin that declares and is granted jobs.write can do all of it', async () => {
+    const { k, ctx, job } = await setup({ demo: ['jobs.write'] }, ['jobs.write']);
+    const stage = ctx.jobs.startStage(job.id, 'approve-merge');
+    ctx.jobs.setStatus(job.id, 'awaiting_approval');
+    ctx.jobs.finishStage(stage.id, 'passed');
+    ctx.jobs.setStatus(job.id, 'running');
+    ctx.jobs.setStatus(job.id, 'done');
+    expect(k.jobs.get(job.id)!.status).toBe('done');
+  });
+});

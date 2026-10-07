@@ -5,7 +5,19 @@ import { fileURLToPath } from 'node:url';
 import { afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { createKernel } from '@bulig/core';
 import { definePlugin, type BuligEvent, type Plugin } from '@bulig/plugin-sdk';
-import worker, { createWorker, EDIT_DENIED_TOOLS, EDIT_TOOLS, READONLY_TOOLS, buildArgs, buildEnv, parseClaudeOutput } from '../src/index.ts';
+import worker, {
+  BASE_ALLOWED_DOMAINS,
+  GITHUB_HOSTS,
+  createWorker,
+  EDIT_DENIED_TOOLS,
+  EDIT_TOOLS,
+  READONLY_TOOLS,
+  buildArgs,
+  buildEnv,
+  hardenEnv,
+  parseClaudeOutput,
+  sandboxSettings,
+} from '../src/index.ts';
 
 const FAKE = fileURLToPath(new URL('./fixtures/fake-claude.mjs', import.meta.url));
 const dirs: string[] = [];
@@ -22,7 +34,7 @@ beforeAll(() => chmodSync(FAKE, 0o755));
 /** A plugin that fires stage.requested and records what comes back. */
 function driver() {
   const seen: BuligEvent[] = [];
-  let fire: (payload: unknown) => void = () => {};
+  let fire: (payload: unknown, jobId?: string) => void = () => {};
   const plugin: Plugin = definePlugin({
     manifest: {
       name: 'driver',
@@ -35,10 +47,10 @@ function driver() {
     register(ctx) {
       ctx.on('stage.completed', (e) => void seen.push(e));
       ctx.on('stage.failed', (e) => void seen.push(e));
-      fire = (payload) => ctx.emit('stage.requested', payload, 'job-1');
+      fire = (payload, jobId = 'job-1') => ctx.emit('stage.requested', payload, jobId);
     },
   });
-  return { plugin, seen, fire: (p: unknown) => fire(p) };
+  return { plugin, seen, fire: (p: unknown, jobId?: string) => fire(p, jobId) };
 }
 
 async function setup(config: Record<string, unknown> = {}, grants?: string[], plugin: Plugin = worker) {
@@ -107,6 +119,77 @@ describe('buildArgs', () => {
   it('appends extra args', () => {
     const args = buildArgs({ stage: 's', prompt: 'p', model: 'm', mode: 'edit', cwd: '/x' }, ['--setting-sources', 'project']);
     expect(args.slice(-2)).toEqual(['--setting-sources', 'project']);
+  });
+});
+
+describe('the OS sandbox (layer 1)', () => {
+  const settingsOf = (args: string[]) => JSON.parse(args[args.indexOf('--settings') + 1]!) as { sandbox: Record<string, any> };
+
+  it('every stage, edit or readonly, carries the sandbox settings on --settings', () => {
+    for (const mode of ['readonly', 'edit'] as const) {
+      const args = buildArgs({ stage: 's', prompt: 'p', model: 'm', mode, cwd: '/x' });
+      expect(args.filter((a) => a === '--settings')).toHaveLength(1);
+      expect(settingsOf(args)).toEqual(sandboxSettings());
+    }
+  });
+
+  it('turns the sandbox on, cannot start without it, and lets nothing run outside it', () => {
+    const { sandbox } = sandboxSettings() as { sandbox: Record<string, any> };
+    expect(sandbox.enabled).toBe(true);
+    expect(sandbox.failIfUnavailable).toBe(true);
+    expect(sandbox.allowUnsandboxedCommands).toBe(false);
+    expect(sandbox.excludedCommands).toEqual([]);
+    // The tool allow list, not the sandbox, decides which commands may run at all.
+    expect(sandbox.autoAllowBashIfSandboxed).toBe(false);
+  });
+
+  it('allows Claude and the npm registry, refuses every other host, and names GitHub as denied', () => {
+    const { sandbox } = sandboxSettings() as { sandbox: Record<string, any> };
+    expect(sandbox.network.strictAllowlist).toBe(true);
+    expect(sandbox.network.allowedDomains).toEqual(expect.arrayContaining(['api.anthropic.com', 'registry.npmjs.org']));
+    expect(sandbox.network.allowedDomains).toEqual(BASE_ALLOWED_DOMAINS);
+    expect(sandbox.network.deniedDomains).toEqual(GITHUB_HOSTS);
+    for (const host of ['github.com', 'api.github.com', '*.githubusercontent.com']) expect(sandbox.network.deniedDomains).toContain(host);
+    for (const d of sandbox.network.allowedDomains as string[]) expect(d).not.toMatch(/github/i);
+  });
+
+  it('allowDomains adds hosts but can never add a GitHub one', () => {
+    const { sandbox } = sandboxSettings(['pypi.org', 'github.com', 'codeload.github.com', 'raw.githubusercontent.com', '*.githubusercontent.com']) as {
+      sandbox: Record<string, any>;
+    };
+    expect(sandbox.network.allowedDomains).toEqual([...BASE_ALLOWED_DOMAINS, 'pypi.org']);
+    const args = buildArgs({ stage: 's', prompt: 'p', model: 'm', mode: 'edit', cwd: '/x' }, [], ['pypi.org', 'github.com']);
+    expect(settingsOf(args).sandbox.network.allowedDomains).toEqual([...BASE_ALLOWED_DOMAINS, 'pypi.org']);
+  });
+
+  it('hides the places gh and git keep their logins from sandboxed reads', () => {
+    const { sandbox } = sandboxSettings() as { sandbox: Record<string, any> };
+    expect(sandbox.filesystem.denyRead).toEqual(expect.arrayContaining(['~/.config/gh', '~/.ssh', '~/.git-credentials']));
+  });
+});
+
+describe('hardenEnv (layer 2)', () => {
+  const base = buildEnv({ PATH: '/bin', HOME: '/h', USER: 'u' });
+  const env = hardenEnv({ ...base, SSH_AUTH_SOCK: '/tmp/agent.sock', GIT_ASKPASS: '/usr/bin/real-askpass', GIT_DIR: '/x', GH_HOST: 'h', GH_CONFIG_DIR: '/h/.config/gh' }, '/tmp/gh-empty');
+
+  it('points gh at the empty dir it was given', () => {
+    expect(env.GH_CONFIG_DIR).toBe('/tmp/gh-empty');
+  });
+  it('gives git no global or system config, no prompt and no password helper', () => {
+    expect(env).toMatchObject({ GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0', GIT_ASKPASS: '/bin/false' });
+  });
+  it('clears the credential helper the way git -c credential.helper= does', () => {
+    expect(env).toMatchObject({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'credential.helper', GIT_CONFIG_VALUE_0: '' });
+    expect('GIT_CONFIG_VALUE_0' in env).toBe(true); // empty, not missing: missing would leave the helper alone
+  });
+  it('drops the ssh agent and any other git or gh setting that came in', () => {
+    expect(env).not.toHaveProperty('SSH_AUTH_SOCK');
+    expect(env).not.toHaveProperty('GIT_DIR');
+    expect(env).not.toHaveProperty('GH_HOST');
+  });
+  it('keeps HOME, because Claude needs it to log in', () => {
+    expect(env.HOME).toBe('/h');
+    expect(env.PATH).toBe('/bin');
   });
 });
 
@@ -203,6 +286,39 @@ describe('worker-claude-code plugin', () => {
     expect(env.PATH).toBeTruthy();
     expect(env.HOME).toBeTruthy();
     expect(env.ANTHROPIC_API_KEY).toBe('sk-ant-test');
+  });
+
+  it('the child gets a fresh empty GH_CONFIG_DIR per stage, hardened git env, no ssh agent, and the dir is removed afterwards', async () => {
+    const dumpA = join(tmp(), 'a.json');
+    const dumpB = join(tmp(), 'b.json');
+    const saved = { ...process.env };
+    process.env.SSH_AUTH_SOCK = '/tmp/agent.sock';
+    process.env.GIT_ASKPASS = '/usr/bin/real-askpass';
+    try {
+      const dirsSeen: string[] = [];
+      for (const dump of [dumpA, dumpB]) {
+        process.env.FAKE_CLAUDE_ENV_DUMP = dump;
+        const { fire, seen } = await setup({ passEnv: ['FAKE_CLAUDE_ENV_DUMP', 'SSH_AUTH_SOCK'] });
+        fire(req({ mode: 'edit', stage: 'build' }));
+        await waitFor(() => seen.length > 0);
+        expect(seen[0]!.type).toBe('stage.completed');
+        const env = JSON.parse(readFileSync(dump, 'utf8')) as Record<string, string>;
+        expect(env.GH_CONFIG_DIR).toMatch(/bulig-gh-/);
+        expect(existsSync(env.GH_CONFIG_DIR!)).toBe(false); // gone once the run ended
+        expect((env as unknown as { __GH_DIR_ENTRIES: string[] }).__GH_DIR_ENTRIES).toEqual([]); // and it was empty while the child ran
+        expect(env).toMatchObject({
+          GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0', GIT_ASKPASS: '/bin/false',
+          GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'credential.helper', GIT_CONFIG_VALUE_0: '',
+        });
+        expect(env).not.toHaveProperty('SSH_AUTH_SOCK'); // even passEnv cannot bring it back
+        expect(env.HOME).toBe(saved.HOME);
+        dirsSeen.push(env.GH_CONFIG_DIR!);
+      }
+      expect(dirsSeen[0]).not.toBe(dirsSeen[1]); // one per stage
+    } finally {
+      for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k];
+      Object.assign(process.env, saved);
+    }
   });
 
   it('every run is its own session', async () => {
@@ -328,6 +444,89 @@ describe('stop()', () => {
     const started = Date.now();
     await h.k.stop();
     expect(Date.now() - started).toBeLessThan(2000);
+  });
+});
+
+describe('a job that ends takes its own Claude with it', () => {
+  const alive = (pid: number) => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const pidsIn = (mark: string) => (existsSync(mark) ? [...readFileSync(mark, 'utf8').matchAll(/PID (\d+)/g)].map((m) => Number(m[1])) : []);
+
+  async function twoJobs(prompts: [string, string], config: Record<string, unknown> = {}) {
+    const mark = join(tmp(), 'jobs.log');
+    process.env.FAKE_CLAUDE_MARK = mark;
+    const h = await setup({ passEnv: ['FAKE_CLAUDE_MARK'], ...config }, undefined, createWorker());
+    delete process.env.FAKE_CLAUDE_MARK;
+    const a = h.k.jobs.create({ repo: '/r', title: 'a' });
+    const b = h.k.jobs.create({ repo: '/r', title: 'b' });
+    process.env.FAKE_CLAUDE_MARK = mark;
+    h.fire(req({ prompt: prompts[0], stage: 'build', mode: 'edit' }), a.id);
+    await waitFor(() => pidsIn(mark).length === 1);
+    h.fire(req({ prompt: prompts[1], stage: 'build', mode: 'edit' }), b.id);
+    await waitFor(() => pidsIn(mark).length === 2);
+    delete process.env.FAKE_CLAUDE_MARK;
+    const [pa, pb] = pidsIn(mark) as [number, number];
+    return { ...h, a, b, pa, pb, mark };
+  }
+
+  it('cancelling a job SIGTERMs only that job\'s Claude, and the stage is closed as failed', async () => {
+    const h = await twoJobs(['FAKE:term', 'FAKE:term']);
+    h.k.jobs.setStatus(h.a.id, 'cancelled');
+    await waitFor(() => !alive(h.pa));
+    expect(alive(h.pb)).toBe(true); // the other job's run is untouched
+    await waitFor(() => h.seen.length === 1);
+    expect(h.seen[0]).toMatchObject({ type: 'stage.failed', jobId: h.a.id });
+    expect((h.seen[0]!.payload as { error: string }).error).toMatch(/job ended/);
+    await h.k.stop();
+    expect(alive(h.pb)).toBe(false);
+  });
+
+  it('a job that fails is treated the same way', async () => {
+    const h = await twoJobs(['FAKE:term', 'FAKE:term']);
+    h.k.jobs.setStatus(h.b.id, 'failed');
+    await waitFor(() => !alive(h.pb));
+    expect(alive(h.pa)).toBe(true);
+    await h.k.stop();
+  });
+
+  it('follows SIGTERM with SIGKILL after the grace period when the run ignores it', async () => {
+    const h = await twoJobs(['FAKE:ignoreterm', 'FAKE:term'], { stopGraceMs: 400 });
+    const started = Date.now();
+    h.k.jobs.setStatus(h.a.id, 'cancelled');
+    await waitFor(() => !alive(h.pa));
+    expect(Date.now() - started).toBeGreaterThanOrEqual(350);
+    expect(readFileSync(h.mark, 'utf8')).toContain('TERM'); // asked nicely first
+    expect(alive(h.pb)).toBe(true);
+    await h.k.stop();
+  });
+
+  it('other status changes leave the run alone', async () => {
+    const h = await twoJobs(['FAKE:term', 'FAKE:term']);
+    h.k.jobs.setStatus(h.a.id, 'running');
+    h.k.jobs.setStatus(h.a.id, 'awaiting_approval');
+    await new Promise((r) => setTimeout(r, 150));
+    expect(alive(h.pa) && alive(h.pb)).toBe(true);
+    expect(h.seen).toHaveLength(0);
+    await h.k.stop();
+  });
+
+  it('a stage requested for a job that already ended never starts', async () => {
+    const mark = join(tmp(), 'never.log');
+    process.env.FAKE_CLAUDE_MARK = mark;
+    const h = await setup({ passEnv: ['FAKE_CLAUDE_MARK'] }, undefined, createWorker());
+    delete process.env.FAKE_CLAUDE_MARK;
+    const job = h.k.jobs.create({ repo: '/r', title: 'x' });
+    h.k.jobs.setStatus(job.id, 'cancelled');
+    h.fire(req({ prompt: 'FAKE:term', stage: 'build', mode: 'edit' }), job.id);
+    await waitFor(() => h.seen.length === 1);
+    expect(h.seen[0]!.type).toBe('stage.failed');
+    expect(existsSync(mark)).toBe(false);
   });
 });
 

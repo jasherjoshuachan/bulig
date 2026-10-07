@@ -50,12 +50,15 @@ export class FakeTelegram {
   }
 
   /** A text message from a chat. */
-  say(chatId: number, text: string): void {
-    this.updates.push({ update_id: this.nextUpdateId++, message: { message_id: this.nextMessageId++, text, chat: { id: chatId } } });
+  say(chatId: number, text: string, fromId?: number): void {
+    this.updates.push({
+      update_id: this.nextUpdateId++,
+      message: { message_id: this.nextMessageId++, text, chat: { id: chatId }, ...(fromId !== undefined && { from: { id: fromId } }) },
+    });
   }
 
   /** A press on an inline button of a message the bot sent. */
-  press(chatId: number, messageId: number, text: string, data: string, from: Record<string, string> = { username: 'jasher' }): void {
+  press(chatId: number, messageId: number, text: string, data: string, from: Record<string, string | number> = { username: 'jasher' }): void {
     this.updates.push({
       update_id: this.nextUpdateId++,
       callback_query: { id: `cb${this.nextUpdateId}`, data, from, message: { message_id: messageId, text, chat: { id: chatId } } },

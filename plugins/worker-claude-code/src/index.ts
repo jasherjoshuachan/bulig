@@ -1,4 +1,7 @@
 import { spawn, type ChildProcess } from 'node:child_process';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { definePlugin, type BuligEvent } from '@bulig/plugin-sdk';
 
 export type StageMode = 'readonly' | 'edit';
@@ -22,6 +25,11 @@ export interface WorkerConfig {
    * GH_TOKEN, GITHUB_TOKEN and BULIG_* can never be passed, even from here.
    */
   passEnv?: string[];
+  /**
+   * Extra hosts a sandboxed command may reach, on top of the npm registry. GitHub hosts are refused here:
+   * an entry that names one is dropped.
+   */
+  allowDomains?: string[];
   /** On stop, how long a run gets after SIGTERM before it is killed with SIGKILL, in ms. Default 10000. */
   stopGraceMs?: number;
 }
@@ -100,11 +108,71 @@ export function buildEnv(source: NodeJS.ProcessEnv, passEnv: readonly string[] =
 }
 
 /**
+ * Layer 2 of keeping an edit stage away from GitHub: the ambient credentials. HOME stays, because Claude Code
+ * needs it to log in, and the signed-in gh and git's credential helper live under it. So gh gets an empty
+ * config dir, git gets no global or system config and no credential helper, and nothing can prompt or ask
+ * an agent for a password. `ghConfigDir` must be a fresh empty directory made for this one run.
+ */
+export function hardenEnv(env: NodeJS.ProcessEnv, ghConfigDir: string): NodeJS.ProcessEnv {
+  const out: NodeJS.ProcessEnv = {};
+  for (const [name, value] of Object.entries(env)) {
+    if (/^(GIT_|GH_|GITHUB_|SSH_|SSH$)/.test(name)) continue;
+    out[name] = value;
+  }
+  return {
+    ...out,
+    GH_CONFIG_DIR: ghConfigDir,
+    GH_PROMPT_DISABLED: '1',
+    GIT_CONFIG_GLOBAL: '/dev/null',
+    GIT_CONFIG_NOSYSTEM: '1',
+    GIT_TERMINAL_PROMPT: '0',
+    GIT_ASKPASS: '/bin/false',
+    // Same as `git -c credential.helper=`: an empty value clears every helper set at any other level.
+    GIT_CONFIG_COUNT: '1',
+    GIT_CONFIG_KEY_0: 'credential.helper',
+    GIT_CONFIG_VALUE_0: '',
+  };
+}
+
+/** Hosts a sandboxed command may never reach, whatever the config says. */
+export const GITHUB_HOSTS = ['github.com', '*.github.com', 'api.github.com', 'githubusercontent.com', '*.githubusercontent.com'];
+/** Hosts a sandboxed command may reach: Claude's own API and the npm registry. Everything else is refused. */
+export const BASE_ALLOWED_DOMAINS = ['api.anthropic.com', 'registry.npmjs.org'];
+/** Credential files a sandboxed command may not even read. */
+export const DENY_READ = ['~/.config/gh', '~/.ssh', '~/.git-credentials', '~/.netrc', '~/.gitconfig', '~/.config/git'];
+
+const isGithubHost = (d: string) => /(^|\.)(github\.com|githubusercontent\.com)$/i.test(d.replace(/^\*\./, ''));
+
+/**
+ * Layer 1: Claude Code's own OS sandbox (Seatbelt on macOS, bubblewrap on Linux) around every Bash command of
+ * every stage, so `node`, `npm` and `pnpm` are fenced in too, not just the commands named in a deny list.
+ * It is passed with --settings, so no project or user file can turn it off.
+ *  - strictAllowlist: a host outside allowedDomains is refused, never prompted for.
+ *  - allowUnsandboxedCommands false and no excludedCommands: nothing runs outside the sandbox.
+ *  - failIfUnavailable: if the sandbox cannot start, Claude exits instead of running unfenced.
+ *  - autoAllowBashIfSandboxed false: the allowed-tools list still decides which commands run at all.
+ */
+export function sandboxSettings(extraDomains: readonly string[] = []): Record<string, unknown> {
+  const allowed = [...new Set([...BASE_ALLOWED_DOMAINS, ...extraDomains.filter((d) => !isGithubHost(d))])];
+  return {
+    sandbox: {
+      enabled: true,
+      failIfUnavailable: true,
+      allowUnsandboxedCommands: false,
+      autoAllowBashIfSandboxed: false,
+      excludedCommands: [],
+      network: { allowedDomains: allowed, deniedDomains: GITHUB_HOSTS, strictAllowlist: true },
+      filesystem: { denyRead: DENY_READ },
+    },
+  };
+}
+
+/**
  * The argument list for one run. Every run is a fresh session: there is no resume or continue flag,
  * so a reviewer never sees the build session's context.
  */
-export function buildArgs(req: StageRequest, extra: string[] = []): string[] {
-  const args = ['-p', req.prompt, '--output-format', 'json', '--model', req.model];
+export function buildArgs(req: StageRequest, extra: string[] = [], allowDomains: readonly string[] = []): string[] {
+  const args = ['-p', req.prompt, '--output-format', 'json', '--model', req.model, '--settings', JSON.stringify(sandboxSettings(allowDomains))];
   if (req.mode === 'edit') {
     args.push('--permission-mode', 'acceptEdits', '--allowedTools', EDIT_TOOLS.join(','), '--disallowedTools', EDIT_DENIED_TOOLS.join(','));
   } else {
@@ -138,16 +206,34 @@ export function parseClaudeOutput(stdout: string): RunResult {
   return { ok: true, result, ...(sessionId && { sessionId }), ...(costUsd !== undefined && { costUsd }) };
 }
 
-function run(bin: string, args: string[], cwd: string, timeoutMs: number, env: NodeJS.ProcessEnv, children: Set<ChildProcess>): Promise<RunResult> {
+function run(
+  bin: string,
+  args: string[],
+  cwd: string,
+  timeoutMs: number,
+  env: NodeJS.ProcessEnv,
+  children: Set<ChildProcess>,
+  onSpawn: (child: ChildProcess) => () => void,
+): Promise<RunResult> {
   return new Promise((resolve) => {
-    let child;
+    // A fresh, empty gh config dir for this one run, so no signed-in gh state can be found under HOME.
+    let ghDir: string;
     try {
-      child = spawn(bin, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'], env });
+      ghDir = mkdtempSync(join(tmpdir(), 'bulig-gh-'));
     } catch (err) {
+      resolve({ ok: false, result: '', error: `could not make a temp dir: ${(err as Error).message}` });
+      return;
+    }
+    let child: ChildProcess;
+    try {
+      child = spawn(bin, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'], env: hardenEnv(env, ghDir) });
+    } catch (err) {
+      rmSync(ghDir, { recursive: true, force: true });
       resolve({ ok: false, result: '', error: `could not start ${bin}: ${(err as Error).message}` });
       return;
     }
     children.add(child);
+    const untrack = onSpawn(child);
     let stdout = '';
     let stderr = '';
     let timedOut = false;
@@ -157,6 +243,8 @@ function run(bin: string, args: string[], cwd: string, timeoutMs: number, env: N
       settled = true;
       clearTimeout(timer);
       children.delete(child);
+      untrack();
+      rmSync(ghDir, { recursive: true, force: true });
       resolve(r);
     };
     const timer = setTimeout(() => {
@@ -164,8 +252,8 @@ function run(bin: string, args: string[], cwd: string, timeoutMs: number, env: N
       child.kill('SIGTERM');
       setTimeout(() => child.kill('SIGKILL'), KILL_GRACE_MS).unref();
     }, timeoutMs);
-    child.stdout.on('data', (d: Buffer) => (stdout += d.toString()));
-    child.stderr.on('data', (d: Buffer) => (stderr += d.toString()));
+    child.stdout!.on('data', (d: Buffer) => (stdout += d.toString()));
+    child.stderr!.on('data', (d: Buffer) => (stderr += d.toString()));
     child.on('error', (err) => done({ ok: false, result: '', error: `could not start ${bin}: ${err.message}` }));
     child.on('close', (code) => {
       if (timedOut) return done({ ok: false, result: '', error: `timed out after ${Math.round(timeoutMs / 1000)}s` });
@@ -191,12 +279,25 @@ function isRequest(p: unknown): p is StageRequest {
   );
 }
 
+/** SIGTERM now, SIGKILL after `graceMs` if it is still alive. */
+function terminate(child: ChildProcess, graceMs: number): void {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  child.kill('SIGTERM');
+  setTimeout(() => {
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+  }, graceMs).unref();
+}
+
 /**
  * A worker. Each one tracks its own Claude processes, so stop() ends exactly those and nothing else.
  * The default export is one shared instance for normal use.
  */
 export function createWorker() {
   const children = new Set<ChildProcess>();
+  /** The running Claude processes of each job, so cancelling one job ends only its own. */
+  const byJob = new Map<string, Set<ChildProcess>>();
+  /** Children that were ended because their job was cancelled or failed. */
+  const ended = new WeakSet<ChildProcess>();
   let stopping = false;
   let graceMs = STOP_GRACE_MS;
 
@@ -207,7 +308,7 @@ export function createWorker() {
       sdk: '0',
       description: 'Runs one fresh Claude Code session per stage, inside the job worktree.',
       provides: { stages: ['*'] },
-      subscribes: ['stage.requested'],
+      subscribes: ['stage.requested', 'job.status'],
       emits: ['stage.completed', 'stage.failed'],
       needs: ['claude.run', 'fs.worktree'],
     },
@@ -220,6 +321,17 @@ export function createWorker() {
       graceMs = cfg.stopGraceMs ?? STOP_GRACE_MS;
       stopping = false;
 
+      // A job that was cancelled or failed must not keep a Claude running in its worktree: the worktree is removed
+      // when the job ends, and a live child would write into it, or recreate it, after that.
+      ctx.on('job.status', (event: BuligEvent) => {
+        const to = (event.payload as { to?: string } | null)?.to;
+        if (!event.jobId || (to !== 'cancelled' && to !== 'failed')) return;
+        for (const child of byJob.get(event.jobId) ?? []) {
+          ended.add(child);
+          terminate(child, graceMs);
+        }
+      });
+
       ctx.on('stage.requested', async (event: BuligEvent) => {
         const req = event.payload;
         if (!isRequest(req)) {
@@ -227,9 +339,31 @@ export function createWorker() {
           return;
         }
         if (stopping) return; // shutting down: start nothing. The stage stays running and is picked up on resume.
-        const out = await run(bin, buildArgs(req, cfg.extraArgs), req.cwd, timeoutMs, buildEnv(process.env, cfg.passEnv), children);
+        const jobId = event.jobId;
+        const state = jobId ? ctx.jobs.get(jobId)?.status : undefined;
+        if (state === 'cancelled' || state === 'failed') {
+          ctx.emit('stage.failed', { stage: req.stage, error: `the job is ${state}, so the stage did not start` }, jobId);
+          return;
+        }
+        let spawned: ChildProcess | undefined;
+        const out = await run(bin, buildArgs(req, cfg.extraArgs, cfg.allowDomains), req.cwd, timeoutMs, buildEnv(process.env, cfg.passEnv), children, (child) => {
+          spawned = child;
+          if (!jobId) return () => {};
+          const set = byJob.get(jobId) ?? new Set<ChildProcess>();
+          set.add(child);
+          byJob.set(jobId, set);
+          return () => {
+            set.delete(child);
+            if (set.size === 0 && byJob.get(jobId) === set) byJob.delete(jobId);
+          };
+        });
         // A run that was ended by stop() says nothing. The stage stays running, and the next start marks it interrupted.
         if (stopping) return;
+        if (spawned && ended.has(spawned)) {
+          // Killed because its job ended. Say so, so the stage is closed and cleanup can go ahead.
+          ctx.emit('stage.failed', { stage: req.stage, error: 'the job ended, so this run was stopped' }, jobId);
+          return;
+        }
         if (out.ok) {
           ctx.emit(
             'stage.completed',

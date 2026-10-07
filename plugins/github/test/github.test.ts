@@ -244,6 +244,18 @@ describe('commit.requested', () => {
     expect(git(cwd, 'status', '--porcelain')).toBe('');
   });
 
+  it('signs the commit with the configured author, not git\'s own identity', async () => {
+    const h = await setup({ authorName: 'Bulig Bot', authorEmail: '1+buligbot@users.noreply.github.com' });
+    h.fire('worktree.requested', { repoPath: h.repo, branch: 'bulig/c-id' });
+    const { cwd } = (await h.waitFor('worktree.ready')).payload as { cwd: string };
+    writeFileSync(join(cwd, 'c.txt'), 'c\n');
+    h.fire('commit.requested', { cwd, message: 'signed' });
+    await h.waitFor('commit.done');
+    expect(git(cwd, 'log', '-1', '--format=%an <%ae>|%cn <%ce>')).toBe(
+      'Bulig Bot <1+buligbot@users.noreply.github.com>|Bulig Bot <1+buligbot@users.noreply.github.com>',
+    );
+  });
+
   it('is safe to ask twice: a clean tree gives the same commit and makes no new one', async () => {
     const h = await setup();
     h.fire('worktree.requested', { repoPath: h.repo, branch: 'bulig/c-2' });

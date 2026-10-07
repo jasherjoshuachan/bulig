@@ -10,6 +10,9 @@ export interface GithubConfig {
   gitBin?: string;
   /** Name of an environment variable that holds a GitHub token. It is passed on as GH_TOKEN. */
   tokenEnv?: string;
+  /** Name and email put on the commits this plugin makes. Without them, git's own identity is used. */
+  authorName?: string;
+  authorEmail?: string;
   /** Treat a PR with no checks at all as allowed to merge. Default false. */
   allowNoChecks?: boolean;
   /** Base branch for new PRs. Default is the repo's default branch. */
@@ -124,6 +127,8 @@ export default definePlugin({
     // Every git call runs with hooks switched off. A job worktree is written by a Claude stage, so a hook it plants
     // (.husky, .git/hooks, lefthook) would otherwise run here, outside the stage sandbox.
     const NO_HOOKS = ['-c', 'core.hooksPath=/dev/null'];
+    // The bot signs its own commits, so the history shows who did the work and your identity is never borrowed.
+    const IDENTITY = cfg.authorName && cfg.authorEmail ? ['-c', `user.name=${cfg.authorName}`, '-c', `user.email=${cfg.authorEmail}`] : [];
     const runGit = (cwd: string, args: string[], withToken = false) => exec(git, [...NO_HOOKS, ...args], { cwd, env: env(withToken) });
     const runGh = (cwd: string, args: string[]) => exec(gh, args, { cwd, env: env(true) });
     // For calls that talk to GitHub. A temporary failure is tried again; any other failure is returned at once.
@@ -227,7 +232,7 @@ export default definePlugin({
         const dirty = must('git status', await runGit(cwd, ['status', '--porcelain']));
         if (dirty) {
           must('git add', await runGit(cwd, ['add', '-A']));
-          must('git commit', await runGit(cwd, ['commit', '-m', message]));
+          must('git commit', await runGit(cwd, [...IDENTITY, 'commit', '-m', message]));
         }
         const sha = must('git rev-parse', await runGit(cwd, ['rev-parse', 'HEAD']));
         ctx.emit('commit.done', { sha, base: await baseOf(cwd) }, event.jobId);

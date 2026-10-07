@@ -23,6 +23,8 @@
     },
     "github": {
       "tokenEnv": "BULIG_GH_TOKEN",
+      "authorName": "Bulig Bot",
+      "authorEmail": "<id>+<username>@users.noreply.github.com",
       "allowNoChecks": false
     },
     "pipeline-dev": {

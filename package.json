@@ -1,0 +1,22 @@
+{
+  "name": "bulig",
+  "private": true,
+  "version": "0.0.0",
+  "description": "A small kernel for Claude Code agent work. Every feature is a plugin.",
+  "type": "module",
+  "license": "MIT",
+  "packageManager": "pnpm@10.34.5",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "verify": "bash scripts/verify.sh",
+    "bulig": "node packages/cli/bin/bulig.mjs"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^22.15.0",
+    "typescript": "^5.9.0",
+    "vitest": "^3.2.0"
+  }
+}

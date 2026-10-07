@@ -71,9 +71,11 @@ pnpm bulig history <jobId>
 
 A job id can be shortened to any unique start of it. If a process dies mid-stage, `pnpm bulig resume <jobId>` picks the job up again. The cut-off stage is marked failed with the reason `interrupted`, the job worktree is put back to its last commit (`git reset --hard` and `git clean -fd`, inside that job's worktree only), and the stage runs again. Edit stages end in a commit, so only the work of the stage that was cut off is lost. When Bulig stops, it sends SIGTERM to the Claude sessions it started and SIGKILL to any that are still alive 10 seconds later (`stopGraceMs` in the worker config).
 
+Every Claude stage runs inside Claude Code's own Bash sandbox, switched on with `--settings`. A command a stage runs, and anything that command starts (`node`, `npm`, `pnpm`), can reach only the Anthropic API and the npm registry; GitHub is refused. If the sandbox cannot start (on Linux it needs `bubblewrap` and `socat`), the stage fails rather than running without it. Add more hosts with `allowDomains` in the `worker-claude-code` config (a GitHub host there is ignored). Each stage also gets an empty `GH_CONFIG_DIR` and no git credentials. When a job is cancelled or fails, the Claude process running for that job is stopped first, and its worktree is removed only after that stage has ended. [ADR 0003](docs/adr/0003-capability-manifest.md) lists what the OS enforces and what is only a name.
+
 `run` and `approve` start the kernel, drive the job until it needs you (`awaiting_approval`) or ends (`done`, `failed`), then exit. Everything is saved in SQLite, so the next command carries on from the stored state. Only one Bulig process may use a database at a time; a lock file next to it enforces that.
 
-The config is searched in the current folder (`bulig.config.json`), then `~/.bulig/config.json`. It holds `enabled` (which plugins run), `grants` (what each plugin may do, see [ADR 0003](docs/adr/0003-capability-manifest.md); channels need `approval.grant` and `pipeline-dev` needs `merge.request`), `eventCapabilities` (optional extra rules for which capability an event type needs), `pluginConfig` (per plugin settings) and `dbPath` (default `~/.bulig/bulig.sqlite`). Set `tokenEnv` on the github plugin to the name of an environment variable that holds a GitHub token, for example `BULIG_GH_TOKEN`. The token is read from the environment only and is never written to a file. A job that fails, is denied or is cancelled has its worktree and local branch removed (the branch on origin is left alone). Set `keepFailedWorktrees: true` in the `pipeline-dev` config to keep them for a look. Plugins can keep a little state of their own between runs; see [ADR 0004](docs/adr/0004-plugin-state.md).
+The config is searched in the current folder (`bulig.config.json`), then `~/.bulig/config.json`. It holds `enabled` (which plugins run), `grants` (what each plugin may do, see [ADR 0003](docs/adr/0003-capability-manifest.md); channels need `approval.grant`, and `pipeline-dev` needs `merge.request` and `jobs.write`), `eventCapabilities` (optional extra rules for which capability an event type needs), `pluginConfig` (per plugin settings) and `dbPath` (default `~/.bulig/bulig.sqlite`). Set `tokenEnv` on the github plugin to the name of an environment variable that holds a GitHub token, for example `BULIG_GH_TOKEN`. The token is read from the environment only and is never written to a file. A job that fails, is denied or is cancelled has its worktree and local branch removed (the branch on origin is left alone). Set `keepFailedWorktrees: true` in the `pipeline-dev` config to keep them for a look. Plugins can keep a little state of their own between runs; see [ADR 0004](docs/adr/0004-plugin-state.md).
 
 ### What one job produces
 
@@ -130,10 +132,11 @@ If the merge is refused (the head moved, or a check failed or is still running),
    "channel-telegram": {
      "tokenEnv": "BULIG_TELEGRAM_TOKEN",
      "allowedChatIds": [123456789],
+     "allowedUserIds": [123456789],
      "repos": { "my-project": "~/Projects/my-project" }
    }
    ```
-   `repos` maps a short name to a folder. `allowedChatIds` is the allowlist: updates from any other chat are dropped without a reply, and a warning with that chat id goes to the log.
+   `repos` maps a short name to a folder. `allowedChatIds` is the allowlist: updates from any other chat are dropped without a reply, and a warning with that chat id goes to the log. `allowedUserIds` lists the people who may give commands and tap Approve or Deny. In a group chat, being in the chat is not enough. If you leave it out, anyone in an allowed chat can approve, and a warning says so at start. Your user id is the `"from":{"id":...` number in the same `getUpdates` answer.
 5. **Run it.**
    ```
    bash scripts/serve-with-keychain.sh
@@ -147,7 +150,7 @@ In the chat:
 | `/dev my-project Add multiply function` | Starts a job. Put the issue text on the lines after the title. |
 | `/status` or `/status <jobId>` | Lists recent jobs, or shows one. |
 | `/history <jobId>` | The stages of a job with times. |
-| `/cancel <jobId>` | Stops a job. A stage already running finishes, then nothing else starts. |
+| `/cancel <jobId>` | Stops a job. A Claude that is running for it is stopped (SIGTERM, then SIGKILL after the grace period), and the worktree is removed only after that. |
 | `/help` | The list above. |
 
 When a job needs you, the bot sends the plan or the PR with **Approve** and **Deny** buttons. Tapping one edits the message to show the decision. A button for an approval that is no longer open answers "expired" and does nothing. A job id can be shortened to any unique start of it.

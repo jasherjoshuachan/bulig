@@ -10,6 +10,11 @@ export interface TelegramConfig {
   tokenEnv?: string;
   /** Only these chats may talk to the bot. Everyone else is ignored without a reply. */
   allowedChatIds: number[];
+  /**
+   * Only these Telegram users may use commands or tap Approve and Deny. In a group chat, being in the chat is
+   * not enough. If this is not set, anyone in an allowed chat can approve, and a warning is logged at start.
+   */
+  allowedUserIds?: number[];
   /** Short names for repositories, used by /dev. */
   repos?: Record<string, string>;
   /** Default https://api.telegram.org. Tests point this at a local fake. */
@@ -25,11 +30,11 @@ export interface TelegramChannelOptions {
 
 interface Update {
   update_id: number;
-  message?: { message_id: number; text?: string; chat: { id: number } };
+  message?: { message_id: number; text?: string; chat: { id: number }; from?: { id: number } };
   callback_query?: {
     id: string;
     data?: string;
-    from?: { username?: string; first_name?: string };
+    from?: { id?: number; username?: string; first_name?: string };
     message?: { message_id: number; text?: string; chat: { id: number } };
   };
 }
@@ -119,7 +124,7 @@ export function createTelegramChannel(options: TelegramChannelOptions = {}): Plu
       description: 'Run Bulig from Telegram: start jobs, watch progress, tap to approve.',
       provides: { commands: ['dev', 'status', 'history', 'cancel', 'help'] },
       subscribes: SUBSCRIPTIONS,
-      emits: ['approval.granted', 'approval.denied'],
+      emits: ['approval.granted', 'approval.denied', 'cancel.requested'],
       needs: ['channel.send:telegram', 'approval.grant'],
     },
 
@@ -134,6 +139,15 @@ export function createTelegramChannel(options: TelegramChannelOptions = {}): Plu
       if (!Array.isArray(allowed) || allowed.length === 0 || !allowed.every((n) => Number.isInteger(n))) {
         throw new Error('channel-telegram: allowedChatIds must list at least one chat id (numbers).');
       }
+      const users = cfg.allowedUserIds;
+      if (users !== undefined && (!Array.isArray(users) || users.length === 0 || !users.every((n) => Number.isInteger(n)))) {
+        throw new Error('channel-telegram: allowedUserIds must list at least one Telegram user id (numbers), or be left out.');
+      }
+      if (users === undefined) {
+        ctx.log.warn('channel-telegram: allowedUserIds is not set, so anyone in an allowed chat can approve and deny. Set it to the user ids that may.');
+      }
+      /** May this Telegram user give orders and approve? Always true when no list is configured. */
+      const userAllowed = (id: number | undefined): boolean => users === undefined || (id !== undefined && users.includes(id));
       const repos = cfg.repos ?? {};
 
       const sleep = options.sleep ?? defaultSleep;
@@ -295,9 +309,10 @@ export function createTelegramChannel(options: TelegramChannelOptions = {}): Plu
           // Same path as pressing Deny, so the pipeline closes the approval stage itself.
           ctx.emit('approval.denied', { jobId: job.id, kind: waiting.name.slice(8) }, job.id);
         } else {
-          ctx.jobs.setStatus(job.id, 'cancelled');
+          // Ending a job needs jobs.write, which the pipeline holds and this channel does not. Ask it.
+          ctx.emit('cancel.requested', { jobId: job.id }, job.id);
         }
-        say([chat], `Job ${short(job.id)} cancelled. A stage that is already running will finish, then nothing else starts.`);
+        say([chat], `Job ${short(job.id)} cancelled. A stage that is running is being stopped, and nothing else starts.`);
       }
 
       const CALLBACK = /^(ap|dn):([0-9a-f-]{36}):(plan|merge)$/;
@@ -307,6 +322,13 @@ export function createTelegramChannel(options: TelegramChannelOptions = {}): Plu
         if (!msg || !allowed.includes(msg.chat.id)) return;
         const m = CALLBACK.exec(q.data ?? '');
         const reply = (text: string) => api.call('answerCallbackQuery', { callback_query_id: q.id, text }).catch(() => undefined);
+        if (!userAllowed(q.from?.id)) {
+          ctx.log.warn(`channel-telegram: refused a button press from user ${q.from?.id ?? 'unknown'}, who is not in allowedUserIds`);
+          await api
+            .call('answerCallbackQuery', { callback_query_id: q.id, text: 'You are not allowed to approve or deny.', show_alert: true })
+            .catch(() => undefined);
+          return;
+        }
         if (!m) return void (await reply('Unknown button.'));
         const [, action, jobId, kind] = m as unknown as [string, 'ap' | 'dn', string, string];
         const edit = (note: string) =>
@@ -342,6 +364,10 @@ export function createTelegramChannel(options: TelegramChannelOptions = {}): Plu
         if (!msg?.text) return;
         if (!allowed.includes(msg.chat.id)) {
           ctx.log.warn(`channel-telegram: ignored a message from chat ${msg.chat.id}, which is not in allowedChatIds`);
+          return;
+        }
+        if (!userAllowed(msg.from?.id)) {
+          ctx.log.warn(`channel-telegram: ignored a message from user ${msg.from?.id ?? 'unknown'}, who is not in allowedUserIds`);
           return;
         }
         handleText(msg.chat.id, msg.text);

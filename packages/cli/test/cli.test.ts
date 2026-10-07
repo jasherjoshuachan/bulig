@@ -47,7 +47,7 @@ function world(configOverride: Record<string, unknown> = {}) {
     dbPath: join(root, 'db', 'bulig.sqlite'),
     grants: {
       'channel-cli': ['channel.send:terminal', 'approval.grant'],
-      'pipeline-dev': ['merge.request'],
+      'pipeline-dev': ['merge.request', 'jobs.write'],
       'worker-claude-code': ['claude.run', 'fs.worktree'],
       github: ['git.push', 'gh.pr'],
     },
@@ -215,7 +215,7 @@ describe('arguments and errors', () => {
   });
 
   it('a plugin that was not granted what it needs stops the run with the reason', async () => {
-    const w = world({ grants: { 'channel-cli': ['channel.send:terminal', 'approval.grant'], 'pipeline-dev': ['merge.request'] } });
+    const w = world({ grants: { 'channel-cli': ['channel.send:terminal', 'approval.grant'], 'pipeline-dev': ['merge.request', 'jobs.write'] } });
     const r = await w.run('run', '--repo', w.repo, '--title', 't');
     expect(r.code).toBe(2);
     expect(r.err).toMatch(/claude\.run/);

@@ -10,6 +10,7 @@ import { loadConfig, runCli, type Io } from '../src/index.ts';
 import { FakeTelegram, until } from '../../../plugins/channel-telegram/test/fake-telegram.ts';
 
 const CHAT = 5150;
+const OWNER = 7001;
 const TOKEN_ENV = 'TEST_SERVE_TG_TOKEN';
 const dirs: string[] = [];
 const fakes: FakeTelegram[] = [];
@@ -76,8 +77,8 @@ async function world(over: { enabled?: string[]; token?: boolean } = {}) {
     JSON.stringify({
       dbPath,
       enabled: over.enabled ?? ['channel-telegram', 'worker-claude-code', 'github', 'pipeline-dev'],
-      grants: { 'channel-telegram': ['channel.send:telegram', 'approval.grant'], 'pipeline-dev': ['merge.request'] },
-      pluginConfig: { 'channel-telegram': { tokenEnv: TOKEN_ENV, allowedChatIds: [CHAT], repos: { app: repo }, apiBase: fake.apiBase, pollTimeoutSec: 0 } },
+      grants: { 'channel-telegram': ['channel.send:telegram', 'approval.grant'], 'pipeline-dev': ['merge.request', 'jobs.write'] },
+      pluginConfig: { 'channel-telegram': { tokenEnv: TOKEN_ENV, allowedChatIds: [CHAT], allowedUserIds: [OWNER], repos: { app: repo }, apiBase: fake.apiBase, pollTimeoutSec: 0 } },
     }),
   );
   return { root, cwd, home, repo, fake, dbPath };
@@ -110,7 +111,7 @@ async function tapApprove(fake: FakeTelegram, kind: string) {
   await until(() => approvalMessage(fake, kind) !== undefined, `${kind} approval message`);
   const m = approvalMessage(fake, kind)!;
   const data = m.reply_markup.inline_keyboard[0][0].callback_data as string;
-  fake.press(CHAT, m.__id, m.text, data);
+  fake.press(CHAT, m.__id, m.text, data, { id: OWNER, username: 'owner' });
 }
 
 describe('bulig serve', () => {
@@ -119,7 +120,7 @@ describe('bulig serve', () => {
     const s = serve(w, [createTelegramChannel(), fakeWorker(), fakeGithub(), pipeline]);
     await until(() => s.out.some((l) => l.includes('serving')), 'serve to start');
 
-    w.fake.say(CHAT, '/dev app Add multiply function\nAdd src/multiply.js exporting multiply(a,b).');
+    w.fake.say(CHAT, '/dev app Add multiply function\nAdd src/multiply.js exporting multiply(a,b).', OWNER);
     await tapApprove(w.fake, 'plan');
     await tapApprove(w.fake, 'merge');
     await until(() => w.fake.texts(CHAT).some((t) => t.endsWith('job done')), 'job done line');
@@ -164,7 +165,7 @@ describe('bulig serve', () => {
     const w = await world();
     const first = serve(w, [createTelegramChannel(), fakeWorker('critique'), fakeGithub(), pipeline]);
     await until(() => first.out.some((l) => l.includes('serving')), 'first serve');
-    w.fake.say(CHAT, '/dev app Survive a restart');
+    w.fake.say(CHAT, '/dev app Survive a restart', OWNER);
     await until(() => w.fake.texts(CHAT).some((t) => t.includes('plan finished')), 'plan finished');
     first.stop();
     expect(await first.done).toBe(0);
@@ -208,7 +209,7 @@ describe('the shipped example config', () => {
     // Only the channels and the pipeline hold the approval and merge capabilities.
     const holders = Object.entries(config.grants).filter(([, caps]) => caps.some((c) => c === 'approval.grant' || c === 'merge.request'));
     expect(holders.map(([name]) => name).sort()).toEqual(['channel-cli', 'channel-telegram', 'pipeline-dev']);
-    expect(config.grants['pipeline-dev']).toEqual(['merge.request']);
+    expect(config.grants['pipeline-dev']).toEqual(['merge.request', 'jobs.write']);
     expect(config.pluginConfig['channel-telegram']).toMatchObject({ tokenEnv: 'BULIG_TELEGRAM_TOKEN', allowedChatIds: [123456789] });
   });
 });

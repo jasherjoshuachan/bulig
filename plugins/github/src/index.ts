@@ -1,5 +1,5 @@
-import { appendFileSync, existsSync, readFileSync, realpathSync } from 'node:fs';
-import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
+import { appendFileSync, existsSync, lstatSync, readFileSync, realpathSync } from 'node:fs';
+import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { definePlugin, type BuligEvent, type PluginContext } from '@bulig/plugin-sdk';
 import { exec, type ExecResult } from './exec.ts';
 
@@ -35,6 +35,28 @@ const num = (p: unknown, key: string): number => {
 
 /** Errors that usually pass if you try again: GitHub hiccups and network drops. */
 export const TRANSIENT = /internal server error|bad gateway|service unavailable|gateway time-?out|HTTP 5\d\d|\b50[0-4]\b|timed out|connection (reset|refused|closed)|could not resolve host|temporarily unavailable|early EOF|RPC failed|unexpected disconnect/i;
+
+/**
+ * Refuse to touch a job worktree that is reached through a symlink. `<repo>/.worktrees` and
+ * `<repo>/.worktrees/<jobId>` must be real directories (checked with lstat, which does not follow links), and
+ * what `cwd` resolves to must lie inside the resolved repo. A link planted there could otherwise point a
+ * reset or a removal at some other repo. A path that does not exist yet passes: nothing can be reached through it.
+ */
+export function assertPlainWorktree(repoPath: string, cwd: string): void {
+  for (const p of [join(repoPath, '.worktrees'), cwd]) {
+    let st;
+    try {
+      st = lstatSync(p);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') continue;
+      throw new StepError(`refusing: cannot inspect ${p}: ${(err as Error).message}`);
+    }
+    if (st.isSymbolicLink()) throw new StepError(`refusing: ${p} is a symlink`);
+  }
+  if (!existsSync(cwd)) return;
+  const rel = relative(realpathSync(repoPath), realpathSync(cwd));
+  if (rel === '' || rel.startsWith('..') || isAbsolute(rel)) throw new StepError(`refusing: ${cwd} resolves outside the repo`);
+}
 
 export type Check = { name?: string; bucket?: string; state?: string };
 
@@ -91,14 +113,19 @@ export default definePlugin({
     const gh = cfg.ghBin ?? 'gh';
     const git = cfg.gitBin ?? 'git';
 
-    const env = (): NodeJS.ProcessEnv => {
-      if (!cfg.tokenEnv) return process.env;
+    // The token goes only to calls that talk to GitHub: gh, and the git commands that push or fetch. Commits,
+    // resets and status never get it. Without a tokenEnv, the ambient login is used, as before.
+    const env = (withToken: boolean): NodeJS.ProcessEnv => {
+      if (!withToken || !cfg.tokenEnv) return process.env;
       const token = process.env[cfg.tokenEnv];
       if (!token) throw new StepError(`config tokenEnv is "${cfg.tokenEnv}" but that environment variable is not set`);
       return { ...process.env, GH_TOKEN: token };
     };
-    const runGit = (cwd: string, args: string[]) => exec(git, args, { cwd, env: env() });
-    const runGh = (cwd: string, args: string[]) => exec(gh, args, { cwd, env: env() });
+    // Every git call runs with hooks switched off. A job worktree is written by a Claude stage, so a hook it plants
+    // (.husky, .git/hooks, lefthook) would otherwise run here, outside the stage sandbox.
+    const NO_HOOKS = ['-c', 'core.hooksPath=/dev/null'];
+    const runGit = (cwd: string, args: string[], withToken = false) => exec(git, [...NO_HOOKS, ...args], { cwd, env: env(withToken) });
+    const runGh = (cwd: string, args: string[]) => exec(gh, args, { cwd, env: env(true) });
     // For calls that talk to GitHub. A temporary failure is tried again; any other failure is returned at once.
     const tries = cfg.tries ?? 3;
     const delay = cfg.retryDelayMs ?? 2000;
@@ -123,6 +150,7 @@ export default definePlugin({
         const branch = str(event.payload, 'branch');
         if (!event.jobId) throw new StepError('worktree.requested needs a job');
         const cwd = join(repoPath, '.worktrees', event.jobId);
+        assertPlainWorktree(repoPath, cwd);
         // A restart can ask twice. If the worktree is already there on this branch, that is the answer.
         const there = existsSync(cwd) ? await runGit(cwd, ['rev-parse', '--abbrev-ref', 'HEAD']) : undefined;
         if (!there || there.code !== 0 || there.stdout.trim() !== branch) {
@@ -143,6 +171,7 @@ export default definePlugin({
         if (!event.jobId || basename(cwd) !== event.jobId || basename(dirname(cwd)) !== '.worktrees') {
           throw new StepError('refusing to reset a directory that is not this job\'s worktree');
         }
+        assertPlainWorktree(dirname(dirname(cwd)), cwd);
         if (!existsSync(cwd)) throw new StepError('the job worktree is gone');
         const top = must('git rev-parse', await runGit(cwd, ['rev-parse', '--show-toplevel']));
         if (realpathSync(top) !== realpathSync(cwd)) throw new StepError('refusing to reset: that directory is not a worktree root');
@@ -169,6 +198,7 @@ export default definePlugin({
         const branch = str(event.payload, 'branch');
         if (!event.jobId) throw new StepError('worktree.cleanup.requested needs a job');
         const cwd = join(repoPath, '.worktrees', event.jobId);
+        assertPlainWorktree(repoPath, cwd);
         if (existsSync(cwd)) must('git worktree remove', await runGit(repoPath, ['worktree', 'remove', '--force', cwd]));
         else await runGit(repoPath, ['worktree', 'prune']);
         if (!['main', 'master', 'HEAD'].includes(branch)) await runGit(repoPath, ['branch', '-D', branch]); // already gone is fine
@@ -221,7 +251,7 @@ export default definePlugin({
         }
         const dirty = must('git status', await runGit(cwd, ['status', '--porcelain']));
         if (dirty) throw new StepError('the worktree has changes that were never committed or reviewed, so no PR was opened');
-        must('git push', await again(() => runGit(cwd, ['push', '-u', 'origin', branch])));
+        must('git push', await again(() => runGit(cwd, ['push', '-u', 'origin', branch], true)));
         const create = ['pr', 'create', '--title', title, '--body', typeof body === 'string' ? body : '', '--head', branch];
         if (cfg.baseBranch) create.push('--base', cfg.baseBranch);
         const made = await again(() => runGh(cwd, create));
@@ -248,13 +278,18 @@ export default definePlugin({
       const common = await runGit(cwd, ['rev-parse', '--path-format=absolute', '--git-common-dir']);
       const repoPath = common.code === 0 ? dirname(common.stdout.trim()) : undefined;
       if (!repoPath || !existsSync(repoPath)) return;
-      await runGit(repoPath, ['worktree', 'remove', '--force', worktree]);
+      try {
+        assertPlainWorktree(repoPath, worktree);
+        await runGit(repoPath, ['worktree', 'remove', '--force', worktree]);
+      } catch (err) {
+        ctx.log.warn(`github: left the worktree alone: ${message(err)}`);
+      }
       // Never delete the branch the PR merged into, whatever the worktree says it is on.
       if (branch && branch !== 'HEAD' && branch !== base) {
         await runGit(repoPath, ['branch', '-D', branch]);
-        await runGit(repoPath, ['push', 'origin', '--delete', branch]); // already gone is fine
+        await runGit(repoPath, ['push', 'origin', '--delete', branch], true); // already gone is fine
       }
-      await runGit(repoPath, ['fetch', '--prune']);
+      await runGit(repoPath, ['fetch', '--prune'], true);
     };
 
     ctx.on('merge.requested', async (event: BuligEvent) => {

@@ -18,7 +18,7 @@ import {
   type StateApi,
 } from '@bulig/plugin-sdk';
 import type { Bus } from './bus.ts';
-import { effectiveCapabilities } from './capabilities.ts';
+import { JOBS_WRITE, TERMINAL_STATUSES, effectiveCapabilities, isApprovalStage } from './capabilities.ts';
 
 export interface LoadOptions {
   plugins: Plugin[];
@@ -28,6 +28,8 @@ export interface LoadOptions {
   pluginConfig: Record<string, Record<string, unknown>>;
   bus: Bus;
   jobs: JobsApi;
+  /** Name of a stage by id. Used to tell approval stages from the rest. */
+  stageName?: (stageId: string) => string | undefined;
   /** Reads and writes one plugin's state. The kernel passes the store. */
   state: { get(plugin: string, key: string): unknown; set(plugin: string, key: string, value: unknown): void };
   logger: Logger;
@@ -71,6 +73,39 @@ export function selectPlugins(plugins: Plugin[], enabled: string[]): LoadedPlugi
     .map((plugin) => ({ plugin, manifest: parseManifest(plugin) }));
 }
 
+/**
+ * The job API one plugin gets. Reading and ordinary stage work are open. Writes that decide an outcome need
+ * jobs.write: opening or closing an approval stage, ending a job, or moving a job out of awaiting_approval.
+ * A plugin without it cannot approve, cancel or finish work, even though it holds the API.
+ */
+function gateJobs(name: string, caps: ReadonlySet<string>, jobs: JobsApi, stageName: (id: string) => string | undefined): JobsApi {
+  const need = (what: string) => {
+    if (!caps.has(JOBS_WRITE)) throw new CapabilityDeniedError(`Plugin "${name}" was denied "${JOBS_WRITE}" (needed to ${what})`);
+  };
+  return {
+    ...jobs,
+    setStatus(id, status) {
+      const current = jobs.get(id)?.status;
+      // Terminal is final: no plugin may reopen a done, failed or cancelled job, because that undoes a person's cancel.
+      if (current !== undefined && TERMINAL_STATUSES.includes(current) && current !== status) {
+        throw new CapabilityDeniedError(`Plugin "${name}" may not move a job out of ${current}: ${current} is final`);
+      }
+      if (TERMINAL_STATUSES.includes(status)) need(`set a job ${status}`);
+      else if (jobs.get(id)?.status === 'awaiting_approval') need('move a job out of awaiting_approval');
+      return jobs.setStatus(id, status);
+    },
+    startStage(jobId, stage) {
+      if (isApprovalStage(stage)) need(`open the "${stage}" stage`);
+      return jobs.startStage(jobId, stage);
+    },
+    finishStage(stageId, status, output) {
+      const stage = stageName(stageId);
+      if (isApprovalStage(stage)) need(`finish the "${stage}" stage`);
+      return jobs.finishStage(stageId, status, output);
+    },
+  };
+}
+
 /** A context that can only do what this one manifest declares. */
 export function buildContext(manifest: Manifest, opts: Omit<LoadOptions, 'plugins' | 'enabled'>): PluginContext {
   const caps = effectiveCapabilities(manifest, opts.grants);
@@ -95,7 +130,7 @@ export function buildContext(manifest: Manifest, opts: Omit<LoadOptions, 'plugin
         throw new CapabilityDeniedError(`Plugin "${name}" was denied "${cap}" (${why})`);
       }
     },
-    jobs: opts.jobs,
+    jobs: gateJobs(name, caps, opts.jobs, opts.stageName ?? (() => undefined)),
     state: {
       get: (key) => opts.state.get(name, key),
       set: (key, value) => opts.state.set(name, key, value),

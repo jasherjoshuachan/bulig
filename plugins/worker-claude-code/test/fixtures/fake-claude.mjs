@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 // A stand-in for the claude CLI. It records how it was called and prints canned JSON.
+import { spawn } from 'node:child_process';
 import { appendFileSync, mkdirSync, readdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
@@ -17,7 +18,14 @@ if (process.env.FAKE_CLAUDE_ENV_DUMP) {
   writeFileSync(process.env.FAKE_CLAUDE_ENV_DUMP, JSON.stringify({ ...process.env, __GH_DIR_ENTRIES: ghEntries }));
 }
 
-if (prompt.includes('FAKE:linger') && args.includes('acceptEdits')) {
+if (prompt.includes('FAKE:grandchild')) {
+  // Like a Bash tool child: a grandchild that ignores SIGTERM. The leader exits on SIGTERM and leaves it behind.
+  const g = spawn(process.execPath, ['-e', "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"], { stdio: 'ignore' });
+  mark(`PID ${process.pid}`);
+  mark(`GRANDCHILD ${g.pid}`);
+  process.on('SIGTERM', () => process.exit(0));
+  setInterval(() => {}, 1000);
+} else if (prompt.includes('FAKE:linger') && args.includes('acceptEdits')) {
   // An edit stage that is slow to die: after SIGTERM it keeps going for a moment and then writes into its own
   // folder, recreating it if it was removed in the meantime, and only then exits.
   const here = process.cwd();

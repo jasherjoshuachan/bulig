@@ -113,14 +113,19 @@ export default definePlugin({
     const gh = cfg.ghBin ?? 'gh';
     const git = cfg.gitBin ?? 'git';
 
-    const env = (): NodeJS.ProcessEnv => {
-      if (!cfg.tokenEnv) return process.env;
+    // The token goes only to calls that talk to GitHub: gh, and the git commands that push or fetch. Commits,
+    // resets and status never get it. Without a tokenEnv, the ambient login is used, as before.
+    const env = (withToken: boolean): NodeJS.ProcessEnv => {
+      if (!withToken || !cfg.tokenEnv) return process.env;
       const token = process.env[cfg.tokenEnv];
       if (!token) throw new StepError(`config tokenEnv is "${cfg.tokenEnv}" but that environment variable is not set`);
       return { ...process.env, GH_TOKEN: token };
     };
-    const runGit = (cwd: string, args: string[]) => exec(git, args, { cwd, env: env() });
-    const runGh = (cwd: string, args: string[]) => exec(gh, args, { cwd, env: env() });
+    // Every git call runs with hooks switched off. A job worktree is written by a Claude stage, so a hook it plants
+    // (.husky, .git/hooks, lefthook) would otherwise run here, outside the stage sandbox.
+    const NO_HOOKS = ['-c', 'core.hooksPath=/dev/null'];
+    const runGit = (cwd: string, args: string[], withToken = false) => exec(git, [...NO_HOOKS, ...args], { cwd, env: env(withToken) });
+    const runGh = (cwd: string, args: string[]) => exec(gh, args, { cwd, env: env(true) });
     // For calls that talk to GitHub. A temporary failure is tried again; any other failure is returned at once.
     const tries = cfg.tries ?? 3;
     const delay = cfg.retryDelayMs ?? 2000;
@@ -246,7 +251,7 @@ export default definePlugin({
         }
         const dirty = must('git status', await runGit(cwd, ['status', '--porcelain']));
         if (dirty) throw new StepError('the worktree has changes that were never committed or reviewed, so no PR was opened');
-        must('git push', await again(() => runGit(cwd, ['push', '-u', 'origin', branch])));
+        must('git push', await again(() => runGit(cwd, ['push', '-u', 'origin', branch], true)));
         const create = ['pr', 'create', '--title', title, '--body', typeof body === 'string' ? body : '', '--head', branch];
         if (cfg.baseBranch) create.push('--base', cfg.baseBranch);
         const made = await again(() => runGh(cwd, create));
@@ -282,9 +287,9 @@ export default definePlugin({
       // Never delete the branch the PR merged into, whatever the worktree says it is on.
       if (branch && branch !== 'HEAD' && branch !== base) {
         await runGit(repoPath, ['branch', '-D', branch]);
-        await runGit(repoPath, ['push', 'origin', '--delete', branch]); // already gone is fine
+        await runGit(repoPath, ['push', 'origin', '--delete', branch], true); // already gone is fine
       }
-      await runGit(repoPath, ['fetch', '--prune']);
+      await runGit(repoPath, ['fetch', '--prune'], true);
     };
 
     ctx.on('merge.requested', async (event: BuligEvent) => {

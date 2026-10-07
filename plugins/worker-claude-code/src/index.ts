@@ -150,11 +150,14 @@ const isGithubHost = (d: string) => /(^|\.)(github\.com|githubusercontent\.com)$
  *  - strictAllowlist: a host outside allowedDomains is refused, never prompted for.
  *  - allowUnsandboxedCommands false and no excludedCommands: nothing runs outside the sandbox.
  *  - failIfUnavailable: if the sandbox cannot start, Claude exits instead of running unfenced.
+ *  - disableAllHooks: Claude Code hooks run outside the sandbox, so a hook in a repo's settings could reach GitHub.
  *  - autoAllowBashIfSandboxed false: the allowed-tools list still decides which commands run at all.
  */
 export function sandboxSettings(extraDomains: readonly string[] = []): Record<string, unknown> {
   const allowed = [...new Set([...BASE_ALLOWED_DOMAINS, ...extraDomains.filter((d) => !isGithubHost(d))])];
   return {
+    // Hooks from user or project settings run outside the sandbox, so none may run in a stage.
+    disableAllHooks: true,
     sandbox: {
       enabled: true,
       failIfUnavailable: true,
@@ -226,7 +229,7 @@ function run(
     }
     let child: ChildProcess;
     try {
-      child = spawn(bin, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'], env: hardenEnv(env, ghDir) });
+      child = spawn(bin, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'], env: hardenEnv(env, ghDir), detached: true });
     } catch (err) {
       rmSync(ghDir, { recursive: true, force: true });
       resolve({ ok: false, result: '', error: `could not start ${bin}: ${(err as Error).message}` });
@@ -249,8 +252,8 @@ function run(
     };
     const timer = setTimeout(() => {
       timedOut = true;
-      child.kill('SIGTERM');
-      setTimeout(() => child.kill('SIGKILL'), KILL_GRACE_MS).unref();
+      signalGroup(child, 'SIGTERM');
+      setTimeout(() => signalGroup(child, 'SIGKILL'), KILL_GRACE_MS).unref();
     }, timeoutMs);
     child.stdout!.on('data', (d: Buffer) => (stdout += d.toString()));
     child.stderr!.on('data', (d: Buffer) => (stderr += d.toString()));
@@ -282,10 +285,26 @@ function isRequest(p: unknown): p is StageRequest {
 /** SIGTERM now, SIGKILL after `graceMs` if it is still alive. */
 function terminate(child: ChildProcess, graceMs: number): void {
   if (child.exitCode !== null || child.signalCode !== null) return;
-  child.kill('SIGTERM');
-  setTimeout(() => {
-    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
-  }, graceMs).unref();
+  signalGroup(child, 'SIGTERM');
+  child.once('exit', () => signalGroup(child, 'SIGKILL')); // sweep anything the run left behind
+  setTimeout(() => signalGroup(child, 'SIGKILL'), graceMs).unref();
+}
+
+/**
+ * Signal the whole process group. Claude is started in its own group (detached), so its Bash children, and
+ * what they start, get the signal too and cannot outlive it to write into a removed worktree.
+ */
+function signalGroup(child: ChildProcess, sig: NodeJS.Signals): void {
+  try {
+    if (child.pid !== undefined) process.kill(-child.pid, sig);
+    else child.kill(sig);
+  } catch {
+    try {
+      child.kill(sig);
+    } catch {
+      // already gone
+    }
+  }
 }
 
 /**
@@ -385,19 +404,20 @@ export function createWorker() {
         let left = alive.length;
         const finished = () => {
           if (--left === 0) {
+            for (const c of alive) signalGroup(c, 'SIGKILL'); // sweep anything the runs left behind
             clearTimeout(killTimer);
             clearTimeout(giveUp);
             resolve();
           }
         };
         const killTimer = setTimeout(() => {
-          for (const c of alive) if (c.exitCode === null && c.signalCode === null) c.kill('SIGKILL');
+          for (const c of alive) signalGroup(c, 'SIGKILL');
         }, graceMs);
         // SIGKILL cannot be ignored, so this only matters if the OS never reports the exit.
         const giveUp = setTimeout(resolve, graceMs + 5000);
         for (const c of alive) {
           c.once('exit', finished);
-          c.kill('SIGTERM');
+          signalGroup(c, 'SIGTERM');
         }
       });
     },

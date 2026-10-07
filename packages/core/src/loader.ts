@@ -85,6 +85,11 @@ function gateJobs(name: string, caps: ReadonlySet<string>, jobs: JobsApi, stageN
   return {
     ...jobs,
     setStatus(id, status) {
+      const current = jobs.get(id)?.status;
+      // Terminal is final: no plugin may reopen a done, failed or cancelled job, because that undoes a person's cancel.
+      if (current !== undefined && TERMINAL_STATUSES.includes(current) && current !== status) {
+        throw new CapabilityDeniedError(`Plugin "${name}" may not move a job out of ${current}: ${current} is final`);
+      }
       if (TERMINAL_STATUSES.includes(status)) need(`set a job ${status}`);
       else if (jobs.get(id)?.status === 'awaiting_approval') need('move a job out of awaiting_approval');
       return jobs.setStatus(id, status);

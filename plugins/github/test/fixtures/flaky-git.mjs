@@ -4,8 +4,11 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 
 const args = process.argv.slice(2);
+// The plugin puts `-c key=value` pairs before the subcommand.
+let verb = 0;
+while (args[verb] === '-c') verb += 2;
 const counter = process.env.FLAKY_COUNTER;
-if (args[0] === 'push' && counter) {
+if (args[verb] === 'push' && counter) {
   const n = existsSync(counter) ? Number(readFileSync(counter, 'utf8')) : 0;
   writeFileSync(counter, String(n + 1));
   const failFirst = Number(process.env.FLAKY_FAIL_FIRST ?? 0);

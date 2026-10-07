@@ -133,6 +133,14 @@ describe('the OS sandbox (layer 1)', () => {
     }
   });
 
+  it('switches every Claude Code hook off, because hooks run outside the sandbox', () => {
+    expect(sandboxSettings()).toMatchObject({ disableAllHooks: true });
+    for (const mode of ['readonly', 'edit'] as const) {
+      const args = buildArgs({ stage: 's', prompt: 'p', model: 'm', mode, cwd: '/x' });
+      expect(JSON.parse(args[args.indexOf('--settings') + 1]!)).toMatchObject({ disableAllHooks: true });
+    }
+  });
+
   it('turns the sandbox on, cannot start without it, and lets nothing run outside it', () => {
     const { sandbox } = sandboxSettings() as { sandbox: Record<string, any> };
     expect(sandbox.enabled).toBe(true);
@@ -439,6 +447,16 @@ describe('stop()', () => {
     }
   });
 
+  it('takes the whole process group down, so a grandchild that ignores SIGTERM dies too', async () => {
+    const h = await withMark('FAKE:grandchild', { stopGraceMs: 5000 });
+    const leader = pidFrom(h.mark);
+    const grandchild = Number(/GRANDCHILD (\d+)/.exec(readFileSync(h.mark, 'utf8'))![1]);
+    expect(alive(grandchild)).toBe(true);
+    await h.k.stop();
+    expect(alive(leader)).toBe(false);
+    await waitFor(() => !alive(grandchild), 3000);
+  });
+
   it('returns at once when nothing is running', async () => {
     const h = await setup({}, undefined, createWorker());
     const started = Date.now();
@@ -502,6 +520,16 @@ describe('a job that ends takes its own Claude with it', () => {
     await waitFor(() => !alive(h.pa));
     expect(Date.now() - started).toBeGreaterThanOrEqual(350);
     expect(readFileSync(h.mark, 'utf8')).toContain('TERM'); // asked nicely first
+    expect(alive(h.pb)).toBe(true);
+    await h.k.stop();
+  });
+
+  it('a job that ends also takes its Claude\'s grandchildren', async () => {
+    const h = await twoJobs(['FAKE:grandchild', 'FAKE:term']);
+    const grandchild = Number(/GRANDCHILD (\d+)/.exec(readFileSync(h.mark, 'utf8'))![1]);
+    expect(alive(grandchild)).toBe(true);
+    h.k.jobs.setStatus(h.a.id, 'cancelled');
+    await waitFor(() => !alive(grandchild), 4000);
     expect(alive(h.pb)).toBe(true);
     await h.k.stop();
   });

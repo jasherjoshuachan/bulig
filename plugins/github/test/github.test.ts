@@ -598,8 +598,11 @@ describe('token and grants', () => {
 
   it('fails the step with a clear message when tokenEnv points at nothing', async () => {
     const h = await setup({ tokenEnv: 'TEST_GH_TOKEN_MISSING' });
+    // Local git work needs no token, so it still works. The step that talks to GitHub is the one that fails.
     h.fire('worktree.requested', { repoPath: h.repo, branch: 'bulig/x-9' });
-    const failed = await h.waitFor('worktree.failed');
+    const { cwd } = (await h.waitFor('worktree.ready')).payload as { cwd: string };
+    h.fire('pr.requested', { cwd, branch: 'bulig/x-9', title: 'T', body: '', expectSha: git(cwd, 'rev-parse', 'HEAD') });
+    const failed = await h.waitFor('pr.failed');
     expect((failed.payload as { error: string }).error).toMatch(/TEST_GH_TOKEN_MISSING.*not set/);
   });
 
@@ -682,5 +685,75 @@ describe('a planted symlink never redirects a reset or a cleanup', () => {
     h.fire('worktree.cleanup.requested', { repoPath: h.repo, branch: 'bulig/ok-1' });
     await h.waitFor('worktree.cleaned');
     expect(existsSync(cwd)).toBe(false);
+  });
+});
+
+describe('hooks planted in a job worktree', () => {
+  const HOOK = (out: string) => `#!/bin/sh\necho "RAN token=$GH_TOKEN" >> "${out}"\nexit 0\n`;
+
+  /** A git wrapper that records, for every call, whether GH_TOKEN was in its environment, then runs the real git. */
+  function gitWrapper(root: string) {
+    const log = join(root, 'git-calls.log');
+    const bin = join(root, 'git-wrapper.sh');
+    writeFileSync(bin, `#!/bin/sh\nif [ -n "$GH_TOKEN" ]; then t=TOKEN; else t=NOTOKEN; fi\necho "$t $*" >> "${log}"\nexec git "$@"\n`);
+    chmodSync(bin, 0o755);
+    return { bin, calls: () => (existsSync(log) ? readFileSync(log, 'utf8').trim().split('\n') : []) };
+  }
+
+  it('a .husky or .git/hooks hook does not run on commit or on the push, and never sees the token', async () => {
+    process.env.TEST_GH_TOKEN = 'tok-secret-9';
+    const h = await setup({ tokenEnv: 'TEST_GH_TOKEN' });
+    const out = join(h.root, 'hook-ran.log');
+    h.fire('worktree.requested', { repoPath: h.repo, branch: 'bulig/hook-1' });
+    const { cwd } = (await h.waitFor('worktree.ready')).payload as { cwd: string };
+    // Hooks a stage could plant: husky style (core.hooksPath into the tree) and the shared .git/hooks.
+    mkdirSync(join(cwd, '.husky'));
+    for (const name of ['pre-commit', 'commit-msg', 'post-commit', 'pre-push']) {
+      writeFileSync(join(cwd, '.husky', name), HOOK(out));
+      chmodSync(join(cwd, '.husky', name), 0o755);
+      writeFileSync(join(h.repo, '.git', 'hooks', name), HOOK(out));
+      chmodSync(join(h.repo, '.git', 'hooks', name), 0o755);
+    }
+    git(h.repo, 'config', 'core.hooksPath', join(cwd, '.husky'));
+    writeFileSync(join(cwd, 'new.txt'), 'hello\n');
+    h.fire('commit.requested', { cwd, message: 'Add new.txt' });
+    const { sha } = (await h.waitFor('commit.done')).payload as { sha: string };
+    expect(existsSync(out)).toBe(false);
+    h.fire('pr.requested', { cwd, branch: 'bulig/hook-1', title: 't', body: 'b', expectSha: sha });
+    await h.waitFor('pr.opened');
+    expect(existsSync(out)).toBe(false);
+    expect(git(h.origin, 'branch', '--list', 'bulig/hook-1')).not.toBe(''); // the push itself did happen
+  });
+
+  it('GH_TOKEN reaches git push and gh, and no commit, reset or status', async () => {
+    process.env.TEST_GH_TOKEN = 'tok-secret-9';
+    const wrapRoot = mkdtempSync(join(tmpdir(), 'bulig-wrap-'));
+    dirs.push(wrapRoot);
+    const w = gitWrapper(wrapRoot);
+    const h = await setup({ tokenEnv: 'TEST_GH_TOKEN', gitBin: w.bin });
+    await openPr(h, 'bulig/tok-1');
+    h.fire('worktree.reset.requested', { cwd: join(h.repo, '.worktrees', h.job.id) });
+    await h.waitFor('worktree.reset.done');
+    const calls = w.calls();
+    const withToken = calls.filter((c) => c.startsWith('TOKEN '));
+    expect(withToken.length).toBeGreaterThan(0);
+    for (const c of withToken) expect(c, c).toMatch(/ (push|fetch) /);
+    for (const verb of ['commit', 'reset', 'status', 'add', 'clean']) {
+      expect(calls.some((c) => c.startsWith('NOTOKEN ') && c.includes(` ${verb} `)), verb).toBe(true);
+      expect(withToken.some((c) => c.includes(` ${verb} `)), verb).toBe(false);
+    }
+    expect(h.calls().every((c) => c.token === 'tok-secret-9')).toBe(true); // gh still gets it
+  });
+
+  it('every git call carries core.hooksPath=/dev/null', async () => {
+    const wrapRoot = mkdtempSync(join(tmpdir(), 'bulig-wrap-'));
+    dirs.push(wrapRoot);
+    const w = gitWrapper(wrapRoot);
+    const h = await setup({ gitBin: w.bin });
+    await openPr(h, 'bulig/hp-1');
+    const calls = w.calls();
+    expect(calls.length).toBeGreaterThan(5);
+    for (const c of calls) expect(c, c).toContain('-c core.hooksPath=/dev/null');
+    expect(calls.some((c) => c.includes(' commit -m '))).toBe(true);
   });
 });

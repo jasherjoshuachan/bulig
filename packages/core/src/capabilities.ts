@@ -9,6 +9,8 @@ export const DEFAULT_EVENT_CAPABILITIES: Readonly<Record<string, string>> = {
   'approval.granted': 'approval.grant',
   'approval.denied': 'approval.grant',
   'merge.requested': 'merge.request',
+  // Ending a job on a person's say-so. Without this, any plugin could cancel a job and skip jobs.write.
+  'cancel.requested': 'approval.grant',
 };
 
 /** What a plugin may do: what it declared it needs, intersected with what the config grants it. */

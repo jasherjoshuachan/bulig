@@ -261,6 +261,7 @@ describe('capabilities needed to emit an event', () => {
       'approval.granted': 'approval.grant',
       'approval.denied': 'approval.grant',
       'merge.requested': 'merge.request',
+      'cancel.requested': 'approval.grant',
     });
   });
 });
@@ -379,5 +380,52 @@ describe('jobs.write gates the writes that decide an outcome', () => {
     ctx.jobs.setStatus(job.id, 'running');
     ctx.jobs.setStatus(job.id, 'done');
     expect(k.jobs.get(job.id)!.status).toBe('done');
+  });
+});
+
+describe('cancel.requested is gated like a denial', () => {
+  it('a rogue plugin that lists it in emits is refused, and nothing is written', async () => {
+    const { plugin, box } = probe({ emits: ['cancel.requested'], needs: ['approval.grant'] });
+    const k = kernelWith({ plugins: [plugin], grants: {} });
+    await k.start();
+    expect(() => box.ctx!.emit('cancel.requested', { jobId: 'j' }, 'j')).toThrow(CapabilityDeniedError);
+    expect(() => box.ctx!.emit('cancel.requested', { jobId: 'j' }, 'j')).toThrow(/approval\.grant/);
+    expect(types(k.bus.replay())).not.toContain('cancel.requested');
+  });
+
+  it('a channel that holds approval.grant can still ask for a cancel', async () => {
+    const { plugin, box } = probe({ emits: ['cancel.requested'], needs: ['approval.grant'] });
+    const k = kernelWith({ plugins: [plugin], grants: { demo: ['approval.grant'] } });
+    await k.start();
+    expect(() => box.ctx!.emit('cancel.requested', { jobId: 'j' }, 'j')).not.toThrow();
+  });
+});
+
+describe('terminal is final', () => {
+  it.each(['done', 'failed', 'cancelled'] as const)('no plugin can reopen a %s job, even one holding jobs.write', async (end) => {
+    const cases: Record<string, string[]>[] = [{}, { demo: ['jobs.write'] }];
+    for (const grants of cases) {
+      const { plugin, box } = probe({ needs: ['jobs.write'] });
+      const k = kernelWith({ plugins: [plugin], grants });
+      await k.start();
+      const job = k.jobs.create({ repo: 'r', title: 't' });
+      k.jobs.setStatus(job.id, end);
+      for (const to of ['running', 'queued', 'awaiting_approval'] as const) {
+        expect(() => box.ctx!.jobs.setStatus(job.id, to)).toThrow(CapabilityDeniedError);
+        expect(() => box.ctx!.jobs.setStatus(job.id, to)).toThrow(/final/);
+      }
+      // Moving to another end state is a reopen of the first one too.
+      expect(() => box.ctx!.jobs.setStatus(job.id, end === 'done' ? 'failed' : 'done')).toThrow(/final/);
+      expect(k.jobs.get(job.id)!.status).toBe(end);
+    }
+  });
+
+  it('moving into a terminal status still needs jobs.write', async () => {
+    const { plugin, box } = probe({ needs: ['jobs.write'] });
+    const k = kernelWith({ plugins: [plugin], grants: {} });
+    await k.start();
+    const job = k.jobs.create({ repo: 'r', title: 't' });
+    k.jobs.setStatus(job.id, 'running');
+    expect(() => box.ctx!.jobs.setStatus(job.id, 'cancelled')).toThrow(/jobs\.write/);
   });
 });

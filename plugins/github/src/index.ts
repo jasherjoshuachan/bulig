@@ -128,6 +128,9 @@ export default definePlugin({
     // (.husky, .git/hooks, lefthook) would otherwise run here, outside the stage sandbox.
     const NO_HOOKS = ['-c', 'core.hooksPath=/dev/null'];
     // The bot signs its own commits, so the history shows who did the work and your identity is never borrowed.
+    if (Boolean(cfg.authorName) !== Boolean(cfg.authorEmail)) {
+      throw new Error('github: set both authorName and authorEmail, or neither (only one of them is set)');
+    }
     const IDENTITY = cfg.authorName && cfg.authorEmail ? ['-c', `user.name=${cfg.authorName}`, '-c', `user.email=${cfg.authorEmail}`] : [];
     const runGit = (cwd: string, args: string[], withToken = false) => exec(git, [...NO_HOOKS, ...args], { cwd, env: env(withToken) });
     const runGh = (cwd: string, args: string[]) => exec(gh, args, { cwd, env: env(true) });
@@ -149,6 +152,19 @@ export default definePlugin({
     };
     const message = (err: unknown) => (err instanceof Error ? err.message : String(err));
 
+    // Where the base branch may live, in the order both the worktree start and baseOf look for it.
+    const DEFAULT_BASES = ['origin/HEAD', 'origin/main', 'origin/master', 'main', 'master'];
+    const startCandidates = (remote: boolean): string[] => {
+      const configured = cfg.baseBranch ? (remote ? [`origin/${cfg.baseBranch}`, cfg.baseBranch] : [cfg.baseBranch]) : [];
+      return [...configured, ...(remote ? DEFAULT_BASES : DEFAULT_BASES.filter((c) => !c.startsWith('origin/')))];
+    };
+    const startPointOf = async (repoPath: string, remote: boolean): Promise<string> => {
+      for (const c of startCandidates(remote)) {
+        if ((await runGit(repoPath, ['rev-parse', '--verify', '--quiet', `${c}^{commit}`])).code === 0) return c;
+      }
+      throw new StepError('could not find the base branch (tried ' + startCandidates(remote).join(', ') + ')');
+    };
+
     ctx.on('worktree.requested', async (event: BuligEvent) => {
       try {
         const repoPath = resolve(str(event.payload, 'repoPath'));
@@ -158,11 +174,17 @@ export default definePlugin({
         assertPlainWorktree(repoPath, cwd);
         // A restart can ask twice. If the worktree is already there on this branch, that is the answer.
         const there = existsSync(cwd) ? await runGit(cwd, ['rev-parse', '--abbrev-ref', 'HEAD']) : undefined;
+        let base: string | undefined;
         if (!there || there.code !== 0 || there.stdout.trim() !== branch) {
-          must('git worktree add', await runGit(repoPath, ['worktree', 'add', cwd, '-b', branch]));
+          // Start from the base branch, not from whatever the checkout happens to have open, so the PR carries
+          // only this job's work. With a remote, fetch first and prefer origin's copy over a stale local one.
+          const hasOrigin = (await runGit(repoPath, ['remote', 'get-url', 'origin'])).code === 0;
+          if (hasOrigin) must('git fetch', await again(() => runGit(repoPath, ['fetch', 'origin'], true)));
+          base = await startPointOf(repoPath, hasOrigin);
+          must('git worktree add', await runGit(repoPath, ['worktree', 'add', '--no-track', cwd, '-b', branch, base]));
         }
         ignoreWorktrees(repoPath, await runGit(repoPath, ['rev-parse', '--git-path', 'info/exclude']));
-        ctx.emit('worktree.ready', { cwd, branch }, event.jobId);
+        ctx.emit('worktree.ready', base ? { cwd, branch, base } : { cwd, branch }, event.jobId);
       } catch (err) {
         ctx.emit('worktree.failed', { error: message(err) }, event.jobId);
       }
@@ -215,7 +237,7 @@ export default definePlugin({
 
     // Where this branch left the base branch. The reviewer diffs against it.
     const baseOf = async (cwd: string): Promise<string> => {
-      for (const c of [cfg.baseBranch, 'origin/HEAD', 'origin/main', 'origin/master', 'main', 'master']) {
+      for (const c of [cfg.baseBranch, ...DEFAULT_BASES]) {
         if (!c) continue;
         const r = await runGit(cwd, ['merge-base', 'HEAD', c]);
         if (r.code === 0 && r.stdout.trim()) return r.stdout.trim();

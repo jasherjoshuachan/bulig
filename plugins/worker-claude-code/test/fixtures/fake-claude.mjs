@@ -21,15 +21,15 @@ if (process.env.FAKE_CLAUDE_ENV_DUMP) {
 if (prompt.includes('FAKE:grandchild')) {
   // Like a Bash tool child: a grandchild that ignores SIGTERM. The leader exits on SIGTERM and leaves it behind.
   const g = spawn(process.execPath, ['-e', "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"], { stdio: 'ignore' });
+  // The handler goes in before the PID mark: a test reads the mark as "ready to be stopped".
+  process.on('SIGTERM', () => process.exit(0));
   mark(`PID ${process.pid}`);
   mark(`GRANDCHILD ${g.pid}`);
-  process.on('SIGTERM', () => process.exit(0));
   setInterval(() => {}, 1000);
 } else if (prompt.includes('FAKE:linger') && args.includes('acceptEdits')) {
   // An edit stage that is slow to die: after SIGTERM it keeps going for a moment and then writes into its own
   // folder, recreating it if it was removed in the meantime, and only then exits.
   const here = process.cwd();
-  mark(`PID ${process.pid}`);
   process.on('SIGTERM', () => {
     mark('TERM');
     setTimeout(() => {
@@ -39,14 +39,16 @@ if (prompt.includes('FAKE:grandchild')) {
       process.exit(0);
     }, 400);
   });
+  mark(`PID ${process.pid}`);
   setInterval(() => {}, 1000);
 } else if (prompt.includes('FAKE:term') || prompt.includes('FAKE:ignoreterm')) {
   // Report the pid, then wait to be told to stop. "ignoreterm" refuses SIGTERM, so only SIGKILL ends it.
-  mark(`PID ${process.pid}`);
+  // The handler goes in before the PID mark: a test reads the mark as "ready to be stopped".
   process.on('SIGTERM', () => {
     mark('TERM');
     if (prompt.includes('FAKE:term')) process.exit(0);
   });
+  mark(`PID ${process.pid}`);
   setInterval(() => {}, 1000);
 } else if (prompt.includes('FAKE:sleep')) {
   setTimeout(() => {}, 60_000);

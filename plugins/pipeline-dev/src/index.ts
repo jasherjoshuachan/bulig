@@ -1,8 +1,8 @@
-import { definePlugin, type BuligEvent, type Job, type PluginContext, type Stage } from '@bulig/plugin-sdk';
-import { CLAUDE_STAGES, decide, outputOf, parseVerdict, type Action, type ClaudeStage, type StageOutput } from './decide.ts';
+import { definePlugin, parseScopeBlock, type BuligEvent, type Job, type PluginContext, type Stage } from '@bulig/plugin-sdk';
+import { CLAUDE_STAGES, decide, outputOf, parseVerdict, scopeLines, type Action, type ClaudeStage, type StageOutput } from './decide.ts';
 import { renderPrompt } from './prompts.ts';
 
-export { decide, parseVerdict, type Action } from './decide.ts';
+export { decide, namedFiles, parseVerdict, type Action } from './decide.ts';
 export { renderPrompt } from './prompts.ts';
 
 export interface PipelineConfig {
@@ -15,6 +15,12 @@ export interface PipelineConfig {
   resume?: 'all' | false | string[];
   /** Keep the worktree and branch of a job that failed or was cancelled, for a look. Default false: they are removed. */
   keepFailedWorktrees?: boolean;
+  /** Globs that are always allowed to change, whatever the plan says (for example a test runner's results file). Default none. */
+  scopeAlwaysAllow?: string[];
+  /** "enforce" refuses a commit with files outside the approved scope. "warn" commits them and lists them in the PR. Default "enforce". */
+  scopeMode?: 'enforce' | 'warn';
+  /** Accept a plan whose scope matches every file (such as **). Default false. */
+  allowBroadScope?: boolean;
 }
 
 const READONLY = new Set<ClaudeStage>(['plan', 'critique', 'review']);
@@ -65,6 +71,10 @@ export default definePlugin({
     const standard = cfg.models?.standard ?? 'sonnet';
     const maxBuilds = cfg.maxBuildAttempts ?? 2;
     const prefix = cfg.branchPrefix ?? 'bulig';
+    const scopeMode = cfg.scopeMode ?? 'enforce';
+    if (scopeMode !== 'enforce' && scopeMode !== 'warn') throw new Error(`pipeline-dev: scopeMode must be "enforce" or "warn", not ${JSON.stringify(scopeMode)}`);
+    const scopeAllow = cfg.scopeAlwaysAllow ?? [];
+    const allowBroad = cfg.allowBroadScope === true;
 
     /** Edit stages whose Claude run is done and whose commit is still being made. Lost on a restart, which just reruns the stage. */
     const committing = new Map<string, { stage: string; status: 'passed' | 'failed'; out: StageOutput }>();
@@ -102,12 +112,19 @@ export default definePlugin({
       cleanupIfIdle(s.jobId);
     }
 
-    function fail(jobId: string, reason: string): void {
+    function fail(jobId: string, reason: string, extra: Record<string, unknown> = {}): void {
       const job = ctx.jobs.get(jobId);
       if (!job || job.status === 'failed' || job.status === 'done' || job.status === 'cancelled') return;
       ctx.jobs.setStatus(jobId, 'failed');
-      ctx.emit('pipeline.failed', { reason }, jobId);
+      ctx.emit('pipeline.failed', { reason, ...extra }, jobId);
     }
+
+    /** The scope the person approved with the plan. Undefined if the plan on record has none. */
+    const scopeOf = (stages: Stage[]): string[] | undefined => {
+      const plan = [...stages].reverse().find((s) => s.name === 'plan' && s.status === 'passed');
+      const scope = plan ? outputOf(plan).scope : undefined;
+      return Array.isArray(scope) && scope.length > 0 ? scope : undefined;
+    };
 
     /** Run a handler's body; if it throws, the job fails with the reason instead of hanging. */
     function guard(jobId: string | undefined, body: () => void): void {
@@ -139,7 +156,7 @@ export default definePlugin({
           if (job.status !== 'cancelled') ctx.jobs.setStatus(job.id, 'cancelled');
           return;
         case 'fail':
-          return fail(job.id, action.reason);
+          return fail(job.id, action.reason, action.outOfScope ? { outOfScope: action.outOfScope } : {});
         case 'worktree': {
           ctx.jobs.startStage(job.id, 'worktree');
           const branch = `${prefix}/${slug(job.title)}-${job.id.slice(0, 8)}`;
@@ -149,7 +166,11 @@ export default definePlugin({
         case 'stage': {
           const wt = outputOf(lastOf(stages, 'worktree')!);
           const name = action.name;
+          const scope = scopeOf(stages);
+          // Nothing that edits files runs without an approved scope on record.
+          if (!READONLY.has(name) && !scope) return fail(job.id, `the approved plan has no recorded SCOPE, so ${name} was not run`);
           const prompt = renderPrompt(name, {
+            scope: scopeLines(scope),
             title: job.title,
             issue: job.body || '(no extra details were given)',
             plan: clip(textOf(stages, 'plan')),
@@ -178,7 +199,7 @@ export default definePlugin({
           ctx.jobs.setStatus(job.id, 'awaiting_approval');
           if (action.which === 'plan') {
             const summary = `PLAN\n${textOf(stages, 'plan')}\n\nCRITIQUE\n${textOf(stages, 'critique')}`;
-            ctx.emit('approval.requested', { jobId: job.id, kind: 'plan', summary: clip(summary, 4000) }, job.id);
+            ctx.emit('approval.requested', { jobId: job.id, kind: 'plan', summary: clip(summary, 4000), scope: scopeOf(stages) ?? [] }, job.id);
           } else {
             const pr = outputOf(lastOf(stages, 'pr')!);
             const review = textOf(stages, 'review');
@@ -200,9 +221,14 @@ export default definePlugin({
           const wt = outputOf(lastOf(stages, 'worktree')!);
           const reviewed = outputOf(lastOf(stages, 'docs')!);
           ctx.jobs.startStage(job.id, 'pr');
+          const warned = [...new Set(stages.flatMap((st) => outputOf(st).scopeWarning ?? []))];
           const body = [
             job.body ? `## Task\n\n${job.body}` : `## Task\n\n${job.title}`,
             `## Plan\n\n${clip(textOf(stages, 'plan'), 3000)}`,
+            `## Approved scope\n\n${scopeLines(scopeOf(stages))}`,
+            ...(warned.length
+              ? [`## Files outside the approved scope\n\nscopeMode is "warn", so these were committed anyway. Check each one:\n\n${warned.map((f) => `- ${f}`).join('\n')}`]
+              : []),
             `## Independent review\n\n${clip(textOf(stages, 'review'), 3000)}`,
             `Opened by Bulig, job ${job.id}.`,
           ].join('\n\n');
@@ -333,8 +359,9 @@ export default definePlugin({
         const s = e.jobId && wait && runningStage(e.jobId, wait.stage);
         if (!e.jobId || !wait || !s) return;
         committing.delete(e.jobId);
-        const p = e.payload as { sha: string; base: string };
-        finish(s, wait.status, { ...wait.out, sha: p.sha, base: p.base });
+        const p = e.payload as { sha: string; base: string; outOfScope?: unknown };
+        const warned = Array.isArray(p.outOfScope) ? p.outOfScope.filter((x): x is string => typeof x === 'string') : [];
+        finish(s, wait.status, { ...wait.out, sha: p.sha, base: p.base, ...(warned.length && { scopeWarning: warned }) });
         advance(e.jobId);
       });
     });
@@ -345,7 +372,15 @@ export default definePlugin({
         const s = e.jobId && wait && runningStage(e.jobId, wait.stage);
         if (!e.jobId || !wait || !s) return;
         committing.delete(e.jobId);
-        const error = (e.payload as { error?: string }).error ?? 'unknown';
+        const p = e.payload as { error?: string; outOfScope?: unknown };
+        // Files outside the approved scope are not a crash: it counts as a failed attempt, and the build stage is told which files.
+        const files = Array.isArray(p.outOfScope) ? p.outOfScope.filter((x): x is string => typeof x === 'string') : [];
+        if (files.length) {
+          finish(s, 'failed', { ...wait.out, outOfScope: files });
+          advance(e.jobId);
+          return;
+        }
+        const error = p.error ?? 'unknown';
         finish(s, 'failed', { error: `commit failed: ${error}` });
         fail(e.jobId, `${wait.stage} could not be committed: ${error}`);
       });
@@ -359,6 +394,15 @@ export default definePlugin({
         const result = p.result ?? '';
         const out: StageOutput = { result, sessionId: p.sessionId, costUsd: p.costUsd };
         let status: 'passed' | 'failed' = 'passed';
+        if (p.stage === 'plan') {
+          // The plan must declare every file the job will touch. A plan without a usable SCOPE block is not a plan.
+          const parsed = parseScopeBlock(result, { allowBroad });
+          if (parsed.ok) out.scope = parsed.scope;
+          else {
+            status = 'failed';
+            out.scopeError = parsed.error;
+          }
+        }
         if (p.stage === 'test' || p.stage === 'review') {
           const verdict = parseVerdict(result);
           out.verdict = verdict ?? 'FAIL';
@@ -374,7 +418,18 @@ export default definePlugin({
           const wt = outputOf(lastOf(stagesOf(e.jobId), 'worktree')!);
           committing.set(e.jobId, { stage: p.stage, status, out });
           const job = ctx.jobs.get(e.jobId);
-          ctx.emit('commit.requested', { cwd: String(wt.cwd), message: `${job?.title ?? 'work'} (${p.stage})` }, e.jobId);
+          ctx.emit(
+            'commit.requested',
+            {
+              cwd: String(wt.cwd),
+              message: `${job?.title ?? 'work'} (${p.stage})`,
+              scope: scopeOf(stagesOf(e.jobId)) ?? [],
+              scopeAllow,
+              scopeMode,
+              allowBroadScope: allowBroad,
+            },
+            e.jobId,
+          );
           return;
         }
         finish(s, status, out);

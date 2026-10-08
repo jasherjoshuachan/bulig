@@ -49,8 +49,10 @@ export function format(e: BuligEvent): string[] | undefined {
       return line(`PR merged (#${one(p.number)})`);
     case 'merge.refused':
       return line(`merge refused: ${one(p.reason, 300)}`);
-    case 'pipeline.failed':
-      return line(`job failed: ${one(p.reason, 300)}`);
+    case 'pipeline.failed': {
+      const files = Array.isArray(p.outOfScope) ? p.outOfScope.slice(0, 20).map((f) => `${tag}   outside the approved scope: ${one(f, 160)}`) : [];
+      return [line(`job failed: ${one(p.reason, 300)}`), ...files].flat();
+    }
     case 'plugin.error':
       return line(`plugin error in ${one(p.plugin)} on ${one(p.eventType)}: ${one(p.message, 300)}`);
     case 'approval.requested': {
@@ -58,6 +60,11 @@ export function format(e: BuligEvent): string[] | undefined {
       const kind = String(p.kind);
       const head = [`${tag} approval needed: ${kind}`];
       if (kind === 'merge') head.push(`${tag}   PR ${one(p.url)} at ${short(String(p.headSha ?? ''))}`);
+      if (kind === 'plan' && Array.isArray(p.scope) && p.scope.length) {
+        head.push(`${tag}   files this job may change:`);
+        // Every entry, in full: the person approving must see all of it.
+        for (const f of p.scope) head.push(`${tag}     - ${String(f).replace(/\s+/g, ' ')}`);
+      }
       const summary = String(p.summary ?? '').trim().split('\n').slice(0, 14);
       for (const s of summary) head.push(`${tag}   | ${s.slice(0, 160)}`);
       head.push(`${tag}   approve: bulig approve ${id} ${kind}`);

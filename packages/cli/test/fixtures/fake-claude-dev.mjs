@@ -7,7 +7,7 @@ const args = process.argv.slice(2);
 const prompt = args[args.indexOf('-p') + 1] ?? '';
 let result = 'ok';
 
-if (prompt.includes('You are planning')) result = '1. Add src/multiply.js\n2. Add test/multiply.test.js';
+if (prompt.includes('You are planning')) result = '1. Add src/multiply.js\n2. Add test/multiply.test.js\n\nSCOPE:\n- src/multiply.js\n- test/multiply.test.js';
 else if (prompt.includes('You are checking a plan')) result = 'The plan is fine.';
 else if (prompt.includes('You are building')) {
   mkdirSync('src', { recursive: true });

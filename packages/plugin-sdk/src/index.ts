@@ -168,3 +168,5 @@ export interface Plugin {
 export function definePlugin(plugin: Plugin): Plugin {
   return plugin;
 }
+
+export * from './scope.ts';

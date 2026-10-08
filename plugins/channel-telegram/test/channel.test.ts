@@ -121,6 +121,44 @@ describe('/dev', () => {
 });
 
 describe('approvals', () => {
+  it('the plan card lists the files the job may change', async () => {
+    const fake = await startFake();
+    const b = await boot(fake);
+    b.d.waitForApproval('plan', { scope: ['README.md', 'src/lib/*.ts', 'docs/my notes.md'] });
+    await until(() => fake.of('sendMessage').length === 1, 'approval message');
+    const text = String(fake.of('sendMessage')[0]!.params.text);
+    expect(text).toContain('Files this job may change:');
+    expect(text).toContain('- README.md');
+    expect(text).toContain('- src/lib/*.ts');
+    expect(text).toContain('- docs/my notes.md');
+  });
+
+  it('shows every scope entry, in full, even when there are many and they are long', async () => {
+    const fake = await startFake();
+    const b = await boot(fake);
+    const scope = Array.from({ length: 100 }, (_, i) => `src/${String(i).padStart(3, '0')}/${'d'.repeat(170)}/file.ts`);
+    b.d.waitForApproval('plan', { scope });
+    await until(() => fake.of('sendMessage').some((m) => m.params.reply_markup), 'the last approval message, with the buttons');
+    const sent = fake.of('sendMessage').map((m) => m.params);
+    expect(sent.length).toBeGreaterThan(2);
+    for (const m of sent) expect(String(m.text).length).toBeLessThanOrEqual(4096);
+    // the approver can't tap before seeing the whole list: buttons only on the last message
+    expect(sent.slice(0, -1).every((m) => m.reply_markup === undefined)).toBe(true);
+    expect(sent.at(-1)!.reply_markup.inline_keyboard[0]).toHaveLength(2);
+    const all = sent.map((m) => String(m.text)).join('\n');
+    for (const entry of scope) expect(all).toContain(`- ${entry}`);
+    expect(all.indexOf(`- ${scope[99]}`)).toBeGreaterThan(all.indexOf(`- ${scope[0]}`));
+    expect(all).not.toMatch(/and \d+ more/);
+  });
+
+  it('a merge card does not show a scope list', async () => {
+    const fake = await startFake();
+    const b = await boot(fake);
+    b.d.waitForApproval('merge', { url: 'https://example.test/pull/7', scope: ['README.md'] });
+    await until(() => fake.of('sendMessage').length === 1, 'approval message');
+    expect(String(fake.of('sendMessage')[0]!.params.text)).not.toContain('Files this job may change');
+  });
+
   it('shows Approve and Deny buttons carrying the job and the kind', async () => {
     const fake = await startFake();
     const b = await boot(fake);
@@ -223,6 +261,22 @@ describe('progress', () => {
     b.d.ctx.emit('pipeline.failed', { reason: 'review failed twice' }, job.id);
     await until(() => fake.texts().length === 1, 'line');
     expect(fake.texts()[0]).toContain('job failed: review failed twice');
+  });
+
+  it('names the out-of-scope files when a job fails because of them', async () => {
+    const fake = await startFake();
+    const b = await boot(fake);
+    const job = b.d.ctx.jobs.create({ repo: '/r', title: 't' });
+    b.d.ctx.emit(
+      'pipeline.failed',
+      { reason: 'build still left files outside the approved scope after 2 attempts', outOfScope: ['test-results/.last-run.json', 'naive file.txt'] },
+      job.id,
+    );
+    await until(() => fake.texts().length === 1, 'line');
+    const text = fake.texts()[0]!;
+    expect(text).toContain('job failed: build still left files outside the approved scope');
+    expect(text).toContain('- test-results/.last-run.json');
+    expect(text).toContain('- naive file.txt');
   });
 
   it('says why a merge failed, with the check names and links, and does not repeat it as a generic job failure', async () => {

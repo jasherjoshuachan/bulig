@@ -8,6 +8,9 @@ Details:
 The plan it was built from:
 {{plan}}
 
+The approved scope. The change may touch only these files:
+{{scope}}
+
 The change is committed. You are reviewing commit {{sha}}, and it is the final version: nothing edits the code after you. Look at it like this:
 
 - `git diff {{base}} HEAD` shows the whole change.
@@ -18,7 +21,7 @@ Check:
 
 1. Does it do what the task asks, and nothing else?
 2. Is there a bug, a missed edge case, or a test that cannot fail?
-3. Did it leave debug output, stray files, or secrets?
+3. Did it leave debug output, stray files, or secrets? Does it touch any file the approved scope does not list?
 
 Be specific. Name the file and the problem. Do not pass a change just because it looks tidy.
 

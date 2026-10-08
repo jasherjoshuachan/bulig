@@ -23,7 +23,7 @@ afterEach(async () => {
 /** Stands in for worker-claude-code. `hangOn` never answers that stage, like a process that dies mid-stage. */
 function fakeWorker(hangOn?: string): Plugin {
   const replies: Record<string, string> = {
-    plan: 'The plan',
+    plan: 'The plan\n\nSCOPE:\n- src/multiply.js\n- test/multiply.test.js',
     critique: 'The critique',
     build: 'built',
     test: 'tests ran\nVERDICT: PASS',

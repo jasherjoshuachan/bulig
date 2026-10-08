@@ -31,7 +31,10 @@
       "models": { "strong": "opus", "standard": "sonnet" },
       "maxBuildAttempts": 2,
       "branchPrefix": "bulig",
-      "keepFailedWorktrees": false
+      "keepFailedWorktrees": false,
+      "scopeMode": "enforce",
+      "scopeAlwaysAllow": [],
+      "allowBroadScope": false
     }
   }
 }

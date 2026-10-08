@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { Stage } from '@bulig/plugin-sdk';
 import { decide, parseVerdict, renderPrompt } from '../src/index.ts';
-import { boot, fakeGithub, fakeHuman, fakeWorker, newDb, stageNames, types, type Script, type Sent } from './harness.ts';
+import { boot, fakeGithub, fakeHuman, fakeWorker, newDb, raw, stageNames, types, type Script, type Sent } from './harness.ts';
 
 const PASS = 'All good.\nVERDICT: PASS';
 const FAIL = (why: string) => `${why}\nVERDICT: FAIL`;
@@ -638,5 +638,278 @@ describe('parseVerdict and prompts', () => {
     for (const name of ['plan', 'critique', 'build', 'test', 'review', 'docs']) {
       expect(renderPrompt(name, {})).not.toMatch(/—|leverage|seamless|robust|comprehensive|ensure/i);
     }
+  });
+});
+
+describe('scope guard: the plan declares its scope', () => {
+  const PLAN_WITH = (lines: string) => raw(`The plan.\n\nSCOPE:\n${lines}\n`);
+  const planPrompts = (r: ReturnType<typeof rig>) => r.worker.filter((s) => s.stage === 'plan').map((s) => s.prompt);
+  const commits = (r: ReturnType<typeof rig>) => r.github.filter((g) => g.type === 'commit.requested').map((g) => g.payload as Record<string, unknown>);
+  const failedReason = (r: ReturnType<typeof rig>, id: string) =>
+    (r.k.history(id).find((e) => e.type === 'pipeline.failed')!.payload as { reason: string }).reason;
+
+  it('stores the scope with the plan stage and puts it on the plan approval', async () => {
+    const r = rig({ plan: PLAN_WITH('- README.md\n- src/lib/*.ts') });
+    await r.k.start();
+    const job = jobOf(r.k);
+    expect(r.human.requests.at(-1)!.payload).toMatchObject({ kind: 'plan', scope: ['README.md', 'src/lib/*.ts'] });
+    const plan = r.k.jobs.stages(job.id).find((s) => s.name === 'plan')!;
+    expect((plan.output as { scope: string[] }).scope).toEqual(['README.md', 'src/lib/*.ts']);
+  });
+
+  it('every commit request carries the approved scope and the settings', async () => {
+    const r = rig({ plan: PLAN_WITH('- README.md') });
+    await r.k.start();
+    const job = jobOf(r.k);
+    r.human.grant(job.id, 'plan');
+    const all = commits(r);
+    expect(all).toHaveLength(3);
+    for (const c of all) expect(c).toMatchObject({ scope: ['README.md'], scopeMode: 'enforce', scopeAllow: [], allowBroadScope: false });
+  });
+
+  it('forwards scopeAlwaysAllow, scopeMode and allowBroadScope from the config', async () => {
+    const r = rig({ plan: PLAN_WITH('- README.md') }, {}, { scopeAlwaysAllow: ['test-results/.last-run.json'], scopeMode: 'warn', allowBroadScope: true });
+    await r.k.start();
+    const job = jobOf(r.k);
+    r.human.grant(job.id, 'plan');
+    expect(commits(r)[0]).toMatchObject({ scopeAllow: ['test-results/.last-run.json'], scopeMode: 'warn', allowBroadScope: true });
+  });
+
+  it('tells the build, test and docs stages which files they may change', async () => {
+    const r = rig({ plan: PLAN_WITH('- README.md\n- src/lib/*.ts') });
+    await r.k.start();
+    const job = jobOf(r.k);
+    r.human.grant(job.id, 'plan');
+    for (const stage of ['build', 'test', 'docs']) {
+      const prompt = r.worker.find((s) => s.stage === stage)!.prompt;
+      expect(prompt, stage).toContain('- README.md');
+      expect(prompt, stage).toContain('- src/lib/*.ts');
+    }
+  });
+
+  it('a plan with no SCOPE block is asked for again, once, with a clear instruction', async () => {
+    const r = rig({ plan: [raw('A plan with no scope.'), PLAN_WITH('- README.md')] });
+    await r.k.start();
+    const job = jobOf(r.k);
+    expect(r.worker.map((s) => s.stage)).toEqual(['plan', 'plan', 'critique']);
+    const [first, second] = planPrompts(r);
+    expect(first).not.toMatch(/retry/);
+    expect(second).toMatch(/retry/);
+    expect(second).toMatch(/no SCOPE/i);
+    expect(r.k.jobs.get(job.id)!.status).toBe('awaiting_approval');
+    expect(r.human.requests.at(-1)!.payload).toMatchObject({ scope: ['README.md'] });
+    expect(stageNames(r.k, job.id).filter((n) => n.startsWith('plan'))).toEqual(['plan:failed', 'plan:passed']);
+  });
+
+  it('fails the job when the second plan has no SCOPE block either, and never builds', async () => {
+    const r = rig({ plan: raw('Still no scope.') });
+    await r.k.start();
+    const job = jobOf(r.k);
+    expect(r.worker.map((s) => s.stage)).toEqual(['plan', 'plan']);
+    expect(r.k.jobs.get(job.id)!.status).toBe('failed');
+    expect(failedReason(r, job.id)).toMatch(/SCOPE/);
+    expect(failedReason(r, job.id)).toMatch(/2 tries|twice|2 attempts/);
+    expect(r.human.requests).toHaveLength(0);
+    expect(r.worker.map((s) => s.stage)).not.toContain('build');
+  });
+
+  it('a too-broad scope is rejected and the retry says which line', async () => {
+    const r = rig({ plan: [PLAN_WITH('- README.md\n- **'), PLAN_WITH('- README.md')] });
+    await r.k.start();
+    jobOf(r.k);
+    expect(planPrompts(r)[1]).toMatch(/broad/);
+    expect(planPrompts(r)[1]).toContain('**');
+    expect(r.human.requests.at(-1)!.payload).toMatchObject({ scope: ['README.md'] });
+  });
+
+  it('allowBroadScope lets a broad scope stand', async () => {
+    const r = rig({ plan: PLAN_WITH('- **') }, {}, { allowBroadScope: true });
+    await r.k.start();
+    jobOf(r.k);
+    expect(r.worker.filter((s) => s.stage === 'plan')).toHaveLength(1);
+    expect(r.human.requests.at(-1)!.payload).toMatchObject({ scope: ['**'] });
+  });
+
+  it('an absolute path or .. in the scope is rejected, and the retry names it', async () => {
+    const r = rig({ plan: [PLAN_WITH('- /etc/passwd'), PLAN_WITH('- ../outside.txt'), PLAN_WITH('- README.md')] });
+    await r.k.start();
+    const job = jobOf(r.k);
+    // Two tries only: the second one is also bad, so the job fails.
+    expect(planPrompts(r)[1]).toContain('/etc/passwd');
+    expect(r.k.jobs.get(job.id)!.status).toBe('failed');
+    expect(failedReason(r, job.id)).toContain('outside.txt');
+  });
+
+  it('a scope with more than 100 entries is rejected at plan time', async () => {
+    const lines = (n: number) => PLAN_WITH(Array.from({ length: n }, (_, i) => `- src/f${i}.ts`).join('\n'));
+    const r = rig({ plan: lines(101) });
+    await r.k.start();
+    const job = jobOf(r.k);
+    expect(r.k.jobs.get(job.id)!.status).toBe('failed');
+    expect(r.worker.map((s) => s.stage)).toEqual(['plan', 'plan']);
+    expect(failedReason(r, job.id)).toMatch(/too many SCOPE lines/);
+    const ok = rig({ plan: lines(100) });
+    await ok.k.start();
+    jobOf(ok.k);
+    expect(ok.human.requests.at(-1)!.payload).toMatchObject({ kind: 'plan' });
+  });
+
+  it('a worker error in the plan stage still fails at once, with no scope retry', async () => {
+    const r = rig({ plan: { fail: 'claude exited with code 1' } as never });
+    await r.k.start();
+    const job = jobOf(r.k);
+    expect(r.worker.filter((s) => s.stage === 'plan')).toHaveLength(1);
+    expect(r.k.jobs.get(job.id)!.status).toBe('failed');
+  });
+
+  it('a job whose approved plan has no recorded scope (an older job) fails instead of building', async () => {
+    const r = rig();
+    await r.k.start();
+    const job = jobOf(r.k);
+    const plan = r.k.jobs.stages(job.id).find((s) => s.name === 'plan')!;
+    r.k.jobs.finishStage(plan.id, 'passed', { result: 'An old plan with no scope recorded' });
+    r.human.grant(job.id, 'plan');
+    expect(r.worker.map((s) => s.stage)).toEqual(['plan', 'critique']);
+    expect(r.k.jobs.get(job.id)!.status).toBe('failed');
+    expect(failedReason(r, job.id)).toMatch(/no recorded SCOPE/);
+  });
+
+  it('the plan prompt asks for the SCOPE block and the critique prompt checks it', () => {
+    const plan = renderPrompt('plan', { title: 't', issue: 'i', feedback: '' });
+    expect(plan).toContain('SCOPE:');
+    expect(plan).toMatch(/test files/i);
+    const critique = renderPrompt('critique', { title: 't', issue: 'i', plan: 'p' });
+    expect(critique).toContain('SCOPE');
+    expect(critique).toMatch(/too broad|tight/i);
+  });
+});
+
+describe('scope guard: the commit step refuses files outside the scope', () => {
+  const reasonOf = (r: ReturnType<typeof rig>, id: string) =>
+    r.k.history(id).find((e) => e.type === 'pipeline.failed')!.payload as { reason: string; outOfScope?: string[] };
+  const JUNK = 'test-results/.last-run.json';
+
+  it('feeds the files back to the build stage and the job passes on the second attempt', async () => {
+    const r = rig({}, { outOfScope: [[JUNK]] });
+    await r.k.start();
+    const job = jobOf(r.k);
+    r.human.grant(job.id, 'plan');
+    expect(r.worker.map((s) => s.stage)).toEqual(['plan', 'critique', 'build', 'build', 'test', 'docs', 'review']);
+    const [first, second] = r.worker.filter((s) => s.stage === 'build');
+    expect(first!.prompt).not.toContain(JUNK);
+    expect(second!.prompt).toContain(JUNK);
+    expect(second!.prompt).toMatch(/outside the approved scope/);
+    expect(second!.prompt).toMatch(/remove them or revert them/);
+    expect(r.k.jobs.get(job.id)!.status).toBe('awaiting_approval');
+    expect(r.human.requests.at(-1)!.payload).toMatchObject({ kind: 'merge' });
+    expect(stageNames(r.k, job.id).filter((n) => n.startsWith('build'))).toEqual(['build:failed', 'build:passed']);
+  });
+
+  it('the incident: junk written by the test stage sends the job back to build, then it passes', async () => {
+    const r = rig({}, { outOfScope: [undefined, [JUNK]] });
+    await r.k.start();
+    const job = jobOf(r.k);
+    r.human.grant(job.id, 'plan');
+    expect(r.worker.map((s) => s.stage)).toEqual(['plan', 'critique', 'build', 'test', 'build', 'test', 'docs', 'review']);
+    expect(r.worker.filter((s) => s.stage === 'build')[1]!.prompt).toContain(JUNK);
+    expect(r.k.jobs.get(job.id)!.status).toBe('awaiting_approval');
+    expect(r.github.map((g) => g.type)).toContain('pr.requested');
+  });
+
+  it('files left by the docs stage are handled the same way', async () => {
+    const r = rig({}, { outOfScope: [undefined, undefined, ['notes.tmp']] });
+    await r.k.start();
+    const job = jobOf(r.k);
+    r.human.grant(job.id, 'plan');
+    expect(r.worker.filter((s) => s.stage === 'build')[1]!.prompt).toContain('notes.tmp');
+    expect(r.k.jobs.get(job.id)!.status).toBe('awaiting_approval');
+  });
+
+  it('fails the job with the file list when the retry budget runs out', async () => {
+    const r = rig({}, { outOfScope: [[JUNK], [JUNK, 'other.tmp']] });
+    await r.k.start();
+    const job = jobOf(r.k);
+    r.human.grant(job.id, 'plan');
+    expect(r.worker.filter((s) => s.stage === 'build')).toHaveLength(2);
+    expect(r.k.jobs.get(job.id)!.status).toBe('failed');
+    const failed = reasonOf(r, job.id);
+    expect(failed.reason).toMatch(/outside the approved scope/);
+    expect(failed.reason).toMatch(/2 build attempts/);
+    expect(failed.reason).toContain(JUNK);
+    expect(failed.reason).toContain('other.tmp');
+    expect(failed.outOfScope).toEqual([JUNK, 'other.tmp']);
+    expect(r.github.map((g) => g.type)).not.toContain('pr.requested');
+  });
+
+  it('respects maxBuildAttempts for scope failures too', async () => {
+    const r = rig({}, { outOfScope: [[JUNK], [JUNK], undefined] }, { maxBuildAttempts: 3 });
+    await r.k.start();
+    const job = jobOf(r.k);
+    r.human.grant(job.id, 'plan');
+    expect(r.worker.filter((s) => s.stage === 'build')).toHaveLength(3);
+    expect(r.k.jobs.get(job.id)!.status).toBe('awaiting_approval');
+  });
+
+  it('a long list is cut in the failure reason but kept whole in the payload', async () => {
+    const many = Array.from({ length: 30 }, (_, i) => `junk/f${i}.tmp`);
+    const r = rig({}, { outOfScope: [many, many] });
+    await r.k.start();
+    const job = jobOf(r.k);
+    r.human.grant(job.id, 'plan');
+    const failed = reasonOf(r, job.id);
+    expect(failed.reason).toContain('junk/f0.tmp');
+    expect(failed.reason).toMatch(/and 22 more/);
+    expect(failed.outOfScope).toHaveLength(30);
+  });
+
+  it('a commit failure that is not about scope still fails the job at once', async () => {
+    const r = rig({}, { failCommit: 'disk full' });
+    await r.k.start();
+    const job = jobOf(r.k);
+    r.human.grant(job.id, 'plan');
+    expect(r.worker.filter((s) => s.stage === 'build')).toHaveLength(1);
+    expect(r.k.jobs.get(job.id)!.status).toBe('failed');
+  });
+
+  it('warn mode: the PR body lists the files that were outside the scope', async () => {
+    const r = rig({}, { warnOutOfScope: [[JUNK]] }, { scopeMode: 'warn' });
+    await r.k.start();
+    const job = jobOf(r.k);
+    r.human.grant(job.id, 'plan');
+    const pr = r.github.find((g) => g.type === 'pr.requested')!.payload as { body: string };
+    expect(pr.body).toMatch(/outside the approved scope/);
+    expect(pr.body).toContain(JUNK);
+    expect(r.worker.filter((s) => s.stage === 'build')).toHaveLength(1);
+  });
+
+  it('a PR with nothing outside the scope has no such section', async () => {
+    const r = rig();
+    await r.k.start();
+    const job = jobOf(r.k);
+    r.human.grant(job.id, 'plan');
+    const pr = r.github.find((g) => g.type === 'pr.requested')!.payload as { body: string };
+    expect(pr.body).not.toMatch(/outside the approved scope/);
+  });
+
+  it('decide() retries build on a scope failure and gives up at the budget', () => {
+    const stage = (name: string, status: Stage['status'], output: unknown): Stage =>
+      ({ id: name + status + Math.random(), jobId: 'j', name, status, attempt: 1, startedAt: '', endedAt: null, output }) as unknown as Stage;
+    const base = [stage('worktree', 'passed', { cwd: '/w' }), stage('plan', 'passed', { result: 'p', scope: ['a'] }), stage('critique', 'passed', {}), stage('approve-plan', 'passed', {})];
+    const bad = stage('build', 'failed', { result: 'done', outOfScope: ['x.tmp'] });
+    const retry = decide({ status: 'running' }, [...base, bad], 2);
+    expect(retry).toMatchObject({ kind: 'stage', name: 'build' });
+    expect((retry as { feedback: string }).feedback).toContain('x.tmp');
+    const spent = decide({ status: 'running' }, [...base, bad, stage('build', 'failed', { outOfScope: ['x.tmp'] })], 2);
+    expect(spent).toMatchObject({ kind: 'fail' });
+    expect((spent as { reason: string }).reason).toContain('x.tmp');
+  });
+
+  it('decide() retries a plan with a scope error once and then fails', () => {
+    const stage = (name: string, status: Stage['status'], output: unknown): Stage =>
+      ({ id: name + status + Math.random(), jobId: 'j', name, status, attempt: 1, startedAt: '', endedAt: null, output }) as unknown as Stage;
+    const wt = stage('worktree', 'passed', { cwd: '/w' });
+    const bad = stage('plan', 'failed', { result: 'p', scopeError: 'no SCOPE block' });
+    expect(decide({ status: 'running' }, [wt, bad], 2)).toMatchObject({ kind: 'stage', name: 'plan' });
+    expect(decide({ status: 'running' }, [wt, bad, stage('plan', 'failed', { scopeError: 'still none' })], 2)).toMatchObject({ kind: 'fail' });
   });
 });

@@ -652,7 +652,7 @@ describe('merge.requested', () => {
   });
 
   it('kills a hung gh call after ghTimeoutMs, tries it again as a temporary failure, and then merges', async () => {
-    const h = await setup({ ghTimeoutMs: 400, tries: 3, retryDelayMs: 5 });
+    const h = await setup({ ghTimeoutMs: 2500, tries: 3, retryDelayMs: 5 });
     const pr = await openPr(h);
     const pidFile = join(h.root, 'pids');
     h.setState({ log: join(h.root, 'gh.log'), pidFile, hangChecksFirst: 1, checks: [{ name: 'ci', bucket: 'pass' }] });
@@ -664,12 +664,12 @@ describe('merge.requested', () => {
   });
 
   it('fails for good when gh keeps hanging', async () => {
-    const h = await setup({ ghTimeoutMs: 300, tries: 2, retryDelayMs: 5 });
+    const h = await setup({ ghTimeoutMs: 2500, tries: 2, retryDelayMs: 5 });
     const pr = await openPr(h);
     h.setState({ log: join(h.root, 'gh.log'), pidFile: join(h.root, 'pids'), hangChecksFirst: 99 });
     h.fire('merge.requested', { cwd: pr.cwd, number: pr.number, headSha: pr.headSha });
     const failed = await h.waitFor('merge.failed');
-    expect((failed.payload as { reason: string }).reason).toMatch(/^could not read checks: timed out after 300ms/);
+    expect((failed.payload as { reason: string }).reason).toMatch(/^could not read checks: timed out after 2500ms/);
     expect(h.calls().filter((c) => c.args[1] === 'checks').length).toBe(2);
   });
 

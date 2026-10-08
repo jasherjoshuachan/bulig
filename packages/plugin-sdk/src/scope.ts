@@ -25,6 +25,8 @@ export const MAX_SCOPE_ENTRIES = 100;
 /** The longest scope line, in characters, and the most path parts in one line. */
 export const MAX_PATTERN_LENGTH = 200;
 export const MAX_PATTERN_PARTS = 32;
+/** The deepest path (in parts) a scope will ever cover. A deeper path never matches, so it counts as out of scope. */
+export const MAX_PATH_PARTS = 32;
 
 export type ScopeEntry = { ok: true; pattern: string } | { ok: false; error: string };
 export type ScopeParse = { ok: true; scope: string[] } | { ok: false; error: string };
@@ -160,10 +162,11 @@ function matchParts(pat: string[], parts: string[]): boolean {
   return go(0, 0);
 }
 
-/** True for a path that stays inside the repo: relative, no empty parts, no "." or ".." parts. */
+/** True for a path that stays inside the repo: relative, no empty parts, no "." or ".." parts, at most MAX_PATH_PARTS deep. */
 export function isRepoPath(path: string): boolean {
   if (!path || path.startsWith('/') || path.includes('\\') || CONTROL.test(path)) return false;
-  return path.split('/').every((part) => part !== '' && part !== '.' && part !== '..');
+  const parts = path.split('/');
+  return parts.length <= MAX_PATH_PARTS && parts.every((part) => part !== '' && part !== '.' && part !== '..');
 }
 
 /** Does this repo-relative path match this scope pattern? A path that leaves the repo never matches. */

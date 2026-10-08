@@ -1,5 +1,16 @@
 import { describe, expect, it } from 'vitest';
-import { matchesGlob, matchesScope, normalizeScopeEntry, parseScopeBlock } from '../src/index.ts';
+import { isRepoPath, matchesGlob, matchesScope, normalizeScopeEntry, parseScopeBlock } from '../src/index.ts';
+
+describe('path depth cap', () => {
+  const deep = (n: number) => `${Array.from({ length: n - 1 }, (_, i) => `d${i}`).join('/')}/f.txt`;
+  it('covers a path 32 parts deep and refuses one 33 deep, even under **', () => {
+    expect(isRepoPath(deep(32))).toBe(true);
+    expect(isRepoPath(deep(33))).toBe(false);
+    expect(matchesGlob(deep(32), 'd0/**')).toBe(true);
+    expect(matchesGlob(deep(33), 'd0/**')).toBe(false);
+    expect(matchesScope(deep(33), ['d0/**'])).toBe(false);
+  });
+});
 
 describe('matchesGlob', () => {
   it('matches a literal path exactly', () => {

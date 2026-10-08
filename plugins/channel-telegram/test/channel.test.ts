@@ -1,6 +1,7 @@
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { Store } from '@bulig/core';
+import { safeLink } from '../src/index.ts';
 import { boot, CHAT, shutdown, startFake, tempDir, TOKEN_ENV } from './harness.ts';
 import { until } from './fake-telegram.ts';
 
@@ -120,6 +121,19 @@ describe('/dev', () => {
   });
 });
 
+describe('safeLink', () => {
+  it('drops user@host links and bidi control characters, keeps plain https', () => {
+    expect(safeLink('https://example.test/runs/1')).toBe(true);
+    expect(safeLink('https://example.test/runs/1?to=a@b.test')).toBe(true);
+    expect(safeLink('https://github.com@evil.test/')).toBe(false);
+    expect(safeLink('https://user@example.test/')).toBe(false);
+    expect(safeLink('https://:pass@example.test/')).toBe(false);
+    for (const ch of ['\u061c', '\u200e', '\u200f', '\u202a', '\u202e', '\u2066', '\u2069']) {
+      expect(safeLink(`https://example.test/a${ch}b`)).toBe(false);
+    }
+  });
+});
+
 describe('approvals', () => {
   it('the plan card lists the files the job may change', async () => {
     const fake = await startFake();
@@ -149,6 +163,18 @@ describe('approvals', () => {
     for (const entry of scope) expect(all).toContain(`- ${entry}`);
     expect(all.indexOf(`- ${scope[99]}`)).toBeGreaterThan(all.indexOf(`- ${scope[0]}`));
     expect(all).not.toMatch(/and \d+ more/);
+  });
+
+  it('withholds the Approve buttons when a piece of the scope list fails to send', async () => {
+    const fake = await startFake();
+    const b = await boot(fake);
+    const scope = Array.from({ length: 100 }, (_, i) => `src/${String(i).padStart(3, '0')}/${'d'.repeat(170)}/file.ts`);
+    fake.fail('sendMessage', { kind: 'status', status: 400, body: { ok: false, error_code: 400, description: 'Bad Request' } });
+    b.d.waitForApproval('plan', { scope });
+    await until(() => fake.texts().some((t) => /no buttons/.test(t)), 'the notice that the buttons were withheld');
+    const sent = fake.of('sendMessage').map((m) => m.params);
+    expect(sent.some((m) => m.reply_markup !== undefined)).toBe(false);
+    expect(sent.some((m) => String(m.text).includes('plan text, after the list above'))).toBe(false);
   });
 
   it('a merge card does not show a scope list', async () => {
@@ -313,6 +339,12 @@ describe('progress', () => {
       'https://example.test/runs/1\nhttps://evil.test/',
       'https://example.test/a b',
       'https://example.test/\u0007x',
+      'https://github.com@evil.test/runs/1',
+      'https://user:pass@example.test/runs/1',
+      'https://example.test@/runs/1',
+      'https://example.test/runs/\u202Egpj.1',
+      'https://example.test/\u200Fruns/1',
+      'https://example.test/\u2066runs/1',
       'not a url',
       42,
       null,

@@ -98,12 +98,15 @@ const HELP = [
   'Plan and merge approvals arrive here with Approve and Deny buttons.',
 ].join('\n');
 
-/** A link from a check is shown only if it is a plain https URL: no other scheme, no spaces, no control characters. */
+/** A link from a check is shown only if it is a plain https URL: no other scheme, no spaces, no control or bidi characters, no user@host. */
 export function safeLink(link: unknown): boolean {
   if (typeof link !== 'string' || link.length === 0 || link.length > 500) return false;
-  if (/[\s\u0000-\u001f\u007f-\u009f\u2028\u2029]/.test(link)) return false;
+  // Controls, spaces, and the bidi marks and overrides that can make a link read as a different address.
+  if (/[\s\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/.test(link)) return false;
   try {
-    return new URL(link).protocol === 'https:';
+    const url = new URL(link);
+    // user@host hides the real host behind a name that looks like one.
+    return url.protocol === 'https:' && !url.username && !url.password && !/^https:\/\/[^/?#]*@/i.test(link);
   } catch {
     return false;
   }
@@ -273,9 +276,25 @@ export function createTelegramChannel(options: TelegramChannelOptions = {}): Plu
         const text = `${head.join('\n')}\n\n${summary}`;
         if (text.length <= MAX_TEXT) return sayJob(jobId, text, buttons);
         // Too long for one message: send the header and the whole scope first, in order, then the plan with the buttons.
+        // If any piece of the scope fails to send, the buttons are withheld in that chat: a job must not be approvable
+        // when the approver could not see what it may change.
         const pieces = chunkLines(head, MAX_TEXT - 20);
-        pieces.forEach((piece, i) => sayJob(jobId, pieces.length > 1 ? `${piece}\n(${i + 1}/${pieces.length})` : piece));
-        sayJob(jobId, `[${short(jobId)}] approval needed: ${kind} (plan text, after the list above)\n\n${summary}`, buttons);
+        later(async () => {
+          for (const chat_id of targets(jobId)) {
+            try {
+              for (const [i, piece] of pieces.entries()) {
+                await api.call('sendMessage', { chat_id, text: clip(pieces.length > 1 ? `${piece}\n(${i + 1}/${pieces.length})` : piece) });
+              }
+            } catch (err) {
+              ctx.log.warn(`channel-telegram: scope list did not send, approval buttons withheld: ${err instanceof Error ? err.message : String(err)}`);
+              await api
+                .call('sendMessage', { chat_id, text: `[${short(jobId)}] approval needed: ${kind}, but the list of files could not be sent, so there are no buttons. Use /cancel ${short(jobId)} or ask for the approval again.` })
+                .catch(() => undefined);
+              continue;
+            }
+            await api.call('sendMessage', { chat_id, text: clip(`[${short(jobId)}] approval needed: ${kind} (plan text, after the list above)\n\n${summary}`), ...buttons });
+          }
+        });
       }
 
       // ----- what you tell Bulig -----

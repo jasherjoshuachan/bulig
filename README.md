@@ -85,10 +85,10 @@ kernel       job.created
 pipeline     worktree.requested
 github       worktree.ready                      a git worktree at R/.worktrees/<jobId>, on a new branch
 pipeline     stage.requested plan (opus, readonly)
-worker       stage.completed plan                a fresh claude session
+worker       stage.completed plan                a fresh claude session; the plan ends with a SCOPE block, or it is asked for again once
 pipeline     stage.requested critique (opus, readonly)
 worker       stage.completed critique            another fresh session
-pipeline     approval.requested plan             job -> awaiting_approval, the process exits
+pipeline     approval.requested plan { scope }   job -> awaiting_approval, the process exits. The card lists the files the job may change
 you          bulig approve <jobId> plan
 channel      approval.granted
 pipeline     stage.requested build (sonnet, edit)
@@ -97,8 +97,9 @@ pipeline     stage.requested test (sonnet, edit)      ends with VERDICT: PASS or
 worker       stage.completed test
 pipeline     stage.requested docs (sonnet, edit)
 worker       stage.completed docs
-pipeline     commit.requested                    after build, after test, after docs: the work on disk is committed
-github       commit.done { sha, base }           the docs commit is the one the reviewer will judge
+pipeline     commit.requested { scope }          after build, after test, after docs: the work on disk is committed
+github       commit.done { sha, base }           only files the scope names are staged. The docs commit is the one the reviewer will judge
+github       commit.failed { error, outOfScope } instead, if any file is outside the scope: nothing is committed and build is told which files
 pipeline     stage.requested review (opus, readonly)  an independent session, ends with a VERDICT
 worker       stage.completed review              a FAIL here loops back to build, once. Nothing edits the code after this.
 pipeline     pr.requested { expectSha }
@@ -110,6 +111,26 @@ pipeline     merge.requested
 github       pr.merged                           only if the head is still headSha and no check is red or pending
 kernel       job.status done
 ```
+
+### Scope guard
+
+Every plan ends with a block that names the files the job may change:
+
+```
+SCOPE:
+- README.md
+- src/lib/*.ts
+```
+
+One path or glob per line, relative to the repo root, covering every file the job will create, edit or delete, test files included. You see the list on the plan approval card ("Files this job may change"), so approving the plan approves the list. If the plan has no usable block, it is asked for once more, and then the job fails. The commit step (in the github plugin, outside the Claude sandbox) stages only paths the list covers, by name. It never runs `git add -A`. If any changed file is outside the list, nothing is committed. The files are sent back to the build stage to remove or revert, within `maxBuildAttempts`, and if that runs out the job fails and the Telegram message names them. This stops things like a test runner's `test-results/.last-run.json` from riding into a commit. See [ADR 0005](docs/adr/0005-scope-guard.md).
+
+In a scope line, `*` stays inside one folder, `**` crosses folders and `?` is one character. Nothing else is special, so `app/[id]/page.tsx` is just that file. A wildcard does not match names that start with a dot, so `.github/**` has to be written out. A trailing slash (`docs/`) means everything under it. Absolute paths, `..`, anything in `.git`, symlinks and a line that matches every file (`**`, `*`) are rejected. Settings in the `pipeline-dev` config:
+
+| Setting | Default | What it does |
+|---|---|---|
+| `scopeMode` | `enforce` | `enforce` refuses a commit with files outside the scope. `warn` commits them anyway, logs them and lists them in the PR body. |
+| `scopeAlwaysAllow` | `[]` | Globs that are always allowed, whatever the plan says. For example `["test-results/.last-run.json"]` for a project whose test runner always writes it. |
+| `allowBroadScope` | `false` | Accept a plan whose scope matches every file, such as `**`. |
 
 If the merge is refused (the head moved, or a check failed or is still running), the github plugin emits `merge.refused { reason }` and the pipeline asks for the merge approval again. If the PR was already merged at the approved commit (a crash after the merge), that counts as done. If it was closed without merging, or merged at a different commit, the github plugin emits `merge.failed { reason }` and the job fails instead of asking again.
 

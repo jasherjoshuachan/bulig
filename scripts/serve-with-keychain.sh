@@ -6,7 +6,11 @@ cd "$(dirname "$0")/.."
 
 # The database module is built for one Node major. Use the pinned one when fnm is installed.
 if [[ -f .node-version ]] && command -v fnm >/dev/null; then
-  eval "$(fnm env --shell bash)"
+  if ! fnm_env="$(fnm env --shell bash)"; then
+    echo "serve-with-keychain: 'fnm env' failed, so the pinned Node version could not be set up." >&2
+    exit 1
+  fi
+  eval "$fnm_env"
   fnm use --install-if-missing --silent-if-unchanged >/dev/null
 fi
 

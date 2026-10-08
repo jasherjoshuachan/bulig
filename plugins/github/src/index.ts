@@ -128,6 +128,9 @@ export default definePlugin({
     // (.husky, .git/hooks, lefthook) would otherwise run here, outside the stage sandbox.
     const NO_HOOKS = ['-c', 'core.hooksPath=/dev/null'];
     // The bot signs its own commits, so the history shows who did the work and your identity is never borrowed.
+    if (Boolean(cfg.authorName) !== Boolean(cfg.authorEmail)) {
+      throw new Error('github: set both authorName and authorEmail, or neither (only one of them is set)');
+    }
     const IDENTITY = cfg.authorName && cfg.authorEmail ? ['-c', `user.name=${cfg.authorName}`, '-c', `user.email=${cfg.authorEmail}`] : [];
     const runGit = (cwd: string, args: string[], withToken = false) => exec(git, [...NO_HOOKS, ...args], { cwd, env: env(withToken) });
     const runGh = (cwd: string, args: string[]) => exec(gh, args, { cwd, env: env(true) });
@@ -149,6 +152,21 @@ export default definePlugin({
     };
     const message = (err: unknown) => (err instanceof Error ? err.message : String(err));
 
+    // The one place that decides what "the base branch" is, so the worktree start and the reviewer's diff agree.
+    // With an origin, origin's copy wins over the local one (the local copy may be stale). A configured
+    // baseBranch that resolves nowhere is an error: the PR would still target it.
+    const hasOrigin = async (dir: string): Promise<boolean> => (await runGit(dir, ['remote', 'get-url', 'origin'])).code === 0;
+    const resolveBase = async (dir: string, remote: boolean): Promise<string | undefined> => {
+      const candidates = cfg.baseBranch
+        ? remote ? [`origin/${cfg.baseBranch}`, cfg.baseBranch] : [cfg.baseBranch]
+        : remote ? ['origin/HEAD', 'origin/main', 'origin/master', 'main', 'master'] : ['main', 'master'];
+      for (const c of candidates) {
+        if ((await runGit(dir, ['rev-parse', '--verify', '--quiet', `${c}^{commit}`])).code === 0) return c;
+      }
+      if (cfg.baseBranch) throw new StepError(`the configured baseBranch "${cfg.baseBranch}" was not found (tried ${candidates.join(', ')})`);
+      return undefined;
+    };
+
     ctx.on('worktree.requested', async (event: BuligEvent) => {
       try {
         const repoPath = resolve(str(event.payload, 'repoPath'));
@@ -158,11 +176,18 @@ export default definePlugin({
         assertPlainWorktree(repoPath, cwd);
         // A restart can ask twice. If the worktree is already there on this branch, that is the answer.
         const there = existsSync(cwd) ? await runGit(cwd, ['rev-parse', '--abbrev-ref', 'HEAD']) : undefined;
+        let base: string | undefined;
         if (!there || there.code !== 0 || there.stdout.trim() !== branch) {
-          must('git worktree add', await runGit(repoPath, ['worktree', 'add', cwd, '-b', branch]));
+          // Start from the base branch, not from whatever the checkout happens to have open, so the PR carries
+          // only this job's work. With a remote, fetch first and prefer origin's copy over a stale local one.
+          const remote = await hasOrigin(repoPath);
+          if (remote) must('git fetch', await again(() => runGit(repoPath, ['fetch', 'origin'], true)));
+          base = await resolveBase(repoPath, remote);
+          if (!base) throw new StepError('could not find a base branch (tried origin/HEAD, origin/main, origin/master, main, master)');
+          must('git worktree add', await runGit(repoPath, ['worktree', 'add', '--no-track', cwd, '-b', branch, base]));
         }
         ignoreWorktrees(repoPath, await runGit(repoPath, ['rev-parse', '--git-path', 'info/exclude']));
-        ctx.emit('worktree.ready', { cwd, branch }, event.jobId);
+        ctx.emit('worktree.ready', base ? { cwd, branch, base } : { cwd, branch }, event.jobId);
       } catch (err) {
         ctx.emit('worktree.failed', { error: message(err) }, event.jobId);
       }
@@ -215,9 +240,9 @@ export default definePlugin({
 
     // Where this branch left the base branch. The reviewer diffs against it.
     const baseOf = async (cwd: string): Promise<string> => {
-      for (const c of [cfg.baseBranch, 'origin/HEAD', 'origin/main', 'origin/master', 'main', 'master']) {
-        if (!c) continue;
-        const r = await runGit(cwd, ['merge-base', 'HEAD', c]);
+      const ref = await resolveBase(cwd, await hasOrigin(cwd));
+      if (ref) {
+        const r = await runGit(cwd, ['merge-base', 'HEAD', ref]);
         if (r.code === 0 && r.stdout.trim()) return r.stdout.trim();
       }
       return '4b825dc642cb6eb9a060e54bf8d69288fbee4904'; // git's empty tree: the diff is then everything

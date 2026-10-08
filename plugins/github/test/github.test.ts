@@ -112,6 +112,105 @@ describe('judgeChecks', () => {
   });
 });
 
+describe('worktree start point', () => {
+  const ready = async (h: Awaited<ReturnType<typeof setup>>, branch: string) => {
+    h.fire('worktree.requested', { repoPath: h.repo, branch });
+    return (await h.waitFor('worktree.ready')).payload as { cwd: string; branch: string; base?: string };
+  };
+
+  it('starts at the base tip even when the checkout sits on a feature branch with extra commits', async () => {
+    const h = await setup();
+    git(h.repo, 'checkout', '-b', 'feature');
+    writeFileSync(join(h.repo, 'feature.txt'), 'unrelated\n');
+    git(h.repo, 'add', '-A');
+    git(h.repo, 'commit', '-m', 'unrelated feature work');
+    const { cwd, base } = await ready(h, 'bulig/s-1');
+    expect(git(cwd, 'rev-list', '--count', 'main..HEAD')).toBe('0');
+    expect(git(cwd, 'merge-base', 'HEAD', 'main')).toBe(git(h.repo, 'rev-parse', 'main'));
+    expect(git(cwd, 'rev-parse', 'HEAD')).toBe(git(h.repo, 'rev-parse', 'main'));
+    expect(existsSync(join(cwd, 'feature.txt'))).toBe(false);
+    expect(base).toMatch(/^origin\//);
+  });
+
+  it('starts from origin/main when the local main is behind it', async () => {
+    const h = await setup();
+    const other = join(h.root, 'other');
+    execFileSync('git', ['clone', h.origin, other], { stdio: 'ignore' });
+    git(other, 'config', 'user.email', 'test@example.com');
+    git(other, 'config', 'user.name', 'Test');
+    writeFileSync(join(other, 'newer.txt'), 'newer\n');
+    git(other, 'add', '-A');
+    git(other, 'commit', '-m', 'newer on origin');
+    git(other, 'push', 'origin', 'main');
+    const staleLocal = git(h.repo, 'rev-parse', 'main');
+    const { cwd, base } = await ready(h, 'bulig/s-2');
+    expect(git(cwd, 'rev-parse', 'HEAD')).toBe(git(other, 'rev-parse', 'HEAD'));
+    expect(git(cwd, 'rev-parse', 'HEAD')).not.toBe(staleLocal);
+    expect(existsSync(join(cwd, 'newer.txt'))).toBe(true);
+    expect(base).toMatch(/^origin\//);
+    expect(() => git(cwd, 'config', '--get', 'branch.bulig/s-2.remote')).toThrow(); // --no-track
+  });
+
+  it('falls back to the local base when there is no remote', async () => {
+    const h = await setup();
+    git(h.repo, 'remote', 'remove', 'origin');
+    git(h.repo, 'checkout', '-b', 'feature');
+    writeFileSync(join(h.repo, 'feature.txt'), 'unrelated\n');
+    git(h.repo, 'add', '-A');
+    git(h.repo, 'commit', '-m', 'unrelated feature work');
+    const { cwd, base } = await ready(h, 'bulig/s-3');
+    expect(base).toBe('main');
+    expect(git(cwd, 'rev-parse', 'HEAD')).toBe(git(h.repo, 'rev-parse', 'main'));
+    expect(git(cwd, 'rev-list', '--count', 'main..HEAD')).toBe('0');
+  });
+
+  it('fails the request when the fetch fails for a reason that will not pass', async () => {
+    const h = await setup();
+    git(h.repo, 'remote', 'set-url', 'origin', join(h.root, 'does-not-exist.git'));
+    h.fire('worktree.requested', { repoPath: h.repo, branch: 'bulig/s-4' });
+    const failed = (await h.waitFor('worktree.failed')).payload as { error: string };
+    expect(failed.error).toMatch(/git fetch failed/);
+    expect(existsSync(join(h.repo, '.worktrees'))).toBe(false);
+  });
+  it('uses one base for the worktree start and the commit base, even when the configured base is stale locally', async () => {
+    const h = await setup({ baseBranch: 'develop' });
+    git(h.repo, 'branch', 'develop');
+    git(h.repo, 'push', 'origin', 'develop');
+    const other = join(h.root, 'other-dev');
+    execFileSync('git', ['clone', '-b', 'develop', h.origin, other], { stdio: 'ignore' });
+    git(other, 'config', 'user.email', 'test@example.com');
+    git(other, 'config', 'user.name', 'Test');
+    writeFileSync(join(other, 'dev.txt'), 'dev\n');
+    git(other, 'add', '-A');
+    git(other, 'commit', '-m', 'develop moves on');
+    git(other, 'push', 'origin', 'develop');
+    const tip = git(other, 'rev-parse', 'HEAD');
+    expect(git(h.repo, 'rev-parse', 'develop')).not.toBe(tip); // the local copy lags
+    const { cwd } = await ready(h, 'bulig/s-5');
+    expect(git(cwd, 'rev-parse', 'HEAD')).toBe(tip);
+    writeFileSync(join(cwd, 'job.txt'), 'job\n');
+    h.fire('commit.requested', { cwd, message: 'job work' });
+    const { base } = (await h.waitFor('commit.done')).payload as { base: string };
+    expect(base).toBe(tip);
+    expect(git(cwd, 'rev-list', '--count', `${base}..HEAD`)).toBe('1');
+  });
+
+  it('fails the request when the configured baseBranch exists nowhere', async () => {
+    const h = await setup({ baseBranch: 'no-such-branch' });
+    h.fire('worktree.requested', { repoPath: h.repo, branch: 'bulig/s-6' });
+    const failed = (await h.waitFor('worktree.failed')).payload as { error: string };
+    expect(failed.error).toMatch(/baseBranch "no-such-branch" was not found/);
+    expect(existsSync(join(h.repo, '.worktrees'))).toBe(false);
+  });
+});
+
+describe('github config', () => {
+  it('refuses to start when only one of authorName and authorEmail is set', async () => {
+    await expect(setup({ authorName: 'Bot' })).rejects.toThrow(/authorName and authorEmail/);
+    await expect(setup({ authorEmail: 'bot@example.com' })).rejects.toThrow(/authorName and authorEmail/);
+  });
+});
+
 describe('worktree.cleanup.requested', () => {
   it('removes the worktree and the local branch, but not the branch on origin', async () => {
     const h = await setup();
@@ -610,9 +709,13 @@ describe('token and grants', () => {
 
   it('fails the step with a clear message when tokenEnv points at nothing', async () => {
     const h = await setup({ tokenEnv: 'TEST_GH_TOKEN_MISSING' });
-    // Local git work needs no token, so it still works. The step that talks to GitHub is the one that fails.
+    // The worktree step fetches from origin, so it needs the token and says so.
     h.fire('worktree.requested', { repoPath: h.repo, branch: 'bulig/x-9' });
-    const { cwd } = (await h.waitFor('worktree.ready')).payload as { cwd: string };
+    const refused = await h.waitFor('worktree.failed');
+    expect((refused.payload as { error: string }).error).toMatch(/TEST_GH_TOKEN_MISSING.*not set/);
+    // Local git work needs no token. The step that talks to GitHub is the one that fails.
+    const cwd = join(h.root, 'manual-wt');
+    git(h.repo, 'worktree', 'add', cwd, '-b', 'bulig/x-9');
     h.fire('pr.requested', { cwd, branch: 'bulig/x-9', title: 'T', body: '', expectSha: git(cwd, 'rev-parse', 'HEAD') });
     const failed = await h.waitFor('pr.failed');
     expect((failed.payload as { error: string }).error).toMatch(/TEST_GH_TOKEN_MISSING.*not set/);

@@ -103,6 +103,23 @@ async function openPr(h: Awaited<ReturnType<typeof setup>>, branch = 'bulig/x-1'
   return { cwd: ready.cwd, branch, ...opened };
 }
 
+const alive = (pid: number) => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+const until = async (cond: () => boolean, ms = 10_000) => {
+  const end = Date.now() + ms;
+  while (!cond()) {
+    if (Date.now() > end) throw new Error('timed out waiting for a condition');
+    await new Promise((r) => setTimeout(r, 10));
+  }
+};
+
 describe('judgeChecks', () => {
   it('sorts passing, failing and pending', () => {
     expect(judgeChecks([{ name: 'a', bucket: 'pass' }, { name: 'b', bucket: 'skipping' }])).toEqual({ failing: [], pending: [] });
@@ -541,23 +558,192 @@ describe('merge.requested', () => {
     expect(existsSync(pr.cwd)).toBe(true);
   });
 
-  it('refuses on a failing check and on a pending check', async () => {
-    for (const [bucket, word] of [['fail', 'failing'], ['pending', 'pending']] as const) {
-      const h = await setup();
-      const pr = await openPr(h);
-      h.setState({ log: join(h.root, 'gh.log'), checks: [{ name: 'ci', bucket }] });
-      h.fire('merge.requested', { cwd: pr.cwd, number: pr.number, headSha: pr.headSha });
-      const refused = await h.waitFor('merge.refused');
-      expect((refused.payload as { reason: string }).reason).toMatch(new RegExp(`checks ${word}: ci`));
-      expect(h.calls().some((c) => c.args[1] === 'merge')).toBe(false);
-    }
+  it('fails for good on a failing check, names it, and never calls merge', async () => {
+    const h = await setup();
+    const pr = await openPr(h);
+    h.setState({
+      log: join(h.root, 'gh.log'),
+      checks: [{ name: 'Typecheck & build', bucket: 'fail', link: 'https://example.test/runs/9' }, { name: 'lint', bucket: 'pass' }],
+    });
+    h.fire('merge.requested', { cwd: pr.cwd, number: pr.number, headSha: pr.headSha });
+    const failed = await h.waitFor('merge.failed');
+    expect(failed.payload).toEqual({
+      reason: 'checks failing: Typecheck & build. Fix the failing check, then run the job again.',
+      checks: [{ name: 'Typecheck & build', link: 'https://example.test/runs/9' }],
+    });
+    expect(h.seen.some((e) => e.type === 'merge.refused')).toBe(false);
+    expect(h.calls().some((c) => c.args[1] === 'merge')).toBe(false);
   });
 
-  it('treats no checks as a refusal unless allowNoChecks is on', async () => {
+  it('waits for pending checks and merges when they turn green, on the one approval', async () => {
+    const h = await setup({ checksPollMs: 20, checksWaitMs: 10_000 });
+    const pr = await openPr(h);
+    const pending = [{ name: 'ci', bucket: 'pending' }];
+    h.setState({ log: join(h.root, 'gh.log'), checksSequence: [pending, pending, pending, [{ name: 'ci', bucket: 'pass' }]] });
+    h.fire('merge.requested', { cwd: pr.cwd, number: pr.number, headSha: pr.headSha });
+    await h.waitFor('pr.merged');
+    expect(h.calls().filter((c) => c.args[1] === 'checks').length).toBe(4);
+    expect(h.calls().filter((c) => c.args[1] === 'merge')).toHaveLength(1);
+    expect(h.seen.some((e) => e.type === 'merge.refused' || e.type === 'merge.failed')).toBe(false);
+  });
+
+  it('waits for pending checks and fails with their names when they turn red', async () => {
+    const h = await setup({ checksPollMs: 20, checksWaitMs: 10_000 });
+    const pr = await openPr(h);
+    h.setState({
+      log: join(h.root, 'gh.log'),
+      checksSequence: [[{ name: 'unit', bucket: 'pending' }, { name: 'e2e', bucket: 'pending' }], [{ name: 'unit', bucket: 'fail' }, { name: 'e2e', bucket: 'fail' }]],
+    });
+    h.fire('merge.requested', { cwd: pr.cwd, number: pr.number, headSha: pr.headSha });
+    const failed = await h.waitFor('merge.failed');
+    expect((failed.payload as { reason: string }).reason).toMatch(/^checks failing: unit, e2e\. Fix the failing check, then run the job again\.$/);
+    expect(h.calls().some((c) => c.args[1] === 'merge')).toBe(false);
+  });
+
+  it('fails with a timeout message when checks stay pending past checksWaitMs', async () => {
+    const h = await setup({ checksPollMs: 20, checksWaitMs: 800 });
+    const pr = await openPr(h);
+    h.setState({ log: join(h.root, 'gh.log'), checks: [{ name: 'ci', bucket: 'pending' }] });
+    const t0 = Date.now();
+    h.fire('merge.requested', { cwd: pr.cwd, number: pr.number, headSha: pr.headSha });
+    const failed = await h.waitFor('merge.failed');
+    expect((failed.payload as { reason: string }).reason).toMatch(/^checks still pending after 0 minutes: ci/);
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(790); // it really waited the whole time before giving up
+    expect(h.calls().some((c) => c.args[1] === 'merge')).toBe(false);
+    expect(h.seen.some((e) => e.type === 'merge.refused')).toBe(false);
+  });
+
+  it('stops waiting at once when the job is cancelled, and never calls merge', async () => {
+    const h = await setup({ checksPollMs: 20, checksWaitMs: 60_000 });
+    const pr = await openPr(h);
+    h.setState({ log: join(h.root, 'gh.log'), checks: [{ name: 'ci', bucket: 'pending' }] });
+    h.fire('merge.requested', { cwd: pr.cwd, number: pr.number, headSha: pr.headSha });
+    await until(() => h.calls().filter((c) => c.args[1] === 'checks').length >= 2);
+    h.k.jobs.setStatus(h.job.id, 'cancelled');
+    await new Promise((r) => setTimeout(r, 150));
+    const polls = h.calls().filter((c) => c.args[1] === 'checks').length;
+    await new Promise((r) => setTimeout(r, 200));
+    expect(h.calls().filter((c) => c.args[1] === 'checks').length).toBe(polls); // no more looking
+    expect(h.calls().some((c) => c.args[1] === 'merge')).toBe(false);
+    expect(h.seen.some((e) => e.type === 'merge.refused' || e.type === 'merge.failed' || e.type === 'pr.merged')).toBe(false);
+  });
+
+  it('does not merge if the job was cancelled just as the checks turned green', async () => {
+    const h = await setup({ checksPollMs: 20, checksWaitMs: 60_000 });
+    const pr = await openPr(h);
+    h.setState({ log: join(h.root, 'gh.log'), checks: [{ name: 'ci', bucket: 'pass' }] });
+    h.k.jobs.setStatus(h.job.id, 'running');
+    h.k.jobs.setStatus(h.job.id, 'cancelled');
+    h.fire('merge.requested', { cwd: pr.cwd, number: pr.number, headSha: pr.headSha });
+    await new Promise((r) => setTimeout(r, 300));
+    expect(h.calls().some((c) => c.args[1] === 'merge')).toBe(false);
+    expect(h.seen.some((e) => e.type === 'pr.merged')).toBe(false);
+  });
+
+  it('does not merge when the job is cancelled during the last read of the checks', async () => {
+    const h = await setup({ checksPollMs: 20, checksWaitMs: 60_000 });
+    const pr = await openPr(h);
+    // gh answers green, but slowly, and does not stop when asked, so the answer still arrives after the cancel.
+    h.setState({ log: join(h.root, 'gh.log'), checks: [{ name: 'ci', bucket: 'pass' }], checksDelayMs: 700, ignoreTerm: true });
+    h.fire('merge.requested', { cwd: pr.cwd, number: pr.number, headSha: pr.headSha });
+    await until(() => h.calls().some((c) => c.args[1] === 'checks'));
+    h.k.jobs.setStatus(h.job.id, 'cancelled');
+    await new Promise((r) => setTimeout(r, 1500));
+    expect(h.calls().some((c) => c.args[1] === 'merge')).toBe(false);
+    expect(h.seen.some((e) => e.type === 'pr.merged' || e.type === 'merge.refused' || e.type === 'merge.failed')).toBe(false);
+  });
+
+  it('kills a hung gh call after ghTimeoutMs, tries it again as a temporary failure, and then merges', async () => {
+    const h = await setup({ ghTimeoutMs: 2500, tries: 3, retryDelayMs: 5 });
+    const pr = await openPr(h);
+    const pidFile = join(h.root, 'pids');
+    h.setState({ log: join(h.root, 'gh.log'), pidFile, hangChecksFirst: 1, checks: [{ name: 'ci', bucket: 'pass' }] });
+    h.fire('merge.requested', { cwd: pr.cwd, number: pr.number, headSha: pr.headSha });
+    await h.waitFor('pr.merged');
+    expect(h.calls().filter((c) => c.args[1] === 'checks').length).toBe(2);
+    const pid = Number(readFileSync(pidFile, 'utf8').trim());
+    expect(alive(pid)).toBe(false);
+  });
+
+  it('fails for good when gh keeps hanging', async () => {
+    const h = await setup({ ghTimeoutMs: 2500, tries: 2, retryDelayMs: 5 });
+    const pr = await openPr(h);
+    h.setState({ log: join(h.root, 'gh.log'), pidFile: join(h.root, 'pids'), hangChecksFirst: 99 });
+    h.fire('merge.requested', { cwd: pr.cwd, number: pr.number, headSha: pr.headSha });
+    const failed = await h.waitFor('merge.failed');
+    expect((failed.payload as { reason: string }).reason).toMatch(/^could not read checks: timed out after 2500ms/);
+    expect(h.calls().filter((c) => c.args[1] === 'checks').length).toBe(2);
+  });
+
+  it('cancel ends a running gh call at once, instead of waiting for its timeout', async () => {
+    const h = await setup({ ghTimeoutMs: 60_000 });
+    const pr = await openPr(h);
+    const pidFile = join(h.root, 'pids');
+    h.setState({ log: join(h.root, 'gh.log'), pidFile, hangChecksFirst: 99 });
+    h.fire('merge.requested', { cwd: pr.cwd, number: pr.number, headSha: pr.headSha });
+    await until(() => existsSync(pidFile));
+    const pid = Number(readFileSync(pidFile, 'utf8').trim().split('\n')[0]);
+    h.k.jobs.setStatus(h.job.id, 'cancelled');
+    await until(() => !alive(pid), 5000);
+    await new Promise((r) => setTimeout(r, 100));
+    expect(h.seen.some((e) => e.type === 'merge.refused' || e.type === 'merge.failed' || e.type === 'pr.merged')).toBe(false);
+    expect(h.calls().some((c) => c.args[1] === 'merge')).toBe(false);
+  });
+
+  it('stop ends a running gh call at once', async () => {
+    const h = await setup({ ghTimeoutMs: 60_000 });
+    const pr = await openPr(h);
+    const pidFile = join(h.root, 'pids');
+    h.setState({ log: join(h.root, 'gh.log'), pidFile, hangChecksFirst: 99 });
+    h.fire('merge.requested', { cwd: pr.cwd, number: pr.number, headSha: pr.headSha });
+    await until(() => existsSync(pidFile));
+    const pid = Number(readFileSync(pidFile, 'utf8').trim().split('\n')[0]);
+    await h.k.stop();
+    await until(() => !alive(pid), 5000);
+    expect(h.seen.some((e) => e.type === 'merge.refused' || e.type === 'merge.failed' || e.type === 'pr.merged')).toBe(false);
+  });
+
+  it('stops waiting when the plugin stops, and never calls merge', async () => {
+    const h = await setup({ checksPollMs: 20, checksWaitMs: 60_000 });
+    const pr = await openPr(h);
+    h.setState({ log: join(h.root, 'gh.log'), checks: [{ name: 'ci', bucket: 'pending' }] });
+    h.fire('merge.requested', { cwd: pr.cwd, number: pr.number, headSha: pr.headSha });
+    await until(() => h.calls().filter((c) => c.args[1] === 'checks').length >= 2);
+    await h.k.stop();
+    await new Promise((r) => setTimeout(r, 100));
+    const polls = h.calls().filter((c) => c.args[1] === 'checks').length;
+    await new Promise((r) => setTimeout(r, 200));
+    expect(h.calls().filter((c) => c.args[1] === 'checks').length).toBe(polls);
+    expect(h.calls().some((c) => c.args[1] === 'merge')).toBe(false);
+    expect(h.seen.some((e) => e.type === 'merge.refused' || e.type === 'merge.failed')).toBe(false);
+  });
+
+  it('still retries a temporary failure to read checks, then merges', async () => {
+    const h = await setup({ tries: 3, retryDelayMs: 5 });
+    const pr = await openPr(h);
+    h.setState({ log: join(h.root, 'gh.log'), checksErrorFirst: 2, checks: [{ name: 'ci', bucket: 'pass' }] });
+    h.fire('merge.requested', { cwd: pr.cwd, number: pr.number, headSha: pr.headSha });
+    await h.waitFor('pr.merged');
+    expect(h.calls().filter((c) => c.args[1] === 'checks').length).toBe(3);
+  });
+
+  it('fails for good when checks still cannot be read after the retries', async () => {
+    const h = await setup({ tries: 3, retryDelayMs: 5 });
+    const pr = await openPr(h);
+    h.setState({ log: join(h.root, 'gh.log'), checksErrorFirst: 99, checks: [{ name: 'ci', bucket: 'pass' }] });
+    h.fire('merge.requested', { cwd: pr.cwd, number: pr.number, headSha: pr.headSha });
+    const failed = await h.waitFor('merge.failed');
+    expect((failed.payload as { reason: string }).reason).toMatch(/^could not read checks: .*502/);
+    expect(h.calls().filter((c) => c.args[1] === 'checks').length).toBe(3);
+    expect(h.calls().some((c) => c.args[1] === 'merge')).toBe(false);
+  });
+
+  it('treats no checks as a permanent failure unless allowNoChecks is on', async () => {
     const strict = await setup();
     const a = await openPr(strict);
     strict.fire('merge.requested', { cwd: a.cwd, number: a.number, headSha: a.headSha });
-    expect(((await strict.waitFor('merge.refused')).payload as { reason: string }).reason).toMatch(/no checks/);
+    expect(((await strict.waitFor('merge.failed')).payload as { reason: string }).reason).toMatch(/no checks/);
+    expect(strict.seen.some((e) => e.type === 'merge.refused')).toBe(false);
 
     const relaxed = await setup({ allowNoChecks: true });
     const b = await openPr(relaxed);
@@ -574,13 +760,41 @@ describe('merge.requested', () => {
     expect(existsSync(pr.cwd)).toBe(false);
   });
 
-  it('refuses when the merge really fails', async () => {
+  it('fails for good when the PR cannot be merged because of a conflict', async () => {
     const h = await setup({ allowNoChecks: true });
     const pr = await openPr(h);
     h.setState({ log: join(h.root, 'gh.log'), mergeExit: 1, mergeError: 'merge conflict' });
     h.fire('merge.requested', { cwd: pr.cwd, number: pr.number, headSha: pr.headSha });
+    const failed = await h.waitFor('merge.failed');
+    expect((failed.payload as { reason: string }).reason).toMatch(/merge conflict/);
+    expect(h.seen.some((e) => e.type === 'merge.refused')).toBe(false);
+    expect(existsSync(pr.cwd)).toBe(true);
+  });
+
+  it('fails for good when branch protection wants a review or a required check', async () => {
+    for (const msg of [
+      'GraphQL: Repository rule violations found: base branch policy prohibits the merge',
+      'X Pull request is not mergeable: the base branch policy prohibits the merge. Required reviews are missing.',
+      'GraphQL: 2 of 2 required status checks are expected.',
+      'At least 1 approving review is required by reviewers with write access.',
+    ]) {
+      const h = await setup({ allowNoChecks: true });
+      const pr = await openPr(h);
+      h.setState({ log: join(h.root, 'gh.log'), mergeExit: 1, mergeError: msg });
+      h.fire('merge.requested', { cwd: pr.cwd, number: pr.number, headSha: pr.headSha });
+      const failed = await h.waitFor('merge.failed');
+      expect((failed.payload as { reason: string }).reason).toContain(msg);
+      expect(h.seen.some((e) => e.type === 'merge.refused')).toBe(false);
+    }
+  });
+
+  it('refuses (may be asked again) when gh fails to merge for a reason that can pass by itself', async () => {
+    const h = await setup({ allowNoChecks: true });
+    const pr = await openPr(h);
+    h.setState({ log: join(h.root, 'gh.log'), mergeExit: 1, mergeError: 'GraphQL: GraphQL: Something went wrong while executing your query. Please try again.' });
+    h.fire('merge.requested', { cwd: pr.cwd, number: pr.number, headSha: pr.headSha });
     const refused = await h.waitFor('merge.refused');
-    expect((refused.payload as { reason: string }).reason).toMatch(/merge conflict/);
+    expect((refused.payload as { reason: string }).reason).toMatch(/Something went wrong/);
     expect(existsSync(pr.cwd)).toBe(true);
   });
 

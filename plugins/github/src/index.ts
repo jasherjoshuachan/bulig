@@ -21,6 +21,12 @@ export interface GithubConfig {
   tries?: number;
   /** Wait before the second try, in ms. It doubles each time. Default 2000. */
   retryDelayMs?: number;
+  /** How long to wait for pending checks to finish before giving up, in ms. Default 900000 (15 minutes). */
+  checksWaitMs?: number;
+  /** How often to look at pending checks again, in ms. Default 15000. */
+  checksPollMs?: number;
+  /** Longest a single gh call may run, in ms. A call that hangs is killed and counts as a temporary failure. Default 120000. */
+  ghTimeoutMs?: number;
 }
 
 class StepError extends Error {}
@@ -61,7 +67,11 @@ export function assertPlainWorktree(repoPath: string, cwd: string): void {
   if (rel === '' || rel.startsWith('..') || isAbsolute(rel)) throw new StepError(`refusing: ${cwd} resolves outside the repo`);
 }
 
-export type Check = { name?: string; bucket?: string; state?: string };
+/** gh messages that mean the PR cannot be merged as it stands: a conflict, or branch protection that wants a review or a check nobody is going to supply. */
+const PERMANENT_MERGE_FAILURE =
+  /conflict|not mergeable|cannot be cleanly created|not in a mergeable state|base branch policy|branch protection|protected branch|required status check|required (code )?reviews?|review is required|approving reviews?|reviews? (is|are) required/i;
+
+export type Check = { name?: string; bucket?: string; state?: string; link?: string };
 
 /** Sort checks into failing and pending. Unknown buckets count as pending, to stay on the safe side. */
 export function judgeChecks(checks: Check[]): { failing: string[]; pending: string[] } {
@@ -77,6 +87,9 @@ export function judgeChecks(checks: Check[]): { failing: string[]; pending: stri
   return { failing, pending };
 }
 
+/** One stopper per registered copy of the plugin. stop() runs them all, which ends any wait for checks. */
+const stoppers = new Set<() => void>();
+
 export default definePlugin({
   manifest: {
     name: 'github',
@@ -91,6 +104,7 @@ export default definePlugin({
       'commit.requested',
       'pr.requested',
       'merge.requested',
+      'job.status',
     ],
     emits: [
       'worktree.ready',
@@ -108,6 +122,10 @@ export default definePlugin({
       'merge.failed',
     ],
     needs: ['git.push', 'gh.pr'],
+  },
+  stop() {
+    for (const stopOne of stoppers) stopOne();
+    stoppers.clear();
   },
   register(ctx: PluginContext) {
     ctx.require('git.push');
@@ -133,7 +151,8 @@ export default definePlugin({
     }
     const IDENTITY = cfg.authorName && cfg.authorEmail ? ['-c', `user.name=${cfg.authorName}`, '-c', `user.email=${cfg.authorEmail}`] : [];
     const runGit = (cwd: string, args: string[], withToken = false) => exec(git, [...NO_HOOKS, ...args], { cwd, env: env(withToken) });
-    const runGh = (cwd: string, args: string[]) => exec(gh, args, { cwd, env: env(true) });
+    const runGh = (cwd: string, args: string[], signal?: AbortSignal) =>
+      exec(gh, args, { cwd, env: env(true), timeoutMs: cfg.ghTimeoutMs ?? 120_000, ...(signal && { signal }) });
     // For calls that talk to GitHub. A temporary failure is tried again; any other failure is returned at once.
     const tries = cfg.tries ?? 3;
     const delay = cfg.retryDelayMs ?? 2000;
@@ -322,10 +341,41 @@ export default definePlugin({
       await runGit(repoPath, ['fetch', '--prune'], true);
     };
 
+    // A merge request may wait for checks. The wait of each job can be ended at once: when the job is cancelled or
+    // fails (the same signal the worker acts on), or when the plugin stops.
+    const waits = new Map<string, AbortController>();
+    stoppers.add(() => {
+      for (const w of waits.values()) w.abort();
+    });
+    ctx.on('job.status', (event: BuligEvent) => {
+      const to = (event.payload as { to?: string } | null)?.to;
+      if (event.jobId && (to === 'cancelled' || to === 'failed' || to === 'done')) waits.get(event.jobId)?.abort();
+    });
+    const nap = (ms: number, signal: AbortSignal) =>
+      new Promise<void>((res) => {
+        if (signal.aborted) return res();
+        const done = () => {
+          clearTimeout(timer);
+          signal.removeEventListener('abort', done);
+          res();
+        };
+        const timer = setTimeout(done, ms);
+        signal.addEventListener('abort', done, { once: true });
+      });
+
     ctx.on('merge.requested', async (event: BuligEvent) => {
-      // Refused: the merge did not happen but asking again may work. Failed: it never will, so do not ask again.
+      // Refused: the merge did not happen but asking again may work without anything changing. Failed: it never
+      // will, or only a new commit or a new job can fix it, so do not ask again. Failing checks are failed, not refused.
       const refuse = (reason: string) => ctx.emit('merge.refused', { reason }, event.jobId);
-      const giveUp = (reason: string) => ctx.emit('merge.failed', { reason }, event.jobId);
+      const giveUp = (reason: string, checks?: { name: string; link?: string }[]) =>
+        ctx.emit('merge.failed', { reason, ...(checks?.length && { checks }) }, event.jobId);
+      const wait = new AbortController();
+      if (event.jobId) waits.set(event.jobId, wait);
+      // The job ended while we waited, or the plugin is stopping: nothing more happens, and the approval is spent.
+      const over = () => {
+        const status = event.jobId ? ctx.jobs.get(event.jobId)?.status : undefined;
+        return wait.signal.aborted || status === 'cancelled' || status === 'failed' || status === 'done';
+      };
       try {
         const worktree = str(event.payload, 'cwd');
         const number = num(event.payload, 'number');
@@ -334,49 +384,91 @@ export default definePlugin({
         const short = (sha: string) => sha.slice(0, 7);
         // After a crash the worktree may already be gone. Ask GitHub from the repo it hung off instead.
         const cwd = existsSync(worktree) ? worktree : basename(dirname(worktree)) === '.worktrees' ? dirname(dirname(worktree)) : worktree;
+        let branch: string | undefined;
+        let baseRef: string | undefined;
 
-        const head = JSON.parse(must('gh pr view', await runGh(cwd, ['pr', 'view', n, '--json', 'headRefOid,state,baseRefName']))) as {
-          headRefOid: string;
-          state: string;
-          baseRefName?: string;
-        };
-        // Read the branch now, before anything changes it. The worktree may already be gone after a crash.
-        const branchOut = existsSync(worktree) ? await runGit(worktree, ['rev-parse', '--abbrev-ref', 'HEAD']) : undefined;
-        const given = (event.payload as { branch?: unknown }).branch;
-        const branch = typeof given === 'string' && given ? given : branchOut && branchOut.code === 0 ? branchOut.stdout.trim() : undefined;
-        // A merge that already landed (a crash between the merge and our bookkeeping) is a success, not a new request.
-        if (head.state === 'MERGED') {
-          if (head.headRefOid !== headSha) {
-            return giveUp(`PR #${number} was merged at ${short(head.headRefOid)}, not the approved ${short(headSha)}`);
+        // Looks at the PR itself. True means it is open and still at the approved commit.
+        const gate = async (): Promise<boolean> => {
+          const head = JSON.parse(must('gh pr view', await runGh(cwd, ['pr', 'view', n, '--json', 'headRefOid,state,baseRefName'], wait.signal))) as {
+            headRefOid: string;
+            state: string;
+            baseRefName?: string;
+          };
+          baseRef = head.baseRefName;
+          // Read the branch now, before anything changes it. The worktree may already be gone after a crash.
+          const branchOut = existsSync(worktree) ? await runGit(worktree, ['rev-parse', '--abbrev-ref', 'HEAD']) : undefined;
+          const given = (event.payload as { branch?: unknown }).branch;
+          branch = typeof given === 'string' && given ? given : branchOut && branchOut.code === 0 ? branchOut.stdout.trim() : undefined;
+          // A merge that already landed (a crash between the merge and our bookkeeping) is a success, not a new request.
+          if (head.state === 'MERGED') {
+            if (head.headRefOid !== headSha) {
+              giveUp(`PR #${number} was merged at ${short(head.headRefOid)}, not the approved ${short(headSha)}`);
+              return false;
+            }
+            await tidy(cwd, worktree, branch, head.baseRefName);
+            ctx.emit('pr.merged', { number }, event.jobId);
+            return false;
           }
-          await tidy(cwd, worktree, branch, head.baseRefName);
-          return void ctx.emit('pr.merged', { number }, event.jobId);
-        }
-        if (head.state === 'CLOSED') return giveUp(`PR #${number} was closed without being merged`);
-        if (head.state !== 'OPEN') return refuse(`PR #${number} is ${head.state}, not open`);
-        if (head.headRefOid !== headSha) {
-          // New commits landed after the review. They were never reviewed, so this job can't merge them.
-          return giveUp(`PR head moved: approved ${headSha.slice(0, 7)} but it is now ${head.headRefOid.slice(0, 7)}`);
-        }
+          if (head.state !== 'OPEN') {
+            giveUp(head.state === 'CLOSED' ? `PR #${number} was closed without being merged` : `PR #${number} is ${head.state}, not open`);
+            return false;
+          }
+          if (head.headRefOid !== headSha) {
+            // New commits landed after the review. They were never reviewed, so this job can't merge them.
+            giveUp(`PR head moved: approved ${headSha.slice(0, 7)} but it is now ${head.headRefOid.slice(0, 7)}`);
+            return false;
+          }
+          return true;
+        };
 
-        const checks = await runGh(cwd, ['pr', 'checks', n, '--json', 'name,bucket,state']);
-        let list: Check[] | undefined;
-        try {
-          list = JSON.parse(checks.stdout) as Check[];
-        } catch {
-          list = undefined;
-        }
-        if (list === undefined) {
-          if (/no checks reported/i.test(checks.stderr + checks.stdout)) list = [];
-          else return refuse(`could not read checks: ${(checks.stderr || checks.stdout).trim().slice(0, 300)}`);
-        }
-        if (list.length === 0) {
-          if (!cfg.allowNoChecks) return refuse('the PR has no checks and allowNoChecks is off');
-        } else {
+        // The checks, read as JSON. gh exits non-zero when checks fail or are pending but still prints the JSON, so
+        // only output that is not JSON counts as a bad read, and only that is tried again when it looks temporary.
+        const readChecks = async (): Promise<{ list: Check[] } | { error: string }> => {
+          let list: Check[] | undefined;
+          const r = await again(async () => {
+            const out = await runGh(cwd, ['pr', 'checks', n, '--json', 'name,bucket,state,link'], wait.signal);
+            try {
+              list = JSON.parse(out.stdout) as Check[];
+              return { ...out, code: 0 };
+            } catch {
+              list = undefined;
+              return out;
+            }
+          });
+          if (list) return { list };
+          if (/no checks reported/i.test(r.stderr + r.stdout)) return { list: [] };
+          return { error: (r.stderr || r.stdout).trim().slice(0, 300) };
+        };
+
+        const waitMs = cfg.checksWaitMs ?? 900_000;
+        const pollMs = Math.max(cfg.checksPollMs ?? 15_000, 1);
+        const deadline = Date.now() + waitMs;
+        for (;;) {
+          if (over()) return;
+          if (!(await gate())) return;
+          const got = await readChecks();
+          if ('error' in got) return over() ? undefined : giveUp(`could not read checks: ${got.error}`);
+          const list = got.list;
+          if (list.length === 0) {
+            if (!cfg.allowNoChecks) return giveUp('the PR has no checks and allowNoChecks is off. Turn it on or add a check, then run the job again.');
+            break;
+          }
           const { failing, pending } = judgeChecks(list);
-          if (failing.length) return refuse(`checks failing: ${failing.join(', ')}`);
-          if (pending.length) return refuse(`checks pending: ${pending.join(', ')}`);
+          if (failing.length) {
+            const named = list
+              .filter((c) => failing.includes(c.name ?? '(unnamed)'))
+              .map((c) => ({ name: c.name ?? '(unnamed)', ...(c.link && { link: c.link }) }));
+            return giveUp(`checks failing: ${failing.join(', ')}. Fix the failing check, then run the job again.`, named);
+          }
+          if (pending.length === 0) break;
+          const left = deadline - Date.now();
+          if (left <= 0) {
+            const minutes = Number((waitMs / 60_000).toFixed(1));
+            return giveUp(`checks still pending after ${minutes} minutes: ${pending.join(', ')}. Run the job again once they finish.`);
+          }
+          await nap(Math.min(pollMs, left), wait.signal);
         }
+        if (over()) return;
 
         // From a worktree, gh can merge and then fail to switch branches. Trust the PR state, not the exit code.
         // --match-head-commit pins the merge to the approved commit: a push that races the merge makes gh refuse.
@@ -384,13 +476,19 @@ export default definePlugin({
         if (merge.code !== 0) {
           const state = await runGh(cwd, ['pr', 'view', n, '--json', 'state']);
           const merged = state.code === 0 && (JSON.parse(state.stdout) as { state: string }).state === 'MERGED';
-          if (!merged) return refuse(`gh pr merge failed (exit ${merge.code}): ${(merge.stderr || merge.stdout).trim().slice(0, 400)}`);
+          if (!merged) {
+            const why = `gh pr merge failed (exit ${merge.code}): ${(merge.stderr || merge.stdout).trim().slice(0, 400)}`;
+            // A conflict stays a conflict until someone changes the branch, so asking again would loop.
+            return PERMANENT_MERGE_FAILURE.test(merge.stderr + merge.stdout) ? giveUp(why) : refuse(why);
+          }
         }
 
-        await tidy(cwd, worktree, branch, head.baseRefName);
+        await tidy(cwd, worktree, branch, baseRef);
         ctx.emit('pr.merged', { number }, event.jobId);
       } catch (err) {
-        refuse(message(err));
+        if (!over()) refuse(message(err));
+      } finally {
+        if (event.jobId && waits.get(event.jobId) === wait) waits.delete(event.jobId);
       }
     });
   },

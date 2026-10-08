@@ -740,6 +740,20 @@ describe('scope guard: the plan declares its scope', () => {
     expect(failedReason(r, job.id)).toContain('outside.txt');
   });
 
+  it('a scope with more than 100 entries is rejected at plan time', async () => {
+    const lines = (n: number) => PLAN_WITH(Array.from({ length: n }, (_, i) => `- src/f${i}.ts`).join('\n'));
+    const r = rig({ plan: lines(101) });
+    await r.k.start();
+    const job = jobOf(r.k);
+    expect(r.k.jobs.get(job.id)!.status).toBe('failed');
+    expect(r.worker.map((s) => s.stage)).toEqual(['plan', 'plan']);
+    expect(failedReason(r, job.id)).toMatch(/too many SCOPE lines/);
+    const ok = rig({ plan: lines(100) });
+    await ok.k.start();
+    jobOf(ok.k);
+    expect(ok.human.requests.at(-1)!.payload).toMatchObject({ kind: 'plan' });
+  });
+
   it('a worker error in the plan stage still fails at once, with no scope retry', async () => {
     const r = rig({ plan: { fail: 'claude exited with code 1' } as never });
     await r.k.start();

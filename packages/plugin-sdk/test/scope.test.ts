@@ -76,6 +76,16 @@ describe('matchesGlob', () => {
     expect(matchesGlob('', '**')).toBe(false);
   });
 
+  it('repeated ** parts take no longer than one', () => {
+    const deep = Array.from({ length: 28 }, () => 'x').join('/');
+    const started = performance.now();
+    expect(matchesGlob(`${deep}/end.md`, `${Array.from({ length: 28 }, () => '**').join('/')}/nope.md`)).toBe(false);
+    expect(matchesGlob(`${deep}/end.md`, `${Array.from({ length: 28 }, () => '**').join('/')}/end.md`)).toBe(true);
+    // parts that cannot be collapsed must not blow up either
+    expect(matchesGlob(`${deep}/end.md`, `${Array.from({ length: 28 }, () => '**/x').join('/')}/nope.md`)).toBe(false);
+    expect(performance.now() - started).toBeLessThan(50);
+  });
+
   it('is not slow on a hostile pattern', () => {
     const started = Date.now();
     matchesGlob(`${'a'.repeat(60)}b`, `${'a*'.repeat(30)}c`);
@@ -101,7 +111,7 @@ describe('normalizeScopeEntry', () => {
     expect(ok('README.md')).toBe('README.md');
     expect(ok('src/lib/*.ts')).toBe('src/lib/*.ts');
     expect(ok('  docs/**  ')).toBe('docs/**');
-    expect(ok('**/*.test.ts')).toBe('**/*.test.ts');
+    expect(ok('src/**/*.test.ts')).toBe('src/**/*.test.ts');
     expect(ok('docs/my notes.md')).toBe('docs/my notes.md');
     expect(ok('docs/日本語.md')).toBe('docs/日本語.md');
   });
@@ -146,10 +156,33 @@ describe('normalizeScopeEntry', () => {
       expect(ok(broad), broad).toMatch(/^ERR:.*broad/);
       expect(ok(broad, true), broad).not.toMatch(/^ERR:/);
     }
-    // a pattern with a fixed part is not broad
-    expect(ok('**/*.ts')).toBe('**/*.ts');
+    // a pattern anchored by a fixed folder or file name is not broad
     expect(ok('*.md')).toBe('*.md');
     expect(ok('src/**')).toBe('src/**');
+  });
+
+  it('rejects the sneaky broad patterns too: no literal character, or no fixed folder up front', () => {
+    for (const broad of ['**/?*', '?*/**', '*?', '?', '**/*.*', '*.*', '.*/**', '.*', '**/*.md', '**/*.ts', '*/docs/**', 'src*/**', '?rc/**', '**/README.md']) {
+      expect(ok(broad), broad).toMatch(/^ERR:.*broad/);
+      expect(ok(broad, true), broad).not.toMatch(/^ERR:/);
+    }
+  });
+
+  it('still accepts sensible, anchored scopes', () => {
+    for (const fine of ['README.md', 'docs/**', 'src/**/*.ts', '.gitignore', '.github/workflows/ci.yml', 'src/*', 'src/lib/?.ts', 'docs/**/?*', '*.md', 'package.json']) {
+      expect(ok(fine), fine).toBe(fine);
+    }
+  });
+
+  it('collapses repeated ** parts', () => {
+    expect(ok('docs/**/**/**/a.md')).toBe('docs/**/a.md');
+  });
+
+  it('rejects a pattern that is too long or has too many parts', () => {
+    expect(ok(`docs/${'a'.repeat(200)}`)).toMatch(/^ERR:.*too long/);
+    expect(ok(`docs/${'a'.repeat(190)}`)).toBe(`docs/${'a'.repeat(190)}`);
+    expect(ok(Array.from({ length: 33 }, (_, i) => `d${i}`).join('/'))).toMatch(/^ERR:.*too many/);
+    expect(ok(Array.from({ length: 32 }, (_, i) => `d${i}`).join('/'))).not.toMatch(/^ERR:/);
   });
 
   it('still rejects traversal and absolute paths when broad scope is allowed', () => {
@@ -214,8 +247,10 @@ describe('parseScopeBlock', () => {
     expect(r.ok).toBe(false);
   });
 
-  it('caps the number of entries', () => {
-    const many = `SCOPE:\n${Array.from({ length: 300 }, (_, i) => `- f${i}.txt`).join('\n')}`;
+  it('caps the number of entries at 100', () => {
+    const lines = (n: number) => `SCOPE:\n${Array.from({ length: n }, (_, i) => `- f${i}.txt`).join('\n')}`;
+    expect(parseScopeBlock(lines(100)).ok).toBe(true);
+    const many = lines(101);
     const r = parseScopeBlock(many);
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.error).toMatch(/too many/i);

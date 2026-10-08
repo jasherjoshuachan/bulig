@@ -1053,6 +1053,29 @@ describe('scope guard on commit.requested', () => {
     expect(committed(cwd)).toEqual(['lit[1].txt']);
   });
 
+  it('stages named paths, never a bare add -A: a file that appears after the scope check is not committed', async () => {
+    const wrapRoot = mkdtempSync(join(tmpdir(), 'bulig-wrap-'));
+    dirs.push(wrapRoot);
+    const log = join(wrapRoot, 'calls.log');
+    const bin = join(wrapRoot, 'git-wrapper.sh');
+    // Like a stage that is still writing: when git is asked to add, a new file lands first.
+    writeFileSync(
+      bin,
+      `#!/bin/sh\necho "$*" >> "${log}"\ncase " $* " in *" add "*) echo late > late-junk.tmp;; esac\nexec git "$@"\n`,
+    );
+    chmodSync(bin, 0o755);
+    const h = await setup({ gitBin: bin });
+    const cwd = await worktree(h, 'bulig/s-23');
+    write(cwd, 'README.md');
+    const r = await commit(h, cwd, { scope: ['README.md'] });
+    expect(r.type, JSON.stringify(r.payload)).toBe('commit.done');
+    expect(committed(cwd)).toEqual(['README.md']);
+    expect(git(cwd, 'status', '--porcelain', '--untracked-files=all')).toBe('?? late-junk.tmp');
+    const adds = readFileSync(log, 'utf8').split('\n').filter((l) => / add /.test(` ${l} `) && !/worktree add/.test(l));
+    expect(adds).toHaveLength(1);
+    expect(adds[0]).toMatch(/add -A -- README\.md$/);
+  });
+
   it('refuses a request with no approved scope', async () => {
     const h = await setup();
     const cwd = await worktree(h, 'bulig/s-14');

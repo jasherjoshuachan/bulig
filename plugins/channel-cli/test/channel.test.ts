@@ -41,6 +41,10 @@ describe('format', () => {
     expect(text).toContain('files this job may change');
     expect(text).toContain('- README.md');
     expect(text).toContain('- src/*.ts');
+    const many = Array.from({ length: 60 }, (_, i) => `docs/f${i}.md`);
+    const long = format(ev('approval.requested', { jobId: 'abcdef1234567890', kind: 'plan', summary: 'p', scope: many }))!.join('\n');
+    expect(long).toContain('- docs/f59.md');
+    expect(long).not.toMatch(/and \d+ more/);
     const failed = format(ev('pipeline.failed', { reason: 'build left files outside the approved scope', outOfScope: ['test-results/.last-run.json'] }))!;
     expect(failed.join('\n')).toContain('outside the approved scope: test-results/.last-run.json');
   });

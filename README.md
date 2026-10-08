@@ -124,13 +124,13 @@ SCOPE:
 
 One path or glob per line, relative to the repo root, covering every file the job will create, edit or delete, test files included. You see the list on the plan approval card ("Files this job may change"), so approving the plan approves the list. If the plan has no usable block, it is asked for once more, and then the job fails. The commit step (in the github plugin, outside the Claude sandbox) stages only paths the list covers, by name. It never runs `git add -A`. If any changed file is outside the list, nothing is committed. The files are sent back to the build stage to remove or revert, within `maxBuildAttempts`, and if that runs out the job fails and the Telegram message names them. This stops things like a test runner's `test-results/.last-run.json` from riding into a commit. See [ADR 0005](docs/adr/0005-scope-guard.md).
 
-In a scope line, `*` stays inside one folder, `**` crosses folders and `?` is one character. Nothing else is special, so `app/[id]/page.tsx` is just that file. A wildcard does not match names that start with a dot, so `.github/**` has to be written out. A trailing slash (`docs/`) means everything under it. Absolute paths, `..`, anything in `.git`, symlinks and a line that matches every file (`**`, `*`) are rejected. Settings in the `pipeline-dev` config:
+In a scope line, `*` stays inside one folder, `**` crosses folders and `?` is one character. Nothing else is special, so `app/[id]/page.tsx` is just that file. A wildcard does not match names that start with a dot, so `.github/**` has to be written out. A trailing slash (`docs/`) means everything under it. Absolute paths, `..`, anything in `.git`, symlinks and lines that are too broad are rejected: a line must start from a fixed folder or file name, so `**`, `*?`, `**/*.md` and `.*/**` are out while `docs/**`, `src/**/*.ts` and `*.md` are fine. A scope has at most 100 lines. Rules and examples are in the ADR. Settings in the `pipeline-dev` config:
 
 | Setting | Default | What it does |
 |---|---|---|
 | `scopeMode` | `enforce` | `enforce` refuses a commit with files outside the scope. `warn` commits them anyway, logs them and lists them in the PR body. |
 | `scopeAlwaysAllow` | `[]` | Globs that are always allowed, whatever the plan says. For example `["test-results/.last-run.json"]` for a project whose test runner always writes it. |
-| `allowBroadScope` | `false` | Accept a plan whose scope matches every file, such as `**`. |
+| `allowBroadScope` | `false` | Accept lines that are too broad, such as `**` or `**/*.md`. |
 
 If the merge is refused (the head moved, or a check failed or is still running), the github plugin emits `merge.refused { reason }` and the pipeline asks for the merge approval again. If the PR was already merged at the approved commit (a crash after the merge), that counts as done. If it was closed without merging, or merged at a different commit, the github plugin emits `merge.failed { reason }` and the job fails instead of asking again.
 

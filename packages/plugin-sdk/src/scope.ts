@@ -11,11 +11,20 @@
  *   ?   exactly one character (never a slash)
  * Everything else, including [ ] { } ( ) and spaces, is an ordinary character. Matching is case sensitive.
  * A wildcard never matches a name that starts with a dot (.env, .github); write the dot in the pattern to
- * cover one. There is no regular expression behind it, so a hostile pattern cannot make it slow.
+ * cover one. There is no regular expression behind it. Matching remembers the places it has already tried, so
+ * the work grows with (pattern parts x path parts squared) at worst, and patterns are capped in length and in
+ * number of parts, so it stays small.
+ *
+ * Too broad: a scope line is rejected unless allowBroad is set when (1) no part of it has a literal character
+ * other than dots and wildcards, or (2) it has several parts and its first part is not a plain folder or file
+ * name (no * or ?). So docs/** and src/**\/*.ts pass; **, *?, **\/?*, **\/*.md, *\/docs/** and .*\/** do not.
  */
 
 /** The most entries a SCOPE block may have. */
-export const MAX_SCOPE_ENTRIES = 200;
+export const MAX_SCOPE_ENTRIES = 100;
+/** The longest scope line, in characters, and the most path parts in one line. */
+export const MAX_PATTERN_LENGTH = 200;
+export const MAX_PATTERN_PARTS = 32;
 
 export type ScopeEntry = { ok: true; pattern: string } | { ok: false; error: string };
 export type ScopeParse = { ok: true; scope: string[] } | { ok: false; error: string };
@@ -35,17 +44,31 @@ export function normalizeScopeEntry(raw: string, opts: { allowBroad?: boolean } 
   if (p.startsWith('/') || p.startsWith('~') || /^[A-Za-z]:/.test(p)) return bad('absolute paths are not allowed; use a path relative to the repo root');
   if (/\s\([^)]*\)$/.test(p)) return bad('put only the path on the line, with no note after it');
 
+  if (p.length > MAX_PATTERN_LENGTH) return bad(`too long (${p.length} characters, the most is ${MAX_PATTERN_LENGTH})`);
   const folder = p.endsWith('/');
-  const parts = nfc(p).split('/').filter((part) => part !== '' && part !== '.');
+  const parts = collapseStars(nfc(p).split('/').filter((part) => part !== '' && part !== '.'));
   if (parts.includes('..')) return bad('".." is not allowed; paths stay inside the repo');
   if (parts.some((part) => part.toLowerCase() === '.git')) return bad('.git is not part of the work and can never be in scope');
-  if (folder && parts.length > 0) parts.push('**');
+  if (folder && parts.length > 0 && parts.at(-1) !== '**') parts.push('**');
   if (parts.length === 0) return bad('empty');
+  if (parts.length > MAX_PATTERN_PARTS) return bad(`too many parts (${parts.length}, the most is ${MAX_PATTERN_PARTS})`);
   const pattern = parts.join('/');
-  if (!opts.allowBroad && parts.every((part) => part === '*' || part === '**')) {
-    return bad('too broad: it matches every file. Name the files or folders the job will change (or set allowBroadScope)');
+  if (!opts.allowBroad && isBroad(parts)) {
+    return bad('too broad: it can match files all over the repo. Start with a folder or file name (docs/**, src/**/*.ts, README.md), or set allowBroadScope');
   }
   return { ok: true, pattern };
+}
+
+/** Replace a run of ** parts with one. */
+const collapseStars = (parts: string[]): string[] => parts.filter((part, i) => !(part === '**' && parts[i - 1] === '**'));
+
+/** True when a literal character other than a dot is in the part. */
+const hasLiteral = (part: string) => /[^*?.]/.test(part);
+
+function isBroad(parts: string[]): boolean {
+  if (!parts.some(hasLiteral)) return true;
+  if (parts.length === 1) return false;
+  return /[*?]/.test(parts[0]!);
 }
 
 /**
@@ -109,20 +132,32 @@ function matchPart(pattern: string, name: string): boolean {
   return pi === p.length;
 }
 
-function matchParts(pat: string[], pi: number, parts: string[], si: number): boolean {
-  if (pi === pat.length) return si === parts.length;
-  if (pat[pi] === '**') {
-    if (pi === pat.length - 1) {
-      // A trailing ** needs at least one more part, and none of them may be hidden.
-      return si < parts.length && parts.slice(si).every((x) => !x.startsWith('.'));
+function matchParts(pat: string[], parts: string[]): boolean {
+  // Remember (pattern part, path part) pairs already tried, so repeated ** parts cannot multiply the work.
+  const failed = new Set<number>();
+  const width = parts.length + 1;
+  const go = (pi: number, si: number): boolean => {
+    if (pi === pat.length) return si === parts.length;
+    const key = pi * width + si;
+    if (failed.has(key)) return false;
+    let ok = false;
+    if (pat[pi] === '**') {
+      if (pi === pat.length - 1) {
+        // A trailing ** needs at least one more part, and none of them may be hidden.
+        ok = si < parts.length && parts.slice(si).every((x) => !x.startsWith('.'));
+      } else {
+        for (let k = si; k <= parts.length && !ok; k++) {
+          ok = go(pi + 1, k);
+          if (!ok && k < parts.length && parts[k]!.startsWith('.')) break;
+        }
+      }
+    } else {
+      ok = si < parts.length && matchPart(pat[pi]!, parts[si]!) && go(pi + 1, si + 1);
     }
-    for (let k = si; k <= parts.length; k++) {
-      if (matchParts(pat, pi + 1, parts, k)) return true;
-      if (k < parts.length && parts[k]!.startsWith('.')) return false;
-    }
-    return false;
-  }
-  return si < parts.length && matchPart(pat[pi]!, parts[si]!) && matchParts(pat, pi + 1, parts, si + 1);
+    if (!ok) failed.add(key);
+    return ok;
+  };
+  return go(0, 0);
 }
 
 /** True for a path that stays inside the repo: relative, no empty parts, no "." or ".." parts. */
@@ -134,8 +169,8 @@ export function isRepoPath(path: string): boolean {
 /** Does this repo-relative path match this scope pattern? A path that leaves the repo never matches. */
 export function matchesGlob(path: string, pattern: string): boolean {
   if (!isRepoPath(path)) return false;
-  const pat = nfc(pattern).split('/');
-  return matchParts(pat, 0, nfc(path).split('/'), 0);
+  if (pattern.length > MAX_PATTERN_LENGTH) return false;
+  return matchParts(collapseStars(nfc(pattern).split('/')), nfc(path).split('/'));
 }
 
 /** Does any pattern in the scope cover this path? */

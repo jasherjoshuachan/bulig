@@ -133,14 +133,22 @@ describe('approvals', () => {
     expect(text).toContain('- docs/my notes.md');
   });
 
-  it('a long scope is shortened on the card but says how many more there are', async () => {
+  it('shows every scope entry, in full, even when there are many and they are long', async () => {
     const fake = await startFake();
     const b = await boot(fake);
-    b.d.waitForApproval('plan', { scope: Array.from({ length: 40 }, (_, i) => `src/f${i}.ts`) });
-    await until(() => fake.of('sendMessage').length === 1, 'approval message');
-    const text = String(fake.of('sendMessage')[0]!.params.text);
-    expect(text).toContain('- src/f0.ts');
-    expect(text).toMatch(/and 15 more/);
+    const scope = Array.from({ length: 100 }, (_, i) => `src/${String(i).padStart(3, '0')}/${'d'.repeat(170)}/file.ts`);
+    b.d.waitForApproval('plan', { scope });
+    await until(() => fake.of('sendMessage').some((m) => m.params.reply_markup), 'the last approval message, with the buttons');
+    const sent = fake.of('sendMessage').map((m) => m.params);
+    expect(sent.length).toBeGreaterThan(2);
+    for (const m of sent) expect(String(m.text).length).toBeLessThanOrEqual(4096);
+    // the approver can't tap before seeing the whole list: buttons only on the last message
+    expect(sent.slice(0, -1).every((m) => m.reply_markup === undefined)).toBe(true);
+    expect(sent.at(-1)!.reply_markup.inline_keyboard[0]).toHaveLength(2);
+    const all = sent.map((m) => String(m.text)).join('\n');
+    for (const entry of scope) expect(all).toContain(`- ${entry}`);
+    expect(all.indexOf(`- ${scope[99]}`)).toBeGreaterThan(all.indexOf(`- ${scope[0]}`));
+    expect(all).not.toMatch(/and \d+ more/);
   });
 
   it('a merge card does not show a scope list', async () => {

@@ -1,6 +1,6 @@
 import { appendFileSync, existsSync, lstatSync, readFileSync, realpathSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
-import { definePlugin, isRepoPath, matchesScope, normalizeScopeEntry, type BuligEvent, type PluginContext } from '@bulig/plugin-sdk';
+import { definePlugin, isRepoPath, MAX_SCOPE_ENTRIES, matchesScope, normalizeScopeEntry, type BuligEvent, type PluginContext } from '@bulig/plugin-sdk';
 import { exec, type ExecResult } from './exec.ts';
 
 export interface GithubConfig {
@@ -126,6 +126,7 @@ export function readScopeRules(payload: unknown, cwd: string): ScopeRules {
   const mode = p.scopeMode === undefined ? 'enforce' : p.scopeMode;
   if (mode !== 'enforce' && mode !== 'warn') throw new StepError(`invalid scope: scopeMode must be "enforce" or "warn", not ${JSON.stringify(mode)}`);
   const allowBroad = p.allowBroadScope === true;
+  if (given.length > MAX_SCOPE_ENTRIES) throw new StepError(`invalid scope: ${given.length} entries, the most is ${MAX_SCOPE_ENTRIES}`);
 
   const clean = (list: string[]): string[] => {
     const out: string[] = [];

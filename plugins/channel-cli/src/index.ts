@@ -62,8 +62,8 @@ export function format(e: BuligEvent): string[] | undefined {
       if (kind === 'merge') head.push(`${tag}   PR ${one(p.url)} at ${short(String(p.headSha ?? ''))}`);
       if (kind === 'plan' && Array.isArray(p.scope) && p.scope.length) {
         head.push(`${tag}   files this job may change:`);
-        for (const f of p.scope.slice(0, 25)) head.push(`${tag}     - ${one(f, 160)}`);
-        if (p.scope.length > 25) head.push(`${tag}     ... and ${p.scope.length - 25} more`);
+        // Every entry, in full: the person approving must see all of it.
+        for (const f of p.scope) head.push(`${tag}     - ${String(f).replace(/\s+/g, ' ')}`);
       }
       const summary = String(p.summary ?? '').trim().split('\n').slice(0, 14);
       for (const s of summary) head.push(`${tag}   | ${s.slice(0, 160)}`);

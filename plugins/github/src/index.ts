@@ -242,13 +242,26 @@ export default definePlugin({
     const runGh = (cwd: string, args: string[], signal?: AbortSignal) =>
       exec(gh, args, { cwd, env: env(true), timeoutMs: cfg.ghTimeoutMs ?? 120_000, ...(signal && { signal }) });
     // For calls that talk to GitHub. A temporary failure is tried again; any other failure is returned at once.
+    // With a signal, the wait between tries ends when the signal fires, and no further try is made.
     const tries = cfg.tries ?? 3;
     const delay = cfg.retryDelayMs ?? 2000;
-    const again = async (call: () => Promise<ExecResult>): Promise<ExecResult> => {
+    const nap = (ms: number, signal?: AbortSignal) =>
+      new Promise<void>((res) => {
+        if (signal?.aborted) return res();
+        const done = () => {
+          clearTimeout(timer);
+          signal?.removeEventListener('abort', done);
+          res();
+        };
+        const timer = setTimeout(done, ms);
+        signal?.addEventListener('abort', done, { once: true });
+      });
+    const again = async (call: () => Promise<ExecResult>, signal?: AbortSignal): Promise<ExecResult> => {
       let r = await call();
       for (let n = 1; n < tries && r.code !== 0 && TRANSIENT.test(r.stderr + r.stdout); n++) {
         ctx.log.warn(`github: temporary failure, trying again (${n}/${tries - 1})`, (r.stderr || r.stdout).trim().slice(0, 200));
-        await new Promise((res) => setTimeout(res, delay * 2 ** (n - 1)));
+        await nap(delay * 2 ** (n - 1), signal);
+        if (signal?.aborted) break;
         r = await call();
       }
       return r;
@@ -478,18 +491,6 @@ export default definePlugin({
       const to = (event.payload as { to?: string } | null)?.to;
       if (event.jobId && (to === 'cancelled' || to === 'failed' || to === 'done')) waits.get(event.jobId)?.abort();
     });
-    const nap = (ms: number, signal: AbortSignal) =>
-      new Promise<void>((res) => {
-        if (signal.aborted) return res();
-        const done = () => {
-          clearTimeout(timer);
-          signal.removeEventListener('abort', done);
-          res();
-        };
-        const timer = setTimeout(done, ms);
-        signal.addEventListener('abort', done, { once: true });
-      });
-
     ctx.on('merge.requested', async (event: BuligEvent) => {
       // Refused: the merge did not happen but asking again may work without anything changing. Failed: it never
       // will, or only a new commit or a new job can fix it, so do not ask again. Failing checks are failed, not refused.
@@ -561,7 +562,7 @@ export default definePlugin({
               list = undefined;
               return out;
             }
-          });
+          }, wait.signal);
           if (list) return { list };
           if (/no checks reported/i.test(r.stderr + r.stdout)) return { list: [] };
           return { error: (r.stderr || r.stdout).trim().slice(0, 300) };

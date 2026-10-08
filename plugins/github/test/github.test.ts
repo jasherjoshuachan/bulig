@@ -727,6 +727,20 @@ describe('merge.requested', () => {
     expect(h.calls().filter((c) => c.args[1] === 'checks').length).toBe(3);
   });
 
+  it('cancel ends the wait between retries at once, instead of sleeping out the delay', async () => {
+    const h = await setup({ tries: 3, retryDelayMs: 60_000 });
+    const pr = await openPr(h);
+    h.setState({ log: join(h.root, 'gh.log'), checksErrorFirst: 99, checks: [{ name: 'ci', bucket: 'pass' }] });
+    h.fire('merge.requested', { cwd: pr.cwd, number: pr.number, headSha: pr.headSha });
+    await until(() => h.calls().filter((c) => c.args[1] === 'checks').length === 1);
+    h.k.jobs.setStatus(h.job.id, 'cancelled');
+    await new Promise((r) => setTimeout(r, 300));
+    // No second try after the cancel, and nothing reported or merged.
+    expect(h.calls().filter((c) => c.args[1] === 'checks').length).toBe(1);
+    expect(h.calls().some((c) => c.args[1] === 'merge')).toBe(false);
+    expect(h.seen.some((e) => e.type === 'merge.refused' || e.type === 'merge.failed' || e.type === 'pr.merged')).toBe(false);
+  });
+
   it('fails for good when checks still cannot be read after the retries', async () => {
     const h = await setup({ tries: 3, retryDelayMs: 5 });
     const pr = await openPr(h);
@@ -1128,6 +1142,23 @@ describe('scope guard on commit.requested', () => {
     expect(git(cwd, 'rev-parse', 'HEAD')).toBe(before);
     expect(git(cwd, 'diff', '--cached', '--name-only')).toBe('');
     expect(existsSync(join(cwd, 'test-results/.last-run.json'))).toBe(true);
+  });
+
+  it('takes a scope of exactly 100 entries and refuses 101, committing nothing', async () => {
+    const h = await setup();
+    const cwd = await worktree(h, 'bulig/s-cap');
+    const before = git(cwd, 'rev-parse', 'HEAD');
+    write(cwd, 'README.md', '# hi\n');
+    const entry = (i: number) => `docs/f${i}.md`;
+    const hundred = ['README.md', ...Array.from({ length: 99 }, (_, i) => entry(i))];
+    const tooMany = [...hundred, entry(99)];
+    const refused = await commit(h, cwd, { scope: tooMany });
+    expect(refused.type).toBe('commit.failed');
+    expect(failure(refused).error).toContain('101 entries, the most is 100');
+    expect(git(cwd, 'rev-parse', 'HEAD')).toBe(before);
+    const ok = await commit(h, cwd, { scope: hundred });
+    expect(ok.type).toBe('commit.done');
+    expect(committed(cwd)).toEqual(['README.md']);
   });
 
   it('commits only the in-scope paths: an ignored file and an in-scope file give a commit with exactly one file', async () => {

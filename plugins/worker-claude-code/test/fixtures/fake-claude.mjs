@@ -20,11 +20,14 @@ if (process.env.FAKE_CLAUDE_ENV_DUMP) {
 
 if (prompt.includes('FAKE:grandchild')) {
   // Like a Bash tool child: a grandchild that ignores SIGTERM. The leader exits on SIGTERM and leaves it behind.
-  const g = spawn(process.execPath, ['-e', "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"], { stdio: 'ignore' });
-  // The handler goes in before the PID mark: a test reads the mark as "ready to be stopped".
-  process.on('SIGTERM', () => process.exit(0));
-  mark(`PID ${process.pid}`);
-  mark(`GRANDCHILD ${g.pid}`);
+  // The grandchild says "ready" only once its SIGTERM handler is in, and the leader marks nothing before that, so a
+  // test that sees the PID mark knows both processes are set up and the GRANDCHILD line is already there.
+  const g = spawn(process.execPath, ['-e', "process.on('SIGTERM',()=>{});process.stdout.write('ready\\n');setInterval(()=>{},1000)"], { stdio: ['ignore', 'pipe', 'ignore'] });
+  g.stdout.once('data', () => {
+    process.on('SIGTERM', () => process.exit(0));
+    mark(`GRANDCHILD ${g.pid}`);
+    mark(`PID ${process.pid}`);
+  });
   setInterval(() => {}, 1000);
 } else if (prompt.includes('FAKE:linger') && args.includes('acceptEdits')) {
   // An edit stage that is slow to die: after SIGTERM it keeps going for a moment and then writes into its own

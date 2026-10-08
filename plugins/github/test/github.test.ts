@@ -172,6 +172,36 @@ describe('worktree start point', () => {
     expect(failed.error).toMatch(/git fetch failed/);
     expect(existsSync(join(h.repo, '.worktrees'))).toBe(false);
   });
+  it('uses one base for the worktree start and the commit base, even when the configured base is stale locally', async () => {
+    const h = await setup({ baseBranch: 'develop' });
+    git(h.repo, 'branch', 'develop');
+    git(h.repo, 'push', 'origin', 'develop');
+    const other = join(h.root, 'other-dev');
+    execFileSync('git', ['clone', '-b', 'develop', h.origin, other], { stdio: 'ignore' });
+    git(other, 'config', 'user.email', 'test@example.com');
+    git(other, 'config', 'user.name', 'Test');
+    writeFileSync(join(other, 'dev.txt'), 'dev\n');
+    git(other, 'add', '-A');
+    git(other, 'commit', '-m', 'develop moves on');
+    git(other, 'push', 'origin', 'develop');
+    const tip = git(other, 'rev-parse', 'HEAD');
+    expect(git(h.repo, 'rev-parse', 'develop')).not.toBe(tip); // the local copy lags
+    const { cwd } = await ready(h, 'bulig/s-5');
+    expect(git(cwd, 'rev-parse', 'HEAD')).toBe(tip);
+    writeFileSync(join(cwd, 'job.txt'), 'job\n');
+    h.fire('commit.requested', { cwd, message: 'job work' });
+    const { base } = (await h.waitFor('commit.done')).payload as { base: string };
+    expect(base).toBe(tip);
+    expect(git(cwd, 'rev-list', '--count', `${base}..HEAD`)).toBe('1');
+  });
+
+  it('fails the request when the configured baseBranch exists nowhere', async () => {
+    const h = await setup({ baseBranch: 'no-such-branch' });
+    h.fire('worktree.requested', { repoPath: h.repo, branch: 'bulig/s-6' });
+    const failed = (await h.waitFor('worktree.failed')).payload as { error: string };
+    expect(failed.error).toMatch(/baseBranch "no-such-branch" was not found/);
+    expect(existsSync(join(h.repo, '.worktrees'))).toBe(false);
+  });
 });
 
 describe('github config', () => {

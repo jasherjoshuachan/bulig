@@ -225,6 +225,28 @@ describe('progress', () => {
     expect(fake.texts()[0]).toContain('job failed: review failed twice');
   });
 
+  it('says why a merge failed, with the check names and links, and does not repeat it as a generic job failure', async () => {
+    const fake = await startFake();
+    const b = await boot(fake);
+    const job = b.d.ctx.jobs.create({ repo: '/r', title: 't' });
+    const tag = `[${job.id.slice(0, 8)}]`;
+    b.d.ctx.emit(
+      'merge.failed',
+      {
+        reason: 'checks failing: Typecheck & build. Fix the failing check, then run the job again.',
+        checks: [{ name: 'Typecheck & build', link: 'https://example.test/runs/1' }],
+      },
+      job.id,
+    );
+    b.d.ctx.emit('pipeline.failed', { reason: 'merge failed: checks failing: Typecheck & build. Fix the failing check, then run the job again.' }, job.id);
+    b.d.ctx.emit('merge.failed', { reason: 'PR #3 was closed without being merged' }, job.id);
+    await until(() => fake.texts().length === 2, 'two lines');
+    expect(fake.texts()).toEqual([
+      `${tag} merge failed: checks failing: Typecheck & build. Fix the failing check, then run the job again.\nTypecheck & build: https://example.test/runs/1`,
+      `${tag} merge failed: PR #3 was closed without being merged`,
+    ]);
+  });
+
   it('sends a job started here back to the chat that started it', async () => {
     const fake = await startFake();
     const repo = tempDir();

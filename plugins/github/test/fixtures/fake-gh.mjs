@@ -25,6 +25,19 @@ if (group === 'pr' && sub === 'create' && state.createExists) {
   for (const k of json.split(',')) out[k] = all[k];
   console.log(JSON.stringify(out));
 } else if (group === 'pr' && sub === 'checks') {
+  // Calls are counted in the state file, so a test can change what gh says as checks "finish".
+  const call = state.checkCalls ?? 0;
+  if (statePath) writeFileSync(statePath, JSON.stringify({ ...state, checkCalls: call + 1 }));
+  if (call < (state.checksErrorFirst ?? 0)) {
+    console.error('HTTP 502: Bad Gateway (https://api.github.com/graphql)');
+    process.exit(1);
+  }
+  // checksSequence: one answer per call after the errors; the last answer repeats.
+  if (state.checksSequence) state.checks = state.checksSequence[Math.min(call - (state.checksErrorFirst ?? 0), state.checksSequence.length - 1)];
+  if (state.checksGarbage) {
+    console.error('something went wrong reading checks');
+    process.exit(1);
+  }
   if (state.checks === undefined) {
     console.error("no checks reported on the 'bulig' branch");
     process.exit(1);

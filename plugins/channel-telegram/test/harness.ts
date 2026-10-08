@@ -49,7 +49,7 @@ export function driver() {
       description: 'test driver',
       subscribes: ['approval.granted', 'approval.denied', 'cancel.requested'],
       needs: ['jobs.write'],
-      emits: ['approval.requested', 'stage.completed', 'stage.failed', 'pr.opened', 'pr.merged', 'merge.refused', 'pipeline.failed'],
+      emits: ['approval.requested', 'stage.completed', 'stage.failed', 'pr.opened', 'pr.merged', 'merge.refused', 'merge.failed', 'pipeline.failed'],
     },
     register(ctx) {
       box.ctx = ctx;

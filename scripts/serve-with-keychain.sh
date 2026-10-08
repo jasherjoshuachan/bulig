@@ -4,6 +4,12 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# The database module is built for one Node major. Use the pinned one when fnm is installed.
+if [[ -f .node-version ]] && command -v fnm >/dev/null; then
+  eval "$(fnm env --shell bash)"
+  fnm use --install-if-missing --silent-if-unchanged >/dev/null
+fi
+
 if ! BULIG_TELEGRAM_TOKEN="$(security find-generic-password -s bulig-telegram-bot -w 2>/dev/null)" || [ -z "$BULIG_TELEGRAM_TOKEN" ]; then
   echo "serve-with-keychain: no Keychain item named bulig-telegram-bot." >&2
   echo "Add it with: security add-generic-password -s bulig-telegram-bot -a bulig -w" >&2

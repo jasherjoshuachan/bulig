@@ -28,6 +28,15 @@ if (group === 'pr' && sub === 'create' && state.createExists) {
   // Calls are counted in the state file, so a test can change what gh says as checks "finish".
   const call = state.checkCalls ?? 0;
   if (statePath) writeFileSync(statePath, JSON.stringify({ ...state, checkCalls: call + 1 }));
+  // hangChecksFirst: the first N calls never answer. The pid is written down so a test can see the process die.
+  if (call < (state.hangChecksFirst ?? 0)) {
+    if (state.pidFile) appendFileSync(state.pidFile, `${process.pid}\n`);
+    setInterval(() => {}, 1000);
+    await new Promise(() => {});
+  }
+  // checksDelayMs: answer slowly. ignoreTerm: keep going when asked to stop, as a gh stuck in a network call might.
+  if (state.ignoreTerm) process.on('SIGTERM', () => {});
+  if (state.checksDelayMs) await new Promise((r) => setTimeout(r, state.checksDelayMs));
   if (call < (state.checksErrorFirst ?? 0)) {
     console.error('HTTP 502: Bad Gateway (https://api.github.com/graphql)');
     process.exit(1);

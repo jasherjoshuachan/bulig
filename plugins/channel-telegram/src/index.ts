@@ -72,6 +72,17 @@ const HELP = [
   'Plan and merge approvals arrive here with Approve and Deny buttons.',
 ].join('\n');
 
+/** A link from a check is shown only if it is a plain https URL: no other scheme, no spaces, no control characters. */
+export function safeLink(link: unknown): boolean {
+  if (typeof link !== 'string' || link.length === 0 || link.length > 500) return false;
+  if (/[\s\u0000-\u001f\u007f-\u009f\u2028\u2029]/.test(link)) return false;
+  try {
+    return new URL(link).protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
 /** The one line to show for a progress event. Undefined means say nothing. */
 export function progressLine(e: BuligEvent): string | undefined {
   const p = (e.payload ?? {}) as Record<string, unknown>;
@@ -99,8 +110,8 @@ export function progressLine(e: BuligEvent): string | undefined {
       // The reason says what to do. Failing checks come with their names (already in the reason) and links when GitHub gave them.
       const links = (Array.isArray(p.checks) ? p.checks : [])
         .map((c) => c as { name?: unknown; link?: unknown })
-        .filter((c) => typeof c.link === 'string' && c.link)
-        .map((c) => `\n${one(c.name, 80)}: ${one(c.link, 300)}`);
+        .filter((c) => safeLink(c.link))
+        .map((c) => `\n${one(c.name, 80)}: ${String(c.link)}`);
       return `${tag} merge failed: ${one(p.reason, 400)}${links.join('')}`;
     }
     case 'pipeline.failed':

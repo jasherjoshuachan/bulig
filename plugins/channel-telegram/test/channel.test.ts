@@ -247,6 +247,29 @@ describe('progress', () => {
     ]);
   });
 
+  it('shows only plain https links of failing checks', async () => {
+    const fake = await startFake();
+    const b = await boot(fake);
+    const job = b.d.ctx.jobs.create({ repo: '/r', title: 't' });
+    const tag = `[${job.id.slice(0, 8)}]`;
+    const bad: unknown[] = [
+      'http://example.test/runs/1',
+      'javascript:alert(1)',
+      'data:text/html,<b>x</b>',
+      'https://example.test/runs/1\nhttps://evil.test/',
+      'https://example.test/a b',
+      'https://example.test/\u0007x',
+      'not a url',
+      42,
+      null,
+      { href: 'https://example.test/' },
+    ];
+    const checks = [...bad.map((link, i) => ({ name: `bad${i}`, link })), { name: 'good', link: 'https://example.test/runs/2' }];
+    b.d.ctx.emit('merge.failed', { reason: 'checks failing: x', checks }, job.id);
+    await until(() => fake.texts().length === 1, 'line');
+    expect(fake.texts()[0]).toBe(`${tag} merge failed: checks failing: x\ngood: https://example.test/runs/2`);
+  });
+
   it('sends a job started here back to the chat that started it', async () => {
     const fake = await startFake();
     const repo = tempDir();

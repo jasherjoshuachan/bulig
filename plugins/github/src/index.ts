@@ -25,6 +25,8 @@ export interface GithubConfig {
   checksWaitMs?: number;
   /** How often to look at pending checks again, in ms. Default 15000. */
   checksPollMs?: number;
+  /** Longest a single gh call may run, in ms. A call that hangs is killed and counts as a temporary failure. Default 120000. */
+  ghTimeoutMs?: number;
 }
 
 class StepError extends Error {}
@@ -65,8 +67,9 @@ export function assertPlainWorktree(repoPath: string, cwd: string): void {
   if (rel === '' || rel.startsWith('..') || isAbsolute(rel)) throw new StepError(`refusing: ${cwd} resolves outside the repo`);
 }
 
-/** gh messages that mean the PR cannot be merged as it stands, whatever is tried again. */
-const UNMERGEABLE = /conflict|not mergeable|cannot be cleanly created|not in a mergeable state/i;
+/** gh messages that mean the PR cannot be merged as it stands: a conflict, or branch protection that wants a review or a check nobody is going to supply. */
+const PERMANENT_MERGE_FAILURE =
+  /conflict|not mergeable|cannot be cleanly created|not in a mergeable state|base branch policy|branch protection|protected branch|required status check|required (code )?reviews?|review is required|approving reviews?|reviews? (is|are) required/i;
 
 export type Check = { name?: string; bucket?: string; state?: string; link?: string };
 
@@ -148,7 +151,8 @@ export default definePlugin({
     }
     const IDENTITY = cfg.authorName && cfg.authorEmail ? ['-c', `user.name=${cfg.authorName}`, '-c', `user.email=${cfg.authorEmail}`] : [];
     const runGit = (cwd: string, args: string[], withToken = false) => exec(git, [...NO_HOOKS, ...args], { cwd, env: env(withToken) });
-    const runGh = (cwd: string, args: string[]) => exec(gh, args, { cwd, env: env(true) });
+    const runGh = (cwd: string, args: string[], signal?: AbortSignal) =>
+      exec(gh, args, { cwd, env: env(true), timeoutMs: cfg.ghTimeoutMs ?? 120_000, ...(signal && { signal }) });
     // For calls that talk to GitHub. A temporary failure is tried again; any other failure is returned at once.
     const tries = cfg.tries ?? 3;
     const delay = cfg.retryDelayMs ?? 2000;
@@ -385,7 +389,7 @@ export default definePlugin({
 
         // Looks at the PR itself. True means it is open and still at the approved commit.
         const gate = async (): Promise<boolean> => {
-          const head = JSON.parse(must('gh pr view', await runGh(cwd, ['pr', 'view', n, '--json', 'headRefOid,state,baseRefName']))) as {
+          const head = JSON.parse(must('gh pr view', await runGh(cwd, ['pr', 'view', n, '--json', 'headRefOid,state,baseRefName'], wait.signal))) as {
             headRefOid: string;
             state: string;
             baseRefName?: string;
@@ -422,7 +426,7 @@ export default definePlugin({
         const readChecks = async (): Promise<{ list: Check[] } | { error: string }> => {
           let list: Check[] | undefined;
           const r = await again(async () => {
-            const out = await runGh(cwd, ['pr', 'checks', n, '--json', 'name,bucket,state,link']);
+            const out = await runGh(cwd, ['pr', 'checks', n, '--json', 'name,bucket,state,link'], wait.signal);
             try {
               list = JSON.parse(out.stdout) as Check[];
               return { ...out, code: 0 };
@@ -443,7 +447,7 @@ export default definePlugin({
           if (over()) return;
           if (!(await gate())) return;
           const got = await readChecks();
-          if ('error' in got) return giveUp(`could not read checks: ${got.error}`);
+          if ('error' in got) return over() ? undefined : giveUp(`could not read checks: ${got.error}`);
           const list = got.list;
           if (list.length === 0) {
             if (!cfg.allowNoChecks) return giveUp('the PR has no checks and allowNoChecks is off. Turn it on or add a check, then run the job again.');
@@ -475,14 +479,14 @@ export default definePlugin({
           if (!merged) {
             const why = `gh pr merge failed (exit ${merge.code}): ${(merge.stderr || merge.stdout).trim().slice(0, 400)}`;
             // A conflict stays a conflict until someone changes the branch, so asking again would loop.
-            return UNMERGEABLE.test(merge.stderr + merge.stdout) ? giveUp(why) : refuse(why);
+            return PERMANENT_MERGE_FAILURE.test(merge.stderr + merge.stdout) ? giveUp(why) : refuse(why);
           }
         }
 
         await tidy(cwd, worktree, branch, baseRef);
         ctx.emit('pr.merged', { number }, event.jobId);
       } catch (err) {
-        refuse(message(err));
+        if (!over()) refuse(message(err));
       } finally {
         if (event.jobId && waits.get(event.jobId) === wait) waits.delete(event.jobId);
       }

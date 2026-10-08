@@ -593,10 +593,11 @@ describe('merge.requested', () => {
     const h = await setup({ checksPollMs: 20, checksWaitMs: 800 });
     const pr = await openPr(h);
     h.setState({ log: join(h.root, 'gh.log'), checks: [{ name: 'ci', bucket: 'pending' }] });
+    const t0 = Date.now();
     h.fire('merge.requested', { cwd: pr.cwd, number: pr.number, headSha: pr.headSha });
     const failed = await h.waitFor('merge.failed');
     expect((failed.payload as { reason: string }).reason).toMatch(/^checks still pending after 0 minutes: ci/);
-    expect(h.calls().filter((c) => c.args[1] === 'checks').length).toBeGreaterThan(1);
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(790); // it really waited the whole time before giving up
     expect(h.calls().some((c) => c.args[1] === 'merge')).toBe(false);
     expect(h.seen.some((e) => e.type === 'merge.refused')).toBe(false);
   });

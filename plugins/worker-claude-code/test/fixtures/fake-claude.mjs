@@ -60,12 +60,14 @@ if (prompt.includes('FAKE:grandchild')) {
 } else if (prompt.includes('FAKE:iserror')) {
   process.stdout.write(JSON.stringify({ type: 'result', is_error: true, result: 'rate limited', session_id: 's-err' }));
 } else {
+  // A planning prompt must get a plan that ends with a SCOPE block, like the real thing.
+  const scope = prompt.includes('You are planning') ? '\n\nSCOPE:\n- *.txt' : '';
   process.stdout.write(
     JSON.stringify({
       type: 'result',
       subtype: 'success',
       is_error: false,
-      result: `done: ${prompt.slice(0, 40)}`,
+      result: `done: ${prompt.slice(0, 40)}${scope}`,
       session_id: `session-${process.pid}`,
       total_cost_usd: 0.0123,
     }),

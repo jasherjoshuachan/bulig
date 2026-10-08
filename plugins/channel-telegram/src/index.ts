@@ -55,6 +55,16 @@ const SUBSCRIPTIONS = [
 
 const short = (id?: string) => (id ?? '--------').slice(0, 8);
 const one = (s: unknown, n = 200) => String(s ?? '').replace(/\s+/g, ' ').trim().slice(0, n);
+const MAX_SCOPE_LINES = 25;
+const MAX_FILE_LINES = 20;
+/** "- path" lines for a list of paths, cut at `max` with a count of the rest. Empty when the value is not a list of strings. */
+const bullets = (list: unknown, max: number): string[] => {
+  if (!Array.isArray(list)) return [];
+  const items = list.filter((x): x is string => typeof x === 'string' && x !== '').map((x) => one(x, 200));
+  const lines = items.slice(0, max).map((x) => `- ${x}`);
+  if (items.length > max) lines.push(`... and ${items.length - max} more`);
+  return lines;
+};
 const clip = (s: string) => (s.length > MAX_TEXT ? `${s.slice(0, MAX_TEXT - 20)}\n[cut]` : s);
 const usd = (n: unknown) => (typeof n === 'number' ? ` ($${n.toFixed(2)})` : '');
 const human = (status: string) => status.replace('_', ' ');
@@ -94,8 +104,10 @@ export function progressLine(e: BuligEvent): string | undefined {
       return `${tag} PR merged${p.number !== undefined ? ` (#${one(p.number)})` : ''}`;
     case 'merge.refused':
       return `${tag} merge refused: ${one(p.reason, 300)}`;
-    case 'pipeline.failed':
-      return `${tag} job failed: ${one(p.reason, 300)}`;
+    case 'pipeline.failed': {
+      const files = bullets(p.outOfScope, MAX_FILE_LINES);
+      return `${tag} job failed: ${one(p.reason, 300)}${files.length ? `\nFiles outside the approved scope:\n${files.join('\n')}` : ''}`;
+    }
     case 'job.status':
       return ['done', 'failed', 'cancelled'].includes(String(p.to)) ? `${tag} job ${String(p.to)}` : undefined;
     default:
@@ -206,6 +218,9 @@ export function createTelegramChannel(options: TelegramChannelOptions = {}): Plu
         const kind = String(p.kind);
         const head = [`[${short(jobId)}] approval needed: ${kind}`];
         if (kind === 'merge' && p.url) head.push(`PR ${one(p.url)}`);
+        // Above the plan text, so a long plan can't push it off the end of the message.
+        const scope = kind === 'plan' ? bullets(p.scope, MAX_SCOPE_LINES) : [];
+        if (scope.length) head.push('', 'Files this job may change:', ...scope);
         const text = `${head.join('\n')}\n\n${String(p.summary ?? '').trim()}`;
         sayJob(jobId, text, {
           reply_markup: {

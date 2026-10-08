@@ -21,6 +21,14 @@ export const newDb = () => {
 
 /** What the fake worker says for a stage. A function sees the prompt and the attempt number for that stage. */
 export type Reply = string | ((prompt: string, attempt: number) => string | { fail: string } | 'hang');
+
+/** The scope block every plan must end with. The fake worker adds it to a plan reply that has none, unless the reply is wrapped in raw(). */
+export const SCOPE_BLOCK = 'SCOPE:\n- src/**\n- README.md';
+const RAW_MARK = '\u0000raw';
+/** A plan reply to use exactly as written, with no scope block added. */
+export const raw = (text: string): string => text + RAW_MARK;
+const unwrap = (text: string) => (text.endsWith(RAW_MARK) ? { text: text.slice(0, -RAW_MARK.length), raw: true } : { text, raw: false });
+
 export type Script = Record<string, Reply | Reply[]>;
 
 export interface Sent {
@@ -52,9 +60,12 @@ export function fakeWorker(script: Script, sent: Sent[]): Plugin {
         const attempt = (counts[p.stage] = (counts[p.stage] ?? 0) + 1);
         let reply = script[p.stage] ?? 'ok';
         if (Array.isArray(reply)) reply = reply[Math.min(attempt, reply.length) - 1] ?? 'ok';
-        const out = typeof reply === 'function' ? reply(p.prompt, attempt) : reply;
+        let out = typeof reply === 'function' ? reply(p.prompt, attempt) : reply;
         if (out === 'hang') return;
         if (typeof out === 'object') return ctx.emit('stage.failed', { stage: p.stage, error: out.fail }, e.jobId);
+        const text = unwrap(out);
+        out = text.text;
+        if (p.stage === 'plan' && !text.raw && !/SCOPE:/.test(out)) out = `${out}\n\n${SCOPE_BLOCK}`;
         ctx.emit('stage.completed', { stage: p.stage, ok: true, result: out, costUsd: 0.01, sessionId: `s${++session}` }, e.jobId);
       });
     },
@@ -71,6 +82,10 @@ export interface GithubBehaviour {
   hangReset?: boolean;
   /** The process dies while an edit stage's commit is being made. */
   hangCommit?: boolean;
+  /** For the Nth commit request (0 based): refuse it because these files are outside the approved scope. */
+  outOfScope?: (string[] | undefined)[];
+  /** For the Nth commit request: commit, but report these files as outside the scope (scopeMode warn). */
+  warnOutOfScope?: (string[] | undefined)[];
   /** The merge can never go through, so the job should fail instead of asking again. */
   failMerge?: string;
   /** The process dies after asking for the merge: no answer ever comes back. */
@@ -111,7 +126,11 @@ export function fakeGithub(sent: { type: string; payload: unknown }[], b: Github
         sent.push({ type: e.type, payload: e.payload });
         if (b.hangCommit) return;
         if (b.failCommit) return ctx.emit('commit.failed', { error: b.failCommit }, e.jobId);
-        ctx.emit('commit.done', { sha: `c0ffee${++commits}`, base: 'ba5e000' }, e.jobId);
+        const n = commits++;
+        const bad = b.outOfScope?.[n];
+        if (bad?.length) return ctx.emit('commit.failed', { error: `files outside the approved scope: ${bad.join(', ')}`, outOfScope: bad }, e.jobId);
+        const warn = b.warnOutOfScope?.[n];
+        ctx.emit('commit.done', { sha: `c0ffee${n + 1}`, base: 'ba5e000', ...(warn?.length && { outOfScope: warn }) }, e.jobId);
       });
       ctx.on('pr.requested', (e) => {
         sent.push({ type: e.type, payload: e.payload });

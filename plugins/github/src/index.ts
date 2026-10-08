@@ -1,6 +1,6 @@
 import { appendFileSync, existsSync, lstatSync, readFileSync, realpathSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
-import { definePlugin, type BuligEvent, type PluginContext } from '@bulig/plugin-sdk';
+import { definePlugin, isRepoPath, matchesScope, normalizeScopeEntry, type BuligEvent, type PluginContext } from '@bulig/plugin-sdk';
 import { exec, type ExecResult } from './exec.ts';
 
 export interface GithubConfig {
@@ -59,6 +59,93 @@ export function assertPlainWorktree(repoPath: string, cwd: string): void {
   if (!existsSync(cwd)) return;
   const rel = relative(realpathSync(repoPath), realpathSync(cwd));
   if (rel === '' || rel.startsWith('..') || isAbsolute(rel)) throw new StepError(`refusing: ${cwd} resolves outside the repo`);
+}
+
+
+/** Every path git would put in a commit if the whole tree were added: tracked changes, staged changes, new files, both ends of a rename. Ignored files are left out. */
+export function parseStatusZ(out: string): string[] {
+  const parts = out.split('\0');
+  const seen = new Set<string>();
+  for (let i = 0; i < parts.length; i++) {
+    const entry = parts[i]!;
+    if (entry.length < 4) continue;
+    seen.add(entry.slice(3));
+    // A rename or copy is followed by the path it came from.
+    if (/[RC]/.test(entry.slice(0, 2))) {
+      const from = parts[++i];
+      if (from) seen.add(from);
+    }
+  }
+  return [...seen].sort();
+}
+
+/** The first part of this path (from the repo root down) that is a symlink, or undefined. A part that does not exist is fine. */
+export function symlinkOnPath(root: string, rel: string): string | undefined {
+  const parts = rel.split('/');
+  for (let n = 1; n <= parts.length; n++) {
+    const sub = parts.slice(0, n).join('/');
+    try {
+      if (lstatSync(join(root, sub)).isSymbolicLink()) return sub;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT' || (err as NodeJS.ErrnoException).code === 'ENOTDIR') return undefined;
+      throw err;
+    }
+  }
+  return undefined;
+}
+
+const lstatOrNull = (p: string) => {
+  try {
+    return lstatSync(p);
+  } catch {
+    return null;
+  }
+};
+const hasWildcard = (pattern: string) => /[*?]/.test(pattern);
+const MAX_LISTED = 20;
+const listed = (paths: string[]) => (paths.length > MAX_LISTED ? `${paths.slice(0, MAX_LISTED).join(', ')} and ${paths.length - MAX_LISTED} more` : paths.join(', '));
+
+export interface ScopeRules {
+  scope: string[];
+  allow: string[];
+  mode: 'enforce' | 'warn';
+}
+
+/**
+ * Read and check the scope that came with a commit request. This is the enforcement point, so it trusts nothing:
+ * a missing, empty, malformed, absolute, ".." or too broad scope is refused, and so is a scope line that names a
+ * symlink (or a path behind one) in this worktree.
+ */
+export function readScopeRules(payload: unknown, cwd: string): ScopeRules {
+  const p = (payload ?? {}) as Record<string, unknown>;
+  const strings = (v: unknown): string[] | undefined => (Array.isArray(v) && v.every((x) => typeof x === 'string') ? (v as string[]) : undefined);
+  const given = strings(p.scope);
+  if (!given || given.length === 0) throw new StepError('no approved scope was given with the commit request, so nothing was committed');
+  const allowGiven = p.scopeAllow === undefined ? [] : strings(p.scopeAllow);
+  if (!allowGiven) throw new StepError('invalid scope: scopeAllow must be a list of paths');
+  const mode = p.scopeMode === undefined ? 'enforce' : p.scopeMode;
+  if (mode !== 'enforce' && mode !== 'warn') throw new StepError(`invalid scope: scopeMode must be "enforce" or "warn", not ${JSON.stringify(mode)}`);
+  const allowBroad = p.allowBroadScope === true;
+
+  const clean = (list: string[]): string[] => {
+    const out: string[] = [];
+    const problems: string[] = [];
+    for (const raw of list) {
+      const r = normalizeScopeEntry(raw, { allowBroad });
+      if (!r.ok) {
+        problems.push(r.error);
+        continue;
+      }
+      if (!hasWildcard(r.pattern)) {
+        const link = symlinkOnPath(cwd, r.pattern);
+        if (link) problems.push(`${JSON.stringify(raw)}: ${JSON.stringify(link)} is a symlink, and a symlink is never part of the scope`);
+      }
+      out.push(r.pattern);
+    }
+    if (problems.length) throw new StepError(`invalid scope: ${problems.join('; ')}`);
+    return out;
+  };
+  return { scope: clean(given), allow: clean(allowGiven), mode };
 }
 
 export type Check = { name?: string; bucket?: string; state?: string };
@@ -250,19 +337,58 @@ export default definePlugin({
 
     // Everything the stages left on disk goes into commits now, before the independent review, so the
     // reviewer judges a fixed commit and the PR can be checked against it.
+    //
+    // Only files the approved plan named may go in. The check is here, in the github plugin, which runs outside
+    // the Claude sandbox, so no stage can talk its way past it. Files are staged by name, never with `add -A`.
     ctx.on('commit.requested', async (event: BuligEvent) => {
       try {
         const cwd = str(event.payload, 'cwd');
         const message = str(event.payload, 'message');
-        const dirty = must('git status', await runGit(cwd, ['status', '--porcelain']));
-        if (dirty) {
-          must('git add', await runGit(cwd, ['add', '-A']));
+        const rules = readScopeRules(event.payload, cwd);
+        const status = await runGit(cwd, ['status', '--porcelain=v1', '-z', '--untracked-files=all']);
+        if (status.code !== 0) throw new StepError(`git status failed (exit ${status.code}): ${(status.stderr || status.stdout).trim().slice(0, 500)}`);
+        const changed = parseStatusZ(status.stdout);
+
+        const outside: string[] = [];
+        const links: string[] = [];
+        for (const path of changed) {
+          const link = isRepoPath(path) ? symlinkOnPath(cwd, path) : undefined;
+          if (link) links.push(path);
+          else if (!isRepoPath(path) || !(matchesScope(path, rules.scope) || matchesScope(path, rules.allow))) outside.push(path);
+        }
+        if (links.length) {
+          throw Object.assign(new StepError(`a symlink is never committed: ${listed(links)}`), { outOfScope: [...new Set([...links, ...outside])].sort() });
+        }
+        if (outside.length && rules.mode === 'enforce') {
+          throw Object.assign(new StepError(`files outside the approved scope, so nothing was committed: ${listed(outside)}`), { outOfScope: outside });
+        }
+        if (outside.length) ctx.log.warn(`github: scopeMode is warn; committing files outside the approved scope: ${listed(outside)}`);
+
+        if (changed.length) {
+          // Paths still on disk are added. Paths that are gone (a deletion, or the old end of a rename) are
+          // removed from the index; `add` would refuse a name that no longer exists anywhere.
+          const present = changed.filter((x) => lstatOrNull(join(cwd, x)));
+          const gone = changed.filter((x) => !present.includes(x));
+          for (let i = 0; i < present.length; i += 500) {
+            must('git add', await runGit(cwd, ['--literal-pathspecs', 'add', '-A', '--', ...present.slice(i, i + 500)]));
+          }
+          for (let i = 0; i < gone.length; i += 500) {
+            must('git rm', await runGit(cwd, ['--literal-pathspecs', 'rm', '-q', '--cached', '--ignore-unmatch', '--', ...gone.slice(i, i + 500)]));
+          }
+          // Belt and braces: the index must hold exactly what was checked.
+          const cached = await runGit(cwd, ['diff', '--cached', '--name-only', '-z']);
+          const extra = cached.stdout.split('\0').filter((x) => x && !changed.includes(x));
+          if (cached.code !== 0 || extra.length) {
+            await runGit(cwd, ['reset', '-q']);
+            throw new StepError(`the index held files that were never checked (${listed(extra)}), so nothing was committed`);
+          }
           must('git commit', await runGit(cwd, [...IDENTITY, 'commit', '-m', message]));
         }
         const sha = must('git rev-parse', await runGit(cwd, ['rev-parse', 'HEAD']));
-        ctx.emit('commit.done', { sha, base: await baseOf(cwd) }, event.jobId);
+        ctx.emit('commit.done', { sha, base: await baseOf(cwd), ...(outside.length && { outOfScope: outside }) }, event.jobId);
       } catch (err) {
-        ctx.emit('commit.failed', { error: message(err) }, event.jobId);
+        const outOfScope = (err as { outOfScope?: string[] }).outOfScope;
+        ctx.emit('commit.failed', { error: message(err), ...(outOfScope && { outOfScope }) }, event.jobId);
       }
     });
 

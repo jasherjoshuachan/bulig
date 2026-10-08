@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -8,6 +8,8 @@ import { createKernel } from '@bulig/core';
 import { definePlugin, type BuligEvent } from '@bulig/plugin-sdk';
 import github, { judgeChecks } from '../src/index.ts';
 
+/** The scope the older tests commit under: every file they write is a .txt file. */
+const SCOPE_TXT = ['*.txt'];
 const FAKE_GH = fileURLToPath(new URL('./fixtures/fake-gh.mjs', import.meta.url));
 const dirs: string[] = [];
 afterEach(() => {
@@ -94,7 +96,7 @@ async function openPr(h: Awaited<ReturnType<typeof setup>>, branch = 'bulig/x-1'
   h.fire('worktree.requested', { repoPath: h.repo, branch });
   const ready = (await h.waitFor('worktree.ready')).payload as { cwd: string };
   writeFileSync(join(ready.cwd, 'new.txt'), 'hello\n');
-  h.fire('commit.requested', { cwd: ready.cwd, message: 'Add new.txt' });
+  h.fire('commit.requested', { cwd: ready.cwd, message: 'Add new.txt', scope: SCOPE_TXT });
   const { sha } = (await h.waitFor('commit.done')).payload as { sha: string };
   h.fire('pr.requested', { cwd: ready.cwd, branch, title: 'Add new.txt', body: 'because', expectSha: sha });
   const opened = (await h.waitFor('pr.opened')).payload as { url: string; number: number; headSha: string };
@@ -189,7 +191,7 @@ describe('worktree start point', () => {
     const { cwd } = await ready(h, 'bulig/s-5');
     expect(git(cwd, 'rev-parse', 'HEAD')).toBe(tip);
     writeFileSync(join(cwd, 'job.txt'), 'job\n');
-    h.fire('commit.requested', { cwd, message: 'job work' });
+    h.fire('commit.requested', { cwd, message: 'job work', scope: SCOPE_TXT });
     const { base } = (await h.waitFor('commit.done')).payload as { base: string };
     expect(base).toBe(tip);
     expect(git(cwd, 'rev-list', '--count', `${base}..HEAD`)).toBe('1');
@@ -272,7 +274,7 @@ describe('worktree.reset.requested', () => {
     h.fire('worktree.requested', { repoPath: h.repo, branch: 'bulig/r-1' });
     const { cwd } = (await h.waitFor('worktree.ready')).payload as { cwd: string };
     writeFileSync(join(cwd, 'kept.txt'), 'committed work\n');
-    h.fire('commit.requested', { cwd, message: 'checkpoint' });
+    h.fire('commit.requested', { cwd, message: 'checkpoint', scope: SCOPE_TXT });
     await h.waitFor('commit.done');
     // What a cut-off stage leaves: an edited tracked file, a staged new file, an untracked file and folder.
     writeFileSync(join(cwd, 'kept.txt'), 'half written\n');
@@ -335,7 +337,7 @@ describe('commit.requested', () => {
     h.fire('worktree.requested', { repoPath: h.repo, branch: 'bulig/c-1' });
     const { cwd } = (await h.waitFor('worktree.ready')).payload as { cwd: string };
     writeFileSync(join(cwd, 'c.txt'), 'c\n');
-    h.fire('commit.requested', { cwd, message: 'Do the thing' });
+    h.fire('commit.requested', { cwd, message: 'Do the thing', scope: SCOPE_TXT });
     const done = (await h.waitFor('commit.done')).payload as { sha: string; base: string };
     expect(done.sha).toBe(git(cwd, 'rev-parse', 'HEAD'));
     expect(done.base).toBe(git(h.repo, 'rev-parse', 'main'));
@@ -348,7 +350,7 @@ describe('commit.requested', () => {
     h.fire('worktree.requested', { repoPath: h.repo, branch: 'bulig/c-id' });
     const { cwd } = (await h.waitFor('worktree.ready')).payload as { cwd: string };
     writeFileSync(join(cwd, 'c.txt'), 'c\n');
-    h.fire('commit.requested', { cwd, message: 'signed' });
+    h.fire('commit.requested', { cwd, message: 'signed', scope: SCOPE_TXT });
     await h.waitFor('commit.done');
     expect(git(cwd, 'log', '-1', '--format=%an <%ae>|%cn <%ce>')).toBe(
       'Bulig Bot <1+buligbot@users.noreply.github.com>|Bulig Bot <1+buligbot@users.noreply.github.com>',
@@ -360,10 +362,10 @@ describe('commit.requested', () => {
     h.fire('worktree.requested', { repoPath: h.repo, branch: 'bulig/c-2' });
     const { cwd } = (await h.waitFor('worktree.ready')).payload as { cwd: string };
     writeFileSync(join(cwd, 'c.txt'), 'c\n');
-    h.fire('commit.requested', { cwd, message: 'once' });
+    h.fire('commit.requested', { cwd, message: 'once', scope: SCOPE_TXT });
     const first = (await h.waitFor('commit.done')).payload as { sha: string };
     h.seen.length = 0;
-    h.fire('commit.requested', { cwd, message: 'twice' });
+    h.fire('commit.requested', { cwd, message: 'twice', scope: SCOPE_TXT });
     const second = (await h.waitFor('commit.done')).payload as { sha: string };
     expect(second.sha).toBe(first.sha);
     expect(git(cwd, 'rev-list', '--count', 'main..HEAD')).toBe('1');
@@ -371,7 +373,7 @@ describe('commit.requested', () => {
 
   it('emits commit.failed when the directory is not a repo', async () => {
     const h = await setup();
-    h.fire('commit.requested', { cwd: h.root, message: 'x' });
+    h.fire('commit.requested', { cwd: h.root, message: 'x', scope: SCOPE_TXT });
     const failed = await h.waitFor('commit.failed');
     expect((failed.payload as { error: string }).error).toMatch(/git/);
   });
@@ -430,7 +432,7 @@ describe('pr.requested', () => {
     h.fire('worktree.requested', { repoPath: h.repo, branch: 'bulig/x-4' });
     const { cwd } = (await h.waitFor('worktree.ready')).payload as { cwd: string };
     writeFileSync(join(cwd, 'r.txt'), 'reviewed\n');
-    h.fire('commit.requested', { cwd, message: 'work' });
+    h.fire('commit.requested', { cwd, message: 'work', scope: SCOPE_TXT });
     const { sha } = (await h.waitFor('commit.done')).payload as { sha: string };
     // Something commits again after the review.
     writeFileSync(join(cwd, 'sneaky.txt'), 'late change\n');
@@ -449,7 +451,7 @@ describe('pr.requested', () => {
     h.fire('worktree.requested', { repoPath: h.repo, branch: 'bulig/x-5' });
     const { cwd } = (await h.waitFor('worktree.ready')).payload as { cwd: string };
     writeFileSync(join(cwd, 'r.txt'), 'reviewed\n');
-    h.fire('commit.requested', { cwd, message: 'work' });
+    h.fire('commit.requested', { cwd, message: 'work', scope: SCOPE_TXT });
     const { sha } = (await h.waitFor('commit.done')).payload as { sha: string };
     writeFileSync(join(cwd, 'r.txt'), 'edited after review\n');
     h.fire('pr.requested', { cwd, branch: 'bulig/x-5', title: 'T', body: '', expectSha: sha });
@@ -831,7 +833,7 @@ describe('hooks planted in a job worktree', () => {
     }
     git(h.repo, 'config', 'core.hooksPath', join(cwd, '.husky'));
     writeFileSync(join(cwd, 'new.txt'), 'hello\n');
-    h.fire('commit.requested', { cwd, message: 'Add new.txt' });
+    h.fire('commit.requested', { cwd, message: 'Add new.txt', scope: [...SCOPE_TXT, '.husky/*'] });
     const { sha } = (await h.waitFor('commit.done')).payload as { sha: string };
     expect(existsSync(out)).toBe(false);
     h.fire('pr.requested', { cwd, branch: 'bulig/hook-1', title: 't', body: 'b', expectSha: sha });
@@ -870,5 +872,286 @@ describe('hooks planted in a job worktree', () => {
     expect(calls.length).toBeGreaterThan(5);
     for (const c of calls) expect(c, c).toContain('-c core.hooksPath=/dev/null');
     expect(calls.some((c) => c.includes(' commit -m '))).toBe(true);
+  });
+});
+
+describe('scope guard on commit.requested', () => {
+  type H = Awaited<ReturnType<typeof setup>>;
+  const worktree = async (h: H, branch: string) => {
+    h.fire('worktree.requested', { repoPath: h.repo, branch });
+    return ((await h.waitFor('worktree.ready')).payload as { cwd: string }).cwd;
+  };
+  /** Ask for a commit and wait for whichever answer comes first. */
+  const commit = async (h: H, cwd: string, extra: Record<string, unknown>) => {
+    h.seen.length = 0;
+    h.fire('commit.requested', { cwd, message: 'job work', ...extra });
+    const end = Date.now() + 10000;
+    for (;;) {
+      const hit = h.seen.find((e) => e.type === 'commit.done' || e.type === 'commit.failed');
+      if (hit) return hit;
+      if (Date.now() > end) throw new Error(`no answer to commit.requested; saw ${h.seen.map((e) => e.type)}`);
+      await new Promise((r) => setTimeout(r, 15));
+    }
+  };
+  const write = (cwd: string, rel: string, text = 'x\n') => {
+    mkdirSync(join(cwd, rel, '..'), { recursive: true });
+    writeFileSync(join(cwd, rel), text);
+  };
+  const committed = (cwd: string) => git(cwd, '-c', 'core.quotepath=off', 'show', '--name-only', '--format=', 'HEAD').split('\n').filter(Boolean).sort();
+  const failure = (e: BuligEvent) => e.payload as { error: string; outOfScope?: string[] };
+
+  it('the incident: a test run writes test-results/.last-run.json while the job was told README only', async () => {
+    const h = await setup();
+    const cwd = await worktree(h, 'bulig/s-1');
+    const before = git(cwd, 'rev-parse', 'HEAD');
+    write(cwd, 'README.md', '# hi\n');
+    write(cwd, 'test-results/.last-run.json', '{"status":"passed"}\n');
+    const r = await commit(h, cwd, { scope: ['README.md'] });
+    expect(r.type).toBe('commit.failed');
+    expect(failure(r).outOfScope).toEqual(['test-results/.last-run.json']);
+    expect(failure(r).error).toContain('test-results/.last-run.json');
+    // Nothing was committed or staged, and nothing was deleted.
+    expect(git(cwd, 'rev-parse', 'HEAD')).toBe(before);
+    expect(git(cwd, 'diff', '--cached', '--name-only')).toBe('');
+    expect(existsSync(join(cwd, 'test-results/.last-run.json'))).toBe(true);
+  });
+
+  it('commits only the in-scope paths: an ignored file and an in-scope file give a commit with exactly one file', async () => {
+    const h = await setup();
+    writeFileSync(join(h.repo, '.gitignore'), '*.log\n');
+    git(h.repo, 'add', '.gitignore');
+    git(h.repo, 'commit', '-m', 'ignore logs');
+    git(h.repo, 'push', 'origin', 'main');
+    const cwd = await worktree(h, 'bulig/s-2');
+    write(cwd, 'debug.log', 'noise\n');
+    write(cwd, 'README.md', '# hi\n');
+    const r = await commit(h, cwd, { scope: ['README.md'] });
+    expect(r.type).toBe('commit.done');
+    expect(committed(cwd)).toEqual(['README.md']);
+    expect(git(cwd, 'ls-files', 'debug.log')).toBe('');
+    expect(existsSync(join(cwd, 'debug.log'))).toBe(true);
+  });
+
+  it('a clean tree commits nothing and still answers', async () => {
+    const h = await setup();
+    const cwd = await worktree(h, 'bulig/s-3');
+    const r = await commit(h, cwd, { scope: ['README.md'] });
+    expect(r.type).toBe('commit.done');
+    expect((r.payload as { sha: string }).sha).toBe(git(cwd, 'rev-parse', 'HEAD'));
+    expect(git(cwd, 'rev-list', '--count', 'main..HEAD')).toBe('0');
+  });
+
+  it('after the junk is removed, asking again commits', async () => {
+    const h = await setup();
+    const cwd = await worktree(h, 'bulig/s-4');
+    write(cwd, 'README.md', '# hi\n');
+    write(cwd, 'junk.tmp');
+    expect((await commit(h, cwd, { scope: ['README.md'] })).type).toBe('commit.failed');
+    rmSync(join(cwd, 'junk.tmp'));
+    const r = await commit(h, cwd, { scope: ['README.md'] });
+    expect(r.type).toBe('commit.done');
+    expect(committed(cwd)).toEqual(['README.md']);
+  });
+
+  it('lists every out-of-scope file, not just the first', async () => {
+    const h = await setup();
+    const cwd = await worktree(h, 'bulig/s-5');
+    write(cwd, 'README.md');
+    write(cwd, 'b.tmp');
+    write(cwd, 'sub/c.tmp');
+    write(cwd, 'a.tmp');
+    const r = await commit(h, cwd, { scope: ['README.md'] });
+    expect(failure(r).outOfScope).toEqual(['a.tmp', 'b.tmp', 'sub/c.tmp']);
+  });
+
+  it('a file the stage already staged is still checked', async () => {
+    const h = await setup();
+    const cwd = await worktree(h, 'bulig/s-6');
+    write(cwd, 'README.md');
+    write(cwd, 'sneaky.txt');
+    git(cwd, 'add', 'sneaky.txt');
+    const r = await commit(h, cwd, { scope: ['README.md'] });
+    expect(r.type).toBe('commit.failed');
+    expect(failure(r).outOfScope).toEqual(['sneaky.txt']);
+  });
+
+  it('a modified tracked file outside the scope is refused too', async () => {
+    const h = await setup();
+    const cwd = await worktree(h, 'bulig/s-7');
+    write(cwd, 'a.txt', 'changed\n');
+    const r = await commit(h, cwd, { scope: ['README.md'] });
+    expect(failure(r).outOfScope).toEqual(['a.txt']);
+  });
+
+  it('a deleted tracked file in scope is committed as a deletion', async () => {
+    const h = await setup();
+    const cwd = await worktree(h, 'bulig/s-8');
+    rmSync(join(cwd, 'a.txt'));
+    const r = await commit(h, cwd, { scope: ['a.txt'] });
+    expect(r.type).toBe('commit.done');
+    expect(git(cwd, 'show', '--name-status', '--format=', 'HEAD')).toBe('D\ta.txt');
+  });
+
+  it('a deleted tracked file outside the scope is refused', async () => {
+    const h = await setup();
+    const cwd = await worktree(h, 'bulig/s-9');
+    rmSync(join(cwd, 'a.txt'));
+    write(cwd, 'b.txt');
+    const r = await commit(h, cwd, { scope: ['b.txt'] });
+    expect(r.type).toBe('commit.failed');
+    expect(failure(r).outOfScope).toEqual(['a.txt']);
+  });
+
+  it('a rename with both paths in scope commits, whether or not it was staged', async () => {
+    const h = await setup();
+    const cwd = await worktree(h, 'bulig/s-10');
+    git(cwd, 'mv', 'a.txt', 'c.txt');
+    const staged = await commit(h, cwd, { scope: ['a.txt', 'c.txt'] });
+    expect(staged.payload, JSON.stringify(staged.payload)).toMatchObject({ sha: expect.any(String) });
+    expect(staged.type).toBe('commit.done');
+    expect(git(cwd, 'show', '--name-status', '-M', '--format=', 'HEAD')).toMatch(/^R\d+\ta\.txt\tc\.txt$/);
+
+    renameSync(join(cwd, 'c.txt'), join(cwd, 'd.txt'));
+    const plain = await commit(h, cwd, { scope: ['c.txt', 'd.txt'] });
+    expect(plain.type).toBe('commit.done');
+    expect(git(cwd, 'show', '--name-status', '-M', '--format=', 'HEAD')).toMatch(/^R\d+\tc\.txt\td\.txt$/);
+  });
+
+  it('a rename whose old path is outside the scope is refused and names the old path', async () => {
+    const h = await setup();
+    const cwd = await worktree(h, 'bulig/s-11');
+    git(cwd, 'mv', 'a.txt', 'c.txt');
+    const r = await commit(h, cwd, { scope: ['c.txt'] });
+    expect(r.type).toBe('commit.failed');
+    expect(failure(r).outOfScope).toEqual(['a.txt']);
+  });
+
+  it('handles spaces and unicode in names, and reports them as written, not escaped', async () => {
+    const h = await setup();
+    const cwd = await worktree(h, 'bulig/s-12');
+    write(cwd, 'docs/my notes.md');
+    write(cwd, 'docs/日本語.md');
+    const ok = await commit(h, cwd, { scope: ['docs/*.md'] });
+    expect(ok.type).toBe('commit.done');
+    expect(committed(cwd)).toEqual(['docs/my notes.md', 'docs/日本語.md']);
+
+    write(cwd, 'naïve file.txt');
+    const bad = await commit(h, cwd, { scope: ['docs/*.md'] });
+    expect(failure(bad).outOfScope).toEqual(['naïve file.txt']);
+  });
+
+  it('a scope entry is a name, never a git pathspec: a bracket in it does not pull in other files', async () => {
+    const h = await setup();
+    const cwd = await worktree(h, 'bulig/s-13');
+    write(cwd, 'lit[1].txt');
+    write(cwd, 'lit1.txt');
+    const bad = await commit(h, cwd, { scope: ['lit[1].txt'] });
+    expect(failure(bad).outOfScope).toEqual(['lit1.txt']);
+    rmSync(join(cwd, 'lit1.txt'));
+    const ok = await commit(h, cwd, { scope: ['lit[1].txt'] });
+    expect(ok.type).toBe('commit.done');
+    expect(committed(cwd)).toEqual(['lit[1].txt']);
+  });
+
+  it('refuses a request with no approved scope', async () => {
+    const h = await setup();
+    const cwd = await worktree(h, 'bulig/s-14');
+    write(cwd, 'README.md');
+    for (const extra of [{}, { scope: [] }, { scope: 'README.md' }, { scope: [3] }]) {
+      const r = await commit(h, cwd, extra);
+      expect(r.type).toBe('commit.failed');
+      expect(failure(r).error).toMatch(/approved scope/);
+    }
+    expect(git(cwd, 'rev-list', '--count', 'main..HEAD')).toBe('0');
+  });
+
+  it('refuses a scope that climbs out, is absolute, is .git, or is too broad', async () => {
+    const h = await setup();
+    const cwd = await worktree(h, 'bulig/s-15');
+    write(cwd, 'README.md');
+    for (const bad of ['../README.md', '/etc/passwd', '.git/config', '**', '*']) {
+      const r = await commit(h, cwd, { scope: ['README.md', bad] });
+      expect(r.type, bad).toBe('commit.failed');
+      expect(failure(r).error, bad).toMatch(/invalid scope/i);
+    }
+    expect(git(cwd, 'rev-list', '--count', 'main..HEAD')).toBe('0');
+  });
+
+  it('allowBroadScope lets ** through', async () => {
+    const h = await setup();
+    const cwd = await worktree(h, 'bulig/s-16');
+    write(cwd, 'README.md');
+    write(cwd, 'deep/er/file.md');
+    const r = await commit(h, cwd, { scope: ['**'], allowBroadScope: true });
+    expect(r.type).toBe('commit.done');
+    expect(committed(cwd)).toEqual(['README.md', 'deep/er/file.md']);
+  });
+
+  it('refuses a scope entry that is a symlink in the worktree, and one that sits behind a symlinked folder', async () => {
+    const h = await setup();
+    const cwd = await worktree(h, 'bulig/s-17');
+    const outside = join(h.root, 'outside');
+    mkdirSync(outside);
+    symlinkSync(outside, join(cwd, 'link-dir'));
+    symlinkSync(join(outside, 'x'), join(cwd, 'link.txt'));
+    write(cwd, 'README.md');
+    for (const entry of ['link.txt', 'link-dir/file.txt']) {
+      const r = await commit(h, cwd, { scope: ['README.md', entry] });
+      expect(r.type, entry).toBe('commit.failed');
+      expect(failure(r).error, entry).toMatch(/symlink/);
+    }
+  });
+
+  it('a symlink the stage created is not committed even when a glob would match it', async () => {
+    const h = await setup();
+    const cwd = await worktree(h, 'bulig/s-18');
+    symlinkSync('/etc/hosts', join(cwd, 'hosts.txt'));
+    const r = await commit(h, cwd, { scope: ['*.txt'] });
+    expect(r.type).toBe('commit.failed');
+    expect(failure(r).outOfScope).toEqual(['hosts.txt']);
+    expect(failure(r).error).toMatch(/symlink/);
+  });
+
+  it('scopeAllow paths are always allowed, but ordinary out-of-scope files still are not', async () => {
+    const h = await setup();
+    const cwd = await worktree(h, 'bulig/s-19');
+    write(cwd, 'README.md');
+    write(cwd, 'test-results/.last-run.json');
+    write(cwd, 'other.tmp');
+    const r = await commit(h, cwd, { scope: ['README.md'], scopeAllow: ['test-results/.last-run.json'] });
+    expect(failure(r).outOfScope).toEqual(['other.tmp']);
+    rmSync(join(cwd, 'other.tmp'));
+    const ok = await commit(h, cwd, { scope: ['README.md'], scopeAllow: ['test-results/.last-run.json'] });
+    expect(ok.type).toBe('commit.done');
+    expect(committed(cwd)).toEqual(['README.md', 'test-results/.last-run.json']);
+  });
+
+  it('warn mode commits everything and reports the out-of-scope files', async () => {
+    const h = await setup();
+    const cwd = await worktree(h, 'bulig/s-20');
+    write(cwd, 'README.md');
+    write(cwd, 'test-results/.last-run.json');
+    const r = await commit(h, cwd, { scope: ['README.md'], scopeMode: 'warn' });
+    expect(r.type).toBe('commit.done');
+    expect((r.payload as { outOfScope?: string[] }).outOfScope).toEqual(['test-results/.last-run.json']);
+    expect(committed(cwd)).toEqual(['README.md', 'test-results/.last-run.json']);
+  });
+
+  it('warn mode still refuses an invalid scope and still never follows a symlink', async () => {
+    const h = await setup();
+    const cwd = await worktree(h, 'bulig/s-21');
+    write(cwd, 'README.md');
+    expect((await commit(h, cwd, { scope: ['../x'], scopeMode: 'warn' })).type).toBe('commit.failed');
+    symlinkSync('/etc/hosts', join(cwd, 'hosts.lnk'));
+    const r = await commit(h, cwd, { scope: ['README.md'], scopeMode: 'warn' });
+    expect(r.type).toBe('commit.failed');
+  });
+
+  it('an unknown scopeMode is refused instead of guessed', async () => {
+    const h = await setup();
+    const cwd = await worktree(h, 'bulig/s-22');
+    write(cwd, 'README.md');
+    const r = await commit(h, cwd, { scope: ['README.md'], scopeMode: 'off' });
+    expect(r.type).toBe('commit.failed');
   });
 });

@@ -35,6 +35,16 @@ describe('format', () => {
     expect(format(ev('pipeline.failed', { reason: 'review still failing' }))).toEqual(['[abcdef12] job failed: review still failing']);
   });
 
+  it('a plan approval lists the files the job may change, and a failure names the files outside the scope', () => {
+    const card = format(ev('approval.requested', { jobId: 'abcdef1234567890', kind: 'plan', summary: 'PLAN\nstep one', scope: ['README.md', 'src/*.ts'] }))!;
+    const text = card.join('\n');
+    expect(text).toContain('files this job may change');
+    expect(text).toContain('- README.md');
+    expect(text).toContain('- src/*.ts');
+    const failed = format(ev('pipeline.failed', { reason: 'build left files outside the approved scope', outOfScope: ['test-results/.last-run.json'] }))!;
+    expect(failed.join('\n')).toContain('outside the approved scope: test-results/.last-run.json');
+  });
+
   it('an approval request shows the summary and the exact commands', () => {
     const lines = format(ev('approval.requested', { jobId: 'abcdef1234567890', kind: 'plan', summary: 'PLAN\nstep one' }))!;
     expect(lines[0]).toBe('[abcdef12] approval needed: plan');

@@ -5,6 +5,9 @@ Task: {{title}}
 The plan that was built:
 {{plan}}
 
+The approved scope. These are the only files that may be changed:
+{{scope}}
+
 If the change alters how someone uses this project, update the README or the docs that describe it, in the style already used there. If nothing a reader sees has changed, change nothing and say so.
 
 Rules:
@@ -12,5 +15,6 @@ Rules:
 - Plain sentences. No marketing words.
 - Do not commit, push, or touch git history.
 - Do not change code or tests.
+- Touch no file outside the scope.
 
 Finish with one or two lines saying what you updated, or that nothing needed updating.

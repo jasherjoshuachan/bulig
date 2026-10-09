@@ -47,6 +47,7 @@ const SUBSCRIPTIONS = [
   'job.status',
   'stage.completed',
   'stage.checked',
+  'stage.screened',
   'stage.failed',
   'worktree.failed',
   'pr.opened',
@@ -142,6 +143,11 @@ export function progressLine(e: BuligEvent): string | undefined {
       // A gate (gate-evidence) found a claim with no tool-use record behind it. Say nothing when everything was backed.
       const unverified = bullets(p.unverified, 5);
       return unverified.length ? `${tag} ${one(p.stage)} has claims with no evidence:\n${unverified.join('\n')}\n${one(p.evidenceSummary, 200)}` : undefined;
+    }
+    case 'stage.screened': {
+      // gate-promise found a promise of later work with no live job id behind it. Say nothing when there is none.
+      const promises = bullets(p.promises, 5);
+      return promises.length ? `${tag} ${one(p.stage)} promises later work with no job id:\n${promises.join('\n')}` : undefined;
     }
     case 'stage.failed':
       return `${tag} ${one(p.stage)} FAILED: ${one(p.error, 300)}`;

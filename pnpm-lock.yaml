@@ -35,6 +35,9 @@ importers:
       '@bulig/gate-evidence':
         specifier: workspace:*
         version: link:../../plugins/gate-evidence
+      '@bulig/gate-promise':
+        specifier: workspace:*
+        version: link:../../plugins/gate-promise
       '@bulig/github':
         specifier: workspace:*
         version: link:../../plugins/github
@@ -90,6 +93,16 @@ importers:
         version: link:../../packages/core
 
   plugins/gate-evidence:
+    dependencies:
+      '@bulig/plugin-sdk':
+        specifier: workspace:*
+        version: link:../../packages/plugin-sdk
+    devDependencies:
+      '@bulig/core':
+        specifier: workspace:*
+        version: link:../../packages/core
+
+  plugins/gate-promise:
     dependencies:
       '@bulig/plugin-sdk':
         specifier: workspace:*

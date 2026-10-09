@@ -68,4 +68,15 @@ describe('start-up wiring checks', () => {
     expect(() => assertWiring(CORE_PLUGINS, ['pipeline-dev'], { 'pipeline-dev': { stageResultEvent: 'stage.checked' } })).toThrow(/gate-evidence is not enabled/);
     expect(() => assertWiring(CORE_PLUGINS, ['pipeline-dev', 'gate-evidence'], { 'pipeline-dev': { stageResultEvent: 'stage.checked' } })).not.toThrow();
   });
+
+  it('a command that leaves Telegram out may be given a config that enables it, but still not a missing core plugin', () => {
+    const live = ['channel-telegram', 'worker-claude-code', 'gate-evidence', 'gate-promise', 'github', 'pipeline-dev'];
+    const terminal = [...CORE_PLUGINS];
+    expect(() => assertWiring(terminal, live, {}, ['channel-telegram'])).not.toThrow();
+    expect(() => assertWiring(terminal, ['channel-cli', 'channel-telegram', ...live], {}, ['channel-telegram'])).not.toThrow();
+    const noPromise = terminal.filter((p) => (p.manifest as { name: string }).name !== 'gate-promise');
+    expect(() => assertWiring(noPromise, live, {}, ['channel-telegram'])).toThrow(/gate-promise/);
+    // Without the allowance (serve), a missing Telegram is refused.
+    expect(() => assertWiring(terminal, live, {})).toThrow(/channel-telegram/);
+  });
 });

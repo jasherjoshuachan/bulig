@@ -123,12 +123,13 @@ export const CORE_PLUGINS: Plugin[] = [worker, gate, gatePromise, github, pipeli
 const GATE_FOR_EVENT: Record<string, string> = { 'stage.checked': 'gate-evidence', 'stage.screened': 'gate-promise' };
 
 /**
+ * `mayOmit` names plugins this command legitimately leaves out (run, approve, deny and resume have no Telegram).
  * Fail at start, by name, instead of hanging later: the kernel quietly skips an enabled plugin nobody registered,
  * and a pipeline listening to a gate's event that no running gate emits would wait on its first stage forever.
  */
-export function assertWiring(plugins: readonly Plugin[], enabled: readonly string[], pluginConfig: Record<string, Record<string, unknown>>): void {
+export function assertWiring(plugins: readonly Plugin[], enabled: readonly string[], pluginConfig: Record<string, Record<string, unknown>>, mayOmit: readonly string[] = []): void {
   const registered = new Set(plugins.map((p) => (p.manifest as { name?: string }).name));
-  const missing = enabled.filter((n) => !registered.has(n));
+  const missing = enabled.filter((n) => !registered.has(n) && !mayOmit.includes(n));
   if (missing.length) throw new UserError(`enabled but not registered by this command: ${missing.join(', ')}. Remove it from "enabled" or use a command that loads it.`);
   const event = pluginConfig['pipeline-dev']?.stageResultEvent;
   const gateName = typeof event === 'string' ? GATE_FOR_EVENT[event] : undefined;
@@ -137,17 +138,20 @@ export function assertWiring(plugins: readonly Plugin[], enabled: readonly strin
   }
 }
 
+/** The plugins `run`, `approve`, `deny` and `resume` load: the terminal channel and the core. Telegram belongs to `serve`. */
+const terminalPlugins = (channel: CliChannel): Plugin[] => [channel.plugin, ...CORE_PLUGINS];
+
 async function openSession(
   config: BuligConfig,
   io: Io,
   resume: 'all' | false | string[],
   onlyJob?: string,
-  pluginsFor: (channel: CliChannel) => Plugin[] = (channel) => [channel.plugin, ...CORE_PLUGINS],
+  pluginsFor: (channel: CliChannel) => Plugin[] = terminalPlugins,
 ): Promise<Session> {
   const channel = createCliChannel({ write: (l) => io.out(l), ...(onlyJob && { onlyJob }) });
   const plugins = pluginsFor(channel);
   const pluginConfig = kernelPluginConfig(config, resume);
-  assertWiring(plugins, config.enabled, pluginConfig);
+  assertWiring(plugins, config.enabled, pluginConfig, pluginsFor === terminalPlugins ? ['channel-telegram'] : []);
   mkdirSync(dirname(config.dbPath), { recursive: true });
   const release = acquireLock(config.dbPath);
   const kernel = createKernel({

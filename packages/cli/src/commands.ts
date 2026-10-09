@@ -5,6 +5,7 @@ import { createCliChannel, type CliChannel } from '@bulig/channel-cli';
 import telegram from '@bulig/channel-telegram';
 import { createKernel, Store, type Kernel } from '@bulig/core';
 import gate from '@bulig/gate-evidence';
+import gatePromise from '@bulig/gate-promise';
 import github from '@bulig/github';
 import pipeline from '@bulig/pipeline-dev';
 import type { Job, JobStatus, Plugin, Stage } from '@bulig/plugin-sdk';
@@ -92,12 +93,18 @@ interface Session {
   close(): Promise<void>;
 }
 
+/** The event the pipeline listens to behind the gates that are on. Undefined means no gate: the worker's own stage.completed. */
+export const gateResultEvent = (enabled: readonly string[]) => (enabled.includes('gate-promise') ? 'stage.screened' : enabled.includes('gate-evidence') ? 'stage.checked' : undefined);
+
+/** With gate-evidence on, gate-promise reads its stage.checked so the evidence marks travel on and only one event reaches the pipeline. */
+export const promiseInput = (enabled: readonly string[]) => (enabled.includes('gate-promise') && enabled.includes('gate-evidence') ? 'stage.checked' : undefined);
+
 async function openSession(
   config: BuligConfig,
   io: Io,
   resume: 'all' | false | string[],
   onlyJob?: string,
-  pluginsFor: (channel: CliChannel) => Plugin[] = (channel) => [channel.plugin, worker, gate, github, pipeline],
+  pluginsFor: (channel: CliChannel) => Plugin[] = (channel) => [channel.plugin, worker, gate, gatePromise, github, pipeline],
 ): Promise<Session> {
   mkdirSync(dirname(config.dbPath), { recursive: true });
   const release = acquireLock(config.dbPath);
@@ -111,8 +118,11 @@ async function openSession(
     eventCapabilities: config.eventCapabilities,
     pluginConfig: {
       ...config.pluginConfig,
-      // With the evidence gate on, the pipeline takes its results from the gate (stage.checked), not straight from the worker.
-      'pipeline-dev': { ...(config.enabled.includes('gate-evidence') && { stageResultEvent: 'stage.checked' }), ...config.pluginConfig['pipeline-dev'], resume },
+      // The pipeline takes its results from the last gate of the chain, not straight from the worker:
+      // worker -> stage.completed -> gate-evidence -> stage.checked -> gate-promise -> stage.screened -> pipeline.
+      // Each gate reads the event the one before it says, so a gate can be on alone or with the other, in any order in `enabled`.
+      ...(promiseInput(config.enabled) && { 'gate-promise': { input: promiseInput(config.enabled), ...config.pluginConfig['gate-promise'] } }),
+      'pipeline-dev': { ...(gateResultEvent(config.enabled) && { stageResultEvent: gateResultEvent(config.enabled) }), ...config.pluginConfig['pipeline-dev'], resume },
     },
     logger: {
       debug() {},

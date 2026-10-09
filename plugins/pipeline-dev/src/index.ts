@@ -24,9 +24,10 @@ export interface PipelineConfig {
   /**
    * The event that carries a finished Claude run. "stage.completed" is the worker's own. A gate plugin such as
    * gate-evidence sits between the two: it listens for stage.completed and says "stage.checked", and then this must
-   * be "stage.checked". The CLI sets it for you when gate-evidence is enabled. Default "stage.completed".
+   * be "stage.checked". gate-promise ends the chain with "stage.screened" (it reads gate-evidence's stage.checked when both
+   * are on, so only one event reaches this plugin). The CLI sets it for you. Default "stage.completed".
    */
-  stageResultEvent?: 'stage.completed' | 'stage.checked';
+  stageResultEvent?: 'stage.completed' | 'stage.checked' | 'stage.screened';
 }
 
 const READONLY = new Set<ClaudeStage>(['plan', 'critique', 'review']);
@@ -63,6 +64,7 @@ export default definePlugin({
       'cancel.requested',
       'stage.completed',
       'stage.checked',
+      'stage.screened',
       'stage.failed',
       'approval.granted',
       'approval.denied',
@@ -88,8 +90,8 @@ export default definePlugin({
     const scopeAllow = cfg.scopeAlwaysAllow ?? [];
     const allowBroad = cfg.allowBroadScope === true;
     const resultEvent = cfg.stageResultEvent ?? 'stage.completed';
-    if (resultEvent !== 'stage.completed' && resultEvent !== 'stage.checked') {
-      throw new Error(`pipeline-dev: stageResultEvent must be "stage.completed" or "stage.checked", not ${JSON.stringify(resultEvent)}`);
+    if (resultEvent !== 'stage.completed' && resultEvent !== 'stage.checked' && resultEvent !== 'stage.screened') {
+      throw new Error(`pipeline-dev: stageResultEvent must be "stage.completed", "stage.checked" or "stage.screened", not ${JSON.stringify(resultEvent)}`);
     }
 
     /** Edit stages whose Claude run is done and whose commit is still being made. Lost on a restart, which just reruns the stage. */
@@ -109,7 +111,11 @@ export default definePlugin({
         if (typeof out.evidenceSummary !== 'string') return [];
         return [`${name}: ${out.evidenceSummary}`, ...(out.unverified ?? []).map((u) => `  ${u}`)];
       });
-      return rows.length ? clip(`EVIDENCE (from the tool-use records of each stage, not from the model's text)\n${rows.join('\n')}`, 1500) : '';
+      const evidence = rows.length ? clip(`EVIDENCE (from the tool-use records of each stage, not from the model's text)\n${rows.join('\n')}`, 1500) : '';
+      // gate-promise: promises with no live job id behind them. Its own block, so it shows with or without gate-evidence.
+      const promised = names.flatMap((name) => (outputOf(lastOf(stages, name) ?? ({ output: null } as Stage)).promises ?? []).map((u) => `${name}: ${u}`));
+      const promises = promised.length ? clip(`PROMISES (stage text that promises later work with no live job id)\n${promised.join('\n')}`, 1000) : '';
+      return [evidence, promises].filter(Boolean).join('\n\n');
     };
     const withEvidence = (block: string, text: string) => (block ? `${block}\n\n${text}` : text);
 
@@ -174,7 +180,11 @@ export default definePlugin({
         if (typeof out.evidenceSummary !== 'string') return [];
         return [`**${name}**: ${out.evidenceSummary}`, ...(out.evidenceLines ?? []).map((l) => `- ${l}`), ...(out.unverified ?? []).map((u) => `- **${u}**`)];
       });
-      return rows.length ? [`## Evidence\n\nTaken from the tool-use records of each stage, not from what the model wrote.\n\n${clip(rows.join('\n'), 6000)}`] : [];
+      const promised = ['plan', 'critique', 'build', 'test', 'docs', 'review'].flatMap((name) => (outputOf(lastOf(stages, name) ?? ({ output: null } as Stage)).promises ?? []).map((u) => `- **${name}**: ${u}`));
+      return [
+        ...(rows.length ? [`## Evidence\n\nTaken from the tool-use records of each stage, not from what the model wrote.\n\n${clip(rows.join('\n'), 6000)}`] : []),
+        ...(promised.length ? [`## Unfulfilled promises\n\nStage text that promises later work with no live job id behind it.\n\n${clip(promised.join('\n'), 3000)}`] : []),
+      ];
     }
 
     function advance(jobId: string): void {
@@ -430,19 +440,21 @@ export default definePlugin({
       });
     });
 
-    // A gate that says stage.checked while this listens to stage.completed has no effect. Say so once, loudly.
-    if (resultEvent === 'stage.completed') {
-      let told = false;
-      ctx.on('stage.checked', () => {
+    // A gate whose event this does not listen to has no effect. Say so once, loudly.
+    // gate-evidence says stage.checked and gate-promise says stage.screened, which is the last event of the chain.
+    const ignored = resultEvent === 'stage.completed' ? ['stage.checked', 'stage.screened'] : resultEvent === 'stage.checked' ? ['stage.screened'] : [];
+    let told = false;
+    for (const type of ignored) {
+      ctx.on(type, () => {
         if (told) return;
         told = true;
-        ctx.log.warn('pipeline-dev: a gate is emitting stage.checked, but stageResultEvent is "stage.completed", so the gate has no effect. Set stageResultEvent to "stage.checked".');
+        ctx.log.warn(`pipeline-dev: a gate is emitting ${type}, but stageResultEvent is "${resultEvent}", so the gate has no effect. Set stageResultEvent to "${type}".`);
       });
     }
 
     ctx.on(resultEvent, (e) => {
       guard(e.jobId, () => {
-        const p = e.payload as { stage: string; result?: string; sessionId?: string; costUsd?: number; evidenceSummary?: unknown; evidenceLines?: unknown; unverified?: unknown };
+        const p = e.payload as { stage: string; result?: string; sessionId?: string; costUsd?: number; evidenceSummary?: unknown; evidenceLines?: unknown; unverified?: unknown; promises?: unknown };
         const s = e.jobId && runningStage(e.jobId, p.stage);
         if (!e.jobId || !s) return;
         const result = p.result ?? '';
@@ -453,6 +465,9 @@ export default definePlugin({
           out.evidenceLines = lines(p.evidenceLines, 14, 200);
           out.unverified = lines(p.unverified, 8, 300);
         }
+        // What gate-promise found. Kept apart from the evidence lines so the two gates cannot overwrite each other.
+        const promises = lines(p.promises, 8, 300);
+        if (promises.length) out.promises = promises;
         let status: 'passed' | 'failed' = 'passed';
         if (p.stage === 'plan') {
           // The plan must declare every file the job will touch. A plan without a usable SCOPE block is not a plan.

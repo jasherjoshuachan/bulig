@@ -4,7 +4,7 @@ import { z } from 'zod';
 
 export const BUILTIN_PLUGINS = ['channel-cli', 'worker-claude-code', 'github', 'pipeline-dev'] as const;
 /** Plugins the CLI ships but leaves off until the config turns them on, because they need setup. */
-export const OPT_IN_PLUGINS = ['channel-telegram', 'gate-evidence'] as const;
+export const OPT_IN_PLUGINS = ['channel-telegram', 'gate-evidence', 'gate-promise'] as const;
 
 const ConfigSchema = z.object({
   dbPath: z.string().optional(),

@@ -41,6 +41,11 @@ export function format(e: BuligEvent): string[] | undefined {
       const unverified = Array.isArray(p.unverified) ? p.unverified.slice(0, 5).map((u) => `${tag}   ${one(u, 300)}`) : [];
       return unverified.length ? [...line(`${one(p.stage)}: claims with no evidence (${one(p.evidenceSummary, 200)})`), ...unverified] : undefined;
     }
+    case 'stage.screened': {
+      // gate-promise found a promise of later work with no live job id behind it. Say nothing when there is none.
+      const promises = Array.isArray(p.promises) ? p.promises.slice(0, 5).map((u) => `${tag}   ${one(u, 300)}`) : [];
+      return promises.length ? [...line(`${one(p.stage)}: promises with no job id`), ...promises] : undefined;
+    }
     case 'stage.failed':
       return line(`${one(p.stage)}: FAILED ${one(p.error, 300)}`);
     case 'pr.requested':

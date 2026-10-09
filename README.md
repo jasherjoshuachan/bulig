@@ -22,7 +22,7 @@ bulig/ (pnpm workspaces, TypeScript, vitest)
     worker-claude-code runs `claude -p` in a git worktree, one fresh session per stage
     github             branches, PRs, checks, merge
     pipeline-dev       plan, critique, build, test, docs, review, approve, merge
-    gate-promise       blocks "I'll follow up" without a job ID
+    gate-promise       blocks "I'll follow up" without a job ID (stage.checked -> stage.screened)
     gate-evidence      replies must cite what was read that turn (stage.completed -> stage.checked, from tool-use records)
     memory             lessons that fade, per repo
     live-check         browser check after deploy
@@ -30,7 +30,7 @@ bulig/ (pnpm workspaces, TypeScript, vitest)
     scorecard          public page of how the system is doing
 ```
 
-In v0.1 these exist: `packages/core`, `packages/plugin-sdk`, `packages/cli`, and the plugins `channel-cli` (a terminal channel), `channel-telegram`, `worker-claude-code`, `github` and `pipeline-dev`. v0.2 adds `gate-evidence` (opt-in, see [its README](plugins/gate-evidence/README.md)). The others are planned.
+In v0.1 these exist: `packages/core`, `packages/plugin-sdk`, `packages/cli`, and the plugins `channel-cli` (a terminal channel), `channel-telegram`, `worker-claude-code`, `github` and `pipeline-dev`. v0.2 adds `gate-evidence` and `gate-promise` (both opt-in, see [gate-evidence](plugins/gate-evidence/README.md) and [gate-promise](plugins/gate-promise/README.md)). The others are planned.
 
 ## Roadmap
 
@@ -127,6 +127,18 @@ The pipeline setting that lets a gate sit in front of it is `stageResultEvent` (
 #### Manifest conventions for a gate
 
 A gate is an ordinary plugin that needs no capability. It subscribes to the event it checks (`stage.completed`) and emits the event the next plugin listens to (`stage.checked`) or a failure (`stage.failed`). It never calls the plugin after it and never edits a payload. Whoever sits after it names the event it listens to in config (`stageResultEvent`), so a gate can be added or removed without editing the others.
+
+### Promise gate
+
+`gate-promise` marks a stage that promises work nothing will do. It reads the stage text for commitments to later work ("I'll follow up", "I'll circle back", "I'll look into this later", "I'll let you know", "next I will ...", "I'll do it tomorrow") and passes one only if the same message cites the id of a job that exists, is still live (`queued`, `running` or `awaiting_approval`) and is not the job that wrote the text. Conditions, offers, quotes, code and descriptions of the built-in flow ("the next stage will ...") are not promises. A promise with no such id is marked `Unfulfilled promise: no job id (...)` on the same surfaces as the evidence gate: a `PROMISES` block on the plan and merge cards, an `## Unfulfilled promises` section in the PR body, and the Telegram and terminal lines. `mode: "enforce"` fails the stage and the job instead. It is a phrase matcher with a short documented list, so read [what it cannot catch](plugins/gate-promise/README.md#what-it-cannot-catch) before trusting it. Turn it on by adding `gate-promise` to `enabled`.
+
+| Setting (`gate-promise`) | Default | What it does |
+|---|---|---|
+| `mode` | `warn` | `warn` marks unfulfilled promises and carries on. `enforce` fails the stage. |
+| `enabled` | `true` | `false` lets everything through unchecked while the plugin stays in the chain. |
+| `input` | `stage.completed` | The event it reads. The CLI sets `stage.checked` when `gate-evidence` is also on. |
+
+Gates chain: `stage.completed -> gate-evidence -> stage.checked -> gate-promise -> stage.screened -> pipeline-dev`. Each gate forwards what it read, so with both on neither drops the other's marks and the pipeline hears one event per stage. The CLI sets `stageResultEvent` to the last gate that is on (`stage.checked` behind `gate-evidence` alone, `stage.screened` behind `gate-promise`), whatever the order in `enabled`.
 
 ### Scope guard
 

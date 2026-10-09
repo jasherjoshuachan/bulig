@@ -35,6 +35,8 @@ export interface StageOutput {
   evidenceSummary?: string;
   evidenceLines?: string[];
   unverified?: string[];
+  /** Set when gate-promise found promises of later work with no live job id behind them. */
+  promises?: string[];
   [key: string]: unknown;
 }
 

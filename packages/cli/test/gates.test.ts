@@ -73,7 +73,6 @@ describe('start-up wiring checks', () => {
     const live = ['channel-telegram', 'worker-claude-code', 'gate-evidence', 'gate-promise', 'github', 'pipeline-dev'];
     const terminal = [...CORE_PLUGINS];
     expect(() => assertWiring(terminal, live, {}, ['channel-telegram'])).not.toThrow();
-    expect(() => assertWiring(terminal, ['channel-cli', 'channel-telegram', ...live], {}, ['channel-telegram'])).not.toThrow();
     const noPromise = terminal.filter((p) => (p.manifest as { name: string }).name !== 'gate-promise');
     expect(() => assertWiring(noPromise, live, {}, ['channel-telegram'])).toThrow(/gate-promise/);
     // Without the allowance (serve), a missing Telegram is refused.

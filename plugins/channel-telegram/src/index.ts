@@ -26,6 +26,8 @@ export interface TelegramConfig {
 export interface TelegramChannelOptions {
   fetch?: FetchLike;
   sleep?: Sleep;
+  /** The clock, in milliseconds. Tests set it so job ages are fixed. */
+  now?: () => number;
 }
 
 interface Update {
@@ -87,12 +89,24 @@ const usd = (n: unknown) => (typeof n === 'number' ? ` ($${n.toFixed(2)})` : '')
 const human = (status: string) => status.replace('_', ' ');
 const expandHome = (p: string) => (p === '~' ? homedir() : p.startsWith('~/') ? `${homedir()}/${p.slice(2)}` : p);
 
+const STATUS_LIMIT = 10;
+const ENDED = ['done', 'failed', 'cancelled'];
+/** "45s", "12m", "3h", "2d": how long ago, in the biggest whole unit. */
+const ago = (ms: number): string => {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h`;
+  return `${Math.floor(s / 86400)}d`;
+};
+
 const HELP = [
   'Commands',
   '/dev <repo> <title>   start a job. Put the issue text on the next lines.',
-  '/status [jobId]       list jobs, or show one',
+  '/status [jobId]       your jobs, newest first, or one job',
   '/history <jobId>      the stages of a job',
-  '/cancel <jobId>       stop a job',
+  '/cancel [jobId]       stop a job. Without an id, stops the only active one.',
+  '/retry <jobId>        run a failed or cancelled job again, with a new plan approval',
   '/help                 this text',
   '',
   'Plan and merge approvals arrive here with Approve and Deny buttons.',
@@ -175,7 +189,7 @@ export function createTelegramChannel(options: TelegramChannelOptions = {}): Plu
       version: '0.1.0',
       sdk: '0',
       description: 'Run Bulig from Telegram: start jobs, watch progress, tap to approve.',
-      provides: { commands: ['dev', 'status', 'history', 'cancel', 'help'] },
+      provides: { commands: ['dev', 'status', 'history', 'cancel', 'retry', 'help'] },
       subscribes: SUBSCRIPTIONS,
       emits: ['approval.granted', 'approval.denied', 'cancel.requested'],
       needs: ['channel.send:telegram', 'approval.grant'],
@@ -299,10 +313,28 @@ export function createTelegramChannel(options: TelegramChannelOptions = {}): Plu
 
       // ----- what you tell Bulig -----
 
-      const findJob = (arg: string): Job | string => {
-        const hits = ctx.jobs.list().filter((j) => j.id === arg || j.id.startsWith(arg));
+      const now = options.now ?? Date.now;
+      /** The jobs this chat may see and act on: the ones it started, and the ones with no recorded chat. Oldest first. */
+      const jobsOf = (chat: number): Job[] => ctx.jobs.list().filter((j) => targets(j.id).includes(chat));
+      const findJob = (chat: number, arg: string): Job | string => {
+        const exact = jobsOf(chat).filter((j) => j.id === arg);
+        const hits = exact.length ? exact : jobsOf(chat).filter((j) => j.id.startsWith(arg));
         if (hits.length === 1) return hits[0]!;
-        return hits.length ? `"${arg}" matches ${hits.length} jobs. Send more of the id.` : `No job starts with "${arg}".`;
+        return hits.length ? `"${one(arg, 40)}" matches ${hits.length} jobs. Send more of the id.` : `No job starts with "${one(arg, 40)}".`;
+      };
+      /** The repo's short name from the config; the folder name if it is not listed. */
+      const aliasOf = (repo: string): string => {
+        const hit = Object.entries(repos).find(([, p]) => expandHome(p) === repo);
+        return hit ? hit[0] : one(repo.split('/').filter(Boolean).pop() ?? repo, 40);
+      };
+      const waitingFor = (job: Job): string | undefined => {
+        if (job.status !== 'awaiting_approval') return undefined;
+        const w = ctx.jobs.stages(job.id).find((s) => s.name.startsWith('approve-') && s.status === 'running');
+        return w ? `${w.name.slice(8)} approval` : undefined;
+      };
+      const jobLine = (j: Job): string => {
+        const wait = waitingFor(j);
+        return `${short(j.id)}  ${aliasOf(j.repo)}  ${human(j.status)}  ${ago(now() - Date.parse(j.createdAt))}  ${one(j.title, 80)}${wait ? `\n    waiting for your ${wait}` : ''}`;
       };
 
       function stageLine(s: Stage): string {
@@ -330,6 +362,8 @@ export function createTelegramChannel(options: TelegramChannelOptions = {}): Plu
             return history(chat, args);
           case 'cancel':
             return cancel(chat, args);
+          case 'retry':
+            return retry(chat, args);
           default:
             return say([chat], `I don't know /${cmd}. Send /help.`);
         }
@@ -357,31 +391,43 @@ export function createTelegramChannel(options: TelegramChannelOptions = {}): Plu
 
       function status(chat: number, arg: string): void {
         if (!arg) {
-          const jobs = ctx.jobs.list().reverse().slice(0, 8);
+          const jobs = jobsOf(chat).reverse();
           if (jobs.length === 0) return say([chat], 'No jobs yet. Try /dev.');
-          return say([chat], jobs.map((j) => `${short(j.id)}  ${human(j.status)}  ${j.title}`).join('\n'));
+          const lines = jobs.slice(0, STATUS_LIMIT).map(jobLine);
+          if (jobs.length > STATUS_LIMIT) lines.push(`... and ${jobs.length - STATUS_LIMIT} more`);
+          return say([chat], lines.join('\n'));
         }
-        const job = findJob(arg);
+        const job = findJob(chat, arg);
         if (typeof job === 'string') return say([chat], job);
-        const waiting = ctx.jobs.stages(job.id).find((s) => s.name.startsWith('approve-') && s.status === 'running');
-        const lines = [`${short(job.id)}  ${human(job.status)}`, job.title, job.repo];
-        if (waiting) lines.push(`Waiting for your ${waiting.name.slice(8)} approval.`);
+        const waiting = waitingFor(job);
+        const lines = [`${short(job.id)}  ${human(job.status)}  ${ago(now() - Date.parse(job.createdAt))}`, one(job.title, 200), job.repo];
+        if (waiting) lines.push(`Waiting for your ${waiting}.`);
         say([chat], lines.join('\n'));
       }
 
       function history(chat: number, arg: string): void {
         if (!arg) return say([chat], 'Usage: /history <jobId>');
-        const job = findJob(arg);
+        const job = findJob(chat, arg);
         if (typeof job === 'string') return say([chat], job);
         const stages = ctx.jobs.stages(job.id);
         say([chat], [`${short(job.id)}  ${human(job.status)}  ${job.title}`, ...stages.map(stageLine)].join('\n'));
       }
 
       function cancel(chat: number, arg: string): void {
-        if (!arg) return say([chat], 'Usage: /cancel <jobId>');
-        const job = findJob(arg);
-        if (typeof job === 'string') return say([chat], job);
-        if (['done', 'failed', 'cancelled'].includes(job.status)) return say([chat], `Job ${short(job.id)} is already ${job.status}.`);
+        let job: Job;
+        if (arg) {
+          const found = findJob(chat, arg);
+          if (typeof found === 'string') return say([chat], found);
+          job = found;
+        } else {
+          const active = jobsOf(chat).filter((j) => !ENDED.includes(j.status));
+          if (active.length === 0) return say([chat], 'No active jobs to cancel.');
+          if (active.length > 1) {
+            return say([chat], [`${active.length} jobs are active. Send /cancel <jobId> with one of these:`, ...active.reverse().map(jobLine)].join('\n'));
+          }
+          job = active[0]!;
+        }
+        if (ENDED.includes(job.status)) return say([chat], `Job ${short(job.id)} is already ${job.status}.`);
         const waiting = ctx.jobs.stages(job.id).find((s) => s.name.startsWith('approve-') && s.status === 'running');
         if (waiting) {
           // Same path as pressing Deny, so the pipeline closes the approval stage itself.
@@ -391,6 +437,25 @@ export function createTelegramChannel(options: TelegramChannelOptions = {}): Plu
           ctx.emit('cancel.requested', { jobId: job.id }, job.id);
         }
         say([chat], `Job ${short(job.id)} cancelled. A stage that is running is being stopped, and nothing else starts.`);
+      }
+
+      function retry(chat: number, arg: string): void {
+        if (!arg) return say([chat], 'Usage: /retry <jobId>');
+        const old = findJob(chat, arg);
+        if (typeof old === 'string') return say([chat], old);
+        if (old.status === 'done') return say([chat], `Job ${short(old.id)} is done, so there is nothing to retry.`);
+        if (!ENDED.includes(old.status)) {
+          return say([chat], `Job ${short(old.id)} is still ${human(old.status)}. Only a failed or cancelled job can be retried. Use /cancel ${short(old.id)} first if you want to stop it.`);
+        }
+        if (!existsSync(old.repo)) return say([chat], `The repo for job ${short(old.id)} is not on this machine any more: ${one(old.repo, 200)}`);
+        try {
+          // A new job: it plans again and asks for its own plan approval. Nothing of the old job's approvals or scope is carried over.
+          const job = ctx.jobs.create({ repo: old.repo, title: old.title, ...(old.body && { body: old.body }) });
+          ctx.state.set(`chat:${job.id}`, chat);
+          say([chat], `Job ${short(job.id)} started from ${short(old.id)}: ${one(old.title, 200)}\nRepo ${aliasOf(old.repo)}. It will plan first and ask for your plan approval.`);
+        } catch (err) {
+          say([chat], `Could not start the job: ${err instanceof Error ? err.message : String(err)}`);
+        }
       }
 
       const CALLBACK = /^(ap|dn):([0-9a-f-]{36}):(plan|merge)$/;

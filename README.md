@@ -169,9 +169,10 @@ In the chat:
 | Send | What happens |
 |---|---|
 | `/dev my-project Add multiply function` | Starts a job. Put the issue text on the lines after the title. |
-| `/status` or `/status <jobId>` | Lists recent jobs, or shows one. |
+| `/status` or `/status <jobId>` | Lists this chat's jobs, newest first (up to 10, then "N more"), each with the repo name, state and age, and what a job waiting for you is waiting for (plan or merge approval). Or shows one job. |
 | `/history <jobId>` | The stages of a job with times. |
-| `/cancel <jobId>` | Stops a job. A Claude that is running for it is stopped (SIGTERM, then SIGKILL after the grace period), and the worktree is removed only after that. |
+| `/cancel [jobId]` | Stops a job. With no id it stops the only active job; with several active it lists them and asks for an id. A Claude that is running for it is stopped (SIGTERM, then SIGKILL after the grace period), and the worktree is removed only after that. |
+| `/retry <jobId>` | Starts a new job from a failed or cancelled job (same repo, title and issue text). It plans again and asks for its own plan approval; nothing from the old job's approvals or scope is reused. A job that is done or still active is refused. |
 | `/help` | The list above. |
 
 When a job needs you, the bot sends the plan or the PR with **Approve** and **Deny** buttons. Tapping one edits the message to show the decision. A button for an approval that is no longer open answers "expired" and does nothing. A job id can be shortened to any unique start of it.

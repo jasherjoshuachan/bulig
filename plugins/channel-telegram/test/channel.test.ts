@@ -6,6 +6,9 @@ import { boot, CHAT, shutdown, startFake, tempDir, TOKEN_ENV } from './harness.t
 import { until } from './fake-telegram.ts';
 
 const STRANGER = 999;
+/** What the bot said in reply to commands: the progress lines of job.status changes ("[id] job failed") are left out. */
+const replies = (fake: { texts(chat?: number): string[] }, chat = CHAT) => fake.texts(chat).filter((t) => !/^\[[0-9a-f-]{8}\] job (done|failed|cancelled)$/.test(t));
+
 
 describe('starting up', () => {
   it('refuses to start without a token in the environment', async () => {
@@ -371,15 +374,79 @@ describe('progress', () => {
 });
 
 describe('/status, /history, /cancel', () => {
-  it('/status lists the newest jobs first', async () => {
+  it('/status lists the newest jobs first, with repo alias, state and age', async () => {
     const fake = await startFake();
-    const b = await boot(fake);
-    const a = b.d.ctx.jobs.create({ repo: '/r', title: 'First job' });
-    const c = b.d.ctx.jobs.create({ repo: '/r', title: 'Second job' });
+    const repo = tempDir();
+    const clock = { t: Date.now() };
+    const b = await boot(fake, { repos: { app: repo } }, { now: () => clock.t });
+    const a = b.d.ctx.jobs.create({ repo, title: 'First job' });
+    const c = b.d.ctx.jobs.create({ repo, title: 'Second job' });
     b.d.ctx.jobs.setStatus(c.id, 'running');
+    clock.t += 125_000;
     fake.say(CHAT, '/status');
     await until(() => fake.texts(CHAT).length === 1, 'status');
-    expect(fake.texts(CHAT)[0]!.split('\n')).toEqual([`${c.id.slice(0, 8)}  running  Second job`, `${a.id.slice(0, 8)}  queued  First job`]);
+    expect(fake.texts(CHAT)[0]!.split('\n')).toEqual([`${c.id.slice(0, 8)}  app  running  2m  Second job`, `${a.id.slice(0, 8)}  app  queued  2m  First job`]);
+  });
+
+  it('/status says what a job waiting on you waits for', async () => {
+    const fake = await startFake();
+    const b = await boot(fake);
+    const plan = b.d.waitForApproval('plan');
+    const merge = b.d.waitForApproval('merge');
+    fake.say(CHAT, '/status');
+    await until(() => fake.texts(CHAT).length === 3, 'two cards and status');
+    const text = fake.texts(CHAT)[2]!;
+    expect(text).toContain(`${merge.id.slice(0, 8)}  `);
+    expect(text).toContain('waiting for your merge approval');
+    expect(text.indexOf('merge approval')).toBeLessThan(text.indexOf(plan.id.slice(0, 8)));
+    expect(text).toContain('waiting for your plan approval');
+  });
+
+  it('/status shows at most 10 jobs and counts the rest', async () => {
+    const fake = await startFake();
+    const b = await boot(fake);
+    for (let i = 1; i <= 13; i++) b.d.ctx.jobs.create({ repo: '/r', title: `Job ${i}` });
+    fake.say(CHAT, '/status');
+    await until(() => fake.texts(CHAT).length === 1, 'status');
+    const lines = fake.texts(CHAT)[0]!.split('\n');
+    expect(lines).toHaveLength(11);
+    expect(lines[0]).toContain('Job 13');
+    expect(lines[9]).toContain('Job 4');
+    expect(lines[10]).toBe('... and 3 more');
+  });
+
+  it('/status clips a long title and flattens line breaks', async () => {
+    const fake = await startFake();
+    const b = await boot(fake);
+    b.d.ctx.jobs.create({ repo: '/r', title: `${'x'.repeat(300)}\n/cancel everything` });
+    fake.say(CHAT, '/status');
+    await until(() => fake.texts(CHAT).length === 1, 'status');
+    const lines = fake.texts(CHAT)[0]!.split('\n');
+    expect(lines).toHaveLength(1);
+    expect(lines[0]!.length).toBeLessThan(140);
+  });
+
+  it('/status, /cancel and /retry only see jobs of the chat that asked', async () => {
+    const fake = await startFake();
+    const repo = tempDir();
+    const OTHER = 5151;
+    const b = await boot(fake, { allowedChatIds: [CHAT, OTHER], repos: { app: repo } });
+    fake.say(CHAT, '/dev app Mine');
+    fake.say(OTHER, '/dev app Theirs');
+    await until(() => fake.texts().length === 2, 'two jobs started');
+    const [mine, theirs] = b.d.ctx.jobs.list();
+    fake.say(CHAT, '/status');
+    fake.say(CHAT, `/cancel ${theirs!.id}`);
+    fake.say(CHAT, `/retry ${theirs!.id}`);
+    await until(() => fake.texts(CHAT).length === 4, 'three replies');
+    const [, status, cancel, retry] = fake.texts(CHAT);
+    expect(status).toContain('Mine');
+    expect(status).not.toContain('Theirs');
+    expect(cancel).toContain('No job starts with');
+    expect(retry).toContain('No job starts with');
+    expect(b.d.ctx.jobs.get(theirs!.id)!.status).toBe('queued');
+    expect(b.d.ctx.jobs.list()).toHaveLength(2);
+    expect(mine!.title).toBe('Mine');
   });
 
   it('/status <id> shows one job and what it waits for; a short id works', async () => {
@@ -445,6 +512,169 @@ describe('/status, /history, /cancel', () => {
     fake.say(CHAT, `/cancel ${job.id}`);
     await until(() => fake.texts(CHAT).some((t) => t.includes('already done')), 'reply');
     expect(b.d.ctx.jobs.get(job.id)!.status).toBe('done');
+  });
+
+  it('/cancel with no id stops the only active job', async () => {
+    const fake = await startFake();
+    const b = await boot(fake);
+    const old = b.d.ctx.jobs.create({ repo: '/r', title: 'Old' });
+    b.d.ctx.jobs.setStatus(old.id, 'failed');
+    const job = b.d.ctx.jobs.create({ repo: '/r', title: 'Active' });
+    b.d.ctx.jobs.setStatus(job.id, 'running');
+    fake.say(CHAT, '/cancel');
+    await until(() => b.d.ctx.jobs.get(job.id)!.status === 'cancelled', 'cancelled');
+    expect(b.d.ctx.jobs.get(old.id)!.status).toBe('failed');
+    await until(() => replies(fake).some((t) => t.includes(`Job ${job.id.slice(0, 8)} cancelled`)), 'reply');
+  });
+
+  it('/cancel with no id and no active job says so', async () => {
+    const fake = await startFake();
+    const b = await boot(fake);
+    const j = b.d.ctx.jobs.create({ repo: '/r', title: 'Old' });
+    b.d.ctx.jobs.setStatus(j.id, 'done');
+    fake.say(CHAT, '/cancel');
+    await until(() => replies(fake).length === 1, 'reply');
+    expect(replies(fake)[0]).toBe('No active jobs to cancel.');
+  });
+
+  it('/cancel with no id and several active jobs lists them and cancels none', async () => {
+    const fake = await startFake();
+    const b = await boot(fake);
+    const x = b.d.ctx.jobs.create({ repo: '/r', title: 'Ex' });
+    const y = b.d.ctx.jobs.create({ repo: '/r', title: 'Why' });
+    b.d.ctx.jobs.setStatus(x.id, 'running');
+    fake.say(CHAT, '/cancel');
+    await until(() => replies(fake).length === 1, 'reply');
+    const lines = replies(fake)[0]!.split('\n');
+    expect(lines[0]).toBe('2 jobs are active. Send /cancel <jobId> with one of these:');
+    expect(lines[1]).toContain(`${y.id.slice(0, 8)}`);
+    expect(lines[2]).toContain(`${x.id.slice(0, 8)}`);
+    expect(b.d.ctx.jobs.get(x.id)!.status).toBe('running');
+    expect(b.d.ctx.jobs.get(y.id)!.status).toBe('queued');
+  });
+
+  it('/cancel with an unknown or ambiguous id changes nothing and says so', async () => {
+    const fake = await startFake();
+    const b = await boot(fake);
+    // 17 ids and 16 possible first characters: two of them share one.
+    const ids = Array.from({ length: 17 }, (_, i) => b.d.ctx.jobs.create({ repo: '/r', title: `J${i}` }).id);
+    const first = ids.map((id) => id[0]!).find((c, i, all) => all.indexOf(c) !== i)!;
+    const shared = ids.filter((id) => id.startsWith(first)).length;
+    fake.say(CHAT, '/cancel nope');
+    fake.say(CHAT, `/cancel ${first}`);
+    await until(() => replies(fake).length === 2, 'two replies');
+    expect(replies(fake)[0]).toBe('No job starts with "nope".');
+    expect(replies(fake)[1]).toBe(`"${first}" matches ${shared} jobs. Send more of the id.`);
+    expect(b.d.ctx.jobs.list().every((j) => j.status === 'queued')).toBe(true);
+  });
+
+  it('/cancel on a cancelled or failed job says so', async () => {
+    const fake = await startFake();
+    const b = await boot(fake);
+    const c = b.d.ctx.jobs.create({ repo: '/r', title: 'C' });
+    b.d.ctx.jobs.setStatus(c.id, 'cancelled');
+    const f = b.d.ctx.jobs.create({ repo: '/r', title: 'F' });
+    b.d.ctx.jobs.setStatus(f.id, 'failed');
+    fake.say(CHAT, `/cancel ${c.id}`);
+    fake.say(CHAT, `/cancel ${f.id.slice(0, 8)}`);
+    await until(() => replies(fake).length === 2, 'replies');
+    expect(replies(fake)).toEqual([`Job ${c.id.slice(0, 8)} is already cancelled.`, `Job ${f.id.slice(0, 8)} is already failed.`]);
+  });
+
+  it('/retry starts a new job from a failed job: same repo, title and issue text, with a new id', async () => {
+    const fake = await startFake();
+    const repo = tempDir();
+    const b = await boot(fake, { repos: { app: repo } });
+    fake.say(CHAT, '/dev app Add multiply\nWrite src/multiply.js');
+    await until(() => b.d.ctx.jobs.list().length === 1, 'job');
+    const old = b.d.ctx.jobs.list()[0]!;
+    b.d.ctx.jobs.setStatus(old.id, 'failed');
+    fake.say(CHAT, `/retry ${old.id.slice(0, 8)}`);
+    await until(() => b.d.ctx.jobs.list().length === 2, 'retried job');
+    const fresh = b.d.ctx.jobs.list()[1]!;
+    expect(fresh.id).not.toBe(old.id);
+    expect({ repo: fresh.repo, title: fresh.title, body: fresh.body }).toEqual({ repo, title: 'Add multiply', body: 'Write src/multiply.js' });
+    expect(b.d.ctx.jobs.get(old.id)!.status).toBe('failed');
+    expect(b.d.ctx.jobs.stages(fresh.id)).toEqual([]);
+    await until(() => replies(fake).length === 2, 'reply');
+    const reply = replies(fake)[1]!;
+    expect(reply).toContain(`Job ${fresh.id.slice(0, 8)} started from ${old.id.slice(0, 8)}`);
+    expect(reply).toContain('Repo app.');
+    expect(reply).toContain('plan approval');
+  });
+
+  it('/retry works on a cancelled job too', async () => {
+    const fake = await startFake();
+    const repo = tempDir();
+    const b = await boot(fake);
+    const old = b.d.ctx.jobs.create({ repo, title: 'Stopped' });
+    b.d.ctx.jobs.setStatus(old.id, 'cancelled');
+    fake.say(CHAT, `/retry ${old.id}`);
+    await until(() => b.d.ctx.jobs.list().length === 2, 'retried job');
+    expect(b.d.ctx.jobs.list()[1]).toMatchObject({ repo, title: 'Stopped', status: 'queued' });
+  });
+
+  it('/retry refuses a done job, and a job that is still running, queued or waiting for approval', async () => {
+    const fake = await startFake();
+    const repo = tempDir();
+    const b = await boot(fake);
+    const done = b.d.ctx.jobs.create({ repo, title: 'D' });
+    b.d.ctx.jobs.setStatus(done.id, 'done');
+    const running = b.d.ctx.jobs.create({ repo, title: 'R' });
+    b.d.ctx.jobs.setStatus(running.id, 'running');
+    const queued = b.d.ctx.jobs.create({ repo, title: 'Q' });
+    const waiting = b.d.waitForApproval('plan');
+    fake.say(CHAT, `/retry ${done.id}`);
+    fake.say(CHAT, `/retry ${running.id}`);
+    fake.say(CHAT, `/retry ${queued.id}`);
+    fake.say(CHAT, `/retry ${waiting.id}`);
+    await until(() => replies(fake).length === 5, 'four refusals and a card');
+    const texts = replies(fake).filter((t) => !t.includes('approval needed'));
+    expect(texts[0]).toContain('is done, so there is nothing to retry');
+    expect(texts[1]).toContain('is still running');
+    expect(texts[2]).toContain('is still queued');
+    expect(texts[3]).toContain('is still awaiting approval');
+    expect(texts[3]).toContain(`/cancel ${waiting.id.slice(0, 8)}`);
+    expect(b.d.ctx.jobs.list()).toHaveLength(4);
+  });
+
+  it('/retry with no id, an unknown id, or a repo that is gone creates nothing', async () => {
+    const fake = await startFake();
+    const b = await boot(fake);
+    const gone = b.d.ctx.jobs.create({ repo: '/no/such/folder', title: 'Gone' });
+    b.d.ctx.jobs.setStatus(gone.id, 'failed');
+    fake.say(CHAT, '/retry');
+    fake.say(CHAT, '/retry deadbeef');
+    fake.say(CHAT, `/retry ${gone.id}`);
+    await until(() => replies(fake).length === 3, 'replies');
+    expect(replies(fake)[0]).toBe('Usage: /retry <jobId>');
+    expect(replies(fake)[1]).toBe('No job starts with "deadbeef".');
+    expect(replies(fake)[2]).toContain('is not on this machine any more');
+    expect(b.d.ctx.jobs.list()).toHaveLength(1);
+  });
+
+  it('/retry is ignored from a stranger and from a chat member who is not allowed', async () => {
+    const fake = await startFake();
+    const repo = tempDir();
+    const b = await boot(fake, { allowedUserIds: [1] });
+    const old = b.d.ctx.jobs.create({ repo, title: 'F' });
+    b.d.ctx.jobs.setStatus(old.id, 'failed');
+    fake.say(STRANGER, `/retry ${old.id}`);
+    fake.say(STRANGER, `/cancel ${old.id}`);
+    fake.say(CHAT, `/retry ${old.id}`, 2);
+    fake.say(CHAT, '/help', 1);
+    await until(() => replies(fake).length === 1, 'help only');
+    expect(fake.texts(STRANGER)).toEqual([]);
+    expect(b.d.ctx.jobs.list()).toHaveLength(1);
+  });
+
+  it('/help lists /retry and /cancel with its optional id', async () => {
+    const fake = await startFake();
+    await boot(fake);
+    fake.say(CHAT, '/help');
+    await until(() => replies(fake).length === 1, 'help');
+    expect(replies(fake)[0]).toContain('/retry <jobId>');
+    expect(replies(fake)[0]).toContain('/cancel [jobId]');
   });
 
   it('answers an unknown command and plain text with a pointer to /help', async () => {

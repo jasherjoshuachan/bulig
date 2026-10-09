@@ -94,7 +94,7 @@ export async function boot(
   const warnings: string[] = [];
   const errors: string[] = [];
   const dbPath = opts.dbPath ?? join(tempDir(), 'bulig.sqlite');
-  const plugin = createTelegramChannel({ ...(opts.fetch && { fetch: opts.fetch }), sleep: opts.sleep ?? (async () => {}) });
+  const plugin = createTelegramChannel({ ...(opts.fetch && { fetch: opts.fetch }), sleep: opts.sleep ?? (async () => {}), ...(opts.now && { now: opts.now }) });
   const kernel = createKernel({
     dbPath,
     plugins: [d.plugin, plugin],

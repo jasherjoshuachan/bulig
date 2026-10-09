@@ -101,8 +101,8 @@ const HELP = [
 /** A link from a check is shown only if it is a plain https URL: no other scheme, no spaces, no control or bidi characters, no user@host. */
 export function safeLink(link: unknown): boolean {
   if (typeof link !== 'string' || link.length === 0 || link.length > 500) return false;
-  // Controls, spaces, and the bidi marks and overrides that can make a link read as a different address.
-  if (/[\s\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/.test(link)) return false;
+  // Controls, spaces, zero-width characters, and the bidi marks and overrides that can make a link read as a different address.
+  if (/[\s\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u202a-\u202e\u2060\u2066-\u2069\ufeff]/.test(link)) return false;
   try {
     const url = new URL(link);
     // user@host hides the real host behind a name that looks like one.

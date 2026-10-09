@@ -128,7 +128,7 @@ describe('safeLink', () => {
     expect(safeLink('https://github.com@evil.test/')).toBe(false);
     expect(safeLink('https://user@example.test/')).toBe(false);
     expect(safeLink('https://:pass@example.test/')).toBe(false);
-    for (const ch of ['\u061c', '\u200e', '\u200f', '\u202a', '\u202e', '\u2066', '\u2069']) {
+    for (const ch of ['\u200b', '\u200c', '\u200d', '\u2060', '\ufeff', '\u061c', '\u200e', '\u200f', '\u202a', '\u202e', '\u2066', '\u2069']) {
       expect(safeLink(`https://example.test/a${ch}b`)).toBe(false);
     }
   });

@@ -162,11 +162,15 @@ function matchParts(pat: string[], parts: string[]): boolean {
   return go(0, 0);
 }
 
-/** True for a path that stays inside the repo: relative, no empty parts, no "." or ".." parts, at most MAX_PATH_PARTS deep. */
-export function isRepoPath(path: string): boolean {
+/** True for a well-formed path inside the repo: relative, no empty parts, no "." or ".." parts. Any depth. */
+export function isPlainRepoPath(path: string): boolean {
   if (!path || path.startsWith('/') || path.includes('\\') || CONTROL.test(path)) return false;
-  const parts = path.split('/');
-  return parts.length <= MAX_PATH_PARTS && parts.every((part) => part !== '' && part !== '.' && part !== '..');
+  return path.split('/').every((part) => part !== '' && part !== '.' && part !== '..');
+}
+
+/** A plain repo path that is also at most MAX_PATH_PARTS deep. */
+export function isRepoPath(path: string): boolean {
+  return isPlainRepoPath(path) && path.split('/').length <= MAX_PATH_PARTS;
 }
 
 /** Does this repo-relative path match this scope pattern? A path that leaves the repo never matches. */

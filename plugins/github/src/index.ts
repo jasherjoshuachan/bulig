@@ -1,6 +1,6 @@
 import { appendFileSync, existsSync, lstatSync, readFileSync, realpathSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
-import { definePlugin, isRepoPath, MAX_SCOPE_ENTRIES, matchesScope, normalizeScopeEntry, type BuligEvent, type PluginContext } from '@bulig/plugin-sdk';
+import { definePlugin, isPlainRepoPath, isRepoPath, MAX_SCOPE_ENTRIES, matchesScope, normalizeScopeEntry, type BuligEvent, type PluginContext } from '@bulig/plugin-sdk';
 import { exec, type ExecResult } from './exec.ts';
 
 export interface GithubConfig {
@@ -385,7 +385,8 @@ export default definePlugin({
         const outside: string[] = [];
         const links: string[] = [];
         for (const path of changed) {
-          const link = isRepoPath(path) ? symlinkOnPath(cwd, path) : undefined;
+          // The symlink check runs at any depth; only the scope match has a depth cap.
+          const link = isPlainRepoPath(path) ? symlinkOnPath(cwd, path) : undefined;
           if (link) links.push(path);
           else if (!isRepoPath(path) || !(matchesScope(path, rules.scope) || matchesScope(path, rules.allow))) outside.push(path);
         }

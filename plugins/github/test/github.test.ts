@@ -734,7 +734,10 @@ describe('merge.requested', () => {
     h.fire('merge.requested', { cwd: pr.cwd, number: pr.number, headSha: pr.headSha });
     await until(() => h.calls().filter((c) => c.args[1] === 'checks').length === 1);
     h.k.jobs.setStatus(h.job.id, 'cancelled');
-    await new Promise((r) => setTimeout(r, 300));
+    // Stopping waits for the running merge handler, so it only returns quickly if the 60s retry sleep was cut short.
+    const stopped = Date.now();
+    await h.k.stop();
+    expect(Date.now() - stopped).toBeLessThan(3000);
     // No second try after the cancel, and nothing reported or merged.
     expect(h.calls().filter((c) => c.args[1] === 'checks').length).toBe(1);
     expect(h.calls().some((c) => c.args[1] === 'merge')).toBe(false);
@@ -1413,6 +1416,19 @@ describe('scope guard on commit.requested', () => {
     symlinkSync('/etc/hosts', join(cwd, 'hosts.lnk'));
     const r = await commit(h, cwd, { scope: ['README.md'], scopeMode: 'warn' });
     expect(r.type).toBe('commit.failed');
+  });
+
+  it('warn mode still refuses a symlink nested deeper than the path depth cap', async () => {
+    const h = await setup();
+    const cwd = await worktree(h, 'bulig/s-deep');
+    write(cwd, 'README.md');
+    const dir = Array.from({ length: 32 }, (_, i) => `d${i}`).join('/');
+    mkdirSync(join(cwd, dir), { recursive: true });
+    symlinkSync('/etc/hosts', join(cwd, dir, 'deep.lnk'));
+    const r = await commit(h, cwd, { scope: ['README.md'], scopeMode: 'warn' });
+    expect(r.type).toBe('commit.failed');
+    expect(failure(r).error).toMatch(/symlink/);
+    expect(committed(cwd)).not.toContain(`${dir}/deep.lnk`);
   });
 
   it('an unknown scopeMode is refused instead of guessed', async () => {

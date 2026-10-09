@@ -31,6 +31,10 @@ export interface StageOutput {
   outOfScope?: string[];
   /** On an edit stage that was committed in warn mode: the files that were outside the approved scope. */
   scopeWarning?: string[];
+  /** Set when a gate (gate-evidence) checked the run: a count of tool calls, the distinct ones, and the claims that had no record. */
+  evidenceSummary?: string;
+  evidenceLines?: string[];
+  unverified?: string[];
   [key: string]: unknown;
 }
 

@@ -21,6 +21,12 @@ export interface PipelineConfig {
   scopeMode?: 'enforce' | 'warn';
   /** Accept a plan whose scope matches every file (such as **). Default false. */
   allowBroadScope?: boolean;
+  /**
+   * The event that carries a finished Claude run. "stage.completed" is the worker's own. A gate plugin such as
+   * gate-evidence sits between the two: it listens for stage.completed and says "stage.checked", and then this must
+   * be "stage.checked". The CLI sets it for you when gate-evidence is enabled. Default "stage.completed".
+   */
+  stageResultEvent?: 'stage.completed' | 'stage.checked';
 }
 
 const READONLY = new Set<ClaudeStage>(['plan', 'critique', 'review']);
@@ -30,6 +36,11 @@ const STRONG = new Set<ClaudeStage>(['plan', 'critique', 'review']);
 const MAX_PROMPT_TEXT = 12_000;
 
 const clip = (s: string, n = MAX_PROMPT_TEXT) => (s.length > n ? `${s.slice(0, n)}\n[cut: ${s.length - n} more characters]` : s);
+/** One line, no hidden characters, cut at n. */
+const shortLine = (s: string, n: number) => s.replace(/[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u202a-\u202e\u2060\u2066-\u2069\ufeff]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, n);
+/** The strings in a list, as short lines: at most `max` of them, each cut at n. */
+const lines = (v: unknown, max: number, n: number): string[] =>
+  Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string').slice(0, max).map((x) => shortLine(x, n)) : [];
 const slug = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 30).replace(/-+$/, '') || 'job';
 
 export default definePlugin({
@@ -51,6 +62,7 @@ export default definePlugin({
       'job.status',
       'cancel.requested',
       'stage.completed',
+      'stage.checked',
       'stage.failed',
       'approval.granted',
       'approval.denied',
@@ -75,6 +87,10 @@ export default definePlugin({
     if (scopeMode !== 'enforce' && scopeMode !== 'warn') throw new Error(`pipeline-dev: scopeMode must be "enforce" or "warn", not ${JSON.stringify(scopeMode)}`);
     const scopeAllow = cfg.scopeAlwaysAllow ?? [];
     const allowBroad = cfg.allowBroadScope === true;
+    const resultEvent = cfg.stageResultEvent ?? 'stage.completed';
+    if (resultEvent !== 'stage.completed' && resultEvent !== 'stage.checked') {
+      throw new Error(`pipeline-dev: stageResultEvent must be "stage.completed" or "stage.checked", not ${JSON.stringify(resultEvent)}`);
+    }
 
     /** Edit stages whose Claude run is done and whose commit is still being made. Lost on a restart, which just reruns the stage. */
     const committing = new Map<string, { stage: string; status: 'passed' | 'failed'; out: StageOutput }>();
@@ -82,6 +98,20 @@ export default definePlugin({
     const lastOf = (stages: Stage[], name: string) => [...stages].reverse().find((s) => s.name === name);
     const runningStage = (jobId: string, name: string) => ctx.jobs.stages(jobId).find((s) => s.name === name && s.status === 'running');
     const textOf = (stages: Stage[], name: string) => outputOf(lastOf(stages, name) ?? ({ output: null } as Stage)).result ?? '';
+
+    /**
+     * What a gate found out about the latest run of each named stage: the one-line count of tool calls and any
+     * unverified claims. Empty when no gate ran. It goes above the model's own text on a card, so a long plan cannot push it out.
+     */
+    const evidenceBlock = (stages: Stage[], names: string[]): string => {
+      const rows = names.flatMap((name) => {
+        const out = outputOf(lastOf(stages, name) ?? ({ output: null } as Stage));
+        if (typeof out.evidenceSummary !== 'string') return [];
+        return [`${name}: ${out.evidenceSummary}`, ...(out.unverified ?? []).map((u) => `  ${u}`)];
+      });
+      return rows.length ? clip(`EVIDENCE (from the tool-use records of each stage, not from the model's text)\n${rows.join('\n')}`, 1500) : '';
+    };
+    const withEvidence = (block: string, text: string) => (block ? `${block}\n\n${text}` : text);
 
     /** Jobs whose worktree cleanup was already asked for, so it is asked for once. */
     const cleanupAsked = new Set<string>();
@@ -135,6 +165,16 @@ export default definePlugin({
         ctx.log.error(`pipeline-dev: ${reason}`);
         if (jobId) fail(jobId, reason);
       }
+    }
+
+    /** The PR's record of what each stage did and which claims had no record behind them. Nothing when no gate ran. */
+    function evidenceSection(stages: Stage[]): string[] {
+      const rows = ['plan', 'critique', 'build', 'test', 'docs', 'review'].flatMap((name) => {
+        const out = outputOf(lastOf(stages, name) ?? ({ output: null } as Stage));
+        if (typeof out.evidenceSummary !== 'string') return [];
+        return [`**${name}**: ${out.evidenceSummary}`, ...(out.evidenceLines ?? []).map((l) => `- ${l}`), ...(out.unverified ?? []).map((u) => `- **${u}**`)];
+      });
+      return rows.length ? [`## Evidence\n\nTaken from the tool-use records of each stage, not from what the model wrote.\n\n${clip(rows.join('\n'), 6000)}`] : [];
     }
 
     function advance(jobId: string): void {
@@ -198,7 +238,7 @@ export default definePlugin({
           ctx.jobs.startStage(job.id, stageName);
           ctx.jobs.setStatus(job.id, 'awaiting_approval');
           if (action.which === 'plan') {
-            const summary = `PLAN\n${textOf(stages, 'plan')}\n\nCRITIQUE\n${textOf(stages, 'critique')}`;
+            const summary = withEvidence(evidenceBlock(stages, ['plan', 'critique']), `PLAN\n${textOf(stages, 'plan')}\n\nCRITIQUE\n${textOf(stages, 'critique')}`);
             ctx.emit('approval.requested', { jobId: job.id, kind: 'plan', summary: clip(summary, 4000), scope: scopeOf(stages) ?? [] }, job.id);
           } else {
             const pr = outputOf(lastOf(stages, 'pr')!);
@@ -210,7 +250,10 @@ export default definePlugin({
                 kind: 'merge',
                 url: pr.url,
                 headSha: pr.headSha,
-                summary: clip(`${action.renewed ? 'The last merge was refused. Approve again to retry.\n\n' : ''}REVIEW\n${review}`, 4000),
+                summary: clip(
+                  `${action.renewed ? 'The last merge was refused. Approve again to retry.\n\n' : ''}${withEvidence(evidenceBlock(stages, ['build', 'test', 'docs', 'review']), `REVIEW\n${review}`)}`,
+                  4000,
+                ),
               },
               job.id,
             );
@@ -230,6 +273,7 @@ export default definePlugin({
               ? [`## Files outside the approved scope\n\nscopeMode is "warn", so these were committed anyway. Check each one:\n\n${warned.map((f) => `- ${f}`).join('\n')}`]
               : []),
             `## Independent review\n\n${clip(textOf(stages, 'review'), 3000)}`,
+            ...evidenceSection(stages),
             `Opened by Bulig, job ${job.id}.`,
           ].join('\n\n');
           // expectSha is the commit the reviewer saw. The github plugin opens the PR only if HEAD is exactly that.
@@ -386,13 +430,29 @@ export default definePlugin({
       });
     });
 
-    ctx.on('stage.completed', (e) => {
+    // A gate that says stage.checked while this listens to stage.completed has no effect. Say so once, loudly.
+    if (resultEvent === 'stage.completed') {
+      let told = false;
+      ctx.on('stage.checked', () => {
+        if (told) return;
+        told = true;
+        ctx.log.warn('pipeline-dev: a gate is emitting stage.checked, but stageResultEvent is "stage.completed", so the gate has no effect. Set stageResultEvent to "stage.checked".');
+      });
+    }
+
+    ctx.on(resultEvent, (e) => {
       guard(e.jobId, () => {
-        const p = e.payload as { stage: string; result?: string; sessionId?: string; costUsd?: number };
+        const p = e.payload as { stage: string; result?: string; sessionId?: string; costUsd?: number; evidenceSummary?: unknown; evidenceLines?: unknown; unverified?: unknown };
         const s = e.jobId && runningStage(e.jobId, p.stage);
         if (!e.jobId || !s) return;
         const result = p.result ?? '';
         const out: StageOutput = { result, sessionId: p.sessionId, costUsd: p.costUsd };
+        // What a gate found. Kept as short lines of text, whatever shape arrived.
+        if (typeof p.evidenceSummary === 'string') {
+          out.evidenceSummary = shortLine(p.evidenceSummary, 300);
+          out.evidenceLines = lines(p.evidenceLines, 14, 200);
+          out.unverified = lines(p.unverified, 8, 300);
+        }
         let status: 'passed' | 'failed' = 'passed';
         if (p.stage === 'plan') {
           // The plan must declare every file the job will touch. A plan without a usable SCOPE block is not a plan.

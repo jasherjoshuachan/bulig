@@ -73,6 +73,40 @@ function world(configOverride: Record<string, unknown> = {}) {
 
 const jobIdFrom = (text: string) => /started job ([0-9a-f-]{36})/.exec(text)![1]!;
 
+describe('with gate-evidence enabled', () => {
+  it('the CLI points the pipeline at the gate, so an unbacked claim is marked on the screen and the job still finishes in warn mode', async () => {
+    // The stand-in claude prints the old single-object output, which carries no tool records, so "2 passed" has nothing behind it.
+    const w = world({ enabled: ['channel-cli', 'worker-claude-code', 'gate-evidence', 'github', 'pipeline-dev'] });
+    const run = await w.run('run', '--repo', w.repo, '--title', 'Add multiply function', '--issue', 'Add src/multiply.js');
+    expect(run.err).toBe('');
+    const id = jobIdFrom(run.out);
+    expect(run.out).toContain('approval needed: plan');
+    expect(run.out).toMatch(/\| EVIDENCE \(from the tool-use records/);
+    expect(run.out).toContain('| plan: Evidence this turn: no tool calls recorded');
+
+    const plan = await w.run('approve', id, 'plan');
+    expect(plan.err).toBe('');
+    expect(plan.out).toContain('test: claims with no evidence (Evidence this turn: no tool calls recorded)');
+    expect(plan.out).toContain('Unverified: no record of a test run this turn ("ran npm test, 2 passed")');
+    expect(plan.out).toContain('approval needed: merge');
+
+    const merge = await w.run('approve', id, 'merge');
+    expect(merge.out).toContain('is done');
+  });
+
+  it('enforce mode fails the job at the test stage', async () => {
+    const w = world({
+      enabled: ['channel-cli', 'worker-claude-code', 'gate-evidence', 'github', 'pipeline-dev'],
+      pluginConfig: { 'worker-claude-code': { claudeBin: FAKE_CLAUDE }, github: { ghBin: FAKE_GH, allowNoChecks: true }, 'gate-evidence': { mode: 'enforce' } },
+    });
+    const run = await w.run('run', '--repo', w.repo, '--title', 'Add multiply function', '--issue', 'Add src/multiply.js');
+    const id = jobIdFrom(run.out);
+    const plan = await w.run('approve', id, 'plan');
+    expect(plan.out).toMatch(/job failed: test failed: evidence gate: Unverified: no record of a test run this turn/);
+    expect(plan.out).not.toContain('PR opened');
+  });
+});
+
 describe('a whole job through the CLI', () => {
   it('run, approve plan, approve merge, then history shows every stage', async () => {
     const w = world();

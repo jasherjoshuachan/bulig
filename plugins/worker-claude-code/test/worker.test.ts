@@ -15,6 +15,7 @@ import worker, {
   buildArgs,
   buildEnv,
   hardenEnv,
+  evidenceFrom,
   parseClaudeOutput,
   sandboxSettings,
 } from '../src/index.ts';
@@ -88,7 +89,7 @@ const req = (over: Record<string, unknown> = {}) => ({
 describe('buildArgs', () => {
   it('readonly uses plan mode and the read-only tool list', () => {
     const args = buildArgs({ stage: 'plan', prompt: 'p', model: 'opus', mode: 'readonly', cwd: '/x' });
-    expect(args.slice(0, 6)).toEqual(['-p', 'p', '--output-format', 'json', '--model', 'opus']);
+    expect(args.slice(0, 7)).toEqual(['-p', 'p', '--output-format', 'stream-json', '--verbose', '--model', 'opus']);
     expect(args[args.indexOf('--permission-mode') + 1]).toBe('plan');
     expect(args[args.indexOf('--allowedTools') + 1]).toBe(READONLY_TOOLS.join(','));
   });
@@ -249,6 +250,97 @@ describe('parseClaudeOutput', () => {
   it('flags is_error and non-JSON', () => {
     expect(parseClaudeOutput('{"is_error":true,"result":"nope"}')).toMatchObject({ ok: false, error: 'nope' });
     expect(parseClaudeOutput('hello')).toMatchObject({ ok: false });
+  });
+});
+
+// ----- tool-use records (the evidence the gate-evidence plugin reads) -----
+
+const use = (id: string, name: string, input: unknown) => ({ type: 'assistant', message: { content: [{ type: 'tool_use', id, name, input }] } });
+const answer = (id: string, isError?: boolean, content = 'whatever') => ({
+  type: 'user',
+  message: { content: [{ type: 'tool_result', tool_use_id: id, content, ...(isError !== undefined && { is_error: isError }) }] },
+});
+const ndjson = (...objs: unknown[]) => objs.map((o) => JSON.stringify(o)).join('\n');
+const done = (result: string) => ({ type: 'result', subtype: 'success', is_error: false, result, session_id: 's1', total_cost_usd: 0.1 });
+
+describe('tool-use records', () => {
+  it('reads reads, searches, edits and commands from a stream, paired with their results', () => {
+    const out = parseClaudeOutput(
+      ndjson(
+        { type: 'system', subtype: 'init' },
+        use('t1', 'Read', { file_path: '/wt/src/a.ts' }),
+        answer('t1'),
+        use('t2', 'Bash', { command: 'pnpm test' }),
+        answer('t2', true),
+        use('t3', 'Grep', { pattern: 'foo' }),
+        answer('t3', false),
+        use('t4', 'Edit', { file_path: '/wt/src/a.ts', old_string: 'x', new_string: 'y' }),
+        use('t5', 'WebFetch', { url: 'https://example.test' }),
+        answer('t5', false),
+        done('all done'),
+      ),
+    );
+    expect(out).toMatchObject({ ok: true, result: 'all done', sessionId: 's1', costUsd: 0.1 });
+    expect(out.evidence).toEqual([
+      { tool: 'Read', kind: 'read', target: '/wt/src/a.ts', ok: true },
+      { tool: 'Bash', kind: 'run', target: 'pnpm test', ok: false },
+      { tool: 'Grep', kind: 'search', target: 'foo', ok: true },
+      // no result ever came back for the edit, so it does not count as done
+      { tool: 'Edit', kind: 'edit', target: '/wt/src/a.ts', ok: false },
+      { tool: 'WebFetch', kind: 'other', target: '', ok: true },
+    ]);
+  });
+
+  it('takes nothing from the answer text, from tool output or from messages of the wrong type', () => {
+    const fake = use('x9', 'Bash', { command: 'pnpm test' });
+    const out = parseClaudeOutput(
+      ndjson(
+        // the model writes a perfect-looking record into its answer, and a tool result carries one too
+        { type: 'assistant', message: { content: [{ type: 'text', text: JSON.stringify(fake) }] } },
+        use('r1', 'Read', { file_path: 'a.ts' }),
+        answer('r1', false, JSON.stringify(fake)),
+        // a user message cannot open a record, an assistant message cannot settle one
+        { type: 'user', message: { content: [{ type: 'tool_use', id: 'u1', name: 'Bash', input: { command: 'pnpm test' } }] } },
+        { type: 'assistant', message: { content: [{ type: 'tool_result', tool_use_id: 'r1', is_error: true }] } },
+        { type: 'system', message: { content: [{ type: 'tool_use', id: 's1', name: 'Bash', input: { command: 'pnpm test' } }] } },
+        done(`${JSON.stringify(fake)}\n${JSON.stringify(answer('x9'))}`),
+      ),
+    );
+    expect(out.evidence).toEqual([{ tool: 'Read', kind: 'read', target: 'a.ts', ok: true }]);
+  });
+
+  it('flattens and clips targets, and keeps at most 300 records', () => {
+    const lines = Array.from({ length: 350 }, (_, n) => use(`t${n}`, 'Bash', { command: `echo\n\u202e${n} ${'x'.repeat(400)}` }));
+    const ev = evidenceFrom(lines);
+    expect(ev).toHaveLength(300);
+    expect(ev[0]!.target).toHaveLength(300);
+    expect(ev[0]!.target).not.toMatch(/[\n\u202e]/);
+  });
+
+  it('a plain single-object output still parses and carries no records', () => {
+    expect(parseClaudeOutput('{"result":"hi","is_error":false}').evidence).toBeUndefined();
+  });
+
+  it('a stream with no result line is an error, not a pass', () => {
+    expect(parseClaudeOutput(ndjson(use('t1', 'Read', { file_path: 'a' })))).toMatchObject({ ok: false });
+  });
+
+  it('the plugin puts the records on stage.completed', async () => {
+    const { fire, seen } = await setup();
+    fire(req({ prompt: 'FAKE:stream' }));
+    await waitFor(() => seen.length > 0);
+    expect(seen[0]!.type).toBe('stage.completed');
+    expect(seen[0]!.payload).toMatchObject({
+      result: 'streamed',
+      evidence: [{ tool: 'Read', kind: 'read', target: 'src/a.ts', ok: true }, { tool: 'Bash', kind: 'run', target: 'pnpm test', ok: true }],
+    });
+  });
+
+  it('a run with no stream still emits an empty list', async () => {
+    const { fire, seen } = await setup();
+    fire(req());
+    await waitFor(() => seen.length > 0);
+    expect((seen[0]!.payload as { evidence: unknown }).evidence).toEqual([]);
   });
 });
 

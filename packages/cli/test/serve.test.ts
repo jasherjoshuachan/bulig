@@ -205,6 +205,9 @@ describe('the shipped example config', () => {
     writeFileSync(join(root, 'bulig.config.json'), readFileSync(new URL('../../../bulig.config.example.json', import.meta.url)));
     const { config } = loadConfig(root, home);
     expect(config.enabled).toContain('channel-telegram');
+    expect(config.enabled).toContain('gate-evidence');
+    expect(config.pluginConfig['gate-evidence']).toEqual({ mode: 'warn', enabled: true });
+    expect(config.grants['gate-evidence']).toBeUndefined(); // it needs no capability
     expect(config.grants['channel-telegram']).toEqual(['channel.send:telegram', 'approval.grant']);
     // Only the channels and the pipeline hold the approval and merge capabilities.
     const holders = Object.entries(config.grants).filter(([, caps]) => caps.some((c) => c === 'approval.grant' || c === 'merge.request'));

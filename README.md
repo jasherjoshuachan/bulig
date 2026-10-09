@@ -23,14 +23,14 @@ bulig/ (pnpm workspaces, TypeScript, vitest)
     github             branches, PRs, checks, merge
     pipeline-dev       plan, critique, build, test, docs, review, approve, merge
     gate-promise       blocks "I'll follow up" without a job ID
-    gate-evidence      replies must cite what was read that turn
+    gate-evidence      replies must cite what was read that turn (stage.completed -> stage.checked, from tool-use records)
     memory             lessons that fade, per repo
     live-check         browser check after deploy
     self-diagnosis     one draft fix at a time, never merges
     scorecard          public page of how the system is doing
 ```
 
-In v0.1 these exist: `packages/core`, `packages/plugin-sdk`, `packages/cli`, and the plugins `channel-cli` (a terminal channel), `channel-telegram`, `worker-claude-code`, `github` and `pipeline-dev`. The others are planned.
+In v0.1 these exist: `packages/core`, `packages/plugin-sdk`, `packages/cli`, and the plugins `channel-cli` (a terminal channel), `channel-telegram`, `worker-claude-code`, `github` and `pipeline-dev`. v0.2 adds `gate-evidence` (opt-in, see [its README](plugins/gate-evidence/README.md)). The others are planned.
 
 ## Roadmap
 
@@ -111,6 +111,22 @@ pipeline     merge.requested
 github       pr.merged                           only if the head is still headSha and no check is red or pending
 kernel       job.status done
 ```
+
+### Evidence gate
+
+`gate-evidence` checks that a stage which claims a result has a record from the same Claude run behind it. The worker runs Claude with `--output-format stream-json` and sends the tool calls it saw (files read, files edited, commands run, and whether each worked) on `stage.completed`. The gate reads the stage text for claims ("all tests pass", "`src/a.ts` exports X", "I fixed it", "VERDICT: PASS"), looks for a matching record from that run, and marks the ones with none: the plan and merge cards open with an `EVIDENCE` block (tool calls per stage, plus `Unverified: no record of a test run this turn ("All tests pass.")`), the PR body lists the evidence, and Telegram and the terminal print the unverified lines. `mode: "enforce"` fails the stage and the job instead of marking. The text the model writes never counts as evidence. It is a phrase matcher with a short documented list of claim patterns, so read [what it cannot catch](plugins/gate-evidence/README.md#what-it-cannot-catch) before trusting it. Turn it on by adding `gate-evidence` to `enabled`; the CLI then points the pipeline at it.
+
+| Setting (`gate-evidence`) | Default | What it does |
+|---|---|---|
+| `mode` | `warn` | `warn` marks unbacked claims and carries on. `enforce` fails the stage. |
+| `enabled` | `true` | `false` lets everything through unchecked while the plugin stays in the chain. |
+| `evidenceSources` | `["worker-claude-code"]` | Which plugins' tool records count. |
+
+The pipeline setting that lets a gate sit in front of it is `stageResultEvent` (`stage.completed` by default, `stage.checked` behind a gate).
+
+#### Manifest conventions for a gate
+
+A gate is an ordinary plugin that needs no capability. It subscribes to the event it checks (`stage.completed`) and emits the event the next plugin listens to (`stage.checked`) or a failure (`stage.failed`). It never calls the plugin after it and never edits a payload. Whoever sits after it names the event it listens to in config (`stageResultEvent`), so a gate can be added or removed without editing the others.
 
 ### Scope guard
 

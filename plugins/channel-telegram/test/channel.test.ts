@@ -1,7 +1,7 @@
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { Store } from '@bulig/core';
-import { safeLink } from '../src/index.ts';
+import { progressLine, safeLink } from '../src/index.ts';
 import { boot, CHAT, shutdown, startFake, tempDir, TOKEN_ENV } from './harness.ts';
 import { until } from './fake-telegram.ts';
 
@@ -857,5 +857,18 @@ describe('per-user approvals in a group chat', () => {
     fake.press(CHAT, sent.__id, sent.text, `ap:${job.id}:plan`, { id: MEMBER });
     await until(() => fake.of('editMessageText').length === 1, 'edit');
     expect(b.d.seen.map((e) => e.type)).toEqual(['approval.granted']);
+  });
+});
+
+describe('stage.checked lines', () => {
+  const ev = (payload: unknown) => ({ id: 'e', type: 'stage.checked', payload, jobId: 'abcdef1234567890', source: 'test', at: '2026-01-01T00:00:00Z' });
+
+  it('shows unverified claims, flattened and clipped, and is silent when there are none', () => {
+    expect(progressLine(ev({ stage: 'build', unverified: [], evidenceSummary: 'Evidence this turn: 2 read' }))).toBeUndefined();
+    const text = progressLine(ev({ stage: 'build', unverified: [`Unverified: no record of a test run this turn\n\n("${'x'.repeat(500)}")`], evidenceSummary: 'Evidence this turn: no tool calls recorded' }))!;
+    expect(text).toContain('[abcdef12] build has claims with no evidence:');
+    expect(text).toContain('- Unverified: no record of a test run this turn ("xxx');
+    expect(text.split('\n')).toHaveLength(3);
+    expect(text.length).toBeLessThan(500);
   });
 });

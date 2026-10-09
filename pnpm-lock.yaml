@@ -32,6 +32,9 @@ importers:
       '@bulig/core':
         specifier: workspace:*
         version: link:../core
+      '@bulig/gate-evidence':
+        specifier: workspace:*
+        version: link:../../plugins/gate-evidence
       '@bulig/github':
         specifier: workspace:*
         version: link:../../plugins/github
@@ -77,6 +80,16 @@ importers:
         version: link:../../packages/core
 
   plugins/channel-telegram:
+    dependencies:
+      '@bulig/plugin-sdk':
+        specifier: workspace:*
+        version: link:../../packages/plugin-sdk
+    devDependencies:
+      '@bulig/core':
+        specifier: workspace:*
+        version: link:../../packages/core
+
+  plugins/gate-evidence:
     dependencies:
       '@bulig/plugin-sdk':
         specifier: workspace:*

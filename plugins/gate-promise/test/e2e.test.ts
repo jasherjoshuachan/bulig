@@ -55,7 +55,7 @@ function rig(script: Script, wiring: Wiring, configs: { promise?: Record<string,
   const human = fakeHuman();
   const holder = { followUp: 'not-yet' };
   const worker: Plugin = definePlugin({
-    manifest: { name: 'worker-claude-code', version: '0.1.0', sdk: '0', description: 'stand-in', subscribes: ['stage.requested'], emits: ['stage.completed'] },
+    manifest: { name: 'worker-claude-code', version: '0.1.0', sdk: '1', description: 'stand-in', subscribes: ['stage.requested'], emits: ['stage.completed'] },
     register(ctx) {
       ctx.on('stage.requested', (e) => {
         const p = e.payload as { stage: string };
@@ -70,7 +70,7 @@ function rig(script: Script, wiring: Wiring, configs: { promise?: Record<string,
   const names = gates.map((g) => g.manifest.name);
   const seen: BuligEvent[] = [];
   const recorder = definePlugin({
-    manifest: { name: 'recorder', version: '0.1.0', sdk: '0', description: 'records', subscribes: ['stage.*', 'pr.requested'] },
+    manifest: { name: 'recorder', version: '0.1.0', sdk: '1', description: 'records', subscribes: ['stage.*', 'pr.requested'] },
     register(ctx) {
       ctx.on('stage.*', (e) => void seen.push(e));
       ctx.on('pr.requested', (e) => void seen.push(e));

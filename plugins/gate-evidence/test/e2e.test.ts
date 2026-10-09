@@ -35,7 +35,7 @@ function rig(script: Script, gateConfig: Record<string, unknown> = {}, wired = t
   const sent: { type: string; payload: unknown }[] = [];
   const human = fakeHuman();
   const worker: Plugin = definePlugin({
-    manifest: { name: 'worker-claude-code', version: '0.1.0', sdk: '0', description: 'stand-in', subscribes: ['stage.requested'], emits: ['stage.completed'] },
+    manifest: { name: 'worker-claude-code', version: '0.1.0', sdk: '1', description: 'stand-in', subscribes: ['stage.requested'], emits: ['stage.completed'] },
     register(ctx) {
       ctx.on('stage.requested', (e) => {
         const p = e.payload as { stage: string };
@@ -177,7 +177,7 @@ describe('evidence gate through the real pipeline', () => {
     dirs.push(dir);
     const human = fakeHuman();
     const worker = definePlugin({
-      manifest: { name: 'worker-claude-code', version: '0.1.0', sdk: '0', description: 'stand-in', subscribes: ['stage.requested'], emits: ['stage.completed'] },
+      manifest: { name: 'worker-claude-code', version: '0.1.0', sdk: '1', description: 'stand-in', subscribes: ['stage.requested'], emits: ['stage.completed'] },
       register(ctx) {
         ctx.on('stage.requested', (e) => {
           const p = e.payload as { stage: string };

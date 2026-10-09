@@ -31,7 +31,7 @@ function fakeWorker(hangOn?: string): Plugin {
     docs: 'docs done',
   };
   return definePlugin({
-    manifest: { name: 'worker-claude-code', version: '0.1.0', sdk: '0', description: 'fake', subscribes: ['stage.requested'], emits: ['stage.completed'] },
+    manifest: { name: 'worker-claude-code', version: '0.1.0', sdk: '1', description: 'fake', subscribes: ['stage.requested'], emits: ['stage.completed'] },
     register(ctx) {
       ctx.on('stage.requested', (e) => {
         const stage = (e.payload as { stage: string }).stage;
@@ -47,7 +47,7 @@ function fakeGithub(): Plugin {
     manifest: {
       name: 'github',
       version: '0.1.0',
-      sdk: '0',
+      sdk: '1',
       description: 'fake',
       subscribes: ['worktree.requested', 'commit.requested', 'pr.requested', 'merge.requested'],
       emits: ['worktree.ready', 'commit.done', 'pr.opened', 'pr.merged'],

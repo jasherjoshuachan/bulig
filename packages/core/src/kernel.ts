@@ -1,4 +1,4 @@
-import type { Job, JobsApi, Logger, Plugin } from '@bulig/plugin-sdk';
+import { DEPRECATED_SDK_MAJORS, type Job, type JobsApi, type Logger, type Plugin } from '@bulig/plugin-sdk';
 import { Bus } from './bus.ts';
 import { DEFAULT_EVENT_CAPABILITIES } from './capabilities.ts';
 import { buildContext, selectPlugins, type LoadedPlugin } from './loader.ts';
@@ -66,6 +66,11 @@ export function createKernel(options: KernelOptions) {
         state: { get: (p: string, k: string) => store.getState(p, k), set: (p: string, k: string, v: unknown) => store.setState(p, k, v) },
         logger,
       };
+      for (const { manifest } of loaded) {
+        if (DEPRECATED_SDK_MAJORS.includes(manifest.sdk)) {
+          logger.warn(`Plugin "${manifest.name}" targets sdk ${manifest.sdk}, which is deprecated. Set "sdk" to "1" after it passes the conformance suite.`);
+        }
+      }
       for (const { plugin, manifest } of loaded) {
         await plugin.register(buildContext(manifest, base));
       }

@@ -54,7 +54,7 @@ async function setup(config: Record<string, unknown> = {}, grants = ['git.push',
     manifest: {
       name: 'driver',
       version: '0.1.0',
-      sdk: '0',
+      sdk: '1',
       description: 'test driver',
       subscribes: ['worktree.ready', 'worktree.failed', 'worktree.cleaned', 'worktree.cleanup.failed', 'worktree.reset.done', 'worktree.reset.failed', 'commit.done', 'commit.failed', 'pr.opened', 'pr.failed', 'pr.merged', 'merge.refused', 'merge.failed'],
       emits: ['worktree.requested', 'worktree.cleanup.requested', 'worktree.reset.requested', 'commit.requested', 'pr.requested', 'merge.requested'],

@@ -28,7 +28,7 @@ describe.skipIf(!repo)('live: an edit stage cannot reach GitHub through node', (
     const seen: BuligEvent[] = [];
     let fire: (p: unknown) => void = () => {};
     const driver = definePlugin({
-      manifest: { name: 'driver', version: '0.1.0', sdk: '0', description: 'live driver', subscribes: ['stage.completed', 'stage.failed'], emits: ['stage.requested'] },
+      manifest: { name: 'driver', version: '0.1.0', sdk: '1', description: 'live driver', subscribes: ['stage.completed', 'stage.failed'], emits: ['stage.requested'] },
       register(ctx) {
         ctx.on('stage.completed', (e) => void seen.push(e));
         ctx.on('stage.failed', (e) => void seen.push(e));

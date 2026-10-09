@@ -48,7 +48,7 @@ export default definePlugin({
   manifest: {
     name: 'pipeline-dev',
     version: '0.1.0',
-    sdk: '0',
+    sdk: '1',
     description: 'The dev pipeline: plan, critique, approve, build, test, docs, commit, review, PR, approve, merge.',
     provides: { stages: ['plan', 'critique', 'build', 'test', 'review', 'docs'] },
     subscribes: [

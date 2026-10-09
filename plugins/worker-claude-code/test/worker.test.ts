@@ -17,6 +17,9 @@ import worker, {
   hardenEnv,
   evidenceFrom,
   parseClaudeOutput,
+  OutputParser,
+  MAX_LINE_BYTES,
+  MAX_SINGLE_OBJECT_BYTES,
   sandboxSettings,
 } from '../src/index.ts';
 
@@ -341,6 +344,78 @@ describe('tool-use records', () => {
     fire(req());
     await waitFor(() => seen.length > 0);
     expect((seen[0]!.payload as { evidence: unknown }).evidence).toEqual([]);
+  });
+});
+
+describe('bounded stream reading', () => {
+  const toolResult = (id: string, size: number) => JSON.stringify(answer(id, false, 'z'.repeat(size))) + '\n';
+  /** Feed text to the parser in 64 KiB pieces, like a pipe would. */
+  const feed = (p: OutputParser, text: string) => {
+    const b = Buffer.from(text);
+    for (let i = 0; i < b.length; i += 65536) p.write(b.subarray(i, i + 65536));
+  };
+
+  it('many MB of tool results then a result: the stage parses and memory stays bounded', () => {
+    const p = new OutputParser();
+    feed(p, JSON.stringify(use('t1', 'Read', { file_path: 'a.ts' })) + '\n');
+    let total = 0;
+    for (let n = 0; n < 300; n++) {
+      const l = toolResult(n === 0 ? 't1' : `n${n}`, 100_000);
+      total += l.length;
+      feed(p, l);
+    }
+    feed(p, JSON.stringify(done('fine')));
+    const out = p.finish();
+    expect(total).toBeGreaterThan(30_000_000);
+    expect(out).toMatchObject({ ok: true, result: 'fine', evidence: [{ tool: 'Read', kind: 'read', target: 'a.ts', ok: true }] });
+    expect(p.peakRetained).toBeLessThan(200_000);
+  });
+
+  it('one over-long line is skipped and the lines after it are still read', () => {
+    const p = new OutputParser();
+    feed(p, ndjson({ type: 'system', subtype: 'init' }) + '\n');
+    feed(p, JSON.stringify(use('t1', 'Read', { file_path: 'a.ts' })) + '\n');
+    feed(p, toolResult('t1', MAX_LINE_BYTES + 10));
+    feed(p, JSON.stringify(use('t2', 'Bash', { command: 'ls' })) + '\n');
+    feed(p, JSON.stringify(answer('t2')) + '\n' + JSON.stringify(done('after')));
+    const out = p.finish();
+    expect(out).toMatchObject({ ok: true, result: 'after' });
+    // the skipped line was t1's answer, so t1 never settled; t2 did
+    expect(out.evidence).toEqual([
+      { tool: 'Read', kind: 'read', target: 'a.ts', ok: false },
+      { tool: 'Bash', kind: 'run', target: 'ls', ok: true },
+    ]);
+    expect(p.peakRetained).toBeLessThanOrEqual(MAX_LINE_BYTES + 70_000);
+  });
+
+  it('a stream with no result line says so, and says what was skipped', () => {
+    const p = new OutputParser();
+    feed(p, ndjson({ type: 'system', subtype: 'init' }) + '\n' + toolResult('t1', MAX_LINE_BYTES + 10));
+    expect(p.finish()).toMatchObject({ ok: false, error: expect.stringMatching(/no result line \(1 line over 1 MiB skipped\)/) });
+  });
+
+  it('an old single-object output under the cap parses; over the cap it fails clearly', () => {
+    const big = JSON.stringify({ type: 'result', is_error: false, result: 'r'.repeat(MAX_LINE_BYTES * 2) });
+    expect(parseClaudeOutput(big)).toMatchObject({ ok: true });
+    expect(parseClaudeOutput(big).evidence).toBeUndefined();
+    const huge = JSON.stringify({ is_error: false, result: 'r'.repeat(MAX_SINGLE_OBJECT_BYTES + 10) });
+    expect(parseClaudeOutput(huge)).toMatchObject({ ok: false, error: expect.stringMatching(/over 8 MiB/) });
+  });
+
+  it('a result line without a trailing newline and split across chunks is read', () => {
+    const p = new OutputParser();
+    const b = Buffer.from(JSON.stringify(done('split')));
+    p.write(b.subarray(0, 20));
+    p.write(b.subarray(20));
+    expect(p.finish()).toMatchObject({ ok: true, result: 'split' });
+  });
+
+  it('through the plugin: a 24 MB verbose run still completes with its records', async () => {
+    const { fire, seen } = await setup();
+    fire(req({ prompt: 'FAKE:flood' }));
+    await waitFor(() => seen.length > 0, 20000);
+    expect(seen[0]!.type).toBe('stage.completed');
+    expect(seen[0]!.payload).toMatchObject({ result: 'flooded', evidence: [{ tool: 'Read', kind: 'read', target: 'big.txt', ok: true }] });
   });
 });
 

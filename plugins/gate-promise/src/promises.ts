@@ -46,7 +46,7 @@ export const PROMISE_PATTERNS: readonly RegExp[] = [
   new RegExp(String.raw`\bnext,?\s+(?:I|we)(?:'ll|’ll| will| shall)\b`, 'i'),
   // Any "I will ..." with a deferral word: "I'll do it tomorrow", "we will fix that later", "I will get to it next week"
   new RegExp(
-    `${WE}\\b[^.!?\\n]*\\b(?:later|tomorrow|tonight|afterwards?|in a (?:bit|while|day|few \\w+)|next (?:week|time|session|sprint|month)|when I (?:get|have) (?:a chance|time)|at a later (?:time|date))\\b`,
+    `${WE}\\b[^.!?\\n]{0,200}\\b(?:later|tomorrow|tonight|afterwards?|in a (?:bit|while|day|few \\w+)|next (?:week|time|session|sprint|month)|when I (?:get|have) (?:a chance|time)|at a later (?:time|date))\\b`,
     'i',
   ),
 ];
@@ -60,12 +60,20 @@ const DONE = /\b(?:already|previously|earlier|yesterday|last (?:time|week))\b/i;
 /** The built-in flow described as it is: "the next stage will ...", "the pipeline will ...". */
 const PIPELINE_TALK = /\b(?:next stage|(?:plan|critique|build|test|docs|review|merge|commit) (?:stage|step)|pipeline|approval (?:card|gate)|pull request|the PR)\b/i;
 
+/**
+ * The most text read from one stage result, in characters. The gate runs on the kernel's single event loop, so what it
+ * reads has a ceiling; text past it is not checked. Every quantifier below is bounded too (a quote or an inline-code
+ * span longer than 300 characters is not stripped, which errs towards flagging).
+ */
+export const MAX_SCAN = 50_000;
+
 /** Sentences outside code, quotes and block quotes. Fenced code, inline code, "double quoted" text and `>` lines are material, not statements. */
 export function sentences(text: string): string[] {
   const stripped = text
+    .slice(0, MAX_SCAN)
     .replace(/(```|~~~)[\s\S]*?(?:\1|$)/g, '\n')
-    .replace(/`[^`\n]*`/g, ' ')
-    .replace(/"[^"\n]*"|“[^”\n]*”/g, ' ')
+    .replace(/`[^`\n]{0,300}`/g, ' ')
+    .replace(/"[^"\n]{0,300}"|“[^”\n]{0,300}”/g, ' ')
     .split('\n')
     .filter((l) => !/^\s*>/.test(l))
     .join('\n');
@@ -77,7 +85,7 @@ export function sentences(text: string): string[] {
 
 /** The text with fenced and inline code removed. Job ids only count when they are written in the open. */
 export function plainText(text: string): string {
-  return text.replace(/(```|~~~)[\s\S]*?(?:\1|$)/g, '\n').replace(/`[^`\n]*`/g, ' ');
+  return text.slice(0, MAX_SCAN).replace(/(```|~~~)[\s\S]*?(?:\1|$)/g, '\n').replace(/`[^`\n]{0,300}`/g, ' ');
 }
 
 /** Every promise in a piece of stage text. */

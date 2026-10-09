@@ -50,7 +50,7 @@ Every line a person sees is flattened to one line, stripped of control and bidi 
 |---|---|---|
 | `mode` | `warn` | `warn` marks, `enforce` fails the stage. Anything else stops the start. |
 | `enabled` | `true` | `false` passes every result through unchecked. The plugin stays in the chain, so the pipeline keeps working. To remove it, take it out of `enabled` in the main config. |
-| `input` | `stage.completed` | The event it reads. With `gate-evidence` on it is `stage.checked`. The CLI sets it; set it yourself only when you build a kernel by hand. |
+| `input` | `stage.completed` | The event it reads. With `gate-evidence` on it is `stage.checked`. The CLI computes it from `enabled` and overrides whatever the config says; set it yourself only when you build a kernel by hand. |
 
 It needs no capability. It reads jobs through the same `ctx.jobs` every plugin has.
 
@@ -67,6 +67,7 @@ Alone, `gate-promise` reads `stage.completed` straight from the worker. With `ga
 
 ## What it cannot catch
 
+- **Text past 50,000 characters.** The gate runs on the kernel's single event loop, so it reads at most the first 50,000 characters of a stage result (`MAX_SCAN`) and logs a warning when it cuts. A promise after that point is not seen. Every pattern is also bounded: a quote or an inline-code span longer than 300 characters is not stripped, and an "I will ... later" must have "later" within 200 characters, so a very long quote hides nothing but may be flagged.
 - **Meaning.** It matches phrases. "Leave it with me", "this will be handled shortly", "someone should look at that", a promise in another language, or "I'll" written as "I shall" are not on the list or read as no promise.
 - **Promises without "I" or "we".** "A follow-up will be sent", "the team will look into it", "this will be revisited" have no subject it knows.
 - **Promises in sentences it skips on purpose.** "If you like, I'll follow up" (offer) and "I'll follow up, I already told them" (contains `already`) are skipped. So is any promise in a sentence that also says `pipeline`, `pull request`, `not` or `should`, and any promise inside quotes or code. A model can hide a promise there.

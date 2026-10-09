@@ -1,7 +1,7 @@
 import { definePlugin, type BuligEvent, type PluginContext } from '@bulig/plugin-sdk';
-import { citedJobs, findPromises, promiseLine, clean } from './promises.ts';
+import { MAX_SCAN, citedJobs, findPromises, promiseLine, clean } from './promises.ts';
 
-export { PROMISE_PATTERNS, SKIP_WORDS, LIVE, citedJobs, findPromises, promiseLine, sentences } from './promises.ts';
+export { MAX_SCAN, PROMISE_PATTERNS, SKIP_WORDS, LIVE, citedJobs, findPromises, promiseLine, sentences } from './promises.ts';
 
 export interface GatePromiseConfig {
   /** "warn" marks an unfulfilled promise and carries on. "enforce" fails the stage. Default "warn". */
@@ -58,6 +58,7 @@ export default definePlugin({
 
       if (!on) return ctx.emit('stage.screened', { ...pass, promiseChecked: false }, e.jobId);
 
+      if (result.length > MAX_SCAN) ctx.log.warn(`gate-promise: the ${stage} result is ${result.length} characters long, so only the first ${MAX_SCAN} were checked`);
       const promises = findPromises(result);
       let shown: string[] = [];
       if (promises.length) {

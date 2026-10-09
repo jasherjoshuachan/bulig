@@ -727,6 +727,23 @@ describe('merge.requested', () => {
     expect(h.calls().filter((c) => c.args[1] === 'checks').length).toBe(3);
   });
 
+  it('cancel ends the wait between retries at once, instead of sleeping out the delay', async () => {
+    const h = await setup({ tries: 3, retryDelayMs: 60_000 });
+    const pr = await openPr(h);
+    h.setState({ log: join(h.root, 'gh.log'), checksErrorFirst: 99, checks: [{ name: 'ci', bucket: 'pass' }] });
+    h.fire('merge.requested', { cwd: pr.cwd, number: pr.number, headSha: pr.headSha });
+    await until(() => h.calls().filter((c) => c.args[1] === 'checks').length === 1);
+    h.k.jobs.setStatus(h.job.id, 'cancelled');
+    // Stopping waits for the running merge handler, so it only returns quickly if the 60s retry sleep was cut short.
+    const stopped = Date.now();
+    await h.k.stop();
+    expect(Date.now() - stopped).toBeLessThan(3000);
+    // No second try after the cancel, and nothing reported or merged.
+    expect(h.calls().filter((c) => c.args[1] === 'checks').length).toBe(1);
+    expect(h.calls().some((c) => c.args[1] === 'merge')).toBe(false);
+    expect(h.seen.some((e) => e.type === 'merge.refused' || e.type === 'merge.failed' || e.type === 'pr.merged')).toBe(false);
+  });
+
   it('fails for good when checks still cannot be read after the retries', async () => {
     const h = await setup({ tries: 3, retryDelayMs: 5 });
     const pr = await openPr(h);
@@ -1130,6 +1147,23 @@ describe('scope guard on commit.requested', () => {
     expect(existsSync(join(cwd, 'test-results/.last-run.json'))).toBe(true);
   });
 
+  it('takes a scope of exactly 100 entries and refuses 101, committing nothing', async () => {
+    const h = await setup();
+    const cwd = await worktree(h, 'bulig/s-cap');
+    const before = git(cwd, 'rev-parse', 'HEAD');
+    write(cwd, 'README.md', '# hi\n');
+    const entry = (i: number) => `docs/f${i}.md`;
+    const hundred = ['README.md', ...Array.from({ length: 99 }, (_, i) => entry(i))];
+    const tooMany = [...hundred, entry(99)];
+    const refused = await commit(h, cwd, { scope: tooMany });
+    expect(refused.type).toBe('commit.failed');
+    expect(failure(refused).error).toContain('101 entries, the most is 100');
+    expect(git(cwd, 'rev-parse', 'HEAD')).toBe(before);
+    const ok = await commit(h, cwd, { scope: hundred });
+    expect(ok.type).toBe('commit.done');
+    expect(committed(cwd)).toEqual(['README.md']);
+  });
+
   it('commits only the in-scope paths: an ignored file and an in-scope file give a commit with exactly one file', async () => {
     const h = await setup();
     writeFileSync(join(h.repo, '.gitignore'), '*.log\n');
@@ -1382,6 +1416,19 @@ describe('scope guard on commit.requested', () => {
     symlinkSync('/etc/hosts', join(cwd, 'hosts.lnk'));
     const r = await commit(h, cwd, { scope: ['README.md'], scopeMode: 'warn' });
     expect(r.type).toBe('commit.failed');
+  });
+
+  it('warn mode still refuses a symlink nested deeper than the path depth cap', async () => {
+    const h = await setup();
+    const cwd = await worktree(h, 'bulig/s-deep');
+    write(cwd, 'README.md');
+    const dir = Array.from({ length: 32 }, (_, i) => `d${i}`).join('/');
+    mkdirSync(join(cwd, dir), { recursive: true });
+    symlinkSync('/etc/hosts', join(cwd, dir, 'deep.lnk'));
+    const r = await commit(h, cwd, { scope: ['README.md'], scopeMode: 'warn' });
+    expect(r.type).toBe('commit.failed');
+    expect(failure(r).error).toMatch(/symlink/);
+    expect(committed(cwd)).not.toContain(`${dir}/deep.lnk`);
   });
 
   it('an unknown scopeMode is refused instead of guessed', async () => {

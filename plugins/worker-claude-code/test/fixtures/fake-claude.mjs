@@ -67,6 +67,13 @@ if (prompt.includes('FAKE:grandchild')) {
   line({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 't2', name: 'Bash', input: { command: 'pnpm test' } }] } });
   line({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 't2', content: 'ok', is_error: false }] } });
   line({ type: 'result', subtype: 'success', is_error: false, result: 'streamed', session_id: `session-${process.pid}`, total_cost_usd: 0.01 });
+} else if (prompt.includes('FAKE:flood')) {
+  // A verbose run that read a lot: about 24 MB of tool results, then the result line.
+  const line = (o) => process.stdout.write(JSON.stringify(o) + '\n');
+  line({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'f1', name: 'Read', input: { file_path: 'big.txt' } }] } });
+  const blob = 'y'.repeat(100_000);
+  for (let n = 0; n < 240; n++) line({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: n === 0 ? 'f1' : `none${n}`, content: blob }] } });
+  line({ type: 'result', subtype: 'success', is_error: false, result: 'flooded', session_id: 's-flood', total_cost_usd: 0.02 });
 } else if (prompt.includes('FAKE:garbage')) {
   process.stdout.write('this is not json');
 } else if (prompt.includes('FAKE:iserror')) {

@@ -230,29 +230,36 @@ function recordOf(tool: string, input: unknown): EvidenceRecord {
  * the model wrote, and the content of any tool result, are never read, so nothing the model says can add a record.
  */
 export function evidenceFrom(lines: readonly unknown[]): EvidenceRecord[] {
-  const out: EvidenceRecord[] = [];
-  const open = new Map<string, EvidenceRecord>();
-  for (const line of lines) {
+  const c = new EvidenceCollector();
+  for (const line of lines) c.add(line);
+  return c.records;
+}
+
+/** The same pairing, one message at a time, so a stream can be read as it arrives. Holds at most MAX_RECORDS records. */
+class EvidenceCollector {
+  readonly records: EvidenceRecord[] = [];
+  private readonly open = new Map<string, EvidenceRecord>();
+
+  add(line: unknown): void {
     const msg = (line as { type?: unknown; message?: { content?: unknown } } | null) ?? {};
     const content = msg.message?.content;
-    if (!Array.isArray(content)) continue;
+    if (!Array.isArray(content)) return;
     for (const block of content as Record<string, unknown>[]) {
       if (typeof block !== 'object' || block === null) continue;
       if (msg.type === 'assistant' && block.type === 'tool_use' && typeof block.id === 'string' && typeof block.name === 'string') {
-        if (out.length >= MAX_RECORDS) continue;
+        if (this.records.length >= MAX_RECORDS) continue;
         const rec = recordOf(block.name, block.input);
-        open.set(block.id, rec);
-        out.push(rec);
+        this.open.set(block.id, rec);
+        this.records.push(rec);
       } else if (msg.type === 'user' && block.type === 'tool_result' && typeof block.tool_use_id === 'string') {
-        const rec = open.get(block.tool_use_id);
+        const rec = this.open.get(block.tool_use_id);
         if (rec) {
           rec.ok = block.is_error !== true;
-          open.delete(block.tool_use_id);
+          this.open.delete(block.tool_use_id);
         }
       }
     }
   }
-  return out;
 }
 
 export interface RunResult {
@@ -265,43 +272,120 @@ export interface RunResult {
   evidence?: EvidenceRecord[];
 }
 
+/** The longest stream line that is parsed. A longer one (a huge tool result) is skipped, never held whole. */
+export const MAX_LINE_BYTES = 1024 * 1024;
+/** The old single-object output is one line, so the first line of the output may be this long. */
+export const MAX_SINGLE_OBJECT_BYTES = 8 * 1024 * 1024;
+const HEAD_CHARS = 300;
+const STDERR_KEEP = 4096;
+
 /**
- * Parse what `claude -p --output-format stream-json --verbose` prints: one JSON object per line, the last one of
- * type "result". The older single-object output is still understood (it carries no tool records).
+ * Reads what `claude -p --output-format stream-json --verbose` prints, as it arrives: one JSON object per line, the
+ * last one of type "result". Only the evidence records, the result line and a short head of the output are kept,
+ * so memory does not grow with what the tools printed. The older single-object output (one line, no records) is
+ * still understood, up to MAX_SINGLE_OBJECT_BYTES.
  */
-export function parseClaudeOutput(stdout: string): RunResult {
-  const text = stdout.trim();
-  let data: Record<string, unknown> | undefined;
-  let evidence: EvidenceRecord[] | undefined;
-  try {
-    data = JSON.parse(text) as Record<string, unknown>;
-  } catch {
-    const objs: Record<string, unknown>[] = [];
-    for (const line of text.split('\n')) {
-      try {
-        const o = JSON.parse(line) as unknown;
-        if (typeof o === 'object' && o !== null) objs.push(o as Record<string, unknown>);
-      } catch {
-        // a line that is not JSON is not a record
+export class OutputParser {
+  /** The most bytes held at any moment (the unfinished line, the result, the head). For tests and diagnostics. */
+  peakRetained = 0;
+  private pending: Buffer[] = [];
+  private pendingLen = 0;
+  private skipping = false;
+  private lines = 0;
+  private objects = 0;
+  private skipped = 0;
+  private oversizeFirst = false;
+  private resultLen = 0;
+  private result: Record<string, unknown> | undefined;
+  private single: Record<string, unknown> | undefined;
+  private head = '';
+  private readonly evidence = new EvidenceCollector();
+
+  write(chunk: Buffer): void {
+    if (this.head.length < HEAD_CHARS) this.head += chunk.toString('utf8', 0, HEAD_CHARS * 4).slice(0, HEAD_CHARS - this.head.length);
+    let pos = 0;
+    while (pos < chunk.length) {
+      const nl = chunk.indexOf(10, pos);
+      const end = nl === -1 ? chunk.length : nl;
+      if (!this.skipping) {
+        this.pending.push(chunk.subarray(pos, end));
+        this.pendingLen += end - pos;
+        this.track();
+        if (this.pendingLen > (this.lines === 0 ? MAX_SINGLE_OBJECT_BYTES : MAX_LINE_BYTES)) {
+          if (this.lines === 0) this.oversizeFirst = true;
+          this.pending = [];
+          this.pendingLen = 0;
+          this.skipping = true;
+          this.skipped++;
+        }
       }
+      if (nl === -1) break;
+      if (!this.skipping) this.line();
+      this.skipping = false;
+      this.lines++;
+      pos = nl + 1;
     }
-    data = [...objs].reverse().find((o) => o.type === 'result');
-    if (data) evidence = evidenceFrom(objs);
   }
-  if (typeof data !== 'object' || data === null) {
-    return { ok: false, result: '', error: `claude printed output that is not JSON: ${text.slice(0, 300)}` };
+
+  private track(): void {
+    this.peakRetained = Math.max(this.peakRetained, this.pendingLen + this.resultLen + this.head.length);
   }
-  // A stream that stopped before its result line is not an answer.
-  if (typeof data.type === 'string' && data.type !== 'result') {
-    return { ok: false, result: '', error: `claude printed no result: ${text.slice(0, 300)}` };
+
+  private line(): void {
+    const text = Buffer.concat(this.pending, this.pendingLen).toString('utf8').trim();
+    this.pending = [];
+    this.pendingLen = 0;
+    if (!text) return;
+    let o: unknown;
+    try {
+      o = JSON.parse(text);
+    } catch {
+      return; // a line that is not JSON is not a record
+    }
+    if (typeof o !== 'object' || o === null || Array.isArray(o)) return;
+    const obj = o as Record<string, unknown>;
+    if (this.objects++ === 0 && typeof obj.type !== 'string') this.single = obj;
+    this.evidence.add(obj);
+    if (obj.type === 'result') {
+      this.result = obj;
+      this.resultLen = text.length;
+      this.track();
+    }
   }
-  const result = typeof data.result === 'string' ? data.result : '';
-  const sessionId = typeof data.session_id === 'string' ? data.session_id : undefined;
-  const costUsd = typeof data.total_cost_usd === 'number' ? data.total_cost_usd : undefined;
-  if (data.is_error === true) {
-    return { ok: false, result, error: result || 'claude reported an error', ...(sessionId && { sessionId }) };
+
+  finish(): RunResult {
+    if (!this.skipping && this.pendingLen > 0) this.line(); // the last line may have no newline
+    const data = this.result ?? this.single;
+    if (!data) {
+      if (this.oversizeFirst) {
+        return { ok: false, result: '', error: `claude printed a single JSON object over ${MAX_SINGLE_OBJECT_BYTES / 1024 / 1024} MiB, which is too large to read` };
+      }
+      if (this.objects > 0 || this.skipped > 0) {
+        const skipped = this.skipped > 0 ? ` (${this.skipped} line${this.skipped === 1 ? '' : 's'} over ${MAX_LINE_BYTES / 1024 / 1024} MiB skipped)` : '';
+        return { ok: false, result: '', error: `claude printed no result line${skipped}: ${this.head}` };
+      }
+      return { ok: false, result: '', error: `claude printed output that is not JSON: ${this.head.trim()}` };
+    }
+    // A single object that is not a result (a stream that stopped early) is not an answer.
+    if (typeof data.type === 'string' && data.type !== 'result') {
+      return { ok: false, result: '', error: `claude printed no result: ${this.head}` };
+    }
+    const result = typeof data.result === 'string' ? data.result : '';
+    const sessionId = typeof data.session_id === 'string' ? data.session_id : undefined;
+    const costUsd = typeof data.total_cost_usd === 'number' ? data.total_cost_usd : undefined;
+    if (data.is_error === true) {
+      return { ok: false, result, error: result || 'claude reported an error', ...(sessionId && { sessionId }) };
+    }
+    const evidence = this.objects > 1 ? this.evidence.records : undefined;
+    return { ok: true, result, ...(sessionId && { sessionId }), ...(costUsd !== undefined && { costUsd }), ...(evidence && { evidence }) };
   }
-  return { ok: true, result, ...(sessionId && { sessionId }), ...(costUsd !== undefined && { costUsd }), ...(evidence && { evidence }) };
+}
+
+/** Parse the whole output of a run held in memory. The plugin itself uses OutputParser on the live pipe. */
+export function parseClaudeOutput(stdout: string): RunResult {
+  const p = new OutputParser();
+  p.write(Buffer.from(stdout, 'utf8'));
+  return p.finish();
 }
 
 function run(
@@ -332,7 +416,7 @@ function run(
     }
     children.add(child);
     const untrack = onSpawn(child);
-    let stdout = '';
+    const parser = new OutputParser();
     let stderr = '';
     let timedOut = false;
     let settled = false;
@@ -350,12 +434,15 @@ function run(
       signalGroup(child, 'SIGTERM');
       setTimeout(() => signalGroup(child, 'SIGKILL'), KILL_GRACE_MS).unref();
     }, timeoutMs);
-    child.stdout!.on('data', (d: Buffer) => (stdout += d.toString()));
-    child.stderr!.on('data', (d: Buffer) => (stderr += d.toString()));
+    child.stdout!.on('data', (d: Buffer) => parser.write(d));
+    // Only the start of stderr is ever shown, so only that is kept.
+    child.stderr!.on('data', (d: Buffer) => {
+      if (stderr.length < STDERR_KEEP) stderr += d.toString('utf8', 0, STDERR_KEEP);
+    });
     child.on('error', (err) => done({ ok: false, result: '', error: `could not start ${bin}: ${err.message}` }));
     child.on('close', (code) => {
       if (timedOut) return done({ ok: false, result: '', error: `timed out after ${Math.round(timeoutMs / 1000)}s` });
-      const parsed = parseClaudeOutput(stdout);
+      const parsed = parser.finish();
       if (code !== 0) {
         const why = stderr.trim().slice(0, 300) || parsed.error || 'no output';
         return done({ ok: false, result: parsed.result, error: `claude exited with code ${code}: ${why}` });

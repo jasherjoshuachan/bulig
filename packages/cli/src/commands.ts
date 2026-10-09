@@ -117,24 +117,46 @@ export function kernelPluginConfig(config: BuligConfig, resume: 'all' | false | 
   };
 }
 
+/** The built-in plugins `run` and `serve` share. Each command adds its own channel(s); one list so the two cannot drift apart. */
+export const CORE_PLUGINS: Plugin[] = [worker, gate, gatePromise, github, pipeline];
+
+const GATE_FOR_EVENT: Record<string, string> = { 'stage.checked': 'gate-evidence', 'stage.screened': 'gate-promise' };
+
+/**
+ * Fail at start, by name, instead of hanging later: the kernel quietly skips an enabled plugin nobody registered,
+ * and a pipeline listening to a gate's event that no running gate emits would wait on its first stage forever.
+ */
+export function assertWiring(plugins: readonly Plugin[], enabled: readonly string[], pluginConfig: Record<string, Record<string, unknown>>): void {
+  const registered = new Set(plugins.map((p) => (p.manifest as { name?: string }).name));
+  const missing = enabled.filter((n) => !registered.has(n));
+  if (missing.length) throw new UserError(`enabled but not registered by this command: ${missing.join(', ')}. Remove it from "enabled" or use a command that loads it.`);
+  const event = pluginConfig['pipeline-dev']?.stageResultEvent;
+  const gateName = typeof event === 'string' ? GATE_FOR_EVENT[event] : undefined;
+  if (gateName && enabled.includes('pipeline-dev') && !enabled.includes(gateName)) {
+    throw new UserError(`pipeline-dev reads ${event}, which only ${gateName} emits, but ${gateName} is not enabled. Every job would hang after its first stage.`);
+  }
+}
+
 async function openSession(
   config: BuligConfig,
   io: Io,
   resume: 'all' | false | string[],
   onlyJob?: string,
-  pluginsFor: (channel: CliChannel) => Plugin[] = (channel) => [channel.plugin, worker, gate, gatePromise, github, pipeline],
+  pluginsFor: (channel: CliChannel) => Plugin[] = (channel) => [channel.plugin, ...CORE_PLUGINS],
 ): Promise<Session> {
-  mkdirSync(dirname(config.dbPath), { recursive: true });
-  const release = acquireLock(config.dbPath);
   const channel = createCliChannel({ write: (l) => io.out(l), ...(onlyJob && { onlyJob }) });
   const plugins = pluginsFor(channel);
+  const pluginConfig = kernelPluginConfig(config, resume);
+  assertWiring(plugins, config.enabled, pluginConfig);
+  mkdirSync(dirname(config.dbPath), { recursive: true });
+  const release = acquireLock(config.dbPath);
   const kernel = createKernel({
     dbPath: config.dbPath,
     plugins,
     enabled: config.enabled,
     grants: config.grants,
     eventCapabilities: config.eventCapabilities,
-    pluginConfig: kernelPluginConfig(config, resume),
+    pluginConfig,
     logger: {
       debug() {},
       info() {},
@@ -268,7 +290,7 @@ async function cmdServe(args: string[], io: Io): Promise<number> {
     throw new UserError('serve needs a channel. Enable "channel-telegram" in the config.');
   }
   const session = await openSession(config, io, 'all', undefined, (channel) =>
-    io.servePlugins ?? [telegram, channel.plugin, worker, gate, github, pipeline],
+    io.servePlugins ?? [telegram, channel.plugin, ...CORE_PLUGINS],
   );
   let stop: () => void = () => {};
   const stopped = new Promise<void>((resolve) => (stop = resolve));

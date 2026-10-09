@@ -3,11 +3,11 @@ import {
   DuplicatePluginError,
   ManifestError,
   ManifestSchema,
-  SDK_VERSION,
+  SUPPORTED_SDK_MAJORS,
   SdkVersionMismatchError,
   UndeclaredEventError,
   UndeclaredSubscriptionError,
-  matchesPattern,
+  isReservedEvent,
   patternCovered,
   type EventHandler,
   type JobsApi,
@@ -40,9 +40,6 @@ export interface LoadedPlugin {
   manifest: Manifest;
 }
 
-// Only the kernel may emit these.
-const RESERVED = (type: string) => matchesPattern('kernel.*', type) || matchesPattern('job.*', type) || type === 'plugin.error';
-
 export function parseManifest(plugin: Plugin): Manifest {
   const parsed = ManifestSchema.safeParse(plugin.manifest);
   const name = (plugin.manifest as { name?: unknown } | undefined)?.name;
@@ -51,10 +48,10 @@ export function parseManifest(plugin: Plugin): Manifest {
     throw new ManifestError(`Invalid manifest for plugin "${String(name)}": ${issues}`);
   }
   const m = parsed.data;
-  if (m.sdk !== SDK_VERSION) {
-    throw new SdkVersionMismatchError(`Plugin "${m.name}" targets sdk ${m.sdk}, this kernel runs sdk ${SDK_VERSION}`);
+  if (!SUPPORTED_SDK_MAJORS.includes(m.sdk)) {
+    throw new SdkVersionMismatchError(`Plugin "${m.name}" targets sdk ${m.sdk}, this kernel runs sdk ${SUPPORTED_SDK_MAJORS.join(' and ')}`);
   }
-  const reserved = m.emits.find(RESERVED);
+  const reserved = m.emits.find(isReservedEvent);
   if (reserved) throw new ManifestError(`Plugin "${m.name}" may not emit kernel event "${reserved}"`);
   return m;
 }

@@ -47,7 +47,7 @@ export default definePlugin({
   manifest: {
     name: 'gate-evidence',
     version: '0.1.0',
-    sdk: '0',
+    sdk: '1',
     description: 'Checks that a stage which claims a result has a tool-use record from the same turn to back it.',
     subscribes: ['stage.completed'],
     emits: ['stage.checked', 'stage.failed'],

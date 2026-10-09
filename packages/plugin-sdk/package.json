@@ -1,8 +1,14 @@
 {
   "name": "@bulig/plugin-sdk",
-  "version": "0.0.0",
+  "version": "1.0.0-rc.1",
   "type": "module",
   "license": "MIT",
-  "exports": { ".": "./src/index.ts" },
-  "dependencies": { "zod": "^4.1.0" }
+  "exports": {
+    ".": "./src/index.ts",
+    "./conformance": "./src/conformance/index.ts",
+    "./conformance/check": "./src/conformance/check.ts"
+  },
+  "dependencies": {
+    "zod": "^4.1.0"
+  }
 }

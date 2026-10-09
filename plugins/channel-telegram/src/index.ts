@@ -199,7 +199,7 @@ export function createTelegramChannel(options: TelegramChannelOptions = {}): Plu
     manifest: {
       name: 'channel-telegram',
       version: '0.1.0',
-      sdk: '0',
+      sdk: '1',
       description: 'Run Bulig from Telegram: start jobs, watch progress, tap to approve.',
       provides: { commands: ['dev', 'status', 'history', 'cancel', 'retry', 'help'] },
       subscribes: SUBSCRIPTIONS,

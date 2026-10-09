@@ -506,7 +506,7 @@ export function createWorker() {
     manifest: {
       name: 'worker-claude-code',
       version: '0.1.0',
-      sdk: '0',
+      sdk: '1',
       description: 'Runs one fresh Claude Code session per stage, inside the job worktree.',
       provides: { stages: ['*'] },
       subscribes: ['stage.requested', 'job.status'],

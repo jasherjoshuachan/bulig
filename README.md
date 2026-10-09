@@ -38,7 +38,7 @@ In v0.1 these exist: `packages/core`, `packages/plugin-sdk`, `packages/cli`, and
 |---|---|
 | v0.1 Hands | core (jobs, stages, store, event bus), channel, Claude Code worker, GitHub, dev pipeline |
 | v0.2 Trust | receipts, one-use approvals, promise and evidence gates, status/retry/cancel |
-| v0.3 SDK v1 | freeze the plugin SDK: manifest, permissions, conformance tests |
+| v0.3 SDK v1 | freeze the plugin SDK: manifest, permissions, conformance tests (release candidate: see [docs/sdk-v1.md](docs/sdk-v1.md)) |
 | v0.4 Memory | memory plugin, no changes to the others |
 | v0.5 Eyes | live check after deploy, revert offer |
 | v0.6 Ops pack | private pack on the same SDK |
@@ -53,6 +53,26 @@ bash scripts/verify.sh
 ```
 
 Needs Node 22 and pnpm 10.
+
+## Writing a plugin
+
+A plugin is one `definePlugin({ manifest, register, stop? })`. The manifest says what it listens for, what it emits and what it needs; the kernel refuses the rest. The contract is in [docs/sdk-v1.md](docs/sdk-v1.md): manifest fields, the context a plugin gets, event names and payloads, capabilities, what `"sdk": "1"` means, what counts as a breaking change, and which parts are still experimental. The reasoning is in [ADR 0006](docs/adr/0006-sdk-v1.md).
+
+Run the conformance suite against your plugin from a test file:
+
+```ts
+import { describeConformance } from '@bulig/plugin-sdk/conformance';
+import { createMyPlugin } from '../src/index.ts';
+
+describeConformance('my-plugin', {
+  load: () => createMyPlugin(),
+  config: { /* a config it accepts */ },
+  invalidConfigs: [{ config: {}, reason: 'what is wrong with it' }],
+  scenarios: [{ name: 'a stage finishes', events: [{ type: 'stage.completed', payload: { stage: 'plan', result: 'x' } }] }],
+});
+```
+
+It fails the plugin if it subscribes or emits something its manifest does not declare, uses a capability it did not ask for, does network, process or file-write work no declared capability covers, leaves a timer or process after `stop()`, accepts a bad config, or stores something that is not JSON. See the existing `plugins/*/test/conformance.test.ts` for examples, and the [limits of what it can see](docs/sdk-v1.md#9-conformance-suite).
 
 ## Run it
 

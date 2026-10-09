@@ -34,7 +34,7 @@ export default definePlugin({
   manifest: {
     name: 'gate-promise',
     version: '0.1.0',
-    sdk: '0',
+    sdk: '1',
     description: 'Marks a stage that promises later work ("I\'ll follow up") with no live job id behind the promise.',
     subscribes: ['stage.completed', 'stage.checked'],
     emits: ['stage.screened', 'stage.failed'],

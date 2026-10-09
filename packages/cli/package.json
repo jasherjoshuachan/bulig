@@ -9,6 +9,7 @@
     "@bulig/channel-cli": "workspace:*",
     "@bulig/channel-telegram": "workspace:*",
     "@bulig/core": "workspace:*",
+    "@bulig/gate-evidence": "workspace:*",
     "@bulig/github": "workspace:*",
     "@bulig/pipeline-dev": "workspace:*",
     "@bulig/plugin-sdk": "workspace:*",

@@ -46,6 +46,7 @@ const SUBSCRIPTIONS = [
   'approval.requested',
   'job.status',
   'stage.completed',
+  'stage.checked',
   'stage.failed',
   'worktree.failed',
   'pr.opened',
@@ -136,6 +137,11 @@ export function progressLine(e: BuligEvent): string | undefined {
         ? /^[\s>*_`#-]*VERDICT:\s*(PASS|FAIL)\b/gim.exec(String(p.result ?? ''))?.[1]
         : undefined;
       return `${tag} ${one(p.stage)} finished${verdict ? `: ${verdict}` : ''}${usd(p.costUsd)}`;
+    }
+    case 'stage.checked': {
+      // A gate (gate-evidence) found a claim with no tool-use record behind it. Say nothing when everything was backed.
+      const unverified = bullets(p.unverified, 5);
+      return unverified.length ? `${tag} ${one(p.stage)} has claims with no evidence:\n${unverified.join('\n')}\n${one(p.evidenceSummary, 200)}` : undefined;
     }
     case 'stage.failed':
       return `${tag} ${one(p.stage)} FAILED: ${one(p.error, 300)}`;

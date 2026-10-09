@@ -17,6 +17,15 @@ const ev = (type: string, payload: unknown, jobId = 'abcdef1234567890'): BuligEv
   id: 'e', type, payload, jobId, source: 'test', at: '2026-01-01T00:00:00Z',
 });
 
+describe('format: stage.checked', () => {
+  it('says nothing when every claim was backed, and lists the unverified ones otherwise', () => {
+    expect(format(ev('stage.checked', { stage: 'test', unverified: [], evidenceSummary: 'Evidence this turn: 1 read' }))).toBeUndefined();
+    const out = format(ev('stage.checked', { stage: 'test', unverified: ['Unverified: no record of a test run this turn ("tests pass")'], evidenceSummary: 'Evidence this turn: no tool calls recorded' }))!;
+    expect(out[0]).toBe('[abcdef12] test: claims with no evidence (Evidence this turn: no tool calls recorded)');
+    expect(out[1]).toBe('[abcdef12]   Unverified: no record of a test run this turn ("tests pass")');
+  });
+});
+
 describe('format', () => {
   it('prints short, one-line messages with the job tag', () => {
     expect(format(ev('job.status', { from: 'running', to: 'awaiting_approval' }))).toEqual(['[abcdef12] job awaiting approval']);

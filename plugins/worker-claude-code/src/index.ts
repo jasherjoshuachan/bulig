@@ -175,7 +175,7 @@ export function sandboxSettings(extraDomains: readonly string[] = []): Record<st
  * so a reviewer never sees the build session's context.
  */
 export function buildArgs(req: StageRequest, extra: string[] = [], allowDomains: readonly string[] = []): string[] {
-  const args = ['-p', req.prompt, '--output-format', 'json', '--model', req.model, '--settings', JSON.stringify(sandboxSettings(allowDomains))];
+  const args = ['-p', req.prompt, '--output-format', 'stream-json', '--verbose', '--model', req.model, '--settings', JSON.stringify(sandboxSettings(allowDomains))];
   if (req.mode === 'edit') {
     args.push('--permission-mode', 'acceptEdits', '--allowedTools', EDIT_TOOLS.join(','), '--disallowedTools', EDIT_DENIED_TOOLS.join(','));
   } else {
@@ -184,21 +184,116 @@ export function buildArgs(req: StageRequest, extra: string[] = [], allowDomains:
   return [...args, ...extra];
 }
 
+/**
+ * One thing Claude did in a run, taken from the tool-use records in its stream, never from its text.
+ * `ok` is false when the tool reported an error or never reported back.
+ */
+export interface EvidenceRecord {
+  tool: string;
+  kind: 'read' | 'search' | 'edit' | 'run' | 'other';
+  /** The file path, search pattern or shell command, flattened and cut at 300 characters. */
+  target: string;
+  ok: boolean;
+}
+
+const MAX_RECORDS = 300;
+const MAX_TARGET = 300;
+const KINDS: Record<string, EvidenceRecord['kind']> = {
+  Read: 'read',
+  Glob: 'search',
+  Grep: 'search',
+  Edit: 'edit',
+  MultiEdit: 'edit',
+  Write: 'edit',
+  NotebookEdit: 'edit',
+  Bash: 'run',
+};
+
+const flat = (v: unknown): string =>
+  (typeof v === 'string' ? v : '')
+    .replace(/[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u202a-\u202e\u2060\u2066-\u2069\ufeff]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, MAX_TARGET);
+
+function recordOf(tool: string, input: unknown): EvidenceRecord {
+  const i = (typeof input === 'object' && input !== null ? input : {}) as Record<string, unknown>;
+  const kind = Object.hasOwn(KINDS, tool) ? KINDS[tool]! : 'other';
+  const target =
+    kind === 'run' ? flat(i.command) : kind === 'search' ? flat(i.pattern) : kind === 'other' ? '' : flat(i.file_path) || flat(i.notebook_path);
+  return { tool: flat(tool).slice(0, 60), kind, target, ok: false };
+}
+
+/**
+ * Every tool call in a stream-json run, paired with its result. Only `assistant` messages can start a record
+ * (a tool_use block) and only `user` messages can settle one (a tool_result block with the same id). The text
+ * the model wrote, and the content of any tool result, are never read, so nothing the model says can add a record.
+ */
+export function evidenceFrom(lines: readonly unknown[]): EvidenceRecord[] {
+  const out: EvidenceRecord[] = [];
+  const open = new Map<string, EvidenceRecord>();
+  for (const line of lines) {
+    const msg = (line as { type?: unknown; message?: { content?: unknown } } | null) ?? {};
+    const content = msg.message?.content;
+    if (!Array.isArray(content)) continue;
+    for (const block of content as Record<string, unknown>[]) {
+      if (typeof block !== 'object' || block === null) continue;
+      if (msg.type === 'assistant' && block.type === 'tool_use' && typeof block.id === 'string' && typeof block.name === 'string') {
+        if (out.length >= MAX_RECORDS) continue;
+        const rec = recordOf(block.name, block.input);
+        open.set(block.id, rec);
+        out.push(rec);
+      } else if (msg.type === 'user' && block.type === 'tool_result' && typeof block.tool_use_id === 'string') {
+        const rec = open.get(block.tool_use_id);
+        if (rec) {
+          rec.ok = block.is_error !== true;
+          open.delete(block.tool_use_id);
+        }
+      }
+    }
+  }
+  return out;
+}
+
 export interface RunResult {
   ok: boolean;
   result: string;
   costUsd?: number;
   sessionId?: string;
   error?: string;
+  /** What Claude did in this run. Set only when the output was a stream. */
+  evidence?: EvidenceRecord[];
 }
 
-/** Parse the single JSON object `claude -p --output-format json` prints. */
+/**
+ * Parse what `claude -p --output-format stream-json --verbose` prints: one JSON object per line, the last one of
+ * type "result". The older single-object output is still understood (it carries no tool records).
+ */
 export function parseClaudeOutput(stdout: string): RunResult {
-  let data: Record<string, unknown>;
+  const text = stdout.trim();
+  let data: Record<string, unknown> | undefined;
+  let evidence: EvidenceRecord[] | undefined;
   try {
-    data = JSON.parse(stdout.trim()) as Record<string, unknown>;
+    data = JSON.parse(text) as Record<string, unknown>;
   } catch {
-    return { ok: false, result: '', error: `claude printed output that is not JSON: ${stdout.trim().slice(0, 300)}` };
+    const objs: Record<string, unknown>[] = [];
+    for (const line of text.split('\n')) {
+      try {
+        const o = JSON.parse(line) as unknown;
+        if (typeof o === 'object' && o !== null) objs.push(o as Record<string, unknown>);
+      } catch {
+        // a line that is not JSON is not a record
+      }
+    }
+    data = [...objs].reverse().find((o) => o.type === 'result');
+    if (data) evidence = evidenceFrom(objs);
+  }
+  if (typeof data !== 'object' || data === null) {
+    return { ok: false, result: '', error: `claude printed output that is not JSON: ${text.slice(0, 300)}` };
+  }
+  // A stream that stopped before its result line is not an answer.
+  if (typeof data.type === 'string' && data.type !== 'result') {
+    return { ok: false, result: '', error: `claude printed no result: ${text.slice(0, 300)}` };
   }
   const result = typeof data.result === 'string' ? data.result : '';
   const sessionId = typeof data.session_id === 'string' ? data.session_id : undefined;
@@ -206,7 +301,7 @@ export function parseClaudeOutput(stdout: string): RunResult {
   if (data.is_error === true) {
     return { ok: false, result, error: result || 'claude reported an error', ...(sessionId && { sessionId }) };
   }
-  return { ok: true, result, ...(sessionId && { sessionId }), ...(costUsd !== undefined && { costUsd }) };
+  return { ok: true, result, ...(sessionId && { sessionId }), ...(costUsd !== undefined && { costUsd }), ...(evidence && { evidence }) };
 }
 
 function run(
@@ -386,7 +481,7 @@ export function createWorker() {
         if (out.ok) {
           ctx.emit(
             'stage.completed',
-            { stage: req.stage, ok: true, result: out.result, costUsd: out.costUsd, sessionId: out.sessionId },
+            { stage: req.stage, ok: true, result: out.result, costUsd: out.costUsd, sessionId: out.sessionId, evidence: out.evidence ?? [] },
             event.jobId,
           );
         } else {

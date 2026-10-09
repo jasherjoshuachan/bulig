@@ -4,6 +4,7 @@ import { parseArgs } from 'node:util';
 import { createCliChannel, type CliChannel } from '@bulig/channel-cli';
 import telegram from '@bulig/channel-telegram';
 import { createKernel, Store, type Kernel } from '@bulig/core';
+import gate from '@bulig/gate-evidence';
 import github from '@bulig/github';
 import pipeline from '@bulig/pipeline-dev';
 import type { Job, JobStatus, Plugin, Stage } from '@bulig/plugin-sdk';
@@ -96,7 +97,7 @@ async function openSession(
   io: Io,
   resume: 'all' | false | string[],
   onlyJob?: string,
-  pluginsFor: (channel: CliChannel) => Plugin[] = (channel) => [channel.plugin, worker, github, pipeline],
+  pluginsFor: (channel: CliChannel) => Plugin[] = (channel) => [channel.plugin, worker, gate, github, pipeline],
 ): Promise<Session> {
   mkdirSync(dirname(config.dbPath), { recursive: true });
   const release = acquireLock(config.dbPath);
@@ -108,7 +109,11 @@ async function openSession(
     enabled: config.enabled,
     grants: config.grants,
     eventCapabilities: config.eventCapabilities,
-    pluginConfig: { ...config.pluginConfig, 'pipeline-dev': { ...config.pluginConfig['pipeline-dev'], resume } },
+    pluginConfig: {
+      ...config.pluginConfig,
+      // With the evidence gate on, the pipeline takes its results from the gate (stage.checked), not straight from the worker.
+      'pipeline-dev': { ...(config.enabled.includes('gate-evidence') && { stageResultEvent: 'stage.checked' }), ...config.pluginConfig['pipeline-dev'], resume },
+    },
     logger: {
       debug() {},
       info() {},
@@ -242,7 +247,7 @@ async function cmdServe(args: string[], io: Io): Promise<number> {
     throw new UserError('serve needs a channel. Enable "channel-telegram" in the config.');
   }
   const session = await openSession(config, io, 'all', undefined, (channel) =>
-    io.servePlugins ?? [telegram, channel.plugin, worker, github, pipeline],
+    io.servePlugins ?? [telegram, channel.plugin, worker, gate, github, pipeline],
   );
   let stop: () => void = () => {};
   const stopped = new Promise<void>((resolve) => (stop = resolve));

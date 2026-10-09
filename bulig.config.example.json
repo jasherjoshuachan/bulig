@@ -1,6 +1,6 @@
 {
   "dbPath": "~/.bulig/bulig.sqlite",
-  "enabled": ["channel-cli", "channel-telegram", "worker-claude-code", "github", "pipeline-dev"],
+  "enabled": ["channel-cli", "channel-telegram", "worker-claude-code", "gate-evidence", "github", "pipeline-dev"],
   "grants": {
     "channel-cli": ["channel.send:terminal", "approval.grant"],
     "channel-telegram": ["channel.send:telegram", "approval.grant"],
@@ -15,6 +15,10 @@
       "allowedUserIds": [123456789],
       "repos": { "my-project": "~/Projects/my-project" },
       "pollTimeoutSec": 30
+    },
+    "gate-evidence": {
+      "mode": "warn",
+      "enabled": true
     },
     "worker-claude-code": {
       "claudeBin": "claude",

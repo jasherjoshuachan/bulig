@@ -58,7 +58,7 @@ describe('a 1 MB input cannot freeze the loop', () => {
 
   // The deferral pattern ("I will ... later") reads at most 200 characters between "will" and the deferral word. The bound
   // is what keeps it linear: every "I will" in a long line would otherwise rescan to the end of the line. Two pins, because
-  // the 3000 ms budget above is loose enough that a bound of 2000 would pass it (about 730 ms here, against 80 ms at 200).
+  // the 3000 ms budget above is loose enough that a bound of 2000 would pass it (about 700 ms here, against 70 ms at 200).
   describe('the 200 character bound on the deferral pattern', () => {
     const DEFERRAL = PROMISE_PATTERNS.at(-1)!;
     /** "I will", `gap` characters, then "later". The gap starts and ends with a space. */
@@ -71,10 +71,20 @@ describe('a 1 MB input cannot freeze the loop', () => {
       expect(findPromises(`${withGap(201)}.`)).toEqual([]);
     });
 
-    it('1 MB of "I will x " is scanned in under 400 ms (best of 3, so a busy box does not fail it)', () => {
-      const text = rep('I will x ');
-      const best = Math.min(...[0, 1, 2].map(() => took(() => DEFERRAL.test(text))));
-      expect(best).toBeLessThan(400);
+    // Not a wall-clock limit. The same process times the hostile text and a baseline that costs about as much (150 scans of
+    // a text with no "I will" in it, which the engine skips quickly), both in pieces of a few milliseconds and taking the best
+    // of many, so a loaded box slows both sides alike and a clean slice is likely for each. Long measurements do not work: under load the
+    // short one lands in a clean time slice and the long one never does. Measured here: the ratio is about 3 at a bound of
+    // 200 and about 30 at 2000. The limit sits between.
+    it('64 KB of "I will x " costs less than 10 times as much as a baseline of 150 scans with no "I will" in it, timed in the same process (best of 100)', () => {
+      const best = (fn: () => void) => Math.min(...Array.from({ length: 100 }, () => took(fn)));
+      const quiet = rep('x ').slice(0, 65536);
+      const hostile = rep('I will x ').slice(0, 65536);
+      const baseline = best(() => {
+        for (let i = 0; i < 150; i++) DEFERRAL.test(quiet);
+      });
+      const worst = best(() => DEFERRAL.test(hostile));
+      expect(worst / baseline).toBeLessThan(10);
     });
   });
 

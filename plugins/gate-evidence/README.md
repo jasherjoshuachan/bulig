@@ -44,7 +44,7 @@ Every line a person sees is flattened to one line, stripped of control and bidi 
 | Setting | Default | |
 |---|---|---|
 | `mode` | `warn` | `warn` marks, `enforce` fails the stage. Anything else stops the start. |
-| `enabled` | `true` | `false` passes every result through unchecked. The plugin stays in the chain, so the pipeline keeps working. To remove it, take it out of `enabled` in the main config. |
+| `enabled` | `true` | `false` turns the gate off. With no `enabled` list in the main config it then leaves the default set. If it is listed in `enabled`, it stays in the chain and passes every result through unchecked, so the pipeline keeps working. To remove it, take it out of `enabled`. |
 | `evidenceSources` | `["worker-claude-code"]` | Plugins whose `evidence` counts. A `stage.completed` from any other source is checked as if it had no records, and a warning is logged. |
 
 It needs no capability.
@@ -58,7 +58,7 @@ worker-claude-code  --stage.completed {result, evidence}-->  gate-evidence  --st
                                                                   \--stage.failed (enforce)-->
 ```
 
-`pipeline-dev` listens to `stage.checked` instead of `stage.completed` when its config says `"stageResultEvent": "stage.checked"`. The CLI sets that for you when `gate-evidence` is in `enabled`. If you build a kernel yourself, set it, or the gate has no effect (the pipeline logs one warning when it sees a `stage.checked` it is not listening for). `gate-evidence` is opt-in: it is not in the default `enabled` list.
+`pipeline-dev` listens to `stage.checked` instead of `stage.completed` when its config says `"stageResultEvent": "stage.checked"`. The CLI sets that for you when `gate-evidence` is in `enabled`. If you build a kernel yourself, set it, or the gate has no effect (the pipeline logs one warning when it sees a `stage.checked` it is not listening for). `gate-evidence` is on by default, in `warn` mode: it is in the default `enabled` list, which applies when the main config has no `enabled` of its own. A config that lists `enabled` is used as written.
 
 ## What it cannot catch
 

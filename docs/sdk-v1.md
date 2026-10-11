@@ -191,6 +191,8 @@ These are **not** breaking: adding a manifest field with a default, an event, an
 
 ## 8. Deprecation
 
+These windows are confirmed (Jasher, 12 Oct 2026; [ADR 0006](adr/0006-sdk-v1.md)). They are the rule, not a proposal.
+
 1. A stable thing is deprecated by saying so in this page and by a runtime warning where the kernel can give one (for example, loading a plugin with `sdk: "0"` logs one warning per plugin).
 2. It keeps working for at least one more minor release and at least 30 days after the warning first ships.
 3. It is removed only in the next major. Experimental things are exempt from steps 2 and 3, and are removed or changed with a note in the pull request that does it.

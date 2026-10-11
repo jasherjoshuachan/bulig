@@ -872,3 +872,129 @@ describe('stage.checked lines', () => {
     expect(text.length).toBeLessThan(500);
   });
 });
+
+describe('/retry does not start a second job for the same one', () => {
+  const failedJob = async (title = 'Add multiply') => {
+    const fake = await startFake();
+    const repo = tempDir();
+    const b = await boot(fake, { repos: { app: repo }, allowedChatIds: [CHAT, 5151] });
+    const old = b.d.ctx.jobs.create({ repo, title });
+    b.d.ctx.jobs.setStatus(old.id, 'failed');
+    return { fake, repo, b, old };
+  };
+
+  it('a second /retry is refused, naming the job that already retried it and its state', async () => {
+    const { fake, b, old } = await failedJob();
+    fake.say(CHAT, `/retry ${old.id}`);
+    await until(() => b.d.ctx.jobs.list().length === 2, 'retried job');
+    const fresh = b.d.ctx.jobs.list()[1]!;
+    b.d.ctx.jobs.setStatus(fresh.id, 'running');
+    fake.say(CHAT, `/retry ${old.id}`);
+    await until(() => replies(fake).length === 2, 'refusal');
+    expect(replies(fake)[1]).toBe(`Job ${fresh.id.slice(0, 8)} already retried this one and is running. Use /status ${fresh.id.slice(0, 8)}.`);
+    expect(b.d.ctx.jobs.list()).toHaveLength(2);
+  });
+
+  it('is refused while the retry is queued or waiting for approval', async () => {
+    const { fake, b, old } = await failedJob();
+    fake.say(CHAT, `/retry ${old.id}`);
+    await until(() => b.d.ctx.jobs.list().length === 2, 'retried job');
+    const fresh = b.d.ctx.jobs.list()[1]!;
+    fake.say(CHAT, `/retry ${old.id}`);
+    await until(() => replies(fake).length === 2, 'queued refusal');
+    expect(replies(fake)[1]).toContain('already retried this one and is queued');
+    b.d.ctx.jobs.setStatus(fresh.id, 'running');
+    b.d.ctx.jobs.startStage(fresh.id, 'approve-plan');
+    b.d.ctx.jobs.setStatus(fresh.id, 'awaiting_approval');
+    fake.say(CHAT, `/retry ${old.id}`);
+    await until(() => replies(fake).length === 3, 'approval refusal');
+    expect(replies(fake)[2]).toContain('already retried this one and is awaiting approval');
+    expect(b.d.ctx.jobs.list()).toHaveLength(2);
+  });
+
+  it('is refused after the retry is done', async () => {
+    const { fake, b, old } = await failedJob();
+    fake.say(CHAT, `/retry ${old.id}`);
+    await until(() => b.d.ctx.jobs.list().length === 2, 'retried job');
+    b.d.ctx.jobs.setStatus(b.d.ctx.jobs.list()[1]!.id, 'done');
+    fake.say(CHAT, `/retry ${old.id}`);
+    await until(() => replies(fake).length === 2, 'refusal');
+    expect(replies(fake)[1]).toContain('already retried this one and is done');
+    expect(b.d.ctx.jobs.list()).toHaveLength(2);
+  });
+
+  it('is allowed again once every earlier retry failed, and once it was cancelled', async () => {
+    const { fake, b, old } = await failedJob();
+    fake.say(CHAT, `/retry ${old.id}`);
+    await until(() => b.d.ctx.jobs.list().length === 2, 'first retry');
+    b.d.ctx.jobs.setStatus(b.d.ctx.jobs.list()[1]!.id, 'failed');
+    fake.say(CHAT, `/retry ${old.id}`);
+    await until(() => b.d.ctx.jobs.list().length === 3, 'second retry');
+    b.d.ctx.jobs.setStatus(b.d.ctx.jobs.list()[2]!.id, 'cancelled');
+    fake.say(CHAT, `/retry ${old.id}`);
+    await until(() => b.d.ctx.jobs.list().length === 4, 'third retry');
+    // The third is live, so a fourth is refused and names the third, not an earlier ended one.
+    fake.say(CHAT, `/retry ${old.id}`);
+    await until(() => replies(fake).length === 4, 'refusal');
+    expect(replies(fake)[3]).toContain(`Job ${b.d.ctx.jobs.list()[3]!.id.slice(0, 8)} already retried this one and is queued`);
+    expect(b.d.ctx.jobs.list()).toHaveLength(4);
+  });
+
+  it('a retry of a failed retry links to the retry (a chain), and the original is still guarded', async () => {
+    const { fake, b, old } = await failedJob();
+    fake.say(CHAT, `/retry ${old.id}`);
+    await until(() => b.d.ctx.jobs.list().length === 2, 'first retry');
+    const first = b.d.ctx.jobs.list()[1]!;
+    b.d.ctx.jobs.setStatus(first.id, 'failed');
+    fake.say(CHAT, `/retry ${first.id}`);
+    await until(() => b.d.ctx.jobs.list().length === 3, 'chained retry');
+    const second = b.d.ctx.jobs.list()[2]!;
+    // The job exists before the reply is sent, so wait for the reply itself.
+    await until(() => replies(fake).length === 2, 'chained reply');
+    expect(replies(fake)[1]).toContain(`Job ${second.id.slice(0, 8)} started from ${first.id.slice(0, 8)}`);
+    fake.say(CHAT, `/retry ${first.id}`);
+    await until(() => replies(fake).length === 3, 'refusal');
+    expect(replies(fake)[2]).toContain(`Job ${second.id.slice(0, 8)} already retried this one`);
+    expect(b.d.ctx.jobs.list()).toHaveLength(3);
+  });
+
+  it('the link is kept in plugin state and survives a restart', async () => {
+    const { fake, b, old } = await failedJob();
+    fake.say(CHAT, `/retry ${old.id}`);
+    await until(() => b.d.ctx.jobs.list().length === 2, 'retried job');
+    const fresh = b.d.ctx.jobs.list()[1]!;
+    await shutdown(b);
+    const b2 = await boot(fake, {}, { dbPath: b.dbPath });
+    b2.d.ctx.jobs.setStatus(fresh.id, 'running');
+    fake.say(CHAT, `/retry ${old.id}`);
+    await until(() => replies(fake).length === 2, 'refusal after restart');
+    expect(replies(fake)[1]).toContain('already retried this one and is running');
+    expect(b2.d.ctx.jobs.list()).toHaveLength(2);
+    expect(new Store(b.dbPath).getState('channel-telegram', `retry-of:${fresh.id}`)).toBe(old.id);
+  });
+
+  it('another chat cannot see the retry, and /status is unchanged', async () => {
+    const fake = await startFake();
+    const repo = tempDir();
+    const OTHER = 5151;
+    const b = await boot(fake, { allowedChatIds: [CHAT, OTHER], repos: { app: repo } });
+    fake.say(CHAT, '/dev app Mine');
+    await until(() => b.d.ctx.jobs.list().length === 1, 'job');
+    const old = b.d.ctx.jobs.list()[0]!;
+    b.d.ctx.jobs.setStatus(old.id, 'failed');
+    fake.say(CHAT, `/retry ${old.id}`);
+    await until(() => b.d.ctx.jobs.list().length === 2, 'retry');
+    const fresh = b.d.ctx.jobs.list()[1]!;
+    fake.say(OTHER, `/retry ${old.id}`);
+    fake.say(OTHER, `/retry ${fresh.id}`);
+    await until(() => fake.texts(OTHER).length === 2, 'other chat replies');
+    for (const t of fake.texts(OTHER)) {
+      expect(t).toContain('No job starts with');
+      expect(t).not.toContain('already retried');
+    }
+    fake.say(CHAT, `/status ${old.id.slice(0, 8)}`);
+    await until(() => replies(fake).length === 3, 'status');
+    expect(replies(fake)[2]).toMatch(new RegExp(`^${old.id.slice(0, 8)}  failed  \\d+s\nMine\n`));
+    expect(b.d.ctx.jobs.list()).toHaveLength(2);
+  });
+});

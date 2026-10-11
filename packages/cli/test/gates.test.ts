@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { CORE_PLUGINS, assertWiring, gateResultEvent, kernelPluginConfig, promiseInput } from '../src/commands.ts';
 import type { BuligConfig } from '../src/config.ts';
-import { OPT_IN_PLUGINS } from '../src/config.ts';
+import { BUILTIN_PLUGINS, OPT_IN_PLUGINS, defaultEnabled } from '../src/config.ts';
 
 describe('gate wiring', () => {
   it('the pipeline listens to the last gate of the chain, whatever the order of `enabled`', () => {
@@ -19,8 +19,32 @@ describe('gate wiring', () => {
     expect(promiseInput(['gate-evidence', 'gate-promise'])).toBe('stage.checked');
   });
 
-  it('gate-promise is opt-in', () => {
-    expect(OPT_IN_PLUGINS).toContain('gate-promise');
+  it('the gates are on by default, Telegram is still opt-in', () => {
+    expect(BUILTIN_PLUGINS).toEqual(expect.arrayContaining(['gate-evidence', 'gate-promise']));
+    expect(OPT_IN_PLUGINS).toEqual(['channel-telegram']);
+  });
+
+  it('the default list wires the pipeline to stage.screened and chains the gates, and every opt-out combination stays wired', () => {
+    const wired = (pluginConfig: Record<string, Record<string, unknown>>) => {
+      const enabled = defaultEnabled(pluginConfig);
+      const out = kernelPluginConfig(cfg(enabled, pluginConfig), false);
+      expect(() => assertWiring(CORE_PLUGINS, enabled, out, ['channel-cli'])).not.toThrow();
+      return { enabled, result: out['pipeline-dev']!.stageResultEvent, promiseIn: out['gate-promise']?.input };
+    };
+    const off = { enabled: false };
+    expect(wired({})).toMatchObject({ result: 'stage.screened', promiseIn: 'stage.checked' });
+    expect(wired({ 'gate-promise': off })).toMatchObject({ result: 'stage.checked', promiseIn: undefined });
+    expect(wired({ 'gate-evidence': off })).toMatchObject({ result: 'stage.screened', promiseIn: 'stage.completed' });
+    const none = wired({ 'gate-evidence': off, 'gate-promise': off });
+    expect(none).toMatchObject({ result: undefined, promiseIn: undefined });
+    expect(none.enabled).not.toContain('gate-evidence');
+    expect(none.enabled).not.toContain('gate-promise');
+  });
+
+  it('the default gates run in warn mode: nothing sets enforce', () => {
+    const out = kernelPluginConfig(cfg(defaultEnabled({}), {}), false);
+    expect(out['gate-evidence']).toBeUndefined();
+    expect(out['gate-promise']).toEqual({ input: 'stage.checked' });
   });
 });
 

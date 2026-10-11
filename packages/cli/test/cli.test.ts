@@ -297,3 +297,26 @@ describe('config', () => {
     expect(() => loadConfig(w.cwd, w.home)).toThrow(/mystery/);
   });
 });
+
+describe('a config that also enables Telegram, used from the terminal', () => {
+  const live = ['channel-cli', 'channel-telegram', 'worker-claude-code', 'gate-evidence', 'gate-promise', 'github', 'pipeline-dev'];
+
+  it('run, approve, deny and resume do not need the Telegram plugin the config enables for serve', async () => {
+    const w = world({ enabled: live });
+    const run = await w.run('run', '--repo', w.repo, '--title', 'Add multiply function', '--issue', 'Add src/multiply.js');
+    expect(run.err).not.toMatch(/not registered/);
+    const id = jobIdFrom(run.out);
+    for (const argv of [['approve', id, 'plan'], ['resume', id], ['deny', id]]) {
+      const r = await w.run(...argv);
+      expect(r.err, argv[0]).not.toMatch(/not registered/);
+    }
+  });
+
+  it('a config shaped like the live one (no channel-cli) also opens a session for every command', async () => {
+    const w = world({ enabled: live.filter((n) => n !== 'channel-cli') });
+    for (const argv of [['approve', 'nope', 'plan'], ['deny', 'nope'], ['resume', 'nope']]) {
+      const r = await w.run(...argv);
+      expect(r.err, argv[0]).not.toMatch(/not registered/);
+    }
+  });
+});

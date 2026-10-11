@@ -1,7 +1,9 @@
+import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createTelegramChannel } from '@bulig/channel-telegram';
 import { Store } from '@bulig/core';
 import pipeline from '@bulig/pipeline-dev';
@@ -193,6 +195,72 @@ describe('bulig serve', () => {
     const s = serve(w, [fakeWorker(), fakeGithub(), pipeline]);
     expect(await s.done).toBe(2);
     expect(s.err.join('\n')).toMatch(/needs a channel/);
+  });
+});
+
+/** `serve` with its own plugin list (no io.servePlugins): the real worker runs the fake claude, the real github makes a worktree in a real tmp repo. */
+describe('bulig serve with its default plugin list', () => {
+  const FAKE_CLAUDE = fileURLToPath(new URL('../../../plugins/worker-claude-code/test/fixtures/fake-claude.mjs', import.meta.url));
+  const combos: Array<[string, string[]]> = [
+    ['neither gate', []],
+    ['gate-evidence only', ['gate-evidence']],
+    ['gate-promise only', ['gate-promise']],
+    ['both gates', ['gate-evidence', 'gate-promise']],
+  ];
+
+  it.each(combos)('the first stage reaches the pipeline and the plan approval is requested: %s', async (_name, gates) => {
+    const w = await world({ enabled: ['channel-telegram', 'worker-claude-code', 'github', 'pipeline-dev', ...gates] });
+    const git = (...a: string[]) => execFileSync('git', a, { cwd: w.repo, stdio: 'ignore' });
+    git('init', '-b', 'main');
+    writeFileSync(join(w.repo, 'a.txt'), 'x\n');
+    git('add', '.');
+    git('-c', 'user.name=t', '-c', 'user.email=t@example.test', 'commit', '-m', 'init');
+    const cfgPath = join(w.cwd, 'bulig.config.json');
+    const cfg = JSON.parse(readFileSync(cfgPath, 'utf8'));
+    cfg.grants['worker-claude-code'] = ['claude.run', 'fs.worktree'];
+    cfg.grants.github = ['git.push', 'gh.pr'];
+    cfg.pluginConfig['worker-claude-code'] = { claudeBin: FAKE_CLAUDE };
+    cfg.pluginConfig['gate-evidence'] = { mode: 'warn' };
+    cfg.pluginConfig['gate-promise'] = { mode: 'warn' };
+    writeFileSync(cfgPath, JSON.stringify(cfg));
+
+    // The built-in plugins are module singletons that keep state after a stop, so each case gets fresh modules.
+    vi.resetModules();
+    const { runCli: freshRunCli } = await import('../src/index.ts');
+    const out: string[] = [];
+    const err: string[] = [];
+    let stop: () => void = () => {};
+    const done = freshRunCli(['serve'], { out: (l) => out.push(l), err: (l) => err.push(l), cwd: w.cwd, home: w.home, onStop: (fn) => ((stop = fn), () => {}) });
+    await until(() => out.some((l) => l.includes('serving')), 'serve to start');
+    w.fake.say(CHAT, '/dev app First stage', OWNER);
+    await until(() => approvalMessage(w.fake, 'plan') !== undefined, 'plan approval card', 20000);
+    stop();
+    expect(await done).toBe(0);
+    expect(err).toEqual([]);
+    const store = new Store(w.dbPath);
+    const plan = store.listStages(store.listJobs()[0]!.id).find((st) => st.name === 'plan')!;
+    expect(plan.status).toBe('passed');
+    store.close();
+  }, 30000);
+
+  it('refuses to start when an enabled plugin is not registered, naming it', async () => {
+    const w = await world({ enabled: ['channel-telegram', 'worker-claude-code', 'github', 'pipeline-dev', 'gate-promise'] });
+    const err: string[] = [];
+    // Serving with a plugin list that lacks gate-promise, which the config enables: the old behaviour was to skip it silently.
+    expect(await runCli(['serve'], { out() {}, err: (l) => err.push(l), cwd: w.cwd, home: w.home, onStop: () => () => {}, servePlugins: [createTelegramChannel(), fakeWorker(), fakeGithub(), pipeline] })).toBe(2);
+    expect(err.join('\n')).toMatch(/not registered.*gate-promise/);
+    expect(existsSync(`${w.dbPath}.lock`)).toBe(false);
+  });
+
+  it('refuses a pipeline that reads a gate event when that gate is not enabled', async () => {
+    const w = await world();
+    const cfgPath = join(w.cwd, 'bulig.config.json');
+    const cfg = JSON.parse(readFileSync(cfgPath, 'utf8'));
+    cfg.pluginConfig['pipeline-dev'] = { stageResultEvent: 'stage.screened' };
+    writeFileSync(cfgPath, JSON.stringify(cfg));
+    const err: string[] = [];
+    expect(await runCli(['serve'], { out() {}, err: (l) => err.push(l), cwd: w.cwd, home: w.home, onStop: () => () => {} })).toBe(2);
+    expect(err.join('\n')).toMatch(/stage\.screened.*gate-promise is not enabled/);
   });
 });
 

@@ -182,7 +182,7 @@ export default definePlugin({
   manifest: {
     name: 'github',
     version: '0.1.0',
-    sdk: '0',
+    sdk: '1',
     description: 'Branches, pull requests, checks and merging, through git and the gh CLI.',
     provides: { stages: ['worktree', 'commit', 'pr', 'merge'] },
     subscribes: [

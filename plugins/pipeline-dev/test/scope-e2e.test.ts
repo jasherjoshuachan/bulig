@@ -50,7 +50,7 @@ function rig(act: Act) {
   const counts: Record<string, number> = {};
   const seenStages: string[] = [];
   const worker = definePlugin({
-    manifest: { name: 'fake-worker', version: '0.1.0', sdk: '0', description: 'edits files', subscribes: ['stage.requested'], emits: ['stage.completed'] },
+    manifest: { name: 'fake-worker', version: '0.1.0', sdk: '1', description: 'edits files', subscribes: ['stage.requested'], emits: ['stage.completed'] },
     register(ctx) {
       ctx.on('stage.requested', (e) => {
         const p = e.payload as { stage: string; cwd: string };

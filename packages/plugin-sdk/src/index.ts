@@ -1,7 +1,22 @@
 import { z } from 'zod';
 
-/** Major version of the plugin contract. A plugin must target the same major. */
-export const SDK_VERSION = '0';
+/**
+ * Major version of the plugin contract. A new plugin sets `sdk` in its manifest to this value.
+ * See docs/sdk-v1.md for what a major means and what counts as a breaking change.
+ */
+export const SDK_VERSION = '1';
+
+/** The full release of the contract. v1 candidate until the freeze is tagged. */
+export const SDK_RELEASE = '1.0.0-rc.1';
+
+/**
+ * Majors the kernel loads. "0" is the pre-freeze contract: it loads unchanged, with a deprecation warning, and is
+ * removed no earlier than the next major (see "Deprecation" in docs/sdk-v1.md).
+ */
+export const SUPPORTED_SDK_MAJORS: readonly string[] = ['0', '1'];
+
+/** Majors that still load but are on their way out. */
+export const DEPRECATED_SDK_MAJORS: readonly string[] = ['0'];
 
 // ---------- errors ----------
 
@@ -170,3 +185,4 @@ export function definePlugin(plugin: Plugin): Plugin {
 }
 
 export * from './scope.ts';
+export * from './permissions.ts';

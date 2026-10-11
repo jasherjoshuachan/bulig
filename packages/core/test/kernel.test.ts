@@ -283,8 +283,20 @@ describe('loader', () => {
   });
 
   it('rejects an sdk major mismatch', async () => {
-    const k = kernelWith({ plugins: [probe({ sdk: '1' }).plugin] });
+    const k = kernelWith({ plugins: [probe({ sdk: '9' }).plugin] });
     await expect(k.start()).rejects.toThrow(SdkVersionMismatchError);
+  });
+
+  it('loads sdk 1 quietly and sdk 0 with a deprecation warning', async () => {
+    const warns: string[] = [];
+    const logger = { debug() {}, info() {}, warn: (m: string) => void warns.push(m), error() {} };
+    const one = kernelWith({ plugins: [probe({ sdk: '1' }).plugin], logger });
+    await one.start();
+    expect(warns).toEqual([]);
+    const zero = kernelWith({ plugins: [probe({ sdk: '0' }).plugin], logger });
+    await zero.start();
+    expect(warns).toHaveLength(1);
+    expect(warns[0]).toMatch(/sdk 0.*deprecated/);
   });
 
   it('rejects an invalid manifest and plugins that emit kernel events', async () => {

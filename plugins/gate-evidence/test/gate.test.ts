@@ -27,13 +27,13 @@ async function rig(config: Record<string, unknown> = {}, workerName = 'worker-cl
   const seen: BuligEvent[] = [];
   let say: (stage: string, result: string, evidence?: unknown, jobId?: string) => void = () => {};
   const worker = definePlugin({
-    manifest: { name: workerName, version: '0.1.0', sdk: '0', description: 'stand-in', emits: ['stage.completed'] },
+    manifest: { name: workerName, version: '0.1.0', sdk: '1', description: 'stand-in', emits: ['stage.completed'] },
     register(ctx) {
       say = (stage, result, evidence, jobId = 'job-1') => ctx.emit('stage.completed', { stage, ok: true, result, sessionId: 's', costUsd: 0.01, ...(evidence !== undefined && { evidence }) }, jobId);
     },
   });
   const listener = definePlugin({
-    manifest: { name: 'listener', version: '0.1.0', sdk: '0', description: 'records', subscribes: ['stage.*'] },
+    manifest: { name: 'listener', version: '0.1.0', sdk: '1', description: 'records', subscribes: ['stage.*'] },
     register(ctx) {
       ctx.on('stage.*', (e) => void seen.push(e));
     },

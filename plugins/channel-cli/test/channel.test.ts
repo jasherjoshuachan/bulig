@@ -89,7 +89,7 @@ describe('channel-cli plugin', () => {
   it('prints what the kernel and other plugins announce', async () => {
     const lines: string[] = [];
     const src = definePlugin({
-      manifest: { name: 'src', version: '0.1.0', sdk: '0', description: 's', subscribes: ['kernel.started'], emits: ['stage.requested', 'pr.opened'] },
+      manifest: { name: 'src', version: '0.1.0', sdk: '1', description: 's', subscribes: ['kernel.started'], emits: ['stage.requested', 'pr.opened'] },
       register(ctx) {
         ctx.on('kernel.started', () => void 0);
         (src as unknown as { emit: typeof ctx.emit }).emit = ctx.emit;

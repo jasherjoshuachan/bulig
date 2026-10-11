@@ -20,14 +20,14 @@ async function rig(config: Record<string, unknown> = {}) {
   const seen: BuligEvent[] = [];
   let say: (stage: string, result: string, jobId?: string, extra?: Record<string, unknown>) => void = () => {};
   const worker = definePlugin({
-    manifest: { name: 'worker-claude-code', version: '0.1.0', sdk: '0', description: 'stand-in', emits: ['stage.completed', 'stage.checked'] },
+    manifest: { name: 'worker-claude-code', version: '0.1.0', sdk: '1', description: 'stand-in', emits: ['stage.completed', 'stage.checked'] },
     register(ctx) {
       say = (stage, result, jobId, extra = {}) =>
         ctx.emit(config.input === 'stage.checked' ? 'stage.checked' : 'stage.completed', { stage, ok: true, result, sessionId: 's', costUsd: 0.01, evidence: [{ tool: 'Bash', kind: 'run', target: 'pnpm test', ok: true }], ...extra }, jobId);
     },
   });
   const listener = definePlugin({
-    manifest: { name: 'listener', version: '0.1.0', sdk: '0', description: 'records', subscribes: ['stage.*'] },
+    manifest: { name: 'listener', version: '0.1.0', sdk: '1', description: 'records', subscribes: ['stage.*'] },
     register(ctx) {
       ctx.on('stage.*', (e) => void seen.push(e));
     },

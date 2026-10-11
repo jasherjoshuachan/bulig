@@ -43,7 +43,7 @@ function driver() {
     manifest: {
       name: 'driver',
       version: '0.1.0',
-      sdk: '0',
+      sdk: '1',
       description: 'test driver',
       subscribes: ['stage.completed', 'stage.failed'],
       emits: ['stage.requested'],

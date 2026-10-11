@@ -102,7 +102,7 @@ export function createCliChannel(opts: CliChannelOptions = {}): CliChannel {
     manifest: {
       name: 'channel-cli',
       version: '0.1.0',
-      sdk: '0',
+      sdk: '1',
       description: 'Talk to Bulig from a terminal: prints progress, takes approvals.',
       provides: { commands: ['run', 'approve', 'deny'] },
       subscribes: [

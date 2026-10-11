@@ -48,7 +48,7 @@ export function fakeWorker(script: Script, sent: Sent[]): Plugin {
     manifest: {
       name: 'fake-worker',
       version: '0.1.0',
-      sdk: '0',
+      sdk: '1',
       description: 'test worker',
       subscribes: ['stage.requested'],
       emits: ['stage.completed', 'stage.failed'],
@@ -100,7 +100,7 @@ export function fakeGithub(sent: { type: string; payload: unknown }[], b: Github
     manifest: {
       name: 'fake-github',
       version: '0.1.0',
-      sdk: '0',
+      sdk: '1',
       description: 'test github',
       subscribes: ['worktree.requested', 'worktree.reset.requested', 'worktree.cleanup.requested', 'commit.requested', 'pr.requested', 'merge.requested'],
       emits: ['worktree.ready', 'worktree.failed', 'worktree.reset.done', 'worktree.reset.failed', 'worktree.cleaned', 'commit.done', 'commit.failed', 'pr.opened', 'pr.failed', 'pr.merged', 'merge.refused', 'merge.failed'],
@@ -158,7 +158,7 @@ export function fakeHuman() {
     manifest: {
       name: 'fake-human',
       version: '0.1.0',
-      sdk: '0',
+      sdk: '1',
       description: 'test channel',
       subscribes: ['approval.requested'],
       emits: ['approval.granted', 'approval.denied'],

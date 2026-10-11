@@ -949,6 +949,8 @@ describe('/retry does not start a second job for the same one', () => {
     fake.say(CHAT, `/retry ${first.id}`);
     await until(() => b.d.ctx.jobs.list().length === 3, 'chained retry');
     const second = b.d.ctx.jobs.list()[2]!;
+    // The job exists before the reply is sent, so wait for the reply itself.
+    await until(() => replies(fake).length === 2, 'chained reply');
     expect(replies(fake)[1]).toContain(`Job ${second.id.slice(0, 8)} started from ${first.id.slice(0, 8)}`);
     fake.say(CHAT, `/retry ${first.id}`);
     await until(() => replies(fake).length === 3, 'refusal');

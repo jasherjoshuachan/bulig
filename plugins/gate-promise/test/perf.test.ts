@@ -7,8 +7,8 @@ import { findClaims } from '../../gate-evidence/src/claims.ts';
 
 const MB = 1024 * 1024;
 const rep = (unit: string) => unit.repeat(Math.ceil(MB / unit.length)).slice(0, MB);
-/** Wall-clock budget. The real cost is a few milliseconds; the margin is for a loaded CI box. */
-const BUDGET_MS = 1000;
+/** Wall-clock budget. The real cost is tens of milliseconds; the margin is for a box running the whole suite in parallel (1165 ms was seen once). A backtracking blowup takes many seconds to minutes, so this still catches it. */
+const BUDGET_MS = 3000;
 const took = (fn: () => unknown): number => {
   const t = performance.now();
   fn();

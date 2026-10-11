@@ -92,6 +92,22 @@ describe('findClaims', () => {
     }
   });
 
+  it('a negator earlier in the sentence does not hide a later claim of a change', () => {
+    for (const t of [
+      'There were no failures after I fixed it.',
+      'Not a single test failed after I fixed the parser.',
+      'No one complained after I updated the config.',
+      'Since nothing else was needed I updated README.md.',
+      'Nothing else was needed when I edited README.md.',
+      'No errors appeared before I added the check.',
+      'There was no delay because I fixed the bug.',
+      'No one asked, and the parser has now been fixed.',
+      'Since nothing else was needed the bug has been fixed.',
+    ]) {
+      expect(kinds(t), t).toEqual(['changed']);
+    }
+  });
+
   it('stays fast on 1 MB of text built to keep a negation scan busy', () => {
     const MB = 1024 * 1024;
     for (const unit of ['no I added ', 'I added no ', 'nothing has been changed ', 'I added no tests, ', 'I added no tests but edited ', 'I did not ']) {

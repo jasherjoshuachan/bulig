@@ -86,9 +86,11 @@ const BARE_CHANGE =
   /^(?:(?:just|now|also|then)\s+)*(?:fixed|implemented|added|updated|removed|deleted|refactored|renamed|created|wrote|written|changed|edited|modified|rewrote|replaced|patched|resolved)\b/i;
 const FIRST_PERSON = /\b(?:I|we)\b|\b(?:I|we)['\u2019](?:ve|d)\b/i;
 /** Where a sentence splits into parts that can each say something different. */
-const CLAUSE_BREAK = /[,;:]|\b(?:but|and|so|then|although|though|while|however|yet)\b/i;
+const CLAUSE_BREAK = /[,;:]|\b(?:but|and|so|then|although|though|while|however|yet|after|since|because|when|before|once|until|unless|if)\b/i;
 /** A word before the verb that turns the clause into "none of this happened". */
 const NEGATOR_BEFORE = /\b(?:no|not|never|none|nothing|nobody|without|zero|hardly|barely)\b|n['’]t/i;
+/** How many words before "has been changed" can hold the "nothing" it is about. */
+const NEGATOR_REACH = 5;
 /** "I added no tests", "I changed nothing": the verb is followed straight away by a word that says there was none. */
 const NEGATOR_AFTER = /^\s+(?:no|nothing|none|zero|nobody|neither)\b/i;
 
@@ -109,7 +111,11 @@ export function claimsChange(sentence: string, res: readonly RegExp[]): boolean 
     if (bare && !NEGATOR_AFTER.test(clause.slice(bare[0].length))) return true;
     for (const re of globals) {
       for (const m of clause.matchAll(re)) {
-        if (NEGATOR_BEFORE.test(clause.slice(0, m.index ?? 0)) || NEGATOR_AFTER.test(clause.slice((m.index ?? 0) + m[0].length))) continue;
+        const at = m.index ?? 0;
+        if (NEGATOR_AFTER.test(clause.slice(at + m[0].length))) continue;
+        // "I added ..." names its own subject, so a "no" before it is about something else ("no failures after I fixed it").
+        // "has been changed" takes its subject from the words just before it ("nothing has been changed"), so look at the last few only.
+        if (!/^(?:I|we)\b/i.test(m[0]) && NEGATOR_BEFORE.test(clause.slice(Math.max(0, at - 60), at).split(/\s+/).slice(-NEGATOR_REACH).join(' '))) continue;
         return true;
       }
     }

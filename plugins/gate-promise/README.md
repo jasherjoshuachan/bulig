@@ -49,7 +49,7 @@ Every line a person sees is flattened to one line, stripped of control and bidi 
 | Setting | Default | |
 |---|---|---|
 | `mode` | `warn` | `warn` marks, `enforce` fails the stage. Anything else stops the start. |
-| `enabled` | `true` | `false` passes every result through unchecked. The plugin stays in the chain, so the pipeline keeps working. To remove it, take it out of `enabled` in the main config. |
+| `enabled` | `true` | `false` turns the gate off. With no `enabled` list in the main config it then leaves the default set. If it is listed in `enabled`, it stays in the chain and passes every result through unchecked, so the pipeline keeps working. To remove it, take it out of `enabled`. |
 | `input` | `stage.completed` | The event it reads. With `gate-evidence` on it is `stage.checked`. The CLI computes it from `enabled` and overrides whatever the config says; set it yourself only when you build a kernel by hand. |
 
 It needs no capability. It reads jobs through the same `ctx.jobs` every plugin has.
@@ -63,7 +63,7 @@ worker  --stage.completed-->  gate-evidence  --stage.checked-->  gate-promise  -
                                     \--stage.failed (enforce)-->        \--stage.failed (enforce)-->
 ```
 
-Alone, `gate-promise` reads `stage.completed` straight from the worker. With `gate-evidence` on, it reads that gate's `stage.checked` and forwards everything on it (the evidence marks included), so one event reaches the pipeline and neither gate drops the other's marks. The order of the two names in `enabled` does not matter. The CLI sets `stageResultEvent: "stage.screened"` on the pipeline and `input: "stage.checked"` on this gate. If you build a kernel yourself, set both, or the gate has no effect (the pipeline logs one warning when it sees a `stage.screened` it is not listening for). `gate-promise` is opt-in: it is not in the default `enabled` list.
+Alone, `gate-promise` reads `stage.completed` straight from the worker. With `gate-evidence` on, it reads that gate's `stage.checked` and forwards everything on it (the evidence marks included), so one event reaches the pipeline and neither gate drops the other's marks. The order of the two names in `enabled` does not matter. The CLI sets `stageResultEvent: "stage.screened"` on the pipeline and `input: "stage.checked"` on this gate. If you build a kernel yourself, set both, or the gate has no effect (the pipeline logs one warning when it sees a `stage.screened` it is not listening for). `gate-promise` is on by default, in `warn` mode: it is in the default `enabled` list, which applies when the main config has no `enabled` of its own. A config that lists `enabled` is used as written.
 
 ## What it cannot catch
 

@@ -2,9 +2,12 @@ import { existsSync, readFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { z } from 'zod';
 
-export const BUILTIN_PLUGINS = ['channel-cli', 'worker-claude-code', 'github', 'pipeline-dev'] as const;
+/** The two checks that sit between the worker and the pipeline. Both are on by default, in `warn` mode. */
+export const GATE_PLUGINS = ['gate-evidence', 'gate-promise'] as const;
+/** What runs when the config has no `enabled` list. The gates are in it; see `defaultEnabled` for how to leave one out. */
+export const BUILTIN_PLUGINS = ['channel-cli', 'worker-claude-code', ...GATE_PLUGINS, 'github', 'pipeline-dev'] as const;
 /** Plugins the CLI ships but leaves off until the config turns them on, because they need setup. */
-export const OPT_IN_PLUGINS = ['channel-telegram', 'gate-evidence', 'gate-promise'] as const;
+export const OPT_IN_PLUGINS = ['channel-telegram'] as const;
 
 const ConfigSchema = z.object({
   dbPath: z.string().optional(),
@@ -26,6 +29,15 @@ export interface BuligConfig {
 export class ConfigError extends Error {}
 
 export const defaultDbPath = (home: string) => join(home, '.bulig', 'bulig.sqlite');
+
+/**
+ * The `enabled` list when the config does not write one: the built-ins, gates included. A gate leaves the default list when
+ * its own config says `"enabled": false`, so that line is the one switch for "this gate off". A config that does write `enabled`
+ * is taken exactly as written: a gate it does not list stays off, whatever `pluginConfig` says.
+ */
+export function defaultEnabled(pluginConfig: Record<string, Record<string, unknown>>): string[] {
+  return BUILTIN_PLUGINS.filter((n) => !(GATE_PLUGINS as readonly string[]).includes(n) || pluginConfig[n]?.enabled !== false);
+}
 
 const expand = (p: string, home: string, base: string) => {
   if (p === '~') return home;
@@ -58,7 +70,7 @@ export function loadConfig(cwd: string, home: string): { config: BuligConfig; pa
     throw new ConfigError(`Bad config ${path}: ${issues}`);
   }
   const c = parsed.data;
-  const enabled = c.enabled ?? [...BUILTIN_PLUGINS];
+  const enabled = c.enabled ?? defaultEnabled(c.pluginConfig ?? {});
   const shipped: readonly string[] = [...BUILTIN_PLUGINS, ...OPT_IN_PLUGINS];
   const unknown = enabled.filter((n) => !shipped.includes(n));
   if (unknown.length) throw new ConfigError(`Config enables plugins this CLI does not ship: ${unknown.join(', ')}`);

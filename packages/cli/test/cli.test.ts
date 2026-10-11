@@ -278,12 +278,38 @@ describe('config', () => {
     expect(loadConfig(w.cwd, w.home).config.dbPath).toBe('/elsewhere.sqlite');
   });
 
-  it('defaults the database to ~/.bulig/bulig.sqlite and enables the four plugins and the channel', () => {
+  it('defaults the database to ~/.bulig/bulig.sqlite and enables the built-ins, both gates included', () => {
     const w = world();
     writeFileSync(join(w.cwd, 'bulig.config.json'), '{}');
     const { config } = loadConfig(w.cwd, w.home);
     expect(config.dbPath).toBe(join(w.home, '.bulig', 'bulig.sqlite'));
-    expect(config.enabled).toEqual(['channel-cli', 'worker-claude-code', 'github', 'pipeline-dev']);
+    expect(config.enabled).toEqual(['channel-cli', 'worker-claude-code', 'gate-evidence', 'gate-promise', 'github', 'pipeline-dev']);
+  });
+
+  it('with no `enabled` list, a gate leaves the default only when its own config says enabled:false', () => {
+    const w = world();
+    const load = (c: unknown) => {
+      writeFileSync(join(w.cwd, 'bulig.config.json'), JSON.stringify(c));
+      return loadConfig(w.cwd, w.home).config.enabled;
+    };
+    const base = ['channel-cli', 'worker-claude-code', 'github', 'pipeline-dev'];
+    expect(load({ pluginConfig: { 'gate-evidence': { enabled: false } } })).toEqual(['channel-cli', 'worker-claude-code', 'gate-promise', 'github', 'pipeline-dev']);
+    expect(load({ pluginConfig: { 'gate-promise': { enabled: false } } })).toEqual(['channel-cli', 'worker-claude-code', 'gate-evidence', 'github', 'pipeline-dev']);
+    expect(load({ pluginConfig: { 'gate-promise': { enabled: false }, 'gate-evidence': { enabled: false } } })).toEqual(base);
+    // Anything but a real false keeps the gate, and mode never changes what is on.
+    expect(load({ pluginConfig: { 'gate-promise': { enabled: 'no' }, 'gate-evidence': { mode: 'warn', enabled: true } } })).toContain('gate-promise');
+  });
+
+  it('an explicit `enabled` list is taken as written: no gate is added, and enabled:true does not add one', () => {
+    const w = world();
+    const load = (c: unknown) => {
+      writeFileSync(join(w.cwd, 'bulig.config.json'), JSON.stringify(c));
+      return loadConfig(w.cwd, w.home).config.enabled;
+    };
+    expect(load({ enabled: ['channel-cli', 'worker-claude-code', 'github', 'pipeline-dev'], pluginConfig: { 'gate-evidence': { enabled: true } } })).toEqual(['channel-cli', 'worker-claude-code', 'github', 'pipeline-dev']);
+    expect(load({ enabled: ['channel-cli', 'gate-promise', 'pipeline-dev'] })).toEqual(['channel-cli', 'gate-promise', 'pipeline-dev']);
+    // Listed and switched off inside: still listed, so it stays in the chain and passes everything through.
+    expect(load({ enabled: ['gate-evidence', 'pipeline-dev'], pluginConfig: { 'gate-evidence': { enabled: false } } })).toEqual(['gate-evidence', 'pipeline-dev']);
   });
 
   it('rejects bad JSON, bad shapes and unknown plugins', () => {

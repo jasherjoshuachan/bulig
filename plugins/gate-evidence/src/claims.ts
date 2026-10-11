@@ -47,6 +47,27 @@ export const SKIP_WORDS =
 /** A pass claim in a sentence like this is a report of failure. */
 const NEGATION = /\b(not|never|fail(?:s|ed|ing|ure)?|broken|without|no longer)\b|n't/i;
 
+/**
+ * Phrases where a failure word says the opposite: "0 failed", "none failed", "not a single test failed", "without
+ * warnings". They are blanked before NEGATION is tested, so a clean report is not read as a failure report. A phrase
+ * that is not on this list ("3 failed", "without running the migration") still skips the sentence.
+ */
+const NO_FAILURE: readonly RegExp[] = [
+  /\b(?:0|zero|no|none)\s+(?:(?:tests?|specs?|checks?)\s+)?fail(?:s|ed|ing|ures?)?\b/gi,
+  /\bnot\s+(?:a\s+single|one|any)\s+(?:(?:tests?|specs?|checks?)\s+)?fail(?:s|ed|ing|ures?)?\b/gi,
+  /\bwithout\s+(?:any\s+|a\s+single\s+)?(?:new\s+)?(?:(?:type|lint)\s+)?(?:errors?|fail(?:s|ing|ures?)|warnings?|issues?|problems?)\b/gi,
+];
+/**
+ * Words from SKIP_WORDS in a sense that is not a plan: "I can confirm" reports, and "once I fixed it" is a past
+ * event (a condition would say "once I fix it"). The word is blanked before SKIP_WORDS is tested.
+ */
+const NOT_A_PLAN: readonly RegExp[] = [
+  /\b(I|we)\s+can(?=\s+(?:confirm|see|say|report|tell)\b)/gi,
+  /\bonce(?=\s+(?:I|we)\s+(?:fixed|implemented|added|updated|removed|deleted|refactored|renamed|created|wrote|changed|edited|modified|rewrote|replaced|patched|resolved)\b)/gi,
+];
+/** Replace each match with a space, keeping the first capture group when there is one ("I can" -> "I "). */
+const blank = (s: string, res: readonly RegExp[]) => res.reduce((t, re) => t.replace(re, (_m, g1: unknown) => (typeof g1 === 'string' ? `${g1} ` : ' ')), s);
+
 interface Pattern {
   kind: ClaimKind;
   re: RegExp;
@@ -89,8 +110,8 @@ const FIRST_PERSON = /\b(?:I|we)\b|\b(?:I|we)['\u2019](?:ve|d)\b/i;
 const CLAUSE_BREAK = /[,;:]|\b(?:but|and|so|then|although|though|while|however|yet|after|since|because|when|before|once|until|unless|if)\b/i;
 /** A word before the verb that turns the clause into "none of this happened". */
 const NEGATOR_BEFORE = /\b(?:no|not|never|none|nothing|nobody|without|zero|hardly|barely)\b|n['’]t/i;
-/** How many words before "has been changed" can hold the "nothing" it is about. */
-const NEGATOR_REACH = 5;
+/** How many words before "has been changed" can hold the "nothing" it is about: the nearest four ("No one noticed it has been updated." reads clean, a fifth word back does not). */
+const NEGATOR_REACH = 4;
 /** "I added no tests", "I changed nothing": the verb is followed straight away by a word that says there was none. */
 const NEGATOR_AFTER = /^\s+(?:no|nothing|none|zero|nobody|neither)\b/i;
 
@@ -115,7 +136,7 @@ export function claimsChange(sentence: string, res: readonly RegExp[]): boolean 
         if (NEGATOR_AFTER.test(clause.slice(at + m[0].length))) continue;
         // "I added ..." names its own subject, so a "no" before it is about something else ("no failures after I fixed it").
         // "has been changed" takes its subject from the words just before it ("nothing has been changed"), so look at the last few only.
-        if (!/^(?:I|we)\b/i.test(m[0]) && NEGATOR_BEFORE.test(clause.slice(Math.max(0, at - 60), at).split(/\s+/).slice(-NEGATOR_REACH).join(' '))) continue;
+        if (!/^(?:I|we)\b/i.test(m[0]) && NEGATOR_BEFORE.test(clause.slice(Math.max(0, at - 60), at).split(/\s+/).filter(Boolean).slice(-NEGATOR_REACH).join(' '))) continue;
         return true;
       }
     }
@@ -159,11 +180,12 @@ export function findClaims(text: string, stage: string): Claim[] {
       else if (stage === 'review') found.push({ kind: 'looked', text: show, paths: [] });
       continue;
     }
-    if (SKIP_WORDS.test(s)) continue;
+    if (SKIP_WORDS.test(blank(s, NOT_A_PLAN))) continue;
+    const failureText = blank(s, NO_FAILURE);
     const seen = new Set<ClaimKind>();
     for (const p of CLAIM_PATTERNS) {
       if (p.kind === 'changed' || seen.has(p.kind) || !p.re.test(s)) continue;
-      if (p.negatable && NEGATION.test(s)) continue;
+      if (p.negatable && NEGATION.test(failureText)) continue;
       seen.add(p.kind);
       found.push({ kind: p.kind, text: show, paths: [] });
     }

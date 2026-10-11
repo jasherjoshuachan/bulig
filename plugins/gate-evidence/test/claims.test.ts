@@ -108,9 +108,71 @@ describe('findClaims', () => {
     }
   });
 
+  describe('a skip or failure word in its other sense does not hide the claim', () => {
+    it('"failed" and "without" in a clean report: zero failures is a pass claim', () => {
+      for (const [t, k] of [
+        ['Tests: 12 passed, 0 failed.', 'test'],
+        ['All tests passed, none failed.', 'test'],
+        ['All tests pass and no tests failed.', 'test'],
+        ['Not a single test failed, and the suite is green.', 'test'],
+        ['The build passes without warnings.', 'build'],
+        ['Typecheck passes without any errors.', 'build'],
+        ['The suite passes without a single failure.', 'test'],
+        ['Lint is clean without new issues.', 'build'],
+      ] as const) {
+        expect(kinds(t), t).toEqual([k]);
+      }
+    });
+
+    it('but a failure that is real still skips the sentence', () => {
+      for (const t of [
+        '12 passed, 3 failed.',
+        '0 passed 12 failed.',
+        'The tests failed.',
+        'All 12 passed, 0 failed in unit, 2 failed in e2e.',
+        'The tests pass without running the migration.',
+        'The build did not pass without errors.',
+        'Tests pass, but 1 failed earlier.',
+      ]) {
+        expect(kinds(t), t).toEqual([]);
+      }
+    });
+
+    it('"can" as a report ("I can confirm") is a claim; "can" as an offer or instruction is not', () => {
+      expect(kinds('I can confirm all tests pass.')).toEqual(['test']);
+      expect(kinds('We can see that the suite is green.')).toEqual(['test']);
+      for (const t of ['You can run the tests; they pass.', 'The tests can pass if the cache is warm.', 'I can add a test for it.', "Tests can't pass yet."]) {
+        expect(kinds(t), t).toEqual([]);
+      }
+    });
+
+    it('"once" before a past-tense change ("once I fixed it") is a report; "once" as a condition is not', () => {
+      expect(kinds('Once I fixed the import, all tests passed.')).toEqual(['test', 'changed']);
+      expect(kinds('I fixed the parser once I edited the lexer.')).toEqual(['changed']);
+      for (const t of ['The tests pass once the cache is warm.', 'Tests pass once that is done.', 'Once I fix the import the tests pass.', 'Once I have fixed the import the tests pass.']) {
+        expect(kinds(t), t).toEqual([]);
+      }
+    });
+  });
+
+  describe('how far back "has been changed" looks for the word that says nothing was', () => {
+    // The window is four words, not five: the words just before "has been ...", the nearest four.
+    it('a negator up to four words before reads as "nothing was changed"', () => {
+      expect(kinds('Nothing has been updated.')).toEqual([]);
+      expect(kinds('Nothing one two three has been updated.')).toEqual([]);
+    });
+    it('a negator five words before does not, which is the trade-off: "No one noticed it has been updated." reads clean', () => {
+      expect(kinds('Nothing one two three four has been updated.')).toEqual(['changed']);
+      expect(kinds('No one noticed it has been updated.')).toEqual([]);
+    });
+  });
+
   it('stays fast on 1 MB of text built to keep a negation scan busy', () => {
     const MB = 1024 * 1024;
-    for (const unit of ['no I added ', 'I added no ', 'nothing has been changed ', 'I added no tests, ', 'I added no tests but edited ', 'I did not ']) {
+    for (const unit of [
+      'no I added ', 'I added no ', 'nothing has been changed ', 'I added no tests, ', 'I added no tests but edited ', 'I did not ',
+      'tests pass not a single ', 'tests pass without any ', 'tests pass no tests ', 'I can ', 'once I ',
+    ]) {
       const t0 = performance.now();
       findClaims(unit.repeat(Math.ceil(MB / unit.length)), 'test');
       expect(performance.now() - t0, unit).toBeLessThan(3000);

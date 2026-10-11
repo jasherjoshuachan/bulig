@@ -52,6 +52,55 @@ describe('findClaims', () => {
     expect(kinds('The build is not clean.')).toEqual([]);
   });
 
+  it('does not take a statement that nothing was changed for a claim of a change', () => {
+    for (const t of [
+      'The change is docs-only, so I added no tests.',
+      'I added no tests.',
+      'I have added no new files.',
+      "I've changed nothing in src.",
+      'I did not add any tests.',
+      "I didn't add a test for it.",
+      'I have not edited any files.',
+      "I haven't edited anything.",
+      'No files were edited.',
+      'No files have been changed.',
+      'Nothing has been changed.',
+      'Nothing was changed.',
+      'This was done without editing any file.',
+      'Nothing has been updated, and no file has been removed.',
+      'I made no edits, so I fixed nothing.',
+    ]) {
+      expect(kinds(t), t).toEqual([]);
+    }
+  });
+
+  it('still takes a plain claim of a change, with a negation that is about something else', () => {
+    for (const t of ['I edited README.md.', 'I added a test.', 'I modified the parser.', "We've updated the docs.", 'The parser has now been fixed.', 'I fixed the no-results bug.', 'I added tests, not docs.']) {
+      expect(kinds(t), t).toEqual(['changed']);
+    }
+  });
+
+  it('a negation in one clause does not hide a claim in another clause of the same sentence', () => {
+    for (const t of [
+      'I added no tests but edited README.md.',
+      'I added no tests, and updated README.md.',
+      'I changed nothing in src; I fixed the docs.',
+      'Nothing has been removed, but I added a test.',
+      'I added no tests, then fixed the typo.',
+    ]) {
+      expect(kinds(t), t).toEqual(['changed']);
+    }
+  });
+
+  it('stays fast on 1 MB of text built to keep a negation scan busy', () => {
+    const MB = 1024 * 1024;
+    for (const unit of ['no I added ', 'I added no ', 'nothing has been changed ', 'I added no tests, ', 'I added no tests but edited ', 'I did not ']) {
+      const t0 = performance.now();
+      findClaims(unit.repeat(Math.ceil(MB / unit.length)), 'test');
+      expect(performance.now() - t0, unit).toBeLessThan(3000);
+    }
+  });
+
   it('ignores code fences, URLs and plain prose', () => {
     expect(kinds('Here is the test:\n```ts\nexpect(run()).toBe("tests pass");\n// I fixed it\n```\nThat is all.')).toEqual([]);
     expect(kinds('See https://example.test/index.html contains docs.')).toEqual([]);
@@ -90,6 +139,18 @@ describe('checkClaims', () => {
   it('a build claim needs a build, typecheck or lint run that worked', () => {
     expect(checkClaims(claims('Typecheck passes.'), [run('pnpm typecheck')])).toEqual([]);
     expect(checkClaims(claims('Typecheck passes.'), [run('pnpm test')])[0]!.reason).toMatch(/no record of a build/);
+  });
+
+  it('a stage that says it edited nothing is not flagged, and one that says it edited something is', () => {
+    const t = 'The change is docs-only, so I added no tests.';
+    expect(checkClaims(claims(t, 'test'), [])).toEqual([]);
+    expect(checkClaims(claims(t, 'test'), [read('README.md')])).toEqual([]);
+    expect(checkClaims(claims('I edited README.md.'), [])[0]!.reason).toBe('no record of a file edit this turn');
+    expect(checkClaims(claims('I added a test.'), [read('a.ts')])[0]!.reason).toBe('no record of a file edit this turn');
+    expect(checkClaims(claims('I edited README.md.'), [edit('README.md')])).toEqual([]);
+    expect(checkClaims(claims('I added a test.'), [edit('test/a.test.ts')])).toEqual([]);
+    expect(checkClaims(claims('I added no tests but edited README.md.'), [])[0]!.reason).toBe('no record of a file edit this turn');
+    expect(checkClaims(claims('I added no tests but edited README.md.'), [edit('README.md')])).toEqual([]);
   });
 
   it('a change claim needs an edit that worked', () => {

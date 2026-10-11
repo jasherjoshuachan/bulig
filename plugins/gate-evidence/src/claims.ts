@@ -73,13 +73,52 @@ export const CLAIM_PATTERNS: readonly Pattern[] = [
   { kind: 'build', re: /\b(?:builds?|compiles?|typechecks?|type-checks?)\s+(?:cleanly|successfully|without errors)\b/i },
   {
     kind: 'changed',
-    re: /\b(?:I|we)(?:'ve| have)?\s+(?:just\s+|now\s+|also\s+)?(?:fixed|implemented|added|updated|removed|deleted|refactored|renamed|created|wrote|written|changed|rewrote|replaced|patched|resolved)\b/i,
+    re: /\b(?:I|we)(?:'ve| have)?\s+(?:just\s+|now\s+|also\s+)?(?:fixed|implemented|added|updated|removed|deleted|refactored|renamed|created|wrote|written|changed|edited|modified|rewrote|replaced|patched|resolved)\b/i,
   },
   {
     kind: 'changed',
-    re: /\b(?:has|have)\s+(?:now\s+|already\s+)?been\s+(?:fixed|implemented|added|updated|removed|deleted|refactored|renamed|created|changed|patched|resolved)\b|\b(?:is|are)\s+now\s+(?:fixed|implemented|added|updated|removed|deleted|refactored|renamed|created|changed|patched|resolved)\b/i,
+    re: /\b(?:has|have)\s+(?:now\s+|already\s+)?been\s+(?:fixed|implemented|added|updated|removed|deleted|refactored|renamed|created|changed|edited|modified|patched|resolved)\b|\b(?:is|are)\s+now\s+(?:fixed|implemented|added|updated|removed|deleted|refactored|renamed|created|changed|edited|modified|patched|resolved)\b/i,
   },
 ];
+
+/** A clause that starts with the verb, with the "I" left out: "I added no tests but edited README.md". */
+const BARE_CHANGE =
+  /^(?:(?:just|now|also|then)\s+)*(?:fixed|implemented|added|updated|removed|deleted|refactored|renamed|created|wrote|written|changed|edited|modified|rewrote|replaced|patched|resolved)\b/i;
+const FIRST_PERSON = /\b(?:I|we)\b|\b(?:I|we)['\u2019](?:ve|d)\b/i;
+/** Where a sentence splits into parts that can each say something different. */
+const CLAUSE_BREAK = /[,;:]|\b(?:but|and|so|then|although|though|while|however|yet)\b/i;
+/** A word before the verb that turns the clause into "none of this happened". */
+const NEGATOR_BEFORE = /\b(?:no|not|never|none|nothing|nobody|without|zero|hardly|barely)\b|n['’]t/i;
+/** "I added no tests", "I changed nothing": the verb is followed straight away by a word that says there was none. */
+const NEGATOR_AFTER = /^\s+(?:no|nothing|none|zero|nobody|neither)\b/i;
+
+/**
+ * Does the sentence say something was changed? "I added no tests" and "nothing has been changed" say the opposite
+ * and are not a claim. The sentence is cut into clauses first, so a negation in one ("I added no tests") does not
+ * hide an affirmative claim in another ("but edited README.md"). Every step is a pass over the text with no
+ * nested repeats, so the time grows with the length of the sentence and no more.
+ */
+export function claimsChange(sentence: string, res: readonly RegExp[]): boolean {
+  const globals = res.map((re) => new RegExp(re.source, 'gi'));
+  // A clause with no subject only counts when an earlier clause of the sentence is the author's own ("I added no tests but edited ...").
+  let firstPerson = false;
+  for (const raw of sentence.split(CLAUSE_BREAK)) {
+    const clause = raw.trim();
+    if (!clause) continue;
+    const bare = firstPerson && BARE_CHANGE.exec(clause);
+    if (bare && !NEGATOR_AFTER.test(clause.slice(bare[0].length))) return true;
+    for (const re of globals) {
+      for (const m of clause.matchAll(re)) {
+        if (NEGATOR_BEFORE.test(clause.slice(0, m.index ?? 0)) || NEGATOR_AFTER.test(clause.slice((m.index ?? 0) + m[0].length))) continue;
+        return true;
+      }
+    }
+    if (!firstPerson) firstPerson = FIRST_PERSON.test(clause);
+  }
+  return false;
+}
+
+const CHANGE_PATTERNS = CLAIM_PATTERNS.filter((p) => p.kind === 'changed').map((p) => p.re);
 
 /** A path in a sentence: a name with one of these extensions, with or without folders. */
 const PATH = /(?<![\w@./-])(?:\.{0,2}\/)?(?:[\w@.-]+\/)*[\w@-][\w@.-]*\.(?:tsx?|jsx?|mjs|cjs|json|md|ya?ml|toml|sh|py|css|html|sql|txt|lock|env)(?![\w/-])/gi;
@@ -117,11 +156,12 @@ export function findClaims(text: string, stage: string): Claim[] {
     if (SKIP_WORDS.test(s)) continue;
     const seen = new Set<ClaimKind>();
     for (const p of CLAIM_PATTERNS) {
-      if (seen.has(p.kind) || !p.re.test(s)) continue;
+      if (p.kind === 'changed' || seen.has(p.kind) || !p.re.test(s)) continue;
       if (p.negatable && NEGATION.test(s)) continue;
       seen.add(p.kind);
       found.push({ kind: p.kind, text: show, paths: [] });
     }
+    if (claimsChange(s, CHANGE_PATTERNS)) found.push({ kind: 'changed', text: show, paths: [] });
     if (!NEW_FILE.test(s) && (FILE_VERB.test(s) || READ_SAID.test(s))) {
       const paths = [...new Set([...s.matchAll(PATH)].map((m) => stripPath(m[0])).filter((p) => !/^https?:/i.test(p)))].slice(0, 5);
       if (paths.length) found.push({ kind: 'file', text: show, paths });

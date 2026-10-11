@@ -13,12 +13,14 @@ This plugin reads the stage text, finds claims, and looks for a record of that r
 | tests pass: "all tests pass", "the suite is green", "12 passed", `verify.sh` passes, or `VERDICT: PASS` on the test stage | a successful `Bash` run that starts with a test runner (`pnpm test`, `npm run test`, `vitest`, `jest`, `pytest`, `go test`, `cargo test`, `node --test`, `scripts/verify.sh`) |
 | build is clean: "the typecheck passes", "lint is clean", "compiles without errors", "no type errors" | a successful run of `build`, `typecheck`, `lint`, `check`, `tsc`, `eslint`, `cargo build`, `go build` or `scripts/verify.sh` |
 | a file says something: "`src/a.ts` exports X", "`b.json` contains Y", "I read `c.md`" | a `Read` or `Edit` of that file in this run, or a successful command that names it (`cat src/a.ts`) |
-| a change was made: "I fixed", "I added", "has been implemented" | a successful `Edit` or `Write` in this run |
+| a change was made: "I fixed", "I added", "I edited README.md", "has been implemented" | a successful `Edit` or `Write` in this run |
 | `VERDICT: PASS` on the review stage | a successful `Read`, or a successful `git diff`, `git show` or `git log` |
 
 A command counts only when the runner is the first word of a shell segment (after `cd`, `VAR=1` and `time`). `echo pnpm test`, `cat test.md` and `grep vitest .` are not test runs. A failed run does not back a "pass" claim.
 
 Sentences with a modal, a condition or a purpose (`should`, `will`, `must`, `if`, `make sure`, `ensure`, `to make`, `once`, ...) are skipped, as are sentences that talk about creating a new file, sentences that say something does not pass, and anything inside a code fence. A plan that says "the tests should pass" makes no claim.
+
+A sentence that says nothing was changed makes no change claim: "so I added no tests", "I changed nothing", "nothing has been updated", "I did not edit any file". The sentence is cut into clauses at commas, semicolons and words like `but`, `and`, `so` and `then`, and a clause counts as a negation when `no`, `not`, `nothing`, `none`, `never` or `without` comes before the verb or right after it. A negation in one clause does not hide a claim in another: "I added no tests but edited README.md" still needs a record of an edit.
 
 Evidence is judged per turn. Each `stage.completed` is a fresh Claude session, so a test run in `test` never backs a sentence in `review`.
 

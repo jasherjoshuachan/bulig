@@ -459,11 +459,18 @@ export function createTelegramChannel(options: TelegramChannelOptions = {}): Plu
         if (!ENDED.includes(old.status)) {
           return say([chat], `Job ${short(old.id)} is still ${human(old.status)}. Only a failed or cancelled job can be retried. Use /cancel ${short(old.id)} first if you want to stop it.`);
         }
+        // One live retry per job. An earlier retry that ended failed or cancelled does not count, so a retry can be tried again.
+        const earlier = (ctx.state.get<string[]>(`retries:${old.id}`) ?? []).map((id) => ctx.jobs.get(id)).filter((j): j is Job => !!j);
+        const blocking = earlier.reverse().find((j) => j.status !== 'failed' && j.status !== 'cancelled');
+        if (blocking) return say([chat], `Job ${short(blocking.id)} already retried this one and is ${human(blocking.status)}. Use /status ${short(blocking.id)}.`);
         if (!existsSync(old.repo)) return say([chat], `The repo for job ${short(old.id)} is not on this machine any more: ${one(old.repo, 200)}`);
         try {
           // A new job: it plans again and asks for its own plan approval. Nothing of the old job's approvals or scope is carried over.
           const job = ctx.jobs.create({ repo: old.repo, title: old.title, ...(old.body && { body: old.body }) });
           ctx.state.set(`chat:${job.id}`, chat);
+          // The link both ways: which job this one retries, and the retries a job has had. A retry of a retry links to the retry, so chains work.
+          ctx.state.set(`retry-of:${job.id}`, old.id);
+          ctx.state.set(`retries:${old.id}`, [...(ctx.state.get<string[]>(`retries:${old.id}`) ?? []), job.id]);
           say([chat], `Job ${short(job.id)} started from ${short(old.id)}: ${one(old.title, 200)}\nRepo ${aliasOf(old.repo)}. It will plan first and ask for your plan approval.`);
         } catch (err) {
           say([chat], `Could not start the job: ${err instanceof Error ? err.message : String(err)}`);

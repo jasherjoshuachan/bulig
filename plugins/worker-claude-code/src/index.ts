@@ -240,6 +240,17 @@ class EvidenceCollector {
   readonly records: EvidenceRecord[] = [];
   private readonly open = new Map<string, EvidenceRecord>();
 
+  /** Settle calls from a line that was too long to parse: `failed` is true if the line said any of its results was an error. */
+  settleSkipped(ids: Iterable<string>, failed: boolean): void {
+    for (const id of ids) {
+      const rec = this.open.get(id);
+      if (rec) {
+        rec.ok = !failed;
+        this.open.delete(id);
+      }
+    }
+  }
+
   add(line: unknown): void {
     const msg = (line as { type?: unknown; message?: { content?: unknown } } | null) ?? {};
     const content = msg.message?.content;
@@ -272,12 +283,49 @@ export interface RunResult {
   evidence?: EvidenceRecord[];
 }
 
-/** The longest stream line that is parsed. A longer one (a huge tool result) is skipped, never held whole. */
+/** The longest stream line that is parsed. A longer one (a huge tool result) is skipped, never held whole; a skipped tool result still settles its call (see LineSkim). */
 export const MAX_LINE_BYTES = 1024 * 1024;
 /** The old single-object output is one line, so the first line of the output may be this long. */
 export const MAX_SINGLE_OBJECT_BYTES = 8 * 1024 * 1024;
 const HEAD_CHARS = 300;
 const STDERR_KEEP = 4096;
+
+/** Characters kept from the end of one piece to the start of the next, so a key split across two pipe reads is still found. */
+const SKIM_CARRY = 320;
+const SKIM_MAX_IDS = 64;
+const SKIM_ID = /"tool_use_id"\s*:\s*"([^"\\]{1,200})"/g;
+const SKIM_ERROR = /"is_error"\s*:\s*true\b/;
+const SKIM_USER = /^\s*\{\s*"type"\s*:\s*"user"/;
+
+/**
+ * Reads the outline of a line that is too long to parse, without keeping it. Only the unescaped keys `tool_use_id`
+ * and `is_error` are looked for: text inside a tool's output has its quotes escaped, so it cannot spell either key.
+ * It tells whether the line is a user message, which ids it names, and whether any result on it was an error.
+ */
+class LineSkim {
+  private carry = '';
+  private head = '';
+  private ids = new Set<string>();
+  private failed = false;
+
+  feed(piece: Buffer): void {
+    if (piece.length === 0) return;
+    const text = this.carry + piece.toString('latin1');
+    if (this.head.length < 64) this.head += text.slice(this.carry.length, this.carry.length + 64 - this.head.length);
+    if (!this.failed && SKIM_ERROR.test(text)) this.failed = true;
+    for (const m of text.matchAll(SKIM_ID)) if (this.ids.size < SKIM_MAX_IDS) this.ids.add(m[1]!);
+    this.carry = text.slice(-SKIM_CARRY);
+  }
+
+  /** Settle what the line named, then forget it. Only a line that starts as a user message can settle a call. */
+  settle(into: EvidenceCollector): void {
+    if (SKIM_USER.test(this.head)) into.settleSkipped(this.ids, this.failed);
+    this.carry = '';
+    this.head = '';
+    this.ids = new Set();
+    this.failed = false;
+  }
+}
 
 /**
  * Reads what `claude -p --output-format stream-json --verbose` prints, as it arrives: one JSON object per line, the
@@ -300,6 +348,7 @@ export class OutputParser {
   private single: Record<string, unknown> | undefined;
   private head = '';
   private readonly evidence = new EvidenceCollector();
+  private readonly skim = new LineSkim();
 
   write(chunk: Buffer): void {
     if (this.head.length < HEAD_CHARS) this.head += chunk.toString('utf8', 0, HEAD_CHARS * 4).slice(0, HEAD_CHARS - this.head.length);
@@ -313,14 +362,19 @@ export class OutputParser {
         this.track();
         if (this.pendingLen > (this.lines === 0 ? MAX_SINGLE_OBJECT_BYTES : MAX_LINE_BYTES)) {
           if (this.lines === 0) this.oversizeFirst = true;
+          // The content is dropped, but its outline is kept: a long tool result still says which call it answers and whether it failed.
+          for (const piece of this.pending) this.skim.feed(piece);
           this.pending = [];
           this.pendingLen = 0;
           this.skipping = true;
           this.skipped++;
         }
+      } else {
+        this.skim.feed(chunk.subarray(pos, end));
       }
       if (nl === -1) break;
-      if (!this.skipping) this.line();
+      if (this.skipping) this.skim.settle(this.evidence);
+      else this.line();
       this.skipping = false;
       this.lines++;
       pos = nl + 1;
@@ -354,7 +408,8 @@ export class OutputParser {
   }
 
   finish(): RunResult {
-    if (!this.skipping && this.pendingLen > 0) this.line(); // the last line may have no newline
+    if (this.skipping) this.skim.settle(this.evidence);
+    else if (this.pendingLen > 0) this.line(); // the last line may have no newline
     const data = this.result ?? this.single;
     if (!data) {
       if (this.oversizeFirst) {

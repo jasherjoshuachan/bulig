@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { MAX_SCAN, citedJobs, findPromises } from '../src/index.ts';
+import { MAX_SCAN, PROMISE_PATTERNS, citedJobs, findPromises } from '../src/index.ts';
 import { findClaims } from '../../gate-evidence/src/claims.ts';
 
 // The gate runs on the kernel's single event loop, so a slow regex freezes everything, in warn mode too.
@@ -54,6 +54,28 @@ describe('a 1 MB input cannot freeze the loop', () => {
     const filler = 'Nothing to see here. '.repeat(Math.ceil(MAX_SCAN / 21));
     expect(findPromises(`${filler}I'll follow up tomorrow.`)).toEqual([]);
     expect(findPromises(`I'll follow up tomorrow. ${filler}`)).toHaveLength(1);
+  });
+
+  // The deferral pattern ("I will ... later") reads at most 200 characters between "will" and the deferral word. The bound
+  // is what keeps it linear: every "I will" in a long line would otherwise rescan to the end of the line. Two pins, because
+  // the 3000 ms budget above is loose enough that a bound of 2000 would pass it (about 730 ms here, against 80 ms at 200).
+  describe('the 200 character bound on the deferral pattern', () => {
+    const DEFERRAL = PROMISE_PATTERNS.at(-1)!;
+    /** "I will", `gap` characters, then "later". The gap starts and ends with a space. */
+    const withGap = (gap: number) => `I will ${'a'.repeat(gap - 2)} later`;
+
+    it('a deferral word 200 characters after "will" is found, 201 is not', () => {
+      expect(DEFERRAL.test(withGap(200))).toBe(true);
+      expect(DEFERRAL.test(withGap(201))).toBe(false);
+      expect(findPromises(`${withGap(200)}.`)).toHaveLength(1);
+      expect(findPromises(`${withGap(201)}.`)).toEqual([]);
+    });
+
+    it('1 MB of "I will x " is scanned in under 400 ms (best of 3, so a busy box does not fail it)', () => {
+      const text = rep('I will x ');
+      const best = Math.min(...[0, 1, 2].map(() => took(() => DEFERRAL.test(text))));
+      expect(best).toBeLessThan(400);
+    });
   });
 
   it('a quote or code span longer than 300 characters is not stripped, which flags rather than hides', () => {

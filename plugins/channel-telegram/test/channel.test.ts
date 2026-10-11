@@ -874,10 +874,10 @@ describe('stage.checked lines', () => {
 });
 
 describe('/retry does not start a second job for the same one', () => {
-  const failedJob = async (title = 'Add multiply') => {
+  const failedJob = async (title = 'Add multiply', now?: () => number) => {
     const fake = await startFake();
     const repo = tempDir();
-    const b = await boot(fake, { repos: { app: repo }, allowedChatIds: [CHAT, 5151] });
+    const b = await boot(fake, { repos: { app: repo }, allowedChatIds: [CHAT, 5151] }, now ? { now } : {});
     const old = b.d.ctx.jobs.create({ repo, title });
     b.d.ctx.jobs.setStatus(old.id, 'failed');
     return { fake, repo, b, old };
@@ -999,12 +999,12 @@ describe('/retry does not start a second job for the same one', () => {
   });
 
   describe('a failure between creating the retry and saving its link', () => {
-    /** Make the write of the first `retry-of:` link fail, the way a crash or a full disk between the two steps would. */
-    const breakLinkOnce = () => {
+    /** Make the first write of a link fail (`retry-of:` by default), the way a crash or a full disk between the steps would. */
+    const breakLinkOnce = (prefix = 'retry-of:') => {
       const original = Store.prototype.setState;
       let armed = true;
       const spy = vi.spyOn(Store.prototype, 'setState').mockImplementation(function (this: Store, plugin: string, key: string, value: unknown) {
-        if (armed && key.startsWith('retry-of:')) {
+        if (armed && key.startsWith(prefix)) {
           armed = false;
           throw new Error('simulated crash before the link was saved');
         }
@@ -1063,6 +1063,77 @@ describe('/retry does not start a second job for the same one', () => {
       await until(() => b.d.ctx.jobs.list().length === 2, 'retry after the failure');
       await until(() => replies(fake).length === 2, 'started reply');
       expect(replies(fake)[1]).toContain('started from');
+    });
+
+    it('a failure on any one of the link writes still leaves the second /retry refused', async () => {
+      for (const prefix of ['retries:', 'retry-of:', 'chat:']) {
+        const { fake, b, old } = await failedJob(`Add ${prefix}`);
+        breakLinkOnce(prefix);
+        fake.say(CHAT, `/retry ${old.id}`);
+        await until(() => replies(fake).length === 1, `failure reply (${prefix})`);
+        expect(b.d.ctx.jobs.list(), prefix).toHaveLength(2);
+        const orphan = b.d.ctx.jobs.list()[1]!;
+        fake.say(CHAT, `/retry ${old.id}`);
+        await until(() => replies(fake).length === 2, `refusal (${prefix})`);
+        expect(replies(fake)[1], prefix).toContain(`Job ${orphan.id.slice(0, 8)} already retried this one`);
+        expect(b.d.ctx.jobs.list(), prefix).toHaveLength(2);
+        vi.restoreAllMocks();
+      }
+    });
+
+    it('a handled failure of the create itself leaves no mark, so a lookalike job made later is not taken for the retry', async () => {
+      const { fake, b, old } = await failedJob();
+      const original = Store.prototype.createJob;
+      let armed = true;
+      vi.spyOn(Store.prototype, 'createJob').mockImplementation(function (this: Store, input) {
+        if (armed) {
+          armed = false;
+          throw new Error('simulated handled failure of create');
+        }
+        return original.call(this, input);
+      });
+      fake.say(CHAT, `/retry ${old.id}`);
+      await until(() => replies(fake).length === 1, 'failure reply');
+      const lookalike = b.d.ctx.jobs.create({ repo: old.repo, title: old.title });
+      b.d.ctx.jobs.setStatus(lookalike.id, 'running');
+      fake.say(CHAT, `/retry ${old.id}`);
+      await until(() => replies(fake).length === 2, 'second reply');
+      expect(replies(fake)[1]).toContain('started from');
+      expect(replies(fake)[1]).not.toContain('already retried');
+      expect(b.d.ctx.jobs.list()).toHaveLength(3);
+    });
+
+    it('a mark older than ten minutes is ignored: a lookalike job is not adopted, and the old mark is cleared', async () => {
+      const clock = { t: Date.now() };
+      const { fake, b, old } = await failedJob('Add multiply', () => clock.t);
+      breakLinkOnce('retries:'); // the first write fails, so nothing links the job and the mark stays
+      fake.say(CHAT, `/retry ${old.id}`);
+      await until(() => replies(fake).length === 1, 'failure reply');
+      const stray = b.d.ctx.jobs.list()[1]!;
+      clock.t += 10 * 60_000 + 1000;
+      fake.say(CHAT, `/retry ${old.id}`);
+      await until(() => replies(fake).length === 2, 'second reply');
+      expect(replies(fake)[1]).toContain('started from');
+      expect(b.d.ctx.jobs.list()).toHaveLength(3);
+      const fresh = b.d.ctx.jobs.list()[2]!;
+      expect(fresh.id).not.toBe(stray.id);
+      const store = new Store(b.dbPath);
+      expect(store.getState('channel-telegram', `retries:${old.id}`)).toEqual([fresh.id]);
+      expect(store.getState('channel-telegram', `retry-pending:${old.id}`)).toBeNull();
+    });
+
+    it('a mark a few minutes old is still honoured', async () => {
+      const clock = { t: Date.now() };
+      const { fake, b, old } = await failedJob('Add multiply', () => clock.t);
+      breakLinkOnce('retries:');
+      fake.say(CHAT, `/retry ${old.id}`);
+      await until(() => replies(fake).length === 1, 'failure reply');
+      const stray = b.d.ctx.jobs.list()[1]!;
+      clock.t += 9 * 60_000;
+      fake.say(CHAT, `/retry ${old.id}`);
+      await until(() => replies(fake).length === 2, 'second reply');
+      expect(replies(fake)[1]).toContain(`Job ${stray.id.slice(0, 8)} already retried this one`);
+      expect(b.d.ctx.jobs.list()).toHaveLength(2);
     });
 
     it('an unrelated job with the same title, made before the failed attempt, is not taken for the retry', async () => {

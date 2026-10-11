@@ -93,6 +93,8 @@ const expandHome = (p: string) => (p === '~' ? homedir() : p.startsWith('~/') ? 
 
 const STATUS_LIMIT = 10;
 const ENDED = ['done', 'failed', 'cancelled'];
+/** A `retry-pending` mark older than this is ignored and cleared. A retry takes milliseconds, so anything older is a crash long ago. */
+const RETRY_MARK_TTL_MS = 10 * 60_000;
 /** "45s", "12m", "3h", "2d": how long ago, in the biggest whole unit. */
 const ago = (ms: number): string => {
   const s = Math.max(0, Math.floor(ms / 1000));
@@ -453,10 +455,11 @@ export function createTelegramChannel(options: TelegramChannelOptions = {}): Plu
 
       /** The chat a job came from, which job it retries, and the retries a job has had. A retry of a retry links to the retry, so chains work. The pending mark is cleared last. */
       function linkRetry(newId: string, oldId: string, chat: number): void {
-        ctx.state.set(`chat:${newId}`, chat);
-        ctx.state.set(`retry-of:${newId}`, oldId);
+        // The list the guard reads goes first: a crash after any one write below still leaves the job counted as a retry.
         const earlier = ctx.state.get<string[]>(`retries:${oldId}`) ?? [];
         if (!earlier.includes(newId)) ctx.state.set(`retries:${oldId}`, [...earlier, newId]);
+        ctx.state.set(`retry-of:${newId}`, oldId);
+        ctx.state.set(`chat:${newId}`, chat);
         ctx.state.set(`retry-pending:${oldId}`, null);
       }
 
@@ -468,11 +471,19 @@ export function createTelegramChannel(options: TelegramChannelOptions = {}): Plu
        * job was created, and the mark is just cleared.
        */
       function adoptUnlinkedRetry(old: Job): void {
-        const pending = ctx.state.get<{ at: string; chat: number } | null>(`retry-pending:${old.id}`);
+        const pending = ctx.state.get<{ at: string; ms?: number; chat: number } | null>(`retry-pending:${old.id}`);
         if (!pending) return;
-        const orphan = ctx.jobs
-          .list()
-          .find((j) => j.id !== old.id && j.createdAt >= pending.at && j.repo === old.repo && j.title === old.title && j.body === old.body && ctx.state.get(`retry-of:${j.id}`) === undefined);
+        // A mark from long ago is not trusted: a lookalike job made since would be taken for the retry.
+        if (typeof pending.ms !== 'number' || now() - pending.ms > RETRY_MARK_TTL_MS) {
+          ctx.state.set(`retry-pending:${old.id}`, null);
+          return;
+        }
+        // Not yet linked, or linked part way: linkRetry can be run again for the same job.
+        const orphan = ctx.jobs.list().find((j) => {
+          if (j.id === old.id || j.createdAt < pending.at || j.repo !== old.repo || j.title !== old.title || j.body !== old.body) return false;
+          const of = ctx.state.get(`retry-of:${j.id}`);
+          return of === undefined || of === old.id;
+        });
         if (orphan) linkRetry(orphan.id, old.id, pending.chat);
         else ctx.state.set(`retry-pending:${old.id}`, null);
       }
@@ -493,9 +504,20 @@ export function createTelegramChannel(options: TelegramChannelOptions = {}): Plu
         if (!existsSync(old.repo)) return say([chat], `The repo for job ${short(old.id)} is not on this machine any more: ${one(old.repo, 200)}`);
         try {
           // Written before the job exists, so a crash between creating it and saving its link can be found and healed (see adoptUnlinkedRetry).
-          ctx.state.set(`retry-pending:${old.id}`, { at: new Date().toISOString(), chat });
+          ctx.state.set(`retry-pending:${old.id}`, { at: new Date().toISOString(), ms: now(), chat });
           // A new job: it plans again and asks for its own plan approval. Nothing of the old job's approvals or scope is carried over.
-          const job = ctx.jobs.create({ repo: old.repo, title: old.title, ...(old.body && { body: old.body }) });
+          let job: Job;
+          try {
+            job = ctx.jobs.create({ repo: old.repo, title: old.title, ...(old.body && { body: old.body }) });
+          } catch (err) {
+            // The create itself failed and was handled: no job exists, so the mark must not outlive this attempt.
+            try {
+              ctx.state.set(`retry-pending:${old.id}`, null);
+            } catch {
+              // The mark then goes stale on its own (RETRY_MARK_TTL_MS).
+            }
+            throw err;
+          }
           linkRetry(job.id, old.id, chat);
           say([chat], `Job ${short(job.id)} started from ${short(old.id)}: ${one(old.title, 200)}\nRepo ${aliasOf(old.repo)}. It will plan first and ask for your plan approval.`);
         } catch (err) {

@@ -71,20 +71,20 @@ describe('a 1 MB input cannot freeze the loop', () => {
       expect(findPromises(`${withGap(201)}.`)).toEqual([]);
     });
 
-    // Not a wall-clock limit. The same process times the hostile text and a baseline that costs about as much (150 scans of
-    // a text with no "I will" in it, which the engine skips quickly), both in pieces of a few milliseconds and taking the best
-    // of many, so a loaded box slows both sides alike and a clean slice is likely for each. Long measurements do not work: under load the
-    // short one lands in a clean time slice and the long one never does. Measured here: the ratio is about 3 at a bound of
-    // 200 and about 30 at 2000. The limit sits between.
-    it('64 KB of "I will x " costs less than 10 times as much as a baseline of 150 scans with no "I will" in it, timed in the same process (best of 100)', () => {
-      const best = (fn: () => void) => Math.min(...Array.from({ length: 100 }, () => took(fn)));
-      const quiet = rep('x ').slice(0, 65536);
+    // Not a wall-clock limit: the real pattern is timed against a reference written here with the same shape and a bound of
+    // 200 (one deferral word instead of the list), on the same hostile text, in the same process, one after the other, taking
+    // the best of 40 of each. Load slows both alike. Measured on a quiet machine, 4 runs each: the ratio is 1.0 to 1.2 with
+    // the bound at 200 and 10.9 to 11.9 with it at 2000. The limit, 4, sits between.
+    it('64 KB of "I will x " costs less than 4 times what the same scan costs with a reference bound of 200 (best of 40, same process)', () => {
+      const reference = /\b(?:I|we)(?:'ll|’ll| will| shall)\b[^.!?\n]{0,200}\b(?:later)\b/i;
       const hostile = rep('I will x ').slice(0, 65536);
-      const baseline = best(() => {
-        for (let i = 0; i < 150; i++) DEFERRAL.test(quiet);
-      });
-      const worst = best(() => DEFERRAL.test(hostile));
-      expect(worst / baseline).toBeLessThan(10);
+      let real = Infinity;
+      let ref = Infinity;
+      for (let i = 0; i < 40; i++) {
+        real = Math.min(real, took(() => DEFERRAL.test(hostile)));
+        ref = Math.min(ref, took(() => reference.test(hostile)));
+      }
+      expect(real / ref).toBeLessThan(4);
     });
   });
 

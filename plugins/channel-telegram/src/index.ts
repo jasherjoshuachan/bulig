@@ -93,8 +93,6 @@ const expandHome = (p: string) => (p === '~' ? homedir() : p.startsWith('~/') ? 
 
 const STATUS_LIMIT = 10;
 const ENDED = ['done', 'failed', 'cancelled'];
-/** A `retry-pending` mark older than this is ignored and cleared. A retry takes milliseconds, so anything older is a crash long ago. */
-const RETRY_MARK_TTL_MS = 10 * 60_000;
 /** "45s", "12m", "3h", "2d": how long ago, in the biggest whole unit. */
 const ago = (ms: number): string => {
   const s = Math.max(0, Math.floor(ms / 1000));
@@ -471,13 +469,10 @@ export function createTelegramChannel(options: TelegramChannelOptions = {}): Plu
        * job was created, and the mark is just cleared.
        */
       function adoptUnlinkedRetry(old: Job): void {
-        const pending = ctx.state.get<{ at: string; ms?: number; chat: number } | null>(`retry-pending:${old.id}`);
+        const pending = ctx.state.get<{ at: string; chat: number } | null>(`retry-pending:${old.id}`);
+        // The mark has no expiry. Age cannot tell a crash after the job was created (adopt it) from one before (nothing to adopt),
+        // and guessing wrong would start a second job. A job that matches is always taken for the retry, however old the mark.
         if (!pending) return;
-        // A mark from long ago is not trusted: a lookalike job made since would be taken for the retry.
-        if (typeof pending.ms !== 'number' || now() - pending.ms > RETRY_MARK_TTL_MS) {
-          ctx.state.set(`retry-pending:${old.id}`, null);
-          return;
-        }
         // Not yet linked, or linked part way: linkRetry can be run again for the same job.
         const orphan = ctx.jobs.list().find((j) => {
           if (j.id === old.id || j.createdAt < pending.at || j.repo !== old.repo || j.title !== old.title || j.body !== old.body) return false;
@@ -496,7 +491,13 @@ export function createTelegramChannel(options: TelegramChannelOptions = {}): Plu
         if (!ENDED.includes(old.status)) {
           return say([chat], `Job ${short(old.id)} is still ${human(old.status)}. Only a failed or cancelled job can be retried. Use /cancel ${short(old.id)} first if you want to stop it.`);
         }
-        adoptUnlinkedRetry(old);
+        try {
+          adoptUnlinkedRetry(old);
+        } catch (err) {
+          // Cannot tell whether an earlier attempt left a job behind, so do not start another.
+          ctx.log.warn(`channel-telegram: could not check an earlier retry of ${old.id}: ${err instanceof Error ? err.message : String(err)}`);
+          return say([chat], `Could not check whether job ${short(old.id)} was already retried. Look at /status, then send /retry ${short(old.id)} again.`);
+        }
         // One live retry per job. An earlier retry that ended failed or cancelled does not count, so a retry can be tried again.
         const earlier = (ctx.state.get<string[]>(`retries:${old.id}`) ?? []).map((id) => ctx.jobs.get(id)).filter((j): j is Job => !!j);
         const blocking = earlier.reverse().find((j) => j.status !== 'failed' && j.status !== 'cancelled');
@@ -504,7 +505,7 @@ export function createTelegramChannel(options: TelegramChannelOptions = {}): Plu
         if (!existsSync(old.repo)) return say([chat], `The repo for job ${short(old.id)} is not on this machine any more: ${one(old.repo, 200)}`);
         try {
           // Written before the job exists, so a crash between creating it and saving its link can be found and healed (see adoptUnlinkedRetry).
-          ctx.state.set(`retry-pending:${old.id}`, { at: new Date().toISOString(), ms: now(), chat });
+          ctx.state.set(`retry-pending:${old.id}`, { at: new Date().toISOString(), chat });
           // A new job: it plans again and asks for its own plan approval. Nothing of the old job's approvals or scope is carried over.
           let job: Job;
           try {
@@ -514,7 +515,7 @@ export function createTelegramChannel(options: TelegramChannelOptions = {}): Plu
             try {
               ctx.state.set(`retry-pending:${old.id}`, null);
             } catch {
-              // The mark then goes stale on its own (RETRY_MARK_TTL_MS).
+              // The mark stays; the next /retry finds no matching job and clears it (adoptUnlinkedRetry).
             }
             throw err;
           }

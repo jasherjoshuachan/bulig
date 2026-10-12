@@ -451,6 +451,38 @@ export function createTelegramChannel(options: TelegramChannelOptions = {}): Plu
         say([chat], `Job ${short(job.id)} cancelled. A stage that is running is being stopped, and nothing else starts.`);
       }
 
+      /** The chat a job came from, which job it retries, and the retries a job has had. A retry of a retry links to the retry, so chains work. The pending mark is cleared last. */
+      function linkRetry(newId: string, oldId: string, chat: number): void {
+        // The list the guard reads goes first: a crash after any one write below still leaves the job counted as a retry.
+        const earlier = ctx.state.get<string[]>(`retries:${oldId}`) ?? [];
+        if (!earlier.includes(newId)) ctx.state.set(`retries:${oldId}`, [...earlier, newId]);
+        ctx.state.set(`retry-of:${newId}`, oldId);
+        ctx.state.set(`chat:${newId}`, chat);
+        ctx.state.set(`retry-pending:${oldId}`, null);
+      }
+
+      /**
+       * A retry job is created first and linked after, in separate writes, so a crash between them leaves a job nobody
+       * links to the one it retries, and a second /retry would start another. Before a retry begins it leaves a
+       * `retry-pending` mark. If the mark is still there, look for the job it was about to link: one made since the mark
+       * with the same repo, title and text that nothing links yet. Link it. No such job means the crash came before the
+       * job was created, and the mark is just cleared.
+       */
+      function adoptUnlinkedRetry(old: Job): void {
+        const pending = ctx.state.get<{ at: string; chat: number } | null>(`retry-pending:${old.id}`);
+        // The mark has no expiry. Age cannot tell a crash after the job was created (adopt it) from one before (nothing to adopt),
+        // and guessing wrong would start a second job. A job that matches is always taken for the retry, however old the mark.
+        if (!pending) return;
+        // Not yet linked, or linked part way: linkRetry can be run again for the same job.
+        const orphan = ctx.jobs.list().find((j) => {
+          if (j.id === old.id || j.createdAt < pending.at || j.repo !== old.repo || j.title !== old.title || j.body !== old.body) return false;
+          const of = ctx.state.get(`retry-of:${j.id}`);
+          return of === undefined || of === old.id;
+        });
+        if (orphan) linkRetry(orphan.id, old.id, pending.chat);
+        else ctx.state.set(`retry-pending:${old.id}`, null);
+      }
+
       function retry(chat: number, arg: string): void {
         if (!arg) return say([chat], 'Usage: /retry <jobId>');
         const old = findJob(chat, arg);
@@ -459,18 +491,35 @@ export function createTelegramChannel(options: TelegramChannelOptions = {}): Plu
         if (!ENDED.includes(old.status)) {
           return say([chat], `Job ${short(old.id)} is still ${human(old.status)}. Only a failed or cancelled job can be retried. Use /cancel ${short(old.id)} first if you want to stop it.`);
         }
+        try {
+          adoptUnlinkedRetry(old);
+        } catch (err) {
+          // Cannot tell whether an earlier attempt left a job behind, so do not start another.
+          ctx.log.warn(`channel-telegram: could not check an earlier retry of ${old.id}: ${err instanceof Error ? err.message : String(err)}`);
+          return say([chat], `Could not check whether job ${short(old.id)} was already retried. Look at /status, then send /retry ${short(old.id)} again.`);
+        }
         // One live retry per job. An earlier retry that ended failed or cancelled does not count, so a retry can be tried again.
         const earlier = (ctx.state.get<string[]>(`retries:${old.id}`) ?? []).map((id) => ctx.jobs.get(id)).filter((j): j is Job => !!j);
         const blocking = earlier.reverse().find((j) => j.status !== 'failed' && j.status !== 'cancelled');
         if (blocking) return say([chat], `Job ${short(blocking.id)} already retried this one and is ${human(blocking.status)}. Use /status ${short(blocking.id)}.`);
         if (!existsSync(old.repo)) return say([chat], `The repo for job ${short(old.id)} is not on this machine any more: ${one(old.repo, 200)}`);
         try {
+          // Written before the job exists, so a crash between creating it and saving its link can be found and healed (see adoptUnlinkedRetry).
+          ctx.state.set(`retry-pending:${old.id}`, { at: new Date().toISOString(), chat });
           // A new job: it plans again and asks for its own plan approval. Nothing of the old job's approvals or scope is carried over.
-          const job = ctx.jobs.create({ repo: old.repo, title: old.title, ...(old.body && { body: old.body }) });
-          ctx.state.set(`chat:${job.id}`, chat);
-          // The link both ways: which job this one retries, and the retries a job has had. A retry of a retry links to the retry, so chains work.
-          ctx.state.set(`retry-of:${job.id}`, old.id);
-          ctx.state.set(`retries:${old.id}`, [...(ctx.state.get<string[]>(`retries:${old.id}`) ?? []), job.id]);
+          let job: Job;
+          try {
+            job = ctx.jobs.create({ repo: old.repo, title: old.title, ...(old.body && { body: old.body }) });
+          } catch (err) {
+            // The create itself failed and was handled: no job exists, so the mark must not outlive this attempt.
+            try {
+              ctx.state.set(`retry-pending:${old.id}`, null);
+            } catch {
+              // The mark stays; the next /retry finds no matching job and clears it (adoptUnlinkedRetry).
+            }
+            throw err;
+          }
+          linkRetry(job.id, old.id, chat);
           say([chat], `Job ${short(job.id)} started from ${short(old.id)}: ${one(old.title, 200)}\nRepo ${aliasOf(old.repo)}. It will plan first and ask for your plan approval.`);
         } catch (err) {
           say([chat], `Could not start the job: ${err instanceof Error ? err.message : String(err)}`);

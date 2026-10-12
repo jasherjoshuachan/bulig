@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { MAX_SCAN, citedJobs, findPromises } from '../src/index.ts';
+import { MAX_SCAN, PROMISE_PATTERNS, citedJobs, findPromises } from '../src/index.ts';
 import { findClaims } from '../../gate-evidence/src/claims.ts';
 
 // The gate runs on the kernel's single event loop, so a slow regex freezes everything, in warn mode too.
@@ -54,6 +54,38 @@ describe('a 1 MB input cannot freeze the loop', () => {
     const filler = 'Nothing to see here. '.repeat(Math.ceil(MAX_SCAN / 21));
     expect(findPromises(`${filler}I'll follow up tomorrow.`)).toEqual([]);
     expect(findPromises(`I'll follow up tomorrow. ${filler}`)).toHaveLength(1);
+  });
+
+  // The deferral pattern ("I will ... later") reads at most 200 characters between "will" and the deferral word. The bound
+  // is what keeps it linear: every "I will" in a long line would otherwise rescan to the end of the line. Two pins, because
+  // the 3000 ms budget above is loose enough that a bound of 2000 would pass it (about 700 ms here, against 70 ms at 200).
+  describe('the 200 character bound on the deferral pattern', () => {
+    const DEFERRAL = PROMISE_PATTERNS.at(-1)!;
+    /** "I will", `gap` characters, then "later". The gap starts and ends with a space. */
+    const withGap = (gap: number) => `I will ${'a'.repeat(gap - 2)} later`;
+
+    it('a deferral word 200 characters after "will" is found, 201 is not', () => {
+      expect(DEFERRAL.test(withGap(200))).toBe(true);
+      expect(DEFERRAL.test(withGap(201))).toBe(false);
+      expect(findPromises(`${withGap(200)}.`)).toHaveLength(1);
+      expect(findPromises(`${withGap(201)}.`)).toEqual([]);
+    });
+
+    // Not a wall-clock limit: the real pattern is timed against a reference written here with the same shape and a bound of
+    // 200 (one deferral word instead of the list), on the same hostile text, in the same process, one after the other, taking
+    // the best of 40 of each. Load slows both alike. Measured on a quiet machine, 4 runs each: the ratio is 1.0 to 1.2 with
+    // the bound at 200 and 10.9 to 11.9 with it at 2000. The limit, 4, sits between.
+    it('64 KB of "I will x " costs less than 4 times what the same scan costs with a reference bound of 200 (best of 40, same process)', () => {
+      const reference = /\b(?:I|we)(?:'ll|’ll| will| shall)\b[^.!?\n]{0,200}\b(?:later)\b/i;
+      const hostile = rep('I will x ').slice(0, 65536);
+      let real = Infinity;
+      let ref = Infinity;
+      for (let i = 0; i < 40; i++) {
+        real = Math.min(real, took(() => DEFERRAL.test(hostile)));
+        ref = Math.min(ref, took(() => reference.test(hostile)));
+      }
+      expect(real / ref).toBeLessThan(4);
+    });
   });
 
   it('a quote or code span longer than 300 characters is not stripped, which flags rather than hides', () => {

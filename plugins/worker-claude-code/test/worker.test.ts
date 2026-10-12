@@ -380,12 +380,69 @@ describe('bounded stream reading', () => {
     feed(p, JSON.stringify(answer('t2')) + '\n' + JSON.stringify(done('after')));
     const out = p.finish();
     expect(out).toMatchObject({ ok: true, result: 'after' });
-    // the skipped line was t1's answer, so t1 never settled; t2 did
+    // the skipped line was t1's answer: its content is dropped, but it still settles t1 with its real ok value
     expect(out.evidence).toEqual([
-      { tool: 'Read', kind: 'read', target: 'a.ts', ok: false },
+      { tool: 'Read', kind: 'read', target: 'a.ts', ok: true },
       { tool: 'Bash', kind: 'run', target: 'ls', ok: true },
     ]);
     expect(p.peakRetained).toBeLessThanOrEqual(MAX_LINE_BYTES + 70_000);
+  });
+
+  describe('an over-long tool_result keeps its real ok value', () => {
+    /** One tool_use for `id`, then its answer as raw JSON text (so the key order is under the test's control), then a result line. */
+    const run = (raw: string, chunk = 65536, id = 't1') => {
+      const p = new OutputParser();
+      const b = Buffer.from(JSON.stringify(use(id, 'Bash', { command: 'pnpm test' })) + '\n' + raw + '\n' + JSON.stringify(done('end')));
+      for (let i = 0; i < b.length; i += chunk) p.write(b.subarray(i, i + chunk));
+      return { out: p.finish(), p };
+    };
+    const BIG = 'z'.repeat(MAX_LINE_BYTES + 10);
+    const line = (block: Record<string, unknown>, type = 'user') => JSON.stringify({ type, message: { content: [block] } });
+
+    it('is_error false, true and absent', () => {
+      expect(run(toolResult('t1', MAX_LINE_BYTES + 10).trim()).out.evidence).toEqual([{ tool: 'Bash', kind: 'run', target: 'pnpm test', ok: true }]);
+      const noFlag = line({ type: 'tool_result', tool_use_id: 't1', content: BIG });
+      expect(run(noFlag).out.evidence).toEqual([{ tool: 'Bash', kind: 'run', target: 'pnpm test', ok: true }]);
+      const failed = JSON.stringify(answer('t1', true, BIG));
+      expect(run(failed).out.evidence).toEqual([{ tool: 'Bash', kind: 'run', target: 'pnpm test', ok: false }]);
+    });
+
+    it('does not depend on the order of the keys or on where the chunks split', () => {
+      const flagFirst = line({ is_error: true, type: 'tool_result', content: BIG, tool_use_id: 't1' });
+      const idLast = line({ type: 'tool_result', content: BIG, is_error: false, tool_use_id: 't1' });
+      for (const chunk of [65536, 1000, 7777]) {
+        expect(run(flagFirst, chunk).out.evidence![0]!.ok, `flag first, chunk ${chunk}`).toBe(false);
+        expect(run(idLast, chunk).out.evidence![0]!.ok, `id last, chunk ${chunk}`).toBe(true);
+      }
+    });
+
+    it('text inside the content cannot settle another call or flip the flag', () => {
+      const fake = JSON.stringify({ tool_use_id: 't2', is_error: true });
+      const p = new OutputParser();
+      feed(p, JSON.stringify(use('t1', 'Bash', { command: 'a' })) + '\n' + JSON.stringify(use('t2', 'Bash', { command: 'b' })) + '\n');
+      feed(p, JSON.stringify(answer('t1', false, `${fake} ${BIG}`)) + '\n' + JSON.stringify(done('end')));
+      expect(p.finish().evidence).toEqual([
+        { tool: 'Bash', kind: 'run', target: 'a', ok: true },
+        { tool: 'Bash', kind: 'run', target: 'b', ok: false },
+      ]);
+    });
+
+    it('an over-long assistant line cannot settle a call, and a flag with two answers on one line fails both', () => {
+      expect(run(line({ type: 'tool_result', tool_use_id: 't1', content: BIG }, 'assistant')).out.evidence![0]!.ok).toBe(false);
+      const p = new OutputParser();
+      feed(p, JSON.stringify(use('t1', 'Bash', { command: 'a' })) + '\n' + JSON.stringify(use('t2', 'Bash', { command: 'b' })) + '\n');
+      const two = JSON.stringify({
+        type: 'user',
+        message: { content: [{ type: 'tool_result', tool_use_id: 't1', content: BIG, is_error: false }, { type: 'tool_result', tool_use_id: 't2', content: 'x', is_error: true }] },
+      });
+      feed(p, two + '\n' + JSON.stringify(done('end')));
+      expect(p.finish().evidence!.map((r) => r.ok)).toEqual([false, false]);
+    });
+
+    it('memory still does not grow with the content', () => {
+      const { p } = run(JSON.stringify(answer('t1', false, 'z'.repeat(MAX_LINE_BYTES * 4))));
+      expect(p.peakRetained).toBeLessThanOrEqual(MAX_LINE_BYTES + 70_000);
+    });
   });
 
   it('a stream with no result line says so, and says what was skipped', () => {

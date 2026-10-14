@@ -36,4 +36,12 @@ Checked live: with the real `claude` (haiku) in a throwaway repo whose origin is
 
 ## In my words (Jasher)
 
-_To be written by Jasher before v0.1 is tagged._
+What I care about most is that a plugin can't approve its own work. The worker and the github plugin never hold `approval.grant`, `merge.request` or `jobs.write`. Only a person, through a channel, can say yes, and only the pipeline can ask for the merge. That's the line between Bulig proposing and me deciding. Having one config file that shows every plugin's reach is useful, but it comes second.
+
+A missing grant stops the whole start, and I want it that way. One misconfigured plugin blocking the rest is better than a job that fails halfway.
+
+Capabilities are names, not walls. All plugins run in the same process, and a plugin written to cheat can ignore the API and do anything the process can. So Bulig only loads plugins I've reviewed. A stranger's plugin doesn't run in my Bulig. Real isolation, with separate processes, gets its own ADR before I invite outside plugins.
+
+The command deny list (`git push`, `gh`, `curl`) matches on text, and `node -e` can slip past it. I keep it as the first fence and rely on the sandbox as the real wall.
+
+That sandbox is Claude Code's own, and it's the one OS boundary Bulig has today. Claude's file tools and the Bulig process itself run outside it. We depend on it staying correct, and I'd rather say so openly than pretend there is more.

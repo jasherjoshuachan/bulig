@@ -31,7 +31,7 @@ export interface LoadOptions {
   /** Name of a stage by id. Used to tell approval stages from the rest. */
   stageName?: (stageId: string) => string | undefined;
   /** Reads and writes one plugin's state. The kernel passes the store. */
-  state: { get(plugin: string, key: string): unknown; set(plugin: string, key: string, value: unknown): void };
+  state: { get(plugin: string, key: string): unknown | Promise<unknown>; set(plugin: string, key: string, value: unknown): void | Promise<void> };
   logger: Logger;
 }
 
@@ -128,9 +128,12 @@ export function buildContext(manifest: Manifest, opts: Omit<LoadOptions, 'plugin
       }
     },
     jobs: gateJobs(name, caps, opts.jobs, opts.stageName ?? (() => undefined)),
+    // async functions run their body up to the first await at once, so a write starts the moment the plugin calls set.
     state: {
-      get: (key) => opts.state.get(name, key),
-      set: (key, value) => opts.state.set(name, key, value),
+      get: async (key: string) => opts.state.get(name, key),
+      set: async (key: string, value: unknown) => {
+        await opts.state.set(name, key, value);
+      },
     } as StateApi,
     log: opts.logger,
     config: opts.pluginConfig[name] ?? {},

@@ -52,7 +52,7 @@ Rules the kernel applies when it loads a manifest, and the conformance suite app
 | `jobs.setStatus` | stable | Ending a job (`done`, `failed`, `cancelled`) or moving it out of `awaiting_approval` needs `jobs.write`. A finished job is final. |
 | `jobs.stages(jobId)` | stable | Every stage of a job, oldest first. |
 | `jobs.startStage/finishStage` | experimental | Open or close a stage. Stages whose name starts with `approve-` need `jobs.write`. That prefix is a string convention the permission check relies on. It should become a field. |
-| `state.get/set` | stable | The plugin's own key-value store. JSON values only. Survives a restart. Other plugins' keys are invisible. |
+| `state.get/set` | stable | The plugin's own key-value store. Both calls are async (`Promise`), because the record behind them can be a database server. `set` resolves only when the value is durable, so a plugin that awaits it can save a position and then act. JSON values only: a value that is not JSON rejects. Survives a restart. Other plugins' keys are invisible. Made async before the freeze, while one plugin used it. |
 | `log.debug/info/warn/error` | stable | |
 | `config` | experimental | The plugin's own object from `pluginConfig`, untyped. The manifest has no config schema yet, so every plugin validates its own config in `register()`. The conformance suite checks that an invalid config is refused clearly. A `configSchema` manifest field is the likely fix. |
 

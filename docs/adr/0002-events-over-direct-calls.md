@@ -18,4 +18,14 @@ Plugins never call each other. They publish events through the kernel and subscr
 
 ## In my words (Jasher)
 
-_To be written by Jasher before v0.1 is tagged._
+I chose events so I can add a plugin and nothing else has to change. That's the main reason. The audit trail from the log is a bonus I'm glad to have.
+
+I accept that flow is harder to follow than a function call. The manifests are where I look to see who listens to what, and I'd rather keep that one place than build more tooling around it.
+
+Log first, then deliver. That's a hard rule and it doesn't bend, even when wake-ups arrive through Postgres.
+
+A handler that throws shouldn't take the others down, so the kernel records `plugin.error` and carries on. For gates that already fails safe: the pipeline only trusts the gate's output, so a crashed gate stalls the job and doesn't let it through. I ran it to be sure. The job stayed running, no approval card went out, and the error was in the log. What I want added is that a stalled job gets noticed and failed, not left waiting.
+
+Resume doesn't replay events. It reads the saved job and stage state, marks the stage that was running as interrupted, and runs it again. So the work inside a stage has to be safe to run twice. The log is there to read, not to re-feed.
+
+When the SDK freezes, new event shapes get a schema and are refused when they don't match. Existing shapes stay tolerant until a major version, as ADR 0006 requires.

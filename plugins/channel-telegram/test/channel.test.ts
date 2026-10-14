@@ -148,6 +148,30 @@ describe('news about a new job while its chat link is still being saved', () => 
     await new Promise((r) => setTimeout(r, 100));
     expect(fake.texts(OTHER).filter((t) => t.startsWith(line))).toEqual([]);
   });
+
+  it('does the same for a job started by /retry', async () => {
+    const OTHER = 777;
+    const fake = await startFake();
+    const repo = tempDir();
+    const original = Store.prototype.setState;
+    vi.spyOn(Store.prototype, 'setState').mockImplementation(function (this: Store, plugin: string, key: string, value: unknown) {
+      if (!key.startsWith('chat:')) return original.call(this, plugin, key, value);
+      return new Promise<void>((resolve) => setTimeout(() => resolve(original.call(this, plugin, key, value)), 300)) as unknown as void;
+    });
+    const b = await boot(fake, { repos: { app: repo }, allowedChatIds: [CHAT, OTHER] });
+    fake.say(CHAT, '/dev app Add multiply');
+    await until(() => b.d.ctx.jobs.list().length === 1, 'job created');
+    const old = b.d.ctx.jobs.list()[0]!;
+    b.d.ctx.jobs.setStatus(old.id, 'failed');
+    fake.say(CHAT, `/retry ${old.id}`);
+    await until(() => b.d.ctx.jobs.list().length === 2, 'retried job created');
+    const fresh = b.d.ctx.jobs.list()[1]!;
+    b.d.ctx.emit('stage.completed', { stage: 'plan', result: 'x' }, fresh.id);
+    const line = `[${fresh.id.slice(0, 8)}] plan finished`;
+    await until(() => fake.texts(CHAT).some((t) => t.startsWith(line)), 'progress line in the retrying chat');
+    await new Promise((r) => setTimeout(r, 100));
+    expect(fake.texts(OTHER).filter((t) => t.startsWith(line))).toEqual([]);
+  });
 });
 
 describe('safeLink', () => {

@@ -7,7 +7,7 @@ import { z } from 'zod';
 export const SDK_VERSION = '1';
 
 /** The full release of the contract. v1 candidate until the freeze is tagged. */
-export const SDK_RELEASE = '1.0.0-rc.1';
+export const SDK_RELEASE = '1.0.0-rc.2';
 
 /**
  * Majors the kernel loads. "0" is the pre-freeze contract: it loads unchanged, with a deprecation warning, and is

@@ -1,6 +1,6 @@
 # Plugin SDK v1 (release candidate)
 
-This is the contract between the kernel and a plugin. `@bulig/plugin-sdk` is version `1.0.0-rc.1`. A manifest that sets `"sdk": "1"` is promising to follow this page, and the kernel promises to keep honouring it.
+This is the contract between the kernel and a plugin. `@bulig/plugin-sdk` is version `1.0.0-rc.2`. A manifest that sets `"sdk": "1"` is promising to follow this page, and the kernel promises to keep honouring it.
 
 The page is split by how much Bulig is willing to promise:
 
@@ -176,7 +176,7 @@ The names and the refused/failed meaning are stable because channels depend on t
 
 - The kernel loads a plugin whose `sdk` is in `SUPPORTED_SDK_MAJORS` (today `0` and `1`) and refuses any other with `SdkVersionMismatchError`.
 - A plugin written for major N keeps working on every release of major N, unchanged, without edits to its manifest.
-- The package version of `@bulig/plugin-sdk` is full semver (`1.0.0-rc.1`). The minor and patch numbers are for humans and release notes; plugins never declare them.
+- The package version of `@bulig/plugin-sdk` is full semver (`1.0.0-rc.2`). The minor and patch numbers are for humans and release notes; plugins never declare them.
 - A plugin that needs something added in a later minor checks for it at runtime, or says so in its own docs. There is no `sdkMin` field. Add one only if that turns out to hurt.
 
 A **breaking change** (needs major 2) is any of these, for something marked stable:

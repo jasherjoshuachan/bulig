@@ -18,4 +18,10 @@ Use SQLite through better-sqlite3. The kernel owns the only connection and is th
 
 ## In my words (Jasher)
 
-_To be written by Jasher before v0.1 is tagged._
+SQLite was the right start. Bulig ran on one machine as one process, and a database server would have been more to look after than the data it held. I wanted nothing to install and a log in a clear order, and this gave me both.
+
+The rule I care about most is that the kernel is the only writer and plugins never get the database. That protects the data from every plugin I'll ever add, and it stays when the engine changes. Moving to Postgres changes what sits underneath. It doesn't change who is allowed to write.
+
+The record is moving to Postgres on ths-prod-01, in its own cluster, behind an async Store port. SQLite doesn't go away. It stays as the default for tests and for anyone trying Bulig for the first time, and both adapters have to pass the same test suite. I'd rather keep that honest than let the SQLite path rot.
+
+Status: the storage choice in this ADR is being replaced. The single-writer rule is not.

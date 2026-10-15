@@ -2,7 +2,7 @@ import {
   CapabilityDeniedError,
   DuplicatePluginError,
   ManifestError,
-  ManifestSchema,
+  validateManifest,
   SUPPORTED_SDK_MAJORS,
   SdkVersionMismatchError,
   UndeclaredEventError,
@@ -41,13 +41,13 @@ export interface LoadedPlugin {
 }
 
 export function parseManifest(plugin: Plugin): Manifest {
-  const parsed = ManifestSchema.safeParse(plugin.manifest);
+  const parsed = validateManifest(plugin.manifest);
   const name = (plugin.manifest as { name?: unknown } | undefined)?.name;
-  if (!parsed.success) {
-    const issues = parsed.error.issues.map((i) => `${i.path.join('.') || 'manifest'}: ${i.message}`).join('; ');
+  if (!parsed.ok) {
+    const issues = parsed.issues.map((i) => `${i.path || 'manifest'}: ${i.message}`).join('; ');
     throw new ManifestError(`Invalid manifest for plugin "${String(name)}": ${issues}`);
   }
-  const m = parsed.data;
+  const m = parsed.manifest;
   if (!SUPPORTED_SDK_MAJORS.includes(m.sdk)) {
     throw new SdkVersionMismatchError(`Plugin "${m.name}" targets sdk ${m.sdk}, this kernel runs sdk ${SUPPORTED_SDK_MAJORS.join(' and ')}`);
   }

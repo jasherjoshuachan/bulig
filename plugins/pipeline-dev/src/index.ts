@@ -1,4 +1,5 @@
-import { definePlugin, parseScopeBlock, type BuligEvent, type Job, type PluginContext, type Stage } from '@bulig/plugin-sdk';
+import { definePlugin, type BuligEvent, type Job, type PluginContext, type Stage } from '@bulig/plugin-sdk';
+import { parseScopeBlock } from '@bulig/scope';
 import { CLAUDE_STAGES, decide, outputOf, parseVerdict, scopeLines, type Action, type ClaudeStage, type StageOutput } from './decide.ts';
 import { renderPrompt } from './prompts.ts';
 

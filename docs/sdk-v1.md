@@ -253,5 +253,4 @@ Said plainly, so v1 is not read as more than it is:
 - **The pipeline and github conversation** (`worktree.*`, `commit.*`, `pr.requested`, `merge.requested`). One producer, one consumer.
 - **Stage names and `Stage.output`.** The `approve-` prefix carries a permission. That needs a real field.
 - **`provides`.** Declared, never read.
-- **The scope helpers** in the SDK, which belong somewhere else.
 - **Third-party use.** Nobody outside this repo has written a plugin against it. The first one will find things this page missed. Hence a release candidate, not a final.

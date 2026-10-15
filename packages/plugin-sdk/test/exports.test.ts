@@ -7,7 +7,7 @@ describe('what the SDK no longer exports', () => {
   });
 
   it('leaves the scope guard helpers to @bulig/scope', () => {
-    for (const name of ['parseScopeBlock', 'normalizeScopeEntry', 'matchesScope', 'matchesGlob', 'isRepoPath', 'isPlainRepoPath', 'MAX_SCOPE_ENTRIES']) {
+    for (const name of ['parseScopeBlock', 'normalizeScopeEntry', 'matchesScope', 'matchesGlob', 'isRepoPath', 'isPlainRepoPath', 'MAX_SCOPE_ENTRIES', 'MAX_PATTERN_LENGTH', 'MAX_PATTERN_PARTS', 'MAX_PATH_PARTS']) {
       expect(name in sdk, name).toBe(false);
     }
   });

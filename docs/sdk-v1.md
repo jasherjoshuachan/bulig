@@ -76,9 +76,10 @@ Event delivery: events are written to the log in emit order and delivered to sub
 | `JOBS_WRITE`, `DEFAULT_EVENT_CAPABILITIES` | consts | stable | Names and the event-to-capability map (section 5). |
 | `isReservedEvent` | function | stable | |
 | `TERMINAL_STATUSES`, `isApprovalStage` | helpers | experimental | They encode the `approve-` prefix convention. |
-| `effectiveCapabilities` | function | to remove | Kernel-internal: it intersects `needs` with `grants`. No plugin calls it. Move it into `@bulig/core`. It lives in the SDK for now because the conformance suite builds the same grant set. |
 | `parseScopeBlock`, `normalizeScopeEntry`, `matchesScope`, `matchesGlob`, `isRepoPath`, `isPlainRepoPath`, `MAX_SCOPE_ENTRIES`, `MAX_PATTERN_LENGTH`, `MAX_PATTERN_PARTS`, `MAX_PATH_PARTS` and the `Scope*` types | functions | to remove | The scope guard (ADR 0005) is a pipeline and github feature. It is in the SDK only because two plugins share it. A plugin contract should not carry a glob engine. Move it to a shared package that both plugins depend on. |
 | `@bulig/plugin-sdk/conformance` | subpath | experimental | New in this release. Stabilises when a third party has run it. |
+
+`effectiveCapabilities` was exported until `1.0.0-rc.2`. It now lives in `@bulig/core`. It is kernel-internal (it intersects `needs` with `grants`) and no plugin called it. The conformance suite does not use it; it grants a plugin everything it declares.
 
 ## 4. How plugins reach the kernel today
 

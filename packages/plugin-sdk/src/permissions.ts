@@ -1,4 +1,3 @@
-import type { Manifest } from './index.ts';
 import { matchesPattern } from './index.ts';
 
 /**
@@ -13,15 +12,6 @@ export const DEFAULT_EVENT_CAPABILITIES: Readonly<Record<string, string>> = {
   // Ending a job on a person's say-so. Without this, any plugin could cancel a job and skip jobs.write.
   'cancel.requested': 'approval.grant',
 };
-
-/** What a plugin may do: what it declared it needs, intersected with what the config grants it. */
-export function effectiveCapabilities(
-  manifest: Pick<Manifest, 'name' | 'needs'>,
-  grants: Record<string, readonly string[]>,
-): Set<string> {
-  const granted = new Set(grants[manifest.name] ?? []);
-  return new Set(manifest.needs.filter((cap) => granted.has(cap)));
-}
 
 /** Capability that lets a plugin close an approval stage or end a job. Only the pipeline holds it by default. */
 export const JOBS_WRITE = 'jobs.write';

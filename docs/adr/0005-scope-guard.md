@@ -35,4 +35,14 @@ The plan names its files, and the commit step refuses everything else.
 
 ## In my words (Jasher)
 
-_To be written by Jasher before this is tagged._
+A job never commits a file the approved plan didn't name. That is the one thing this ADR has to guarantee. It came from a real slip: a job told "README only" committed a test runner's leftover file, and only the reviewer's luck caught it.
+
+The check runs in the github plugin, outside Claude's sandbox. A stage can only change files on disk, and the files on disk are what get checked. I want the enforcer to sit outside the thing it enforces.
+
+I can't approve what I can't see. The plan card lists every file the job may change, in full, before any Approve button. Telegram withholds the buttons if the list fails to send, and the terminal prints the list before it asks.
+
+It costs something. A plan that forgets a file makes a build attempt fail, and the critique stage is there to catch that. If one kind of file keeps getting forgotten, it goes into `scopeAlwaysAllow`. I'll take that friction over a smooth path that commits the wrong thing.
+
+`allowBroadScope` and `scopeMode: warn` stay off. I switch them on per project, myself, when I have a reason. A bad scope or a symlink is refused either way.
+
+Scope is a list of names. It can't tell whether a file the plan named was changed in a harmful way. The independent review reads the content. Scope is a fence, not a guarantee that the changes are safe.

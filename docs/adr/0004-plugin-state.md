@@ -18,4 +18,10 @@ The kernel keeps one table, `plugin_state(plugin, key, value)`, added as schema 
 
 ## In my words (Jasher)
 
-_To be written by Jasher before v0.1 is tagged._
+State is for "where I am now" and the event log is for history. I keep them apart. A plugin can only see its own keys, and anything shared goes through events.
+
+The Telegram bot saves its position before it runs a command. If it crashes mid-command, that command is skipped and I send it again. I would rather resend than start a paid job twice.
+
+State is moving from synchronous to async when the record moves to Postgres. I'm doing it before the SDK freeze, while only one plugin uses it, so nobody has to carry two versions. Whatever the API looks like, a state write is durable when the call returns. A plugin that awaits `set` can trust it.
+
+There is no delete and no listing, and state grows with every job. I'm leaving that for now. Adding a method later breaks nobody.

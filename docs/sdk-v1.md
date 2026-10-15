@@ -64,7 +64,7 @@ Event delivery: events are written to the log in emit order and delivered to sub
 |---|---|---|---|
 | `definePlugin`, `Plugin`, `PluginContext`, `EventHandler`, `Logger`, `StateApi`, `JobsApi` | API | stable | The plugin surface above. |
 | `Manifest`, `ManifestInput` | types | stable | |
-| `validateManifest`, `ManifestIssue`, `ManifestResult` | function, types | stable | Checks a manifest against the rules of this SDK and returns `{ ok: true, manifest }` or `{ ok: false, issues }`, with each issue's `path` and `message`. The schema library behind it is private. It replaces the `ManifestSchema` export, which is no longer exported. |
+| `validateManifest`, `ManifestIssue`, `ManifestResult` | function, types | stable | Checks a manifest against the rules of this SDK and returns `{ ok: true, manifest }` or `{ ok: false, issues }`, with each issue's `path` and `message`. The schema library is not part of the exported API (the `Manifest` type is still worked out by it, so a major update of that library could change the type). It replaces the `ManifestSchema` export, which is no longer exported. |
 | `SDK_VERSION` (`"1"`) | const | stable | What a new manifest sets `sdk` to. |
 | `SUPPORTED_SDK_MAJORS`, `DEPRECATED_SDK_MAJORS` | consts | stable | |
 | `SDK_RELEASE` | const | experimental | Moves with every release candidate. |

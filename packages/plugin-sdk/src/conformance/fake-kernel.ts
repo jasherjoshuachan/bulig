@@ -172,8 +172,8 @@ export function createFakeKernel(manifest: Manifest, config: Record<string, unkn
     },
     jobs,
     state: {
-      get: (key) => (state.has(key) ? (JSON.parse(JSON.stringify(state.get(key))) as never) : undefined),
-      set(key, value) {
+      get: async (key) => (state.has(key) ? (JSON.parse(JSON.stringify(state.get(key))) as never) : undefined),
+      async set(key, value) {
         if (!jsonOk(value) || value === undefined) rec.findings.push({ rule: 'state', message: `state.set("${key}") was given a value that is not JSON` });
         else state.set(key, JSON.parse(JSON.stringify(value)));
       },

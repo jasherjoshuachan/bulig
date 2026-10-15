@@ -7,7 +7,7 @@ import { z } from 'zod';
 export const SDK_VERSION = '1';
 
 /** The full release of the contract. v1 candidate until the freeze is tagged. */
-export const SDK_RELEASE = '1.0.0-rc.1';
+export const SDK_RELEASE = '1.0.0-rc.2';
 
 /**
  * Majors the kernel loads. "0" is the pre-freeze contract: it loads unchanged, with a deprecation warning, and is
@@ -142,10 +142,13 @@ export interface JobsApi {
 /**
  * A small key-value store that belongs to one plugin. Values are JSON. A plugin sees only its own keys,
  * and the values survive a restart. Use it for things like "the last update I handled".
+ *
+ * Both calls are async because the record behind them can be a database server. `set` resolves only when the value
+ * is durable, so a plugin that awaits it can trust it: save a position, then act. A value that is not JSON rejects.
  */
 export interface StateApi {
-  get<T = unknown>(key: string): T | undefined;
-  set(key: string, value: unknown): void;
+  get<T = unknown>(key: string): Promise<T | undefined>;
+  set(key: string, value: unknown): Promise<void>;
 }
 
 export interface Logger {

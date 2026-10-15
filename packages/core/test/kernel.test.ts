@@ -332,15 +332,29 @@ describe('loader', () => {
     const dbPath = tempDb();
     const k = kernelWith({ dbPath, plugins: [a.plugin, b.plugin] });
     await k.start();
-    a.box.ctx!.state.set('offset', 7);
-    expect(a.box.ctx!.state.get('offset')).toBe(7);
-    expect(b.box.ctx!.state.get('offset')).toBeUndefined();
+    await a.box.ctx!.state.set('offset', 7);
+    expect(await a.box.ctx!.state.get('offset')).toBe(7);
+    expect(await b.box.ctx!.state.get('offset')).toBeUndefined();
     await k.stop();
 
     const again = probe({ name: 'one' });
     const k2 = kernelWith({ dbPath, plugins: [again.plugin] });
     await k2.start();
-    expect(again.box.ctx!.state.get<number>('offset')).toBe(7);
+    expect(await again.box.ctx!.state.get<number>('offset')).toBe(7);
+  });
+
+  it('state.set resolves only after the value is written, and rejects a value that is not JSON', async () => {
+    const a = probe({ name: 'one' });
+    const dbPath = tempDb();
+    const k = kernelWith({ dbPath, plugins: [a.plugin] });
+    await k.start();
+    const pending = a.box.ctx!.state.set('offset', 9);
+    expect(pending).toBeInstanceOf(Promise);
+    await pending;
+    expect(await a.box.ctx!.state.get('offset')).toBe(9);
+    await expect(a.box.ctx!.state.set('fn', () => {})).rejects.toThrow(/not JSON/);
+    expect(await a.box.ctx!.state.get('fn')).toBeUndefined();
+    await k.stop();
   });
 });
 

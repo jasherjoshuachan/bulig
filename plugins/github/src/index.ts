@@ -1,6 +1,7 @@
 import { appendFileSync, existsSync, lstatSync, readFileSync, realpathSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
-import { definePlugin, isPlainRepoPath, isRepoPath, MAX_SCOPE_ENTRIES, matchesScope, normalizeScopeEntry, type BuligEvent, type PluginContext } from '@bulig/plugin-sdk';
+import { definePlugin, type BuligEvent, type PluginContext } from '@bulig/plugin-sdk';
+import { isPlainRepoPath, isRepoPath, MAX_SCOPE_ENTRIES, matchesScope, normalizeScopeEntry } from '@bulig/scope';
 import { exec, type ExecResult } from './exec.ts';
 
 export interface GithubConfig {

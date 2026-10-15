@@ -16,7 +16,8 @@ Bulig (Hiligaynon for "help, lend a hand") is a small kernel for agent work on C
 bulig/ (pnpm workspaces, TypeScript, vitest)
   packages/core        KERNEL: job + stage engine, SQLite single writer, event bus, plugin loader,
                        capability enforcer (a plugin gets only what its manifest declares and the config grants)
-  packages/plugin-sdk  THE STUDS: manifest schema (zod), plugin interface, error types
+  packages/plugin-sdk  THE STUDS: manifest check (validateManifest), plugin interface, error types
+  packages/scope       SCOPE GUARD helpers: read a plan's SCOPE block, match paths against it (used by pipeline-dev and github)
   plugins/
     channel-telegram   chat in and out
     worker-claude-code runs `claude -p` in a git worktree, one fresh session per stage

@@ -205,5 +205,4 @@ export function definePlugin(plugin: Plugin): Plugin {
   return plugin;
 }
 
-export * from './scope.ts';
 export * from './permissions.ts';

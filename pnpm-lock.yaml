@@ -72,6 +72,8 @@ importers:
         specifier: ^4.1.0
         version: 4.6.5
 
+  packages/scope: {}
+
   plugins/channel-cli:
     dependencies:
       '@bulig/plugin-sdk':
@@ -117,6 +119,9 @@ importers:
       '@bulig/plugin-sdk':
         specifier: workspace:*
         version: link:../../packages/plugin-sdk
+      '@bulig/scope':
+        specifier: workspace:*
+        version: link:../../packages/scope
     devDependencies:
       '@bulig/core':
         specifier: workspace:*
@@ -127,6 +132,9 @@ importers:
       '@bulig/plugin-sdk':
         specifier: workspace:*
         version: link:../../packages/plugin-sdk
+      '@bulig/scope':
+        specifier: workspace:*
+        version: link:../../packages/scope
     devDependencies:
       '@bulig/core':
         specifier: workspace:*

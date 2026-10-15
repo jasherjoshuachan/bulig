@@ -45,7 +45,7 @@ const capability = z
   .string()
   .regex(/^[a-z][a-z0-9_-]*(\.[a-z0-9_-]+)+(:[a-z0-9._-]+)?$/, 'capabilities look like "git.push" or "channel.send:owner-dm"');
 
-export const ManifestSchema = z.object({
+const ManifestSchema = z.object({
   name: z.string().regex(/^[a-z][a-z0-9]*(-[a-z0-9]+)*$/, 'name must be kebab-case'),
   version: z.string().regex(/^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$/, 'version must be semver'),
   sdk: z.string().regex(/^\d+$/, 'sdk is a major version string, e.g. "0"'),
@@ -64,6 +64,24 @@ export const ManifestSchema = z.object({
 export type Manifest = z.infer<typeof ManifestSchema>;
 /** What a plugin author writes. Defaults fill in the rest. */
 export type ManifestInput = z.input<typeof ManifestSchema>;
+
+/** One thing wrong with a manifest. `path` is the field, joined with dots. Empty means the manifest as a whole. */
+export interface ManifestIssue {
+  path: string;
+  message: string;
+}
+
+export type ManifestResult = { ok: true; manifest: Manifest } | { ok: false; issues: ManifestIssue[] };
+
+/**
+ * Check a manifest against the rules of this SDK and fill in the defaults. The kernel and the conformance suite use it.
+ * The schema library behind it is private, so its version is not part of the contract.
+ */
+export function validateManifest(input: unknown): ManifestResult {
+  const parsed = ManifestSchema.safeParse(input);
+  if (parsed.success) return { ok: true, manifest: parsed.data };
+  return { ok: false, issues: parsed.error.issues.map((i) => ({ path: i.path.join('.'), message: i.message })) };
+}
 
 // ---------- event matching ----------
 

@@ -1,8 +1,8 @@
 import {
   DEPRECATED_SDK_MAJORS,
-  ManifestSchema,
   SUPPORTED_SDK_MAJORS,
   isReservedEvent,
+  validateManifest,
   type Manifest,
   type Plugin,
 } from '../index.ts';
@@ -81,12 +81,12 @@ async function leakedSince(before: Map<string, number>): Promise<string[]> {
 export function checkManifest(plugin: Plugin): { manifest?: Manifest; findings: Finding[]; notes: string[] } {
   const findings: Finding[] = [];
   const notes: string[] = [];
-  const parsed = ManifestSchema.safeParse(plugin.manifest);
-  if (!parsed.success) {
-    for (const i of parsed.error.issues) findings.push({ rule: 'manifest', message: `${i.path.join('.') || 'manifest'}: ${i.message}` });
+  const parsed = validateManifest(plugin.manifest);
+  if (!parsed.ok) {
+    for (const i of parsed.issues) findings.push({ rule: 'manifest', message: `${i.path || 'manifest'}: ${i.message}` });
     return { findings, notes };
   }
-  const m = parsed.data;
+  const m = parsed.manifest;
   if (!SUPPORTED_SDK_MAJORS.includes(m.sdk)) findings.push({ rule: 'manifest', message: `sdk "${m.sdk}" is not supported (supported: ${SUPPORTED_SDK_MAJORS.join(', ')})` });
   else if (DEPRECATED_SDK_MAJORS.includes(m.sdk)) notes.push(`sdk "${m.sdk}" is deprecated: set it to the current major once this suite passes`);
   for (const type of m.emits.filter(isReservedEvent)) findings.push({ rule: 'manifest', message: `emits "${type}", which only the kernel may emit` });

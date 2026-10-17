@@ -1,11 +1,18 @@
-import { DEPRECATED_SDK_MAJORS, type Job, type Logger, type Plugin } from '@bulig/plugin-sdk';
+import { DEPRECATED_SDK_MAJORS, type BuligEvent, type Logger, type Plugin } from '@bulig/plugin-sdk';
 import { Bus } from './bus.ts';
 import { DEFAULT_EVENT_CAPABILITIES } from './capabilities.ts';
-import { buildContext, selectPlugins, type KernelJobs, type LoadedPlugin } from './loader.ts';
-import { Store } from './store.ts';
+import { buildContext, selectPlugins, type JobsTx, type KernelJobs, type LoadedPlugin } from './loader.ts';
+import { StoreQueue, type StoreTx } from './queue.ts';
+import { SqliteStore } from './sqlite-store.ts';
+import type { Store } from './store.ts';
 
 export interface KernelOptions {
-  dbPath: string;
+  /** Where the SQLite file lives. Used when no `store` is given. */
+  dbPath?: string;
+  /** A store to use instead of opening SQLite at `dbPath`: another adapter, or one wrapped for a test. The kernel closes it on stop. */
+  store?: Store;
+  /** How long one task on the store queue may take before it is given up on and the queue moves on. Default 30000. */
+  storeTimeoutMs?: number;
   plugins: Plugin[];
   enabled: string[];
   grants?: Record<string, string[]>;
@@ -23,29 +30,45 @@ const defaultLogger: Logger = {
 };
 
 export function createKernel(options: KernelOptions) {
-  const store = new Store(options.dbPath);
-  const bus = new Bus(store, { ...DEFAULT_EVENT_CAPABILITIES, ...options.eventCapabilities });
+  const store = options.store ?? (options.dbPath !== undefined ? new SqliteStore(options.dbPath) : undefined);
+  if (!store) throw new Error('createKernel needs a dbPath or a store');
   const logger = options.logger ?? defaultLogger;
+  // Every store call in the kernel goes through this one queue (ADR 0001: the kernel is the only writer, one at a time).
+  const queue = new StoreQueue(store, options.storeTimeoutMs ?? 30_000);
+  const bus = new Bus(queue, { ...DEFAULT_EVENT_CAPABILITIES, ...options.eventCapabilities }, (err, input) =>
+    logger.error(`Could not write event "${input.type}" to the log, so it was not delivered`, err),
+  );
 
-  // Job changes go through here so the kernel always announces them.
-  // Synchronous for now: the store is. Plugins get an async view of it from the loader.
+  // The job calls as they run on one task of the queue. A change and the event that announces it are written in the same task.
+  const inTask = (tx: StoreTx): JobsTx => ({
+    async create(input) {
+      const job = await tx.createJob(input);
+      await bus.record(tx, { type: 'job.created', source: 'kernel', jobId: job.id, payload: job });
+      return job;
+    },
+    get: (id) => tx.getJob(id),
+    list: (filter) => tx.listJobs(filter),
+    async setStatus(id, status) {
+      const before = await tx.getJob(id);
+      const job = await tx.setJobStatus(id, status);
+      await bus.record(tx, { type: 'job.status', source: 'kernel', jobId: id, payload: { from: before?.status, to: status } });
+      return job;
+    },
+    stages: (jobId) => tx.listStages(jobId),
+    startStage: (jobId, name) => tx.startStage(jobId, name),
+    finishStage: (id, status, output) => tx.finishStage(id, status, output),
+    stageName: async (id) => (await tx.getStage(id))?.name,
+  });
+  const atomic: KernelJobs['atomic'] = (fn) => queue.run('jobs', (tx) => fn(inTask(tx)));
   const jobs: KernelJobs = {
-    create(input) {
-      const job = store.createJob(input);
-      bus.emit({ type: 'job.created', source: 'kernel', jobId: job.id, payload: job });
-      return job;
-    },
-    get: (id) => store.getJob(id),
-    list: (filter) => store.listJobs(filter),
-    setStatus(id, status): Job {
-      const before = store.getJob(id);
-      const job = store.setJobStatus(id, status);
-      bus.emit({ type: 'job.status', source: 'kernel', jobId: id, payload: { from: before?.status, to: status } });
-      return job;
-    },
-    stages: (jobId) => store.listStages(jobId),
-    startStage: (jobId, name) => store.startStage(jobId, name),
-    finishStage: (id, status, output) => store.finishStage(id, status, output),
+    atomic,
+    create: (input) => atomic((t) => t.create(input)),
+    get: (id) => atomic((t) => t.get(id)),
+    list: (filter) => atomic((t) => t.list(filter)),
+    setStatus: (id, status) => atomic((t) => t.setStatus(id, status)),
+    stages: (jobId) => atomic((t) => t.stages(jobId)),
+    startStage: (jobId, name) => atomic((t) => t.startStage(jobId, name)),
+    finishStage: (id, status, output) => atomic((t) => t.finishStage(id, status, output)),
   };
 
   let loaded: LoadedPlugin[] = [];
@@ -53,7 +76,7 @@ export function createKernel(options: KernelOptions) {
   return {
     jobs,
     bus,
-    history: (jobId: string) => bus.history(jobId),
+    history: (jobId: string): Promise<BuligEvent[]> => bus.history(jobId),
 
     async start(): Promise<void> {
       // Validate everything before any plugin runs.
@@ -63,8 +86,10 @@ export function createKernel(options: KernelOptions) {
         pluginConfig: options.pluginConfig ?? {},
         bus,
         jobs,
-        stageName: (id: string) => store.getStage(id)?.name,
-        state: { get: (p: string, k: string) => store.getState(p, k), set: (p: string, k: string, v: unknown) => store.setState(p, k, v) },
+        state: {
+          get: (p: string, k: string) => queue.run('state get', (tx) => tx.getState(p, k)),
+          set: (p: string, k: string, v: unknown) => queue.run('state set', (tx) => tx.setState(p, k, v)),
+        },
         logger,
       };
       for (const { manifest } of loaded) {
@@ -75,7 +100,8 @@ export function createKernel(options: KernelOptions) {
       for (const { plugin, manifest } of loaded) {
         await plugin.register(buildContext(manifest, base));
       }
-      bus.emit({
+      // Wait for it to be written and handed to the handlers, so start() returns with the plugins running, as it always did.
+      await bus.emit({
         type: 'kernel.started',
         source: 'kernel',
         payload: { plugins: loaded.map((l) => l.manifest.name) },
@@ -92,7 +118,7 @@ export function createKernel(options: KernelOptions) {
       }
       // Let handlers that are still working (a git command, a killed Claude run) finish before the log closes.
       await bus.idle();
-      store.close();
+      await queue.close();
     },
   };
 }

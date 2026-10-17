@@ -46,31 +46,31 @@ describe('/cancel and /retry with the real pipeline', () => {
   it('/cancel with no id stops the one job whose stage is running, and nothing starts after it', async () => {
     const r = await rig({ plan: 'hang' });
     r.fake.say(CHAT, '/dev app Slow job');
-    await until(() => r.k.jobs.list().length === 1, 'job');
-    const job = r.k.jobs.list()[0]!;
-    await until(() => r.k.jobs.stages(job.id).some((s) => s.name === 'plan' && s.status === 'running'), 'plan running');
+    await until(async () => (await r.k.jobs.list()).length === 1, 'job');
+    const job = (await r.k.jobs.list())[0]!;
+    await until(async () => (await r.k.jobs.stages(job.id)).some((s) => s.name === 'plan' && s.status === 'running'), 'plan running');
     r.fake.say(CHAT, '/cancel');
-    await until(() => r.k.jobs.get(job.id)!.status === 'cancelled', 'cancelled', 15000);
-    expect(r.k.jobs.stages(job.id).map((s) => s.name)).not.toContain('build');
+    await until(async () => (await r.k.jobs.get(job.id))!.status === 'cancelled', 'cancelled', 15000);
+    expect((await r.k.jobs.stages(job.id)).map((s) => s.name)).not.toContain('build');
   });
 
   it('/retry of a failed job plans again and asks for a new plan approval; the old approval is not reused', async () => {
     // First job: the plan is approved, then the build fails twice, so the job fails.
     const r = await rig({ build: { fail: 'boom' } as never });
     r.fake.say(CHAT, '/dev app Add a thing\nDo it well');
-    await until(() => r.k.jobs.list().length === 1, 'job');
-    const old = r.k.jobs.list()[0]!;
+    await until(async () => (await r.k.jobs.list()).length === 1, 'job');
+    const old = (await r.k.jobs.list())[0]!;
     await until(() => r.fake.texts(CHAT).some((t) => t.includes('approval needed: plan')), 'plan card', 15000);
     r.fake.press(CHAT, 1, 'card', `ap:${old.id}:plan`);
-    await until(() => r.k.jobs.get(old.id)!.status === 'failed', 'the job to fail', 15000);
-    const oldStages = r.k.jobs.stages(old.id).map((s) => `${s.name}:${s.status}`);
+    await until(async () => (await r.k.jobs.get(old.id))!.status === 'failed', 'the job to fail', 15000);
+    const oldStages = (await r.k.jobs.stages(old.id)).map((s) => `${s.name}:${s.status}`);
     expect(oldStages).toContain('approve-plan:passed');
 
     r.fake.say(CHAT, `/retry ${old.id.slice(0, 8)}`);
-    await until(() => r.k.jobs.list().length === 2, 'retried job');
-    const fresh = r.k.jobs.list()[1]!;
-    await until(() => r.k.jobs.get(fresh.id)!.status === 'awaiting_approval', 'new job waits for plan approval', 15000);
-    const freshStages = r.k.jobs.stages(fresh.id).map((s) => `${s.name}:${s.status}`);
+    await until(async () => (await r.k.jobs.list()).length === 2, 'retried job');
+    const fresh = (await r.k.jobs.list())[1]!;
+    await until(async () => (await r.k.jobs.get(fresh.id))!.status === 'awaiting_approval', 'new job waits for plan approval', 15000);
+    const freshStages = (await r.k.jobs.stages(fresh.id)).map((s) => `${s.name}:${s.status}`);
     expect(freshStages).toContain('approve-plan:running');
     expect(freshStages.some((s) => s.startsWith('build') || s === 'approve-plan:passed')).toBe(false);
     expect({ repo: fresh.repo, title: fresh.title, body: fresh.body }).toEqual({ repo: old.repo, title: old.title, body: old.body });
@@ -80,7 +80,7 @@ describe('/cancel and /retry with the real pipeline', () => {
     expect(JSON.stringify(card.params.reply_markup)).toContain(`ap:${fresh.id}:plan`);
     expect(JSON.stringify(card.params.reply_markup)).not.toContain(old.id);
     // The old job stays failed and its record is untouched.
-    expect(r.k.jobs.get(old.id)!.status).toBe('failed');
-    expect(r.k.jobs.stages(old.id).map((s) => `${s.name}:${s.status}`)).toEqual(oldStages);
+    expect((await r.k.jobs.get(old.id))!.status).toBe('failed');
+    expect((await r.k.jobs.stages(old.id)).map((s) => `${s.name}:${s.status}`)).toEqual(oldStages);
   });
 });

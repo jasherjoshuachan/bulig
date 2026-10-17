@@ -616,7 +616,8 @@ export default definePlugin({
         await tidy(cwd, worktree, branch, baseRef);
         ctx.emit('pr.merged', { number }, event.jobId);
       } catch (err) {
-        if (!(await over())) refuse(message(err));
+        // If the job cannot be read either (the store timed out), say the merge did not happen so the pipeline asks again, instead of leaving it waiting.
+        if (!(await over().catch(() => false))) refuse(message(err));
       } finally {
         if (event.jobId && waits.get(event.jobId) === wait) waits.delete(event.jobId);
       }

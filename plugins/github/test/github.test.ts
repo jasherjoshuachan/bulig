@@ -4,8 +4,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeAll, describe, expect, it } from 'vitest';
-import { createKernel } from '@bulig/core';
+import { createKernel, SqliteStore, type Store } from '@bulig/core';
 import { definePlugin, type BuligEvent } from '@bulig/plugin-sdk';
+import { slowStore } from '../../../packages/core/test/slow-store.ts';
 import github, { judgeChecks } from '../src/index.ts';
 
 /** The scope the older tests commit under: every file they write is a .txt file. */
@@ -40,7 +41,12 @@ function repos() {
   return { root, origin, repo };
 }
 
-async function setup(config: Record<string, unknown> = {}, grants = ['git.push', 'gh.pr']) {
+/** `store` wraps the kernel's SQLite store, for tests that need slow or stuck store calls. */
+async function setup(
+  config: Record<string, unknown> = {},
+  grants = ['git.push', 'gh.pr'],
+  kernelExtra: { store?: (inner: Store) => Store; storeTimeoutMs?: number } = {},
+) {
   const { root, origin, repo } = repos();
   const log = join(root, 'gh.log');
   const statePath = join(root, 'gh-state.json');
@@ -68,7 +74,8 @@ async function setup(config: Record<string, unknown> = {}, grants = ['git.push',
     },
   });
   const k = createKernel({
-    dbPath: join(root, 'db.sqlite'),
+    ...(kernelExtra.store ? { store: kernelExtra.store(new SqliteStore(join(root, 'db.sqlite'))) } : { dbPath: join(root, 'db.sqlite') }),
+    ...(kernelExtra.storeTimeoutMs !== undefined && { storeTimeoutMs: kernelExtra.storeTimeoutMs }),
     plugins: [github, driver],
     enabled: ['github', 'driver'],
     grants: { github: grants, driver: ['merge.request'] },
@@ -76,7 +83,7 @@ async function setup(config: Record<string, unknown> = {}, grants = ['git.push',
     logger: { debug() {}, info() {}, warn() {}, error() {} },
   });
   await k.start();
-  const job = k.jobs.create({ repo, title: 'x' });
+  const job = (await k.jobs.create({ repo, title: 'x' }));
   const waitFor = async (type: string) => {
     const end = Date.now() + 10000;
     for (;;) {
@@ -619,7 +626,7 @@ describe('merge.requested', () => {
     h.setState({ log: join(h.root, 'gh.log'), checks: [{ name: 'ci', bucket: 'pending' }] });
     h.fire('merge.requested', { cwd: pr.cwd, number: pr.number, headSha: pr.headSha });
     await until(() => h.calls().filter((c) => c.args[1] === 'checks').length >= 2);
-    h.k.jobs.setStatus(h.job.id, 'cancelled');
+    (await h.k.jobs.setStatus(h.job.id, 'cancelled'));
     await new Promise((r) => setTimeout(r, 150));
     const polls = h.calls().filter((c) => c.args[1] === 'checks').length;
     await new Promise((r) => setTimeout(r, 200));
@@ -632,8 +639,8 @@ describe('merge.requested', () => {
     const h = await setup({ checksPollMs: 20, checksWaitMs: 60_000 });
     const pr = await openPr(h);
     h.setState({ log: join(h.root, 'gh.log'), checks: [{ name: 'ci', bucket: 'pass' }] });
-    h.k.jobs.setStatus(h.job.id, 'running');
-    h.k.jobs.setStatus(h.job.id, 'cancelled');
+    (await h.k.jobs.setStatus(h.job.id, 'running'));
+    (await h.k.jobs.setStatus(h.job.id, 'cancelled'));
     h.fire('merge.requested', { cwd: pr.cwd, number: pr.number, headSha: pr.headSha });
     await new Promise((r) => setTimeout(r, 300));
     expect(h.calls().some((c) => c.args[1] === 'merge')).toBe(false);
@@ -647,10 +654,44 @@ describe('merge.requested', () => {
     h.setState({ log: join(h.root, 'gh.log'), checks: [{ name: 'ci', bucket: 'pass' }], checksDelayMs: 700, ignoreTerm: true });
     h.fire('merge.requested', { cwd: pr.cwd, number: pr.number, headSha: pr.headSha });
     await until(() => h.calls().some((c) => c.args[1] === 'checks'));
-    h.k.jobs.setStatus(h.job.id, 'cancelled');
+    (await h.k.jobs.setStatus(h.job.id, 'cancelled'));
     await new Promise((r) => setTimeout(r, 1500));
     expect(h.calls().some((c) => c.args[1] === 'merge')).toBe(false);
     expect(h.seen.some((e) => e.type === 'pr.merged' || e.type === 'merge.refused' || e.type === 'merge.failed')).toBe(false);
+  });
+
+  it('does not merge when the cancel is written but its announcement is still on its way to the log (slow store)', async () => {
+    // Writing an event takes 700 ms. A cancel is written at once, but the announcement that wakes the merge up (and
+    // aborts its wait) is not delivered until the event is in the log. gh answers green before that happens, so the
+    // only thing that can stop the merge is the last look at the job, which has to wait for the cancel to finish.
+    let slow = false;
+    const h = await setup({ checksPollMs: 20, checksWaitMs: 60_000 }, undefined, {
+      store: (inner) => slowStore(inner, { before: (m) => (slow && m === 'appendEvent' ? 700 : 0) }),
+    });
+    const pr = await openPr(h);
+    h.setState({ log: join(h.root, 'gh.log'), checks: [{ name: 'ci', bucket: 'pass' }], checksDelayMs: 300 });
+    slow = true;
+    h.fire('merge.requested', { cwd: pr.cwd, number: pr.number, headSha: pr.headSha });
+    await until(() => h.calls().some((c) => c.args[1] === 'checks'));
+    await h.k.jobs.setStatus(h.job.id, 'cancelled'); // returns once the announcement is in the log, 700 ms on
+    await new Promise((r) => setTimeout(r, 200));
+    expect(h.calls().some((c) => c.args[1] === 'merge')).toBe(false);
+    expect(h.seen.some((e) => e.type === 'pr.merged' || e.type === 'merge.refused' || e.type === 'merge.failed')).toBe(false);
+  });
+
+  it('says the merge did not happen, instead of going quiet, when the job cannot be read (store call stuck)', async () => {
+    let stuck = false;
+    const h = await setup({ checksPollMs: 20, checksWaitMs: 60_000 }, undefined, {
+      store: (inner) => slowStore(inner, { hang: (m) => stuck && m === 'getJob' }),
+      storeTimeoutMs: 80,
+    });
+    const pr = await openPr(h);
+    h.setState({ log: join(h.root, 'gh.log'), checks: [{ name: 'ci', bucket: 'pass' }] });
+    stuck = true;
+    h.fire('merge.requested', { cwd: pr.cwd, number: pr.number, headSha: pr.headSha });
+    const refused = await h.waitFor('merge.refused');
+    expect((refused.payload as { reason: string }).reason).toMatch(/did not finish within 80 ms/);
+    expect(h.calls().some((c) => c.args[1] === 'merge')).toBe(false);
   });
 
   it('kills a hung gh call after ghTimeoutMs, tries it again as a temporary failure, and then merges', async () => {
@@ -683,7 +724,7 @@ describe('merge.requested', () => {
     h.fire('merge.requested', { cwd: pr.cwd, number: pr.number, headSha: pr.headSha });
     await until(() => existsSync(pidFile));
     const pid = Number(readFileSync(pidFile, 'utf8').trim().split('\n')[0]);
-    h.k.jobs.setStatus(h.job.id, 'cancelled');
+    (await h.k.jobs.setStatus(h.job.id, 'cancelled'));
     await until(() => !alive(pid), 5000);
     await new Promise((r) => setTimeout(r, 100));
     expect(h.seen.some((e) => e.type === 'merge.refused' || e.type === 'merge.failed' || e.type === 'pr.merged')).toBe(false);
@@ -733,7 +774,7 @@ describe('merge.requested', () => {
     h.setState({ log: join(h.root, 'gh.log'), checksErrorFirst: 99, checks: [{ name: 'ci', bucket: 'pass' }] });
     h.fire('merge.requested', { cwd: pr.cwd, number: pr.number, headSha: pr.headSha });
     await until(() => h.calls().filter((c) => c.args[1] === 'checks').length === 1);
-    h.k.jobs.setStatus(h.job.id, 'cancelled');
+    (await h.k.jobs.setStatus(h.job.id, 'cancelled'));
     // Stopping waits for the running merge handler, so it only returns quickly if the 60s retry sleep was cut short.
     const stopped = Date.now();
     await h.k.stop();

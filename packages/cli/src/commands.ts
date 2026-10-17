@@ -3,7 +3,7 @@ import { dirname, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import { createCliChannel, type CliChannel } from '@bulig/channel-cli';
 import telegram from '@bulig/channel-telegram';
-import { createKernel, Store, type Kernel } from '@bulig/core';
+import { createKernel, SqliteStore, type Kernel, type Store } from '@bulig/core';
 import gate from '@bulig/gate-evidence';
 import gatePromise from '@bulig/gate-promise';
 import github from '@bulig/github';
@@ -24,6 +24,10 @@ export interface Io {
   onInterrupt?(cleanup: () => Promise<void> | void): () => void;
   /** `serve` registers here to be told when to stop (SIGINT or SIGTERM). Returns an unregister function. */
   onStop?(stop: () => void): () => void;
+  /** Opens the store the kernel runs on, in place of SQLite at the configured path. Tests use it to put a slow store under a command. */
+  openStore?(dbPath: string): Store;
+  /** The longest `drive` waits for the handlers of already-logged events to return before it trusts a resting status. Default 30000. */
+  settleMs?: number;
   /** Replaces the plugin list `serve` loads. Tests use it to put fakes in place of the worker and GitHub. */
   servePlugins?: Plugin[];
 }
@@ -62,9 +66,9 @@ export async function runCli(argv: string[], io: Io): Promise<number> {
       case 'resume':
         return await cmdResume(rest, io);
       case 'status':
-        return cmdStatus(rest, io);
+        return await cmdStatus(rest, io);
       case 'history':
-        return cmdHistory(rest, io);
+        return await cmdHistory(rest, io);
       case undefined:
       case 'help':
       case '--help':
@@ -156,6 +160,7 @@ async function openSession(
   const release = acquireLock(config.dbPath);
   const kernel = createKernel({
     dbPath: config.dbPath,
+    ...(io.openStore && { store: io.openStore(config.dbPath) }),
     plugins,
     enabled: config.enabled,
     grants: config.grants,
@@ -195,16 +200,24 @@ async function openSession(
   };
 }
 
-/** Wait until the job comes to rest. Polls the store, which only this process writes. */
+/**
+ * Wait until the job comes to rest. Polls the kernel's store, which only this process writes.
+ *
+ * A status read here can predate what the pipeline does with the event the command just emitted (an approval, say):
+ * the job still says awaiting_approval because the handler has not run yet. So when the status looks like rest, wait until
+ * the bus has delivered everything logged so far and the handlers started for it have returned, then read again.
+ * That wait ends when the work is done, not after a set time. `settleMs` only stops a handler that never returns
+ * from holding the command up for good.
+ */
 async function drive(kernel: Kernel, jobId: string, io: Io): Promise<Job> {
   for (;;) {
-    let job = kernel.jobs.get(jobId);
+    let job = await kernel.jobs.get(jobId);
     if (!job) throw new Error(`job ${jobId} vanished`);
     if (RESTING.includes(job.status)) {
-      // Plugins reach jobs through async calls, so the handlers that the last event started may not have run yet.
-      // Let them finish before believing that the job is at rest.
-      await kernel.bus.idle(2000);
-      job = kernel.jobs.get(jobId);
+      let giveUp: NodeJS.Timeout | undefined;
+      await Promise.race([kernel.bus.settle(), new Promise<void>((r) => (giveUp = setTimeout(r, io.settleMs ?? 30_000)))]);
+      clearTimeout(giveUp);
+      job = await kernel.jobs.get(jobId);
       if (!job) throw new Error(`job ${jobId} vanished`);
       if (RESTING.includes(job.status)) return job;
     }
@@ -242,7 +255,7 @@ async function cmdApprove(args: string[], io: Io): Promise<number> {
   const [idArg, kind, ...extra] = args;
   if (!idArg || (kind !== 'plan' && kind !== 'merge') || extra.length) throw new UserError('usage: bulig approve <jobId> <plan|merge>');
   const { config } = loadConfig(io.cwd, io.home);
-  const { job, stages } = lookup(config, idArg);
+  const { job, stages } = await lookup(config, idArg);
   const waiting = stages.find((s) => s.name.startsWith('approve-') && s.status === 'running');
   if (job.status !== 'awaiting_approval' || !waiting) {
     throw new UserError(`job ${job.id} is ${job.status.replace('_', ' ')}, not waiting for an approval`);
@@ -264,7 +277,7 @@ async function cmdDeny(args: string[], io: Io): Promise<number> {
   const [idArg, ...extra] = args;
   if (!idArg || extra.length) throw new UserError('usage: bulig deny <jobId>');
   const { config } = loadConfig(io.cwd, io.home);
-  const { job } = lookup(config, idArg);
+  const { job } = await lookup(config, idArg);
   if (job.status !== 'awaiting_approval') throw new UserError(`job ${job.id} is ${job.status.replace('_', ' ')}, not waiting for an approval`);
   const session = await openSession(config, io, false, job.id);
   try {
@@ -280,7 +293,7 @@ async function cmdResume(args: string[], io: Io): Promise<number> {
   const [idArg, ...extra] = args;
   if (!idArg || extra.length) throw new UserError('usage: bulig resume <jobId>');
   const { config } = loadConfig(io.cwd, io.home);
-  const { job } = lookup(config, idArg);
+  const { job } = await lookup(config, idArg);
   if (job.status !== 'running' && job.status !== 'queued') throw new UserError(`job ${job.id} is ${job.status.replace('_', ' ')}; only running jobs resume`);
   const session = await openSession(config, io, [job.id], job.id);
   try {
@@ -328,29 +341,29 @@ function dbPathFor(io: Io): string {
   }
 }
 
-function readStore<T>(io: Io, fn: (store: Store) => T): T {
+async function readStore<T>(io: Io, fn: (store: Store) => Promise<T>): Promise<T> {
   const dbPath = dbPathFor(io);
   if (!existsSync(dbPath)) throw new UserError(`no database at ${dbPath} yet. Run a job first.`);
-  const store = new Store(dbPath);
+  const store = new SqliteStore(dbPath);
   try {
-    return fn(store);
+    return await fn(store);
   } finally {
-    store.close();
+    await store.close();
   }
 }
 
 /** Find a job by full id or a unique prefix. */
-function lookup(config: BuligConfig, idArg: string): { job: Job; stages: Stage[] } {
+async function lookup(config: BuligConfig, idArg: string): Promise<{ job: Job; stages: Stage[] }> {
   if (!existsSync(config.dbPath)) throw new UserError(`no database at ${config.dbPath} yet. Run a job first.`);
-  const store = new Store(config.dbPath);
+  const store = new SqliteStore(config.dbPath);
   try {
-    const matches = store.listJobs().filter((j) => j.id === idArg || j.id.startsWith(idArg));
+    const matches = (await store.listJobs()).filter((j) => j.id === idArg || j.id.startsWith(idArg));
     if (matches.length === 0) throw new UserError(`no job starts with "${idArg}"`);
     if (matches.length > 1) throw new UserError(`"${idArg}" matches ${matches.length} jobs; type more of the id`);
     const job = matches[0]!;
-    return { job, stages: store.listStages(job.id) };
+    return { job, stages: await store.listStages(job.id) };
   } finally {
-    store.close();
+    await store.close();
   }
 }
 
@@ -358,16 +371,16 @@ const pad = (s: string, n: number) => (s.length >= n ? s : s + ' '.repeat(n - s.
 const secs = (a: string, b: string | null) => (b ? `${((Date.parse(b) - Date.parse(a)) / 1000).toFixed(1)}s` : '-');
 const cell = (v: unknown) => String(v ?? '-');
 
-function cmdStatus(args: string[], io: Io): number {
+async function cmdStatus(args: string[], io: Io): Promise<number> {
   const [idArg] = args;
-  readStore(io, (store) => {
+  await readStore(io, async (store) => {
     if (!idArg) {
-      const jobs = store.listJobs().reverse();
+      const jobs = (await store.listJobs()).reverse();
       if (jobs.length === 0) return io.out('no jobs yet');
       for (const j of jobs) io.out(`${j.id.slice(0, 8)}  ${pad(j.status, 17)}${pad(j.title, 40)} ${j.repo}`);
       return;
     }
-    const matches = store.listJobs().filter((j) => j.id.startsWith(idArg));
+    const matches = (await store.listJobs()).filter((j) => j.id.startsWith(idArg));
     if (matches.length !== 1) throw new UserError(matches.length ? `"${idArg}" matches ${matches.length} jobs` : `no job starts with "${idArg}"`);
     const job = matches[0]!;
     io.out(`job      ${job.id}`);
@@ -376,7 +389,7 @@ function cmdStatus(args: string[], io: Io): number {
     io.out(`status   ${job.status}`);
     io.out(`created  ${job.createdAt}`);
     io.out(`updated  ${job.updatedAt}`);
-    printStages(store.listStages(job.id), io);
+    printStages(await store.listStages(job.id), io);
   });
   return 0;
 }
@@ -393,18 +406,18 @@ function printStages(stages: Stage[], io: Io): void {
   }
 }
 
-function cmdHistory(args: string[], io: Io): number {
+async function cmdHistory(args: string[], io: Io): Promise<number> {
   const [idArg] = args;
   if (!idArg) throw new UserError('usage: bulig history <jobId>');
-  readStore(io, (store) => {
-    const matches = store.listJobs().filter((j) => j.id.startsWith(idArg));
+  await readStore(io, async (store) => {
+    const matches = (await store.listJobs()).filter((j) => j.id.startsWith(idArg));
     if (matches.length !== 1) throw new UserError(matches.length ? `"${idArg}" matches ${matches.length} jobs` : `no job starts with "${idArg}"`);
     const job = matches[0]!;
     io.out(`job ${job.id}  ${job.status}  ${job.title}`);
-    printStages(store.listStages(job.id), io);
+    printStages(await store.listStages(job.id), io);
     io.out('');
     io.out('events');
-    for (const e of store.eventsForJob(job.id)) {
+    for (const e of await store.eventsForJob(job.id)) {
       io.out(`${pad(String(e.seq), 5)}${pad(e.at.slice(11, 19), 9)}${pad(e.type, 20)}${pad(e.source, 20)}${summary(e.payload)}`);
     }
   });

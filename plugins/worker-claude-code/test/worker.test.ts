@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { createKernel } from '@bulig/core';
-import { definePlugin, type BuligEvent, type Plugin } from '@bulig/plugin-sdk';
+import { definePlugin, type BuligEvent, type Plugin, type PluginContext } from '@bulig/plugin-sdk';
 import worker, {
   BASE_ALLOWED_DOMAINS,
   GITHUB_HOSTS,
@@ -705,8 +705,8 @@ describe('a job that ends takes its own Claude with it', () => {
     process.env.FAKE_CLAUDE_MARK = mark;
     const h = await setup({ passEnv: ['FAKE_CLAUDE_MARK'], ...config }, undefined, createWorker());
     delete process.env.FAKE_CLAUDE_MARK;
-    const a = h.k.jobs.create({ repo: '/r', title: 'a' });
-    const b = h.k.jobs.create({ repo: '/r', title: 'b' });
+    const a = (await h.k.jobs.create({ repo: '/r', title: 'a' }));
+    const b = (await h.k.jobs.create({ repo: '/r', title: 'b' }));
     process.env.FAKE_CLAUDE_MARK = mark;
     h.fire(req({ prompt: prompts[0], stage: 'build', mode: 'edit' }), a.id);
     await waitFor(() => pidsIn(mark).length === 1);
@@ -719,7 +719,7 @@ describe('a job that ends takes its own Claude with it', () => {
 
   it('cancelling a job SIGTERMs only that job\'s Claude, and the stage is closed as failed', async () => {
     const h = await twoJobs(['FAKE:term', 'FAKE:term']);
-    h.k.jobs.setStatus(h.a.id, 'cancelled');
+    (await h.k.jobs.setStatus(h.a.id, 'cancelled'));
     await waitFor(() => !alive(h.pa));
     expect(alive(h.pb)).toBe(true); // the other job's run is untouched
     await waitFor(() => h.seen.length === 1);
@@ -731,7 +731,7 @@ describe('a job that ends takes its own Claude with it', () => {
 
   it('a job that fails is treated the same way', async () => {
     const h = await twoJobs(['FAKE:term', 'FAKE:term']);
-    h.k.jobs.setStatus(h.b.id, 'failed');
+    (await h.k.jobs.setStatus(h.b.id, 'failed'));
     await waitFor(() => !alive(h.pb));
     expect(alive(h.pa)).toBe(true);
     await h.k.stop();
@@ -740,7 +740,7 @@ describe('a job that ends takes its own Claude with it', () => {
   it('follows SIGTERM with SIGKILL after the grace period when the run ignores it', async () => {
     const h = await twoJobs(['FAKE:ignoreterm', 'FAKE:term'], { stopGraceMs: 400 });
     const started = Date.now();
-    h.k.jobs.setStatus(h.a.id, 'cancelled');
+    (await h.k.jobs.setStatus(h.a.id, 'cancelled'));
     await waitFor(() => !alive(h.pa));
     expect(Date.now() - started).toBeGreaterThanOrEqual(350);
     expect(readFileSync(h.mark, 'utf8')).toContain('TERM'); // asked nicely first
@@ -752,7 +752,7 @@ describe('a job that ends takes its own Claude with it', () => {
     const h = await twoJobs(['FAKE:grandchild', 'FAKE:term']);
     const grandchild = Number(/GRANDCHILD (\d+)/.exec(readFileSync(h.mark, 'utf8'))![1]);
     expect(alive(grandchild)).toBe(true);
-    h.k.jobs.setStatus(h.a.id, 'cancelled');
+    (await h.k.jobs.setStatus(h.a.id, 'cancelled'));
     await waitFor(() => !alive(grandchild), 4000);
     expect(alive(h.pb)).toBe(true);
     await h.k.stop();
@@ -760,8 +760,8 @@ describe('a job that ends takes its own Claude with it', () => {
 
   it('other status changes leave the run alone', async () => {
     const h = await twoJobs(['FAKE:term', 'FAKE:term']);
-    h.k.jobs.setStatus(h.a.id, 'running');
-    h.k.jobs.setStatus(h.a.id, 'awaiting_approval');
+    (await h.k.jobs.setStatus(h.a.id, 'running'));
+    (await h.k.jobs.setStatus(h.a.id, 'awaiting_approval'));
     await new Promise((r) => setTimeout(r, 150));
     expect(alive(h.pa) && alive(h.pb)).toBe(true);
     expect(h.seen).toHaveLength(0);
@@ -773,12 +773,91 @@ describe('a job that ends takes its own Claude with it', () => {
     process.env.FAKE_CLAUDE_MARK = mark;
     const h = await setup({ passEnv: ['FAKE_CLAUDE_MARK'] }, undefined, createWorker());
     delete process.env.FAKE_CLAUDE_MARK;
-    const job = h.k.jobs.create({ repo: '/r', title: 'x' });
-    h.k.jobs.setStatus(job.id, 'cancelled');
+    const job = (await h.k.jobs.create({ repo: '/r', title: 'x' }));
+    (await h.k.jobs.setStatus(job.id, 'cancelled'));
     h.fire(req({ prompt: 'FAKE:term', stage: 'build', mode: 'edit' }), job.id);
     await waitFor(() => h.seen.length === 1);
     expect(h.seen[0]!.type).toBe('stage.failed');
     expect(existsSync(mark)).toBe(false);
+  });
+});
+
+describe('a job that ends while its stage is still starting (slow store)', () => {
+  /** The worker with a hand-made context, so a test decides exactly when the job read answers and what it says. */
+  function bare() {
+    const handlers = new Map<string, (e: BuligEvent) => unknown>();
+    const emitted: { type: string; payload: unknown; jobId?: string | undefined }[] = [];
+    const reads: { resolve(job: unknown): void; reject(err: unknown): void }[] = [];
+    const ctx = {
+      require() {},
+      can: () => true,
+      config: { claudeBin: FAKE, passEnv: ['FAKE_CLAUDE_MARK'] },
+      on: (pattern: string, h: (e: BuligEvent) => unknown) => void handlers.set(pattern, h),
+      emit: (type: string, payload: unknown, jobId?: string) => void emitted.push({ type, payload, jobId }),
+      jobs: { get: () => new Promise((resolve, reject) => reads.push({ resolve, reject })) },
+      log: { debug() {}, info() {}, warn() {}, error() {} },
+    } as unknown as PluginContext;
+    const w = createWorker();
+    w.register(ctx);
+    const event = (type: string, payload: unknown, jobId = 'j1'): BuligEvent => ({ id: `e-${type}`, seq: 1, type, jobId, source: 'test', payload, at: new Date().toISOString() });
+    return { w, handlers, emitted, reads, event };
+  }
+  const tick = () => new Promise((r) => setTimeout(r, 20));
+
+  it('does not start Claude when the cancel came in while the job was being read, even though the read says running', async () => {
+    const mark = join(tmp(), 'never.log');
+    process.env.FAKE_CLAUDE_MARK = mark;
+    const t = bare();
+    try {
+      const stage = t.handlers.get('stage.requested')!(t.event('stage.requested', req({ prompt: 'FAKE:term', stage: 'build', mode: 'edit' })));
+      await tick();
+      expect(t.reads).toHaveLength(1);
+      // The cancel is announced while the read is out. No Claude exists yet, so there is nothing to stop.
+      t.handlers.get('job.status')!(t.event('job.status', { from: 'running', to: 'cancelled' }));
+      // The read answers with what the job was before the cancel.
+      t.reads[0]!.resolve({ id: 'j1', status: 'running' });
+      const outcome = await Promise.race([Promise.resolve(stage).then(() => 'returned'), new Promise((r) => setTimeout(() => r('still running'), 1500))]);
+      expect(outcome).toBe('returned');
+      expect(existsSync(mark)).toBe(false);
+      expect(t.emitted).toHaveLength(1);
+      expect(t.emitted[0]).toMatchObject({ type: 'stage.failed', jobId: 'j1' });
+      expect((t.emitted[0]!.payload as { error: string }).error).toMatch(/did not start/);
+    } finally {
+      await t.w.stop?.();
+      delete process.env.FAKE_CLAUDE_MARK;
+    }
+  });
+
+  it('a cancel for another job, or one that came after the stage started, does not stop a stage that is starting', async () => {
+    const mark = join(tmp(), 'started.log');
+    process.env.FAKE_CLAUDE_MARK = mark;
+    const t = bare();
+    try {
+      const stage = t.handlers.get('stage.requested')!(t.event('stage.requested', req({ prompt: 'FAKE:term', stage: 'build', mode: 'edit' })));
+      await tick();
+      t.handlers.get('job.status')!(t.event('job.status', { from: 'running', to: 'cancelled' }, 'other-job'));
+      t.reads[0]!.resolve({ id: 'j1', status: 'running' });
+      await waitFor(() => existsSync(mark) && /PID/.test(readFileSync(mark, 'utf8')));
+      // Once it runs, the cancel finds the child through the job, as before.
+      t.handlers.get('job.status')!(t.event('job.status', { from: 'running', to: 'cancelled' }));
+      await stage;
+      expect(t.emitted[0]).toMatchObject({ type: 'stage.failed' });
+      expect((t.emitted[0]!.payload as { error: string }).error).toMatch(/job ended/);
+    } finally {
+      await t.w.stop?.();
+      delete process.env.FAKE_CLAUDE_MARK;
+    }
+  });
+
+  it('fails the stage, rather than leaving it running for good, when the job cannot be read', async () => {
+    const t = bare();
+    const stage = t.handlers.get('stage.requested')!(t.event('stage.requested', req({ stage: 'build', mode: 'edit' })));
+    await tick();
+    t.reads[0]!.reject(new Error('Store call "jobs" did not finish within 30000 ms'));
+    await stage;
+    expect(t.emitted).toHaveLength(1);
+    expect(t.emitted[0]).toMatchObject({ type: 'stage.failed', jobId: 'j1' });
+    expect((t.emitted[0]!.payload as { error: string }).error).toMatch(/could not read the job.*did not finish/);
   });
 });
 

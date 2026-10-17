@@ -14,20 +14,19 @@ function rig(script: Script = {}, gh: Parameters<typeof fakeGithub>[1] = {}, con
   return { k, worker, github, human, db };
 }
 
-const jobOf = (k: ReturnType<typeof rig>['k'], title = 'Add multiply', body = 'Add src/multiply.js') =>
-  k.jobs.create({ repo: '/repo', title, body });
+const jobOf = (k: ReturnType<typeof rig>['k'], title = 'Add multiply', body = 'Add src/multiply.js') => k.jobs.create({ repo: '/repo', title, body });
 
 describe('happy path', () => {
   it('runs the whole graph, stopping at both approvals', async () => {
     const r = rig({ plan: 'PLAN TEXT', critique: 'CRITIQUE TEXT' });
     await r.k.start();
     await settle(r.k);
-    const job = jobOf(r.k);
+    const job = await jobOf(r.k);
     await settle(r.k);
 
     // Plan and critique run, then the job waits for a human.
     expect(r.worker.map((s) => s.stage)).toEqual(['plan', 'critique']);
-    expect(r.k.jobs.get(job.id)!.status).toBe('awaiting_approval');
+    expect((await r.k.jobs.get(job.id))!.status).toBe('awaiting_approval');
     expect(r.human.requests.at(-1)!.payload).toMatchObject({ jobId: job.id, kind: 'plan' });
     expect(String((r.human.requests.at(-1)!.payload as { summary: string }).summary)).toContain('PLAN TEXT');
     expect(r.github.map((g) => g.type)).toEqual(['worktree.requested']);
@@ -36,7 +35,7 @@ describe('happy path', () => {
     await settle(r.k);
     expect(r.worker.map((s) => s.stage)).toEqual(['plan', 'critique', 'build', 'test', 'docs', 'review']);
     expect(r.github.map((g) => g.type)).toEqual(['worktree.requested', 'commit.requested', 'commit.requested', 'commit.requested', 'pr.requested']);
-    expect(r.k.jobs.get(job.id)!.status).toBe('awaiting_approval');
+    expect((await r.k.jobs.get(job.id))!.status).toBe('awaiting_approval');
     expect(r.human.requests.at(-1)!.payload).toMatchObject({ kind: 'merge', url: 'https://example.test/pull/1', headSha: 'abc1234' });
 
     r.human.grant(job.id, 'merge');
@@ -45,9 +44,9 @@ describe('happy path', () => {
       'worktree.requested', 'commit.requested', 'commit.requested', 'commit.requested', 'pr.requested', 'merge.requested',
     ]);
     expect(r.github.at(-1)!.payload).toMatchObject({ number: 1, headSha: 'abc1234', cwd: `/fake/wt/${job.id}` });
-    expect(r.k.jobs.get(job.id)!.status).toBe('done');
+    expect((await r.k.jobs.get(job.id))!.status).toBe('done');
 
-    expect(stageNames(r.k, job.id)).toEqual([
+    expect((await stageNames(r.k, job.id))).toEqual([
       'worktree:passed', 'plan:passed', 'critique:passed', 'approve-plan:passed', 'build:passed',
       'test:passed', 'docs:passed', 'review:passed', 'pr:passed', 'approve-merge:passed', 'merge:passed',
     ]);
@@ -57,7 +56,7 @@ describe('happy path', () => {
     const r = rig({}, {}, { models: { strong: 'big', standard: 'mid' } });
     await r.k.start();
     await settle(r.k);
-    const job = jobOf(r.k);
+    const job = await jobOf(r.k);
     await settle(r.k);
     r.human.grant(job.id, 'plan');
     await settle(r.k);
@@ -76,7 +75,7 @@ describe('happy path', () => {
     const r = rig();
     await r.k.start();
     await settle(r.k);
-    const job = jobOf(r.k);
+    const job = await jobOf(r.k);
     await settle(r.k);
     r.human.grant(job.id, 'plan');
     await settle(r.k);
@@ -88,7 +87,7 @@ describe('happy path', () => {
     const r = rig({ plan: 'PLAN-MARKER', critique: 'CRIT-MARKER' });
     await r.k.start();
     await settle(r.k);
-    const job = jobOf(r.k, 'Add multiply', 'ISSUE-MARKER');
+    const job = await jobOf(r.k, 'Add multiply', 'ISSUE-MARKER');
     await settle(r.k);
     r.human.grant(job.id, 'plan');
     await settle(r.k);
@@ -104,7 +103,7 @@ describe('happy path', () => {
     const r = rig();
     await r.k.start();
     await settle(r.k);
-    const job = jobOf(r.k);
+    const job = await jobOf(r.k);
     await settle(r.k);
     r.human.grant(job.id, 'plan');
     await settle(r.k);
@@ -119,21 +118,21 @@ describe('happy path', () => {
     const r = rig();
     await r.k.start();
     await settle(r.k);
-    const job = jobOf(r.k);
+    const job = await jobOf(r.k);
     await settle(r.k);
     r.human.grant(job.id, 'plan');
     await settle(r.k);
-    const session = (name: string) => (r.k.jobs.stages(job.id).find((s) => s.name === name)!.output as { sessionId: string }).sessionId;
-    expect(session('build')).toBeTruthy();
-    expect(session('review')).toBeTruthy();
-    expect(session('review')).not.toBe(session('build'));
+    const session = async (name: string) => ((await r.k.jobs.stages(job.id)).find((s) => s.name === name)!.output as { sessionId: string }).sessionId;
+    expect(await session('build')).toBeTruthy();
+    expect(await session('review')).toBeTruthy();
+    expect(await session('review')).not.toBe(session('build'));
   });
 
   it('the PR carries the title, the task, the plan and the review', async () => {
     const r = rig({ plan: 'PLAN-MARKER', review: 'Looks right.\nVERDICT: PASS' });
     await r.k.start();
     await settle(r.k);
-    const job = jobOf(r.k, 'Add multiply', 'ISSUE-MARKER');
+    const job = await jobOf(r.k, 'Add multiply', 'ISSUE-MARKER');
     await settle(r.k);
     r.human.grant(job.id, 'plan');
     await settle(r.k);
@@ -149,7 +148,7 @@ describe('happy path', () => {
     const r = rig();
     await r.k.start();
     await settle(r.k);
-    jobOf(r.k);
+    await jobOf(r.k);
     await settle(r.k);
     expect(r.worker.map((s) => s.stage)).not.toContain('build');
   });
@@ -158,19 +157,19 @@ describe('happy path', () => {
     const r = rig();
     await r.k.start();
     await settle(r.k);
-    const job = jobOf(r.k);
+    const job = await jobOf(r.k);
     await settle(r.k);
     r.human.grant(job.id, 'merge');
     await settle(r.k);
     expect(r.worker.map((s) => s.stage)).not.toContain('build');
-    expect(r.k.jobs.get(job.id)!.status).toBe('awaiting_approval');
+    expect((await r.k.jobs.get(job.id))!.status).toBe('awaiting_approval');
   });
 
   it('a second grant for the same approval is ignored', async () => {
     const r = rig();
     await r.k.start();
     await settle(r.k);
-    const job = jobOf(r.k);
+    const job = await jobOf(r.k);
     await settle(r.k);
     r.human.grant(job.id, 'plan');
     await settle(r.k);
@@ -185,7 +184,7 @@ describe('loops and failures', () => {
     const r = rig({ review: [FAIL('multiply ignores negative numbers'), PASS] });
     await r.k.start();
     await settle(r.k);
-    const job = jobOf(r.k);
+    const job = await jobOf(r.k);
     await settle(r.k);
     r.human.grant(job.id, 'plan');
     await settle(r.k);
@@ -194,16 +193,16 @@ describe('loops and failures', () => {
     expect(secondBuild).toContain('multiply ignores negative numbers');
     expect(secondBuild).toMatch(/retry/);
     expect(r.worker.filter((s) => s.stage === 'build')[0]!.prompt).not.toMatch(/retry/);
-    expect(r.k.jobs.get(job.id)!.status).toBe('awaiting_approval');
-    expect(stageNames(r.k, job.id)).toContain('review:failed');
-    expect(stageNames(r.k, job.id).filter((s) => s.startsWith('build'))).toEqual(['build:passed', 'build:passed']);
+    expect((await r.k.jobs.get(job.id))!.status).toBe('awaiting_approval');
+    expect((await stageNames(r.k, job.id))).toContain('review:failed');
+    expect((await stageNames(r.k, job.id)).filter((s) => s.startsWith('build'))).toEqual(['build:passed', 'build:passed']);
   });
 
   it('a test FAIL loops back to build too, and skips review for that round', async () => {
     const r = rig({ test: [FAIL('1 failing: sum'), PASS] });
     await r.k.start();
     await settle(r.k);
-    const job = jobOf(r.k);
+    const job = await jobOf(r.k);
     await settle(r.k);
     r.human.grant(job.id, 'plan');
     await settle(r.k);
@@ -215,14 +214,14 @@ describe('loops and failures', () => {
     const r = rig({ review: FAIL('still wrong') });
     await r.k.start();
     await settle(r.k);
-    const job = jobOf(r.k);
+    const job = await jobOf(r.k);
     await settle(r.k);
     r.human.grant(job.id, 'plan');
     await settle(r.k);
     expect(r.worker.filter((s) => s.stage === 'build')).toHaveLength(2);
-    expect(r.k.jobs.get(job.id)!.status).toBe('failed');
+    expect((await r.k.jobs.get(job.id))!.status).toBe('failed');
     expect(r.github.map((g) => g.type)).not.toContain('pr.requested');
-    const failed = r.k.history(job.id).find((e) => e.type === 'pipeline.failed')!;
+    const failed = (await r.k.history(job.id)).find((e) => e.type === 'pipeline.failed')!;
     expect((failed.payload as { reason: string }).reason).toMatch(/review still failing after 2 build attempts/);
   });
 
@@ -230,19 +229,19 @@ describe('loops and failures', () => {
     const r = rig({ test: FAIL('nope') }, {}, { maxBuildAttempts: 3 });
     await r.k.start();
     await settle(r.k);
-    const job = jobOf(r.k);
+    const job = await jobOf(r.k);
     await settle(r.k);
     r.human.grant(job.id, 'plan');
     await settle(r.k);
     expect(r.worker.filter((s) => s.stage === 'build')).toHaveLength(3);
-    expect(r.k.jobs.get(job.id)!.status).toBe('failed');
+    expect((await r.k.jobs.get(job.id))!.status).toBe('failed');
   });
 
   it('a review with no verdict line counts as a fail', async () => {
     const r = rig({ review: ['Seems fine to me.', PASS] });
     await r.k.start();
     await settle(r.k);
-    const job = jobOf(r.k);
+    const job = await jobOf(r.k);
     await settle(r.k);
     r.human.grant(job.id, 'plan');
     await settle(r.k);
@@ -254,14 +253,14 @@ describe('loops and failures', () => {
     const r = rig({ build: { fail: 'claude exited with code 1' } as never });
     await r.k.start();
     await settle(r.k);
-    const job = jobOf(r.k);
+    const job = await jobOf(r.k);
     await settle(r.k);
     r.human.grant(job.id, 'plan');
     await settle(r.k);
-    expect(r.k.jobs.get(job.id)!.status).toBe('failed');
+    expect((await r.k.jobs.get(job.id))!.status).toBe('failed');
     expect(r.worker.filter((s) => s.stage === 'build')).toHaveLength(1);
-    expect(stageNames(r.k, job.id)).toContain('build:failed');
-    const failed = r.k.history(job.id).find((e) => e.type === 'pipeline.failed')!;
+    expect((await stageNames(r.k, job.id))).toContain('build:failed');
+    const failed = (await r.k.history(job.id)).find((e) => e.type === 'pipeline.failed')!;
     expect((failed.payload as { reason: string }).reason).toMatch(/build failed: claude exited/);
   });
 
@@ -269,9 +268,9 @@ describe('loops and failures', () => {
     const r = rig({}, { failWorktree: 'branch exists' });
     await r.k.start();
     await settle(r.k);
-    const job = jobOf(r.k);
+    const job = await jobOf(r.k);
     await settle(r.k);
-    expect(r.k.jobs.get(job.id)!.status).toBe('failed');
+    expect((await r.k.jobs.get(job.id))!.status).toBe('failed');
     expect(r.worker).toHaveLength(0);
   });
 
@@ -279,41 +278,41 @@ describe('loops and failures', () => {
     const r = rig({}, { failPr: 'push rejected' });
     await r.k.start();
     await settle(r.k);
-    const job = jobOf(r.k);
+    const job = await jobOf(r.k);
     await settle(r.k);
     r.human.grant(job.id, 'plan');
     await settle(r.k);
-    expect(r.k.jobs.get(job.id)!.status).toBe('failed');
+    expect((await r.k.jobs.get(job.id))!.status).toBe('failed');
   });
 
   it('denying cancels the job and nothing else runs', async () => {
     const r = rig();
     await r.k.start();
     await settle(r.k);
-    const job = jobOf(r.k);
+    const job = await jobOf(r.k);
     await settle(r.k);
     r.human.deny(job.id);
     await settle(r.k);
-    expect(r.k.jobs.get(job.id)!.status).toBe('cancelled');
+    expect((await r.k.jobs.get(job.id))!.status).toBe('cancelled');
     expect(r.worker.map((s) => s.stage)).toEqual(['plan', 'critique']);
-    expect(stageNames(r.k, job.id)).toContain('approve-plan:failed');
+    expect((await stageNames(r.k, job.id))).toContain('approve-plan:failed');
   });
 
   it('a refused merge asks again, and the second approval can merge', async () => {
     const r = rig({}, { refuseMerge: ['checks pending: ci'] });
     await r.k.start();
     await settle(r.k);
-    const job = jobOf(r.k);
+    const job = await jobOf(r.k);
     await settle(r.k);
     r.human.grant(job.id, 'plan');
     await settle(r.k);
     r.human.grant(job.id, 'merge');
     await settle(r.k);
-    expect(r.k.jobs.get(job.id)!.status).toBe('awaiting_approval');
+    expect((await r.k.jobs.get(job.id))!.status).toBe('awaiting_approval');
     expect(String((r.human.requests.at(-1)!.payload as { summary: string }).summary)).toMatch(/refused/);
     r.human.grant(job.id, 'merge');
     await settle(r.k);
-    expect(r.k.jobs.get(job.id)!.status).toBe('done');
+    expect((await r.k.jobs.get(job.id))!.status).toBe('done');
     expect(r.github.filter((g) => g.type === 'merge.requested')).toHaveLength(2);
   });
 });
@@ -323,11 +322,11 @@ describe('nothing changes the code after the independent review', () => {
     const r = rig();
     await r.k.start();
     await settle(r.k);
-    const job = jobOf(r.k);
+    const job = await jobOf(r.k);
     await settle(r.k);
     r.human.grant(job.id, 'plan');
     await settle(r.k);
-    const names = stageNames(r.k, job.id).map((s) => s.split(':')[0]);
+    const names = (await stageNames(r.k, job.id)).map((s) => s.split(':')[0]);
     expect(names.slice(names.indexOf('build'))).toEqual(['build', 'test', 'docs', 'review', 'pr', 'approve-merge']);
     // After the review verdict the only thing that happens is the PR request. No worker stage runs again.
     const lastReview = r.worker.map((s) => s.stage).lastIndexOf('review');
@@ -340,7 +339,7 @@ describe('nothing changes the code after the independent review', () => {
     const r = rig();
     await r.k.start();
     await settle(r.k);
-    const job = jobOf(r.k);
+    const job = await jobOf(r.k);
     await settle(r.k);
     r.human.grant(job.id, 'plan');
     await settle(r.k);
@@ -356,7 +355,7 @@ describe('nothing changes the code after the independent review', () => {
     const r = rig({ review: [FAIL('missing a case'), PASS] });
     await r.k.start();
     await settle(r.k);
-    const job = jobOf(r.k);
+    const job = await jobOf(r.k);
     await settle(r.k);
     r.human.grant(job.id, 'plan');
     await settle(r.k);
@@ -371,14 +370,14 @@ describe('nothing changes the code after the independent review', () => {
     const r = rig({}, { failCommit: 'nothing to commit, hook rejected' });
     await r.k.start();
     await settle(r.k);
-    const job = jobOf(r.k);
+    const job = await jobOf(r.k);
     await settle(r.k);
     r.human.grant(job.id, 'plan');
     await settle(r.k);
-    expect(r.k.jobs.get(job.id)!.status).toBe('failed');
+    expect((await r.k.jobs.get(job.id))!.status).toBe('failed');
     expect(r.worker.map((s) => s.stage)).toEqual(['plan', 'critique', 'build']);
     expect(r.github.map((g) => g.type)).not.toContain('pr.requested');
-    expect(stageNames(r.k, job.id).at(-1)).toBe('build:failed');
+    expect((await stageNames(r.k, job.id)).at(-1)).toBe('build:failed');
   });
 
   it('a crash while an edit stage is being committed reruns that stage on resume', async () => {
@@ -386,11 +385,11 @@ describe('nothing changes the code after the independent review', () => {
     const first = rig({}, { hangCommit: true }, {}, db);
     await first.k.start();
     await settle(first.k);
-    const job = jobOf(first.k);
+    const job = await jobOf(first.k);
     await settle(first.k);
     first.human.grant(job.id, 'plan');
     await settle(first.k);
-    expect(first.k.jobs.stages(job.id).at(-1)).toMatchObject({ name: 'build', status: 'running' });
+    expect((await first.k.jobs.stages(job.id)).at(-1)).toMatchObject({ name: 'build', status: 'running' });
     expect(first.worker.map((w) => w.stage)).toEqual(['plan', 'critique', 'build']);
     await first.k.stop();
 
@@ -401,7 +400,7 @@ describe('nothing changes the code after the independent review', () => {
     expect(second.github.map((g) => g.type)).toEqual([
       'worktree.reset.requested', 'commit.requested', 'commit.requested', 'commit.requested', 'pr.requested',
     ]);
-    expect(second.k.jobs.get(job.id)!.status).toBe('awaiting_approval');
+    expect((await second.k.jobs.get(job.id))!.status).toBe('awaiting_approval');
   });
 });
 
@@ -412,11 +411,11 @@ describe('worktrees are removed when a job ends without merging', () => {
     const r = rig({ review: FAIL('still wrong') });
     await r.k.start();
     await settle(r.k);
-    const job = jobOf(r.k);
+    const job = await jobOf(r.k);
     await settle(r.k);
     r.human.grant(job.id, 'plan');
     await settle(r.k);
-    expect(r.k.jobs.get(job.id)!.status).toBe('failed');
+    expect((await r.k.jobs.get(job.id))!.status).toBe('failed');
     const worktree = r.github.find((g) => g.type === 'worktree.requested')!.payload as { branch: string };
     expect(cleanups(r)).toEqual([{ type: 'worktree.cleanup.requested', payload: { repoPath: '/repo', branch: worktree.branch } }]);
   });
@@ -425,11 +424,11 @@ describe('worktrees are removed when a job ends without merging', () => {
     const r = rig();
     await r.k.start();
     await settle(r.k);
-    const job = jobOf(r.k);
+    const job = await jobOf(r.k);
     await settle(r.k);
     r.human.deny(job.id);
     await settle(r.k);
-    expect(r.k.jobs.get(job.id)!.status).toBe('cancelled');
+    expect((await r.k.jobs.get(job.id))!.status).toBe('cancelled');
     expect(cleanups(r)).toHaveLength(1);
   });
 
@@ -437,9 +436,9 @@ describe('worktrees are removed when a job ends without merging', () => {
     const r = rig();
     await r.k.start();
     await settle(r.k);
-    const job = jobOf(r.k);
+    const job = await jobOf(r.k);
     await settle(r.k);
-    r.k.jobs.setStatus(job.id, 'cancelled');
+    (await r.k.jobs.setStatus(job.id, 'cancelled'));
     await settle(r.k);
     expect(cleanups(r)).toHaveLength(1);
     expect(cleanups(r)[0]!.payload).toMatchObject({ repoPath: '/repo' });
@@ -449,13 +448,13 @@ describe('worktrees are removed when a job ends without merging', () => {
     const r = rig({}, { failMerge: 'PR #1 was closed without being merged' });
     await r.k.start();
     await settle(r.k);
-    const job = jobOf(r.k);
+    const job = await jobOf(r.k);
     await settle(r.k);
     r.human.grant(job.id, 'plan');
     await settle(r.k);
     r.human.grant(job.id, 'merge');
     await settle(r.k);
-    expect(r.k.jobs.get(job.id)!.status).toBe('failed');
+    expect((await r.k.jobs.get(job.id))!.status).toBe('failed');
     expect(cleanups(r)).toHaveLength(1);
   });
 
@@ -463,16 +462,16 @@ describe('worktrees are removed when a job ends without merging', () => {
     const r = rig({ review: FAIL('still wrong') }, {}, { keepFailedWorktrees: true });
     await r.k.start();
     await settle(r.k);
-    const job = jobOf(r.k);
+    const job = await jobOf(r.k);
     await settle(r.k);
     r.human.grant(job.id, 'plan');
     await settle(r.k);
-    expect(r.k.jobs.get(job.id)!.status).toBe('failed');
+    expect((await r.k.jobs.get(job.id))!.status).toBe('failed');
     expect(cleanups(r)).toHaveLength(0);
     const second = rig({}, {}, { keepFailedWorktrees: true });
     await second.k.start();
     await settle(second.k);
-    const j2 = jobOf(second.k);
+    const j2 = await jobOf(second.k);
     await settle(second.k);
     second.human.deny(j2.id);
     await settle(second.k);
@@ -483,21 +482,21 @@ describe('worktrees are removed when a job ends without merging', () => {
     const done = rig();
     await done.k.start();
     await settle(done.k);
-    const job = jobOf(done.k);
+    const job = await jobOf(done.k);
     await settle(done.k);
     done.human.grant(job.id, 'plan');
     await settle(done.k);
     done.human.grant(job.id, 'merge');
     await settle(done.k);
-    expect(done.k.jobs.get(job.id)!.status).toBe('done');
+    expect((await done.k.jobs.get(job.id))!.status).toBe('done');
     expect(cleanups(done)).toHaveLength(0);
 
     const none = rig({}, { failWorktree: 'branch already exists' });
     await none.k.start();
     await settle(none.k);
-    const j = jobOf(none.k);
+    const j = await jobOf(none.k);
     await settle(none.k);
-    expect(none.k.jobs.get(j.id)!.status).toBe('failed');
+    expect((await none.k.jobs.get(j.id))!.status).toBe('failed');
     expect(cleanups(none)).toHaveLength(0);
   });
 });
@@ -507,18 +506,18 @@ describe('a merge that can never go through', () => {
     const r = rig({}, { failMerge: 'PR #1 was closed without being merged' });
     await r.k.start();
     await settle(r.k);
-    const job = jobOf(r.k);
+    const job = await jobOf(r.k);
     await settle(r.k);
     r.human.grant(job.id, 'plan');
     await settle(r.k);
     const asked = r.human.requests.length;
     r.human.grant(job.id, 'merge');
     await settle(r.k);
-    expect(r.k.jobs.get(job.id)!.status).toBe('failed');
+    expect((await r.k.jobs.get(job.id))!.status).toBe('failed');
     expect(r.github.filter((g) => g.type === 'merge.requested')).toHaveLength(1);
     expect(r.human.requests).toHaveLength(asked);
-    expect(stageNames(r.k, job.id).at(-1)).toBe('merge:failed');
-    const failure = r.k.history(job.id).find((e) => e.type === 'pipeline.failed');
+    expect((await stageNames(r.k, job.id)).at(-1)).toBe('merge:failed');
+    const failure = (await r.k.history(job.id)).find((e) => e.type === 'pipeline.failed');
     expect(String((failure!.payload as { reason: string }).reason)).toMatch(/closed without being merged/);
   });
 
@@ -545,13 +544,13 @@ describe('resume after a restart', () => {
     const first = rig({}, { hangMerge: true }, {}, db);
     await first.k.start();
     await settle(first.k);
-    const job = jobOf(first.k);
+    const job = await jobOf(first.k);
     await settle(first.k);
     first.human.grant(job.id, 'plan');
     await settle(first.k);
     first.human.grant(job.id, 'merge');
     await settle(first.k);
-    expect(first.k.jobs.stages(job.id).at(-1)).toMatchObject({ name: 'merge', status: 'running' });
+    expect((await first.k.jobs.stages(job.id)).at(-1)).toMatchObject({ name: 'merge', status: 'running' });
     await first.k.stop();
 
     // The new process finds the PR already merged at the approved commit, so github answers with pr.merged.
@@ -560,8 +559,8 @@ describe('resume after a restart', () => {
     await settle(second.k);
     expect(second.github.map((g) => g.type)).toEqual(['merge.requested']);
     expect(second.human.requests).toHaveLength(0);
-    expect(second.k.jobs.get(job.id)!.status).toBe('done');
-    expect(stageNames(second.k, job.id).filter((s) => s.startsWith('approve-merge'))).toEqual(['approve-merge:passed']);
+    expect((await second.k.jobs.get(job.id))!.status).toBe('done');
+    expect((await stageNames(second.k, job.id)).filter((s) => s.startsWith('approve-merge'))).toEqual(['approve-merge:passed']);
   });
 
   it('a new process continues from the plan approval', async () => {
@@ -569,9 +568,9 @@ describe('resume after a restart', () => {
     const first = rig({}, {}, {}, db);
     await first.k.start();
     await settle(first.k);
-    const job = jobOf(first.k);
+    const job = await jobOf(first.k);
     await settle(first.k);
-    expect(first.k.jobs.get(job.id)!.status).toBe('awaiting_approval');
+    expect((await first.k.jobs.get(job.id))!.status).toBe('awaiting_approval');
     await first.k.stop();
 
     const second = rig({}, {}, {}, db);
@@ -579,13 +578,13 @@ describe('resume after a restart', () => {
     await settle(second.k);
     // Starting up alone must not run anything: the job is waiting on a person.
     expect(second.worker).toHaveLength(0);
-    expect(second.k.jobs.get(job.id)!.status).toBe('awaiting_approval');
+    expect((await second.k.jobs.get(job.id))!.status).toBe('awaiting_approval');
     second.human.grant(job.id, 'plan');
     await settle(second.k);
     expect(second.worker.map((s) => s.stage)).toEqual(['build', 'test', 'docs', 'review']);
     expect(second.worker[0]!.cwd).toBe(`/fake/wt/${job.id}`);
     expect(second.worker[0]!.prompt).toContain('Add src/multiply.js');
-    expect(second.k.jobs.get(job.id)!.status).toBe('awaiting_approval');
+    expect((await second.k.jobs.get(job.id))!.status).toBe('awaiting_approval');
     await second.k.stop();
 
     const third = rig({}, {}, {}, db);
@@ -596,7 +595,7 @@ describe('resume after a restart', () => {
     await settle(third.k);
     expect(third.github.map((g) => g.type)).toEqual(['merge.requested']);
     expect(third.github[0]!.payload).toMatchObject({ number: 1, headSha: 'abc1234' });
-    expect(third.k.jobs.get(job.id)!.status).toBe('done');
+    expect((await third.k.jobs.get(job.id))!.status).toBe('done');
   });
 
   it('a stage cut off by a crash is marked interrupted and runs again', async () => {
@@ -604,22 +603,22 @@ describe('resume after a restart', () => {
     const first = rig({ build: () => 'hang' }, {}, {}, db);
     await first.k.start();
     await settle(first.k);
-    const job = jobOf(first.k);
+    const job = await jobOf(first.k);
     await settle(first.k);
     first.human.grant(job.id, 'plan');
     await settle(first.k);
-    expect(first.k.jobs.stages(job.id).at(-1)).toMatchObject({ name: 'build', status: 'running' });
+    expect((await first.k.jobs.stages(job.id)).at(-1)).toMatchObject({ name: 'build', status: 'running' });
     await first.k.stop();
 
     const second = rig({}, {}, {}, db);
     await second.k.start();
     await settle(second.k);
     expect(second.worker.map((s) => s.stage)).toEqual(['build', 'test', 'docs', 'review']);
-    const stages = second.k.jobs.stages(job.id);
+    const stages = (await second.k.jobs.stages(job.id));
     expect(stages.filter((s) => s.name === 'build').map((s) => s.status)).toEqual(['failed', 'passed']);
     expect((stages.find((s) => s.name === 'build')!.output as { interrupted: boolean }).interrupted).toBe(true);
     // The cut-off attempt does not use up one of the two build attempts.
-    expect(second.k.jobs.get(job.id)!.status).toBe('awaiting_approval');
+    expect((await second.k.jobs.get(job.id))!.status).toBe('awaiting_approval');
   });
 
   it('marks the cut-off stage failed with reason interrupted, and resets the worktree before it runs again', async () => {
@@ -627,7 +626,7 @@ describe('resume after a restart', () => {
     const first = rig({ build: () => 'hang' }, {}, {}, db);
     await first.k.start();
     await settle(first.k);
-    const job = jobOf(first.k);
+    const job = await jobOf(first.k);
     await settle(first.k);
     first.human.grant(job.id, 'plan');
     await settle(first.k);
@@ -636,12 +635,12 @@ describe('resume after a restart', () => {
     const second = rig({}, {}, {}, db);
     await second.k.start();
     await settle(second.k);
-    const stages = second.k.jobs.stages(job.id);
+    const stages = (await second.k.jobs.stages(job.id));
     const cut = stages.find((s) => s.name === 'build' && s.status === 'failed')!;
     expect(cut.output).toMatchObject({ interrupted: true, reason: 'interrupted' });
     expect(second.github[0]).toEqual({ type: 'worktree.reset.requested', payload: { cwd: `/fake/wt/${job.id}` } });
     // History order: the reset finished before the second build began.
-    const names = stageNames(second.k, job.id);
+    const names = (await stageNames(second.k, job.id));
     expect(names.slice(names.indexOf('build:failed'))).toEqual([
       'build:failed', 'reset:passed', 'build:passed', 'test:passed', 'docs:passed', 'review:passed', 'pr:passed', 'approve-merge:running',
     ]);
@@ -653,7 +652,7 @@ describe('resume after a restart', () => {
       const first = rig({ [stage]: () => 'hang' }, {}, {}, db);
       await first.k.start();
       await settle(first.k);
-      const job = jobOf(first.k);
+      const job = await jobOf(first.k);
       await settle(first.k);
       if (stage !== 'plan') first.human.grant(job.id, 'plan');
       if (stage === 'critique') first.human.grant(job.id, 'plan');
@@ -670,7 +669,7 @@ describe('resume after a restart', () => {
     const first = rig({ test: () => 'hang' }, {}, {}, db);
     await first.k.start();
     await settle(first.k);
-    const job = jobOf(first.k);
+    const job = await jobOf(first.k);
     await settle(first.k);
     first.human.grant(job.id, 'plan');
     await settle(first.k);
@@ -679,9 +678,9 @@ describe('resume after a restart', () => {
     const second = rig({}, { failReset: 'the job worktree is gone' }, {}, db);
     await second.k.start();
     await settle(second.k);
-    expect(second.k.jobs.get(job.id)!.status).toBe('failed');
+    expect((await second.k.jobs.get(job.id))!.status).toBe('failed');
     expect(second.worker).toHaveLength(0);
-    const failure = second.k.history(job.id).filter((e) => e.type === 'pipeline.failed').at(-1)!;
+    const failure = (await second.k.history(job.id)).filter((e) => e.type === 'pipeline.failed').at(-1)!;
     expect(String((failure.payload as { reason: string }).reason)).toMatch(/could not reset the worktree.*worktree is gone/);
   });
 
@@ -690,7 +689,7 @@ describe('resume after a restart', () => {
     const first = rig({ docs: () => 'hang' }, {}, {}, db);
     await first.k.start();
     await settle(first.k);
-    const job = jobOf(first.k);
+    const job = await jobOf(first.k);
     await settle(first.k);
     first.human.grant(job.id, 'plan');
     await settle(first.k);
@@ -708,7 +707,7 @@ describe('resume after a restart', () => {
     await settle(third.k);
     expect(third.github[0]!.type).toBe('worktree.reset.requested');
     expect(third.worker.map((w) => w.stage)).toEqual(['docs', 'review']);
-    expect(third.k.jobs.get(job.id)!.status).toBe('awaiting_approval');
+    expect((await third.k.jobs.get(job.id))!.status).toBe('awaiting_approval');
   });
 
   it('resume can be turned off or limited to chosen jobs', async () => {
@@ -716,9 +715,9 @@ describe('resume after a restart', () => {
     const first = rig({ plan: () => 'hang' }, {}, {}, db);
     await first.k.start();
     await settle(first.k);
-    const a = jobOf(first.k, 'a');
+    const a = await jobOf(first.k, 'a');
     await settle(first.k);
-    const b = jobOf(first.k, 'b');
+    const b = await jobOf(first.k, 'b');
     await settle(first.k);
     await first.k.stop();
 
@@ -732,7 +731,7 @@ describe('resume after a restart', () => {
     await only.k.start();
     await settle(only.k);
     expect(only.worker.map((s) => s.jobId)).toEqual([b.id, b.id]);
-    expect(only.k.jobs.stages(a.id).at(-1)!.status).toBe('running');
+    expect((await only.k.jobs.stages(a.id)).at(-1)!.status).toBe('running');
   });
 });
 
@@ -788,17 +787,17 @@ describe('scope guard: the plan declares its scope', () => {
   const PLAN_WITH = (lines: string) => raw(`The plan.\n\nSCOPE:\n${lines}\n`);
   const planPrompts = (r: ReturnType<typeof rig>) => r.worker.filter((s) => s.stage === 'plan').map((s) => s.prompt);
   const commits = (r: ReturnType<typeof rig>) => r.github.filter((g) => g.type === 'commit.requested').map((g) => g.payload as Record<string, unknown>);
-  const failedReason = (r: ReturnType<typeof rig>, id: string) =>
-    (r.k.history(id).find((e) => e.type === 'pipeline.failed')!.payload as { reason: string }).reason;
+  const failedReason = async (r: ReturnType<typeof rig>, id: string) =>
+    ((await r.k.history(id)).find((e) => e.type === 'pipeline.failed')!.payload as { reason: string }).reason;
 
   it('stores the scope with the plan stage and puts it on the plan approval', async () => {
     const r = rig({ plan: PLAN_WITH('- README.md\n- src/lib/*.ts') });
     await r.k.start();
     await settle(r.k);
-    const job = jobOf(r.k);
+    const job = await jobOf(r.k);
     await settle(r.k);
     expect(r.human.requests.at(-1)!.payload).toMatchObject({ kind: 'plan', scope: ['README.md', 'src/lib/*.ts'] });
-    const plan = r.k.jobs.stages(job.id).find((s) => s.name === 'plan')!;
+    const plan = (await r.k.jobs.stages(job.id)).find((s) => s.name === 'plan')!;
     expect((plan.output as { scope: string[] }).scope).toEqual(['README.md', 'src/lib/*.ts']);
   });
 
@@ -806,7 +805,7 @@ describe('scope guard: the plan declares its scope', () => {
     const r = rig({ plan: PLAN_WITH('- README.md') });
     await r.k.start();
     await settle(r.k);
-    const job = jobOf(r.k);
+    const job = await jobOf(r.k);
     await settle(r.k);
     r.human.grant(job.id, 'plan');
     await settle(r.k);
@@ -819,7 +818,7 @@ describe('scope guard: the plan declares its scope', () => {
     const r = rig({ plan: PLAN_WITH('- README.md') }, {}, { scopeAlwaysAllow: ['test-results/.last-run.json'], scopeMode: 'warn', allowBroadScope: true });
     await r.k.start();
     await settle(r.k);
-    const job = jobOf(r.k);
+    const job = await jobOf(r.k);
     await settle(r.k);
     r.human.grant(job.id, 'plan');
     await settle(r.k);
@@ -830,7 +829,7 @@ describe('scope guard: the plan declares its scope', () => {
     const r = rig({ plan: PLAN_WITH('- README.md\n- src/lib/*.ts') });
     await r.k.start();
     await settle(r.k);
-    const job = jobOf(r.k);
+    const job = await jobOf(r.k);
     await settle(r.k);
     r.human.grant(job.id, 'plan');
     await settle(r.k);
@@ -845,28 +844,28 @@ describe('scope guard: the plan declares its scope', () => {
     const r = rig({ plan: [raw('A plan with no scope.'), PLAN_WITH('- README.md')] });
     await r.k.start();
     await settle(r.k);
-    const job = jobOf(r.k);
+    const job = await jobOf(r.k);
     await settle(r.k);
     expect(r.worker.map((s) => s.stage)).toEqual(['plan', 'plan', 'critique']);
     const [first, second] = planPrompts(r);
     expect(first).not.toMatch(/retry/);
     expect(second).toMatch(/retry/);
     expect(second).toMatch(/no SCOPE/i);
-    expect(r.k.jobs.get(job.id)!.status).toBe('awaiting_approval');
+    expect((await r.k.jobs.get(job.id))!.status).toBe('awaiting_approval');
     expect(r.human.requests.at(-1)!.payload).toMatchObject({ scope: ['README.md'] });
-    expect(stageNames(r.k, job.id).filter((n) => n.startsWith('plan'))).toEqual(['plan:failed', 'plan:passed']);
+    expect((await stageNames(r.k, job.id)).filter((n) => n.startsWith('plan'))).toEqual(['plan:failed', 'plan:passed']);
   });
 
   it('fails the job when the second plan has no SCOPE block either, and never builds', async () => {
     const r = rig({ plan: raw('Still no scope.') });
     await r.k.start();
     await settle(r.k);
-    const job = jobOf(r.k);
+    const job = await jobOf(r.k);
     await settle(r.k);
     expect(r.worker.map((s) => s.stage)).toEqual(['plan', 'plan']);
-    expect(r.k.jobs.get(job.id)!.status).toBe('failed');
-    expect(failedReason(r, job.id)).toMatch(/SCOPE/);
-    expect(failedReason(r, job.id)).toMatch(/2 tries|twice|2 attempts/);
+    expect((await r.k.jobs.get(job.id))!.status).toBe('failed');
+    expect(await failedReason(r, job.id)).toMatch(/SCOPE/);
+    expect(await failedReason(r, job.id)).toMatch(/2 tries|twice|2 attempts/);
     expect(r.human.requests).toHaveLength(0);
     expect(r.worker.map((s) => s.stage)).not.toContain('build');
   });
@@ -875,7 +874,7 @@ describe('scope guard: the plan declares its scope', () => {
     const r = rig({ plan: [PLAN_WITH('- README.md\n- **'), PLAN_WITH('- README.md')] });
     await r.k.start();
     await settle(r.k);
-    jobOf(r.k);
+    await jobOf(r.k);
     await settle(r.k);
     expect(planPrompts(r)[1]).toMatch(/broad/);
     expect(planPrompts(r)[1]).toContain('**');
@@ -886,7 +885,7 @@ describe('scope guard: the plan declares its scope', () => {
     const r = rig({ plan: PLAN_WITH('- **') }, {}, { allowBroadScope: true });
     await r.k.start();
     await settle(r.k);
-    jobOf(r.k);
+    await jobOf(r.k);
     await settle(r.k);
     expect(r.worker.filter((s) => s.stage === 'plan')).toHaveLength(1);
     expect(r.human.requests.at(-1)!.payload).toMatchObject({ scope: ['**'] });
@@ -896,12 +895,12 @@ describe('scope guard: the plan declares its scope', () => {
     const r = rig({ plan: [PLAN_WITH('- /etc/passwd'), PLAN_WITH('- ../outside.txt'), PLAN_WITH('- README.md')] });
     await r.k.start();
     await settle(r.k);
-    const job = jobOf(r.k);
+    const job = await jobOf(r.k);
     await settle(r.k);
     // Two tries only: the second one is also bad, so the job fails.
     expect(planPrompts(r)[1]).toContain('/etc/passwd');
-    expect(r.k.jobs.get(job.id)!.status).toBe('failed');
-    expect(failedReason(r, job.id)).toContain('outside.txt');
+    expect((await r.k.jobs.get(job.id))!.status).toBe('failed');
+    expect(await failedReason(r, job.id)).toContain('outside.txt');
   });
 
   it('a scope with more than 100 entries is rejected at plan time', async () => {
@@ -909,15 +908,15 @@ describe('scope guard: the plan declares its scope', () => {
     const r = rig({ plan: lines(101) });
     await r.k.start();
     await settle(r.k);
-    const job = jobOf(r.k);
+    const job = await jobOf(r.k);
     await settle(r.k);
-    expect(r.k.jobs.get(job.id)!.status).toBe('failed');
+    expect((await r.k.jobs.get(job.id))!.status).toBe('failed');
     expect(r.worker.map((s) => s.stage)).toEqual(['plan', 'plan']);
-    expect(failedReason(r, job.id)).toMatch(/too many SCOPE lines/);
+    expect(await failedReason(r, job.id)).toMatch(/too many SCOPE lines/);
     const ok = rig({ plan: lines(100) });
     await ok.k.start();
     await settle(ok.k);
-    jobOf(ok.k);
+    await jobOf(ok.k);
     await settle(ok.k);
     expect(ok.human.requests.at(-1)!.payload).toMatchObject({ kind: 'plan' });
   });
@@ -926,25 +925,25 @@ describe('scope guard: the plan declares its scope', () => {
     const r = rig({ plan: { fail: 'claude exited with code 1' } as never });
     await r.k.start();
     await settle(r.k);
-    const job = jobOf(r.k);
+    const job = await jobOf(r.k);
     await settle(r.k);
     expect(r.worker.filter((s) => s.stage === 'plan')).toHaveLength(1);
-    expect(r.k.jobs.get(job.id)!.status).toBe('failed');
+    expect((await r.k.jobs.get(job.id))!.status).toBe('failed');
   });
 
   it('a job whose approved plan has no recorded scope (an older job) fails instead of building', async () => {
     const r = rig();
     await r.k.start();
     await settle(r.k);
-    const job = jobOf(r.k);
+    const job = await jobOf(r.k);
     await settle(r.k);
-    const plan = r.k.jobs.stages(job.id).find((s) => s.name === 'plan')!;
-    r.k.jobs.finishStage(plan.id, 'passed', { result: 'An old plan with no scope recorded' });
+    const plan = (await r.k.jobs.stages(job.id)).find((s) => s.name === 'plan')!;
+    (await r.k.jobs.finishStage(plan.id, 'passed', { result: 'An old plan with no scope recorded' }));
     r.human.grant(job.id, 'plan');
     await settle(r.k);
     expect(r.worker.map((s) => s.stage)).toEqual(['plan', 'critique']);
-    expect(r.k.jobs.get(job.id)!.status).toBe('failed');
-    expect(failedReason(r, job.id)).toMatch(/no recorded SCOPE/);
+    expect((await r.k.jobs.get(job.id))!.status).toBe('failed');
+    expect(await failedReason(r, job.id)).toMatch(/no recorded SCOPE/);
   });
 
   it('the plan prompt asks for the SCOPE block and the critique prompt checks it', () => {
@@ -958,15 +957,15 @@ describe('scope guard: the plan declares its scope', () => {
 });
 
 describe('scope guard: the commit step refuses files outside the scope', () => {
-  const reasonOf = (r: ReturnType<typeof rig>, id: string) =>
-    r.k.history(id).find((e) => e.type === 'pipeline.failed')!.payload as { reason: string; outOfScope?: string[] };
+  const reasonOf = async (r: ReturnType<typeof rig>, id: string) =>
+    (await r.k.history(id)).find((e) => e.type === 'pipeline.failed')!.payload as { reason: string; outOfScope?: string[] };
   const JUNK = 'test-results/.last-run.json';
 
   it('feeds the files back to the build stage and the job passes on the second attempt', async () => {
     const r = rig({}, { outOfScope: [[JUNK]] });
     await r.k.start();
     await settle(r.k);
-    const job = jobOf(r.k);
+    const job = await jobOf(r.k);
     await settle(r.k);
     r.human.grant(job.id, 'plan');
     await settle(r.k);
@@ -976,22 +975,22 @@ describe('scope guard: the commit step refuses files outside the scope', () => {
     expect(second!.prompt).toContain(JUNK);
     expect(second!.prompt).toMatch(/outside the approved scope/);
     expect(second!.prompt).toMatch(/remove them or revert them/);
-    expect(r.k.jobs.get(job.id)!.status).toBe('awaiting_approval');
+    expect((await r.k.jobs.get(job.id))!.status).toBe('awaiting_approval');
     expect(r.human.requests.at(-1)!.payload).toMatchObject({ kind: 'merge' });
-    expect(stageNames(r.k, job.id).filter((n) => n.startsWith('build'))).toEqual(['build:failed', 'build:passed']);
+    expect((await stageNames(r.k, job.id)).filter((n) => n.startsWith('build'))).toEqual(['build:failed', 'build:passed']);
   });
 
   it('the incident: junk written by the test stage sends the job back to build, then it passes', async () => {
     const r = rig({}, { outOfScope: [undefined, [JUNK]] });
     await r.k.start();
     await settle(r.k);
-    const job = jobOf(r.k);
+    const job = await jobOf(r.k);
     await settle(r.k);
     r.human.grant(job.id, 'plan');
     await settle(r.k);
     expect(r.worker.map((s) => s.stage)).toEqual(['plan', 'critique', 'build', 'test', 'build', 'test', 'docs', 'review']);
     expect(r.worker.filter((s) => s.stage === 'build')[1]!.prompt).toContain(JUNK);
-    expect(r.k.jobs.get(job.id)!.status).toBe('awaiting_approval');
+    expect((await r.k.jobs.get(job.id))!.status).toBe('awaiting_approval');
     expect(r.github.map((g) => g.type)).toContain('pr.requested');
   });
 
@@ -999,25 +998,25 @@ describe('scope guard: the commit step refuses files outside the scope', () => {
     const r = rig({}, { outOfScope: [undefined, undefined, ['notes.tmp']] });
     await r.k.start();
     await settle(r.k);
-    const job = jobOf(r.k);
+    const job = await jobOf(r.k);
     await settle(r.k);
     r.human.grant(job.id, 'plan');
     await settle(r.k);
     expect(r.worker.filter((s) => s.stage === 'build')[1]!.prompt).toContain('notes.tmp');
-    expect(r.k.jobs.get(job.id)!.status).toBe('awaiting_approval');
+    expect((await r.k.jobs.get(job.id))!.status).toBe('awaiting_approval');
   });
 
   it('fails the job with the file list when the retry budget runs out', async () => {
     const r = rig({}, { outOfScope: [[JUNK], [JUNK, 'other.tmp']] });
     await r.k.start();
     await settle(r.k);
-    const job = jobOf(r.k);
+    const job = await jobOf(r.k);
     await settle(r.k);
     r.human.grant(job.id, 'plan');
     await settle(r.k);
     expect(r.worker.filter((s) => s.stage === 'build')).toHaveLength(2);
-    expect(r.k.jobs.get(job.id)!.status).toBe('failed');
-    const failed = reasonOf(r, job.id);
+    expect((await r.k.jobs.get(job.id))!.status).toBe('failed');
+    const failed = await reasonOf(r, job.id);
     expect(failed.reason).toMatch(/outside the approved scope/);
     expect(failed.reason).toMatch(/2 build attempts/);
     expect(failed.reason).toContain(JUNK);
@@ -1030,12 +1029,12 @@ describe('scope guard: the commit step refuses files outside the scope', () => {
     const r = rig({}, { outOfScope: [[JUNK], [JUNK], undefined] }, { maxBuildAttempts: 3 });
     await r.k.start();
     await settle(r.k);
-    const job = jobOf(r.k);
+    const job = await jobOf(r.k);
     await settle(r.k);
     r.human.grant(job.id, 'plan');
     await settle(r.k);
     expect(r.worker.filter((s) => s.stage === 'build')).toHaveLength(3);
-    expect(r.k.jobs.get(job.id)!.status).toBe('awaiting_approval');
+    expect((await r.k.jobs.get(job.id))!.status).toBe('awaiting_approval');
   });
 
   it('a long list is cut in the failure reason but kept whole in the payload', async () => {
@@ -1043,11 +1042,11 @@ describe('scope guard: the commit step refuses files outside the scope', () => {
     const r = rig({}, { outOfScope: [many, many] });
     await r.k.start();
     await settle(r.k);
-    const job = jobOf(r.k);
+    const job = await jobOf(r.k);
     await settle(r.k);
     r.human.grant(job.id, 'plan');
     await settle(r.k);
-    const failed = reasonOf(r, job.id);
+    const failed = await reasonOf(r, job.id);
     expect(failed.reason).toContain('junk/f0.tmp');
     expect(failed.reason).toMatch(/and 22 more/);
     expect(failed.outOfScope).toHaveLength(30);
@@ -1057,19 +1056,19 @@ describe('scope guard: the commit step refuses files outside the scope', () => {
     const r = rig({}, { failCommit: 'disk full' });
     await r.k.start();
     await settle(r.k);
-    const job = jobOf(r.k);
+    const job = await jobOf(r.k);
     await settle(r.k);
     r.human.grant(job.id, 'plan');
     await settle(r.k);
     expect(r.worker.filter((s) => s.stage === 'build')).toHaveLength(1);
-    expect(r.k.jobs.get(job.id)!.status).toBe('failed');
+    expect((await r.k.jobs.get(job.id))!.status).toBe('failed');
   });
 
   it('warn mode: the PR body lists the files that were outside the scope', async () => {
     const r = rig({}, { warnOutOfScope: [[JUNK]] }, { scopeMode: 'warn' });
     await r.k.start();
     await settle(r.k);
-    const job = jobOf(r.k);
+    const job = await jobOf(r.k);
     await settle(r.k);
     r.human.grant(job.id, 'plan');
     await settle(r.k);
@@ -1083,7 +1082,7 @@ describe('scope guard: the commit step refuses files outside the scope', () => {
     const r = rig();
     await r.k.start();
     await settle(r.k);
-    const job = jobOf(r.k);
+    const job = await jobOf(r.k);
     await settle(r.k);
     r.human.grant(job.id, 'plan');
     await settle(r.k);

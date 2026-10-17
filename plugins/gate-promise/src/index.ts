@@ -48,7 +48,7 @@ export default definePlugin({
     if (input !== 'stage.completed' && input !== 'stage.checked') throw new Error(`gate-promise: input must be "stage.completed" or "stage.checked", not ${JSON.stringify(input)}`);
     const on = cfg.enabled !== false;
 
-    ctx.on(input, (e: BuligEvent) => {
+    ctx.on(input, async (e: BuligEvent) => {
       const raw = (e.payload ?? {}) as Record<string, unknown>;
       const stage = String(raw.stage ?? '');
       const result = typeof raw.result === 'string' ? raw.result : '';
@@ -62,7 +62,7 @@ export default definePlugin({
       const promises = findPromises(result);
       let shown: string[] = [];
       if (promises.length) {
-        const cited = citedJobs(result, ctx.jobs.list(), e.jobId);
+        const cited = citedJobs(result, await ctx.jobs.list(), e.jobId);
         if (!cited.live) {
           shown = promises.slice(0, MAX_SHOWN).map((p) => promiseLine(p, cited));
           if (promises.length > MAX_SHOWN) shown.push(`Unfulfilled promise: ... and ${promises.length - MAX_SHOWN} more with no job id`);

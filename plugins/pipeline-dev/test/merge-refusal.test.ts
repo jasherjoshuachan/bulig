@@ -9,7 +9,7 @@ import { createTelegramChannel } from '../../channel-telegram/src/index.ts';
 import { FakeTelegram, until } from '../../channel-telegram/test/fake-telegram.ts';
 import github from '../../github/src/index.ts';
 import pipeline from '../src/index.ts';
-import { fakeWorker, logger } from './harness.ts';
+import { fakeWorker, logger, settle } from './harness.ts';
 
 const FAKE_GH = fileURLToPath(new URL('../../github/test/fixtures/fake-gh.mjs', import.meta.url));
 beforeAll(() => chmodSync(FAKE_GH, 0o755));
@@ -74,6 +74,7 @@ async function rig(ghConfig: Record<string, unknown> = {}) {
   });
   kernels.push(k);
   await k.start();
+  await settle(k);
 
   const cards = (kind: string) => fake.texts(CHAT).filter((t) => t.includes(`approval needed: ${kind}`));
   const approve = async (jobId: string, kind: 'plan' | 'merge', nth: number) => {
@@ -90,6 +91,7 @@ describe('a merge that cannot go through', () => {
     const r = await rig();
     r.setState({ log: join(r.repo, '..', 'gh.log'), checks: [{ name: 'Typecheck & build', bucket: 'fail', link: 'https://example.test/runs/9' }] });
     const job = r.k.jobs.create({ repo: r.repo, title: 'Add a thing' });
+    await settle(r.k);
 
     await r.approve(job.id, 'plan', 1);
     await r.approve(job.id, 'merge', 1);
@@ -123,6 +125,7 @@ describe('a merge that cannot go through', () => {
     const pending = [{ name: 'ci', bucket: 'pending' }];
     r.setState({ log: join(r.repo, '..', 'gh.log'), checksSequence: [pending, pending, [{ name: 'ci', bucket: 'pass' }]] });
     const job = r.k.jobs.create({ repo: r.repo, title: 'Add a thing' });
+    await settle(r.k);
 
     await r.approve(job.id, 'plan', 1);
     await r.approve(job.id, 'merge', 1);

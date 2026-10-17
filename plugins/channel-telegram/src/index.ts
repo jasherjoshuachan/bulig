@@ -253,7 +253,11 @@ export function createTelegramChannel(options: TelegramChannelOptions = {}): Plu
       /** Where news about a job goes: the chat that started it, else every allowed chat. */
       // Chats set this run, filled in before any await, so the first news about a new job never goes to every chat while its save is in flight.
       const chatOf = new Map<string, number>();
+      // Jobs this plugin is creating right now. Creating a job is async, and the kernel announces the new job before the call
+      // returns, so news about it can be ready to send before chatOf is filled in. Sends wait for these first.
+      const creating = new Set<Promise<unknown>>();
       const targets = async (jobId?: string): Promise<number[]> => {
+        if (jobId && !chatOf.has(jobId) && creating.size > 0) await Promise.allSettled([...creating]);
         const origin = jobId ? (chatOf.get(jobId) ?? (await ctx.state.get<number>(`chat:${jobId}`))) : undefined;
         return origin !== undefined ? [origin] : allowed;
       };
@@ -325,13 +329,27 @@ export function createTelegramChannel(options: TelegramChannelOptions = {}): Plu
         });
       }
 
+      /** Create a job for a chat. The chat is recorded as soon as the job exists, before anything waiting on `creating` can send. */
+      async function createFor(chat: number, input: { repo: string; title: string; body?: string }): Promise<Job> {
+        const made = ctx.jobs.create(input).then((job) => {
+          chatOf.set(job.id, chat);
+          return job;
+        });
+        creating.add(made);
+        try {
+          return await made;
+        } finally {
+          creating.delete(made);
+        }
+      }
+
       // ----- what you tell Bulig -----
 
       const now = options.now ?? Date.now;
       /** The jobs this chat may see and act on: the ones it started, and the ones with no recorded chat. Oldest first. */
       const jobsOf = async (chat: number): Promise<Job[]> => {
         const mine: Job[] = [];
-        for (const j of ctx.jobs.list()) if ((await targets(j.id)).includes(chat)) mine.push(j);
+        for (const j of await ctx.jobs.list()) if ((await targets(j.id)).includes(chat)) mine.push(j);
         return mine;
       };
       const findJob = async (chat: number, arg: string): Promise<Job | string> => {
@@ -346,13 +364,13 @@ export function createTelegramChannel(options: TelegramChannelOptions = {}): Plu
         const hit = Object.entries(repos).find(([, p]) => expandHome(p) === repo);
         return hit ? hit[0] : one(repo.split('/').filter(Boolean).pop() ?? repo, 40);
       };
-      const waitingFor = (job: Job): string | undefined => {
+      const waitingFor = async (job: Job): Promise<string | undefined> => {
         if (job.status !== 'awaiting_approval') return undefined;
-        const w = ctx.jobs.stages(job.id).find((s) => s.name.startsWith('approve-') && s.status === 'running');
+        const w = (await ctx.jobs.stages(job.id)).find((s) => s.name.startsWith('approve-') && s.status === 'running');
         return w ? `${w.name.slice(8)} approval` : undefined;
       };
-      const jobLine = (j: Job): string => {
-        const wait = waitingFor(j);
+      const jobLine = async (j: Job): Promise<string> => {
+        const wait = await waitingFor(j);
         return `${short(j.id)}  ${aliasOf(j.repo)}  ${human(j.status)}  ${ago(now() - Date.parse(j.createdAt))}  ${one(j.title, 80)}${wait ? `\n    waiting for your ${wait}` : ''}`;
       };
 
@@ -400,8 +418,7 @@ export function createTelegramChannel(options: TelegramChannelOptions = {}): Plu
         const repo = expandHome(path);
         if (!existsSync(repo)) return say([chat], `The path for "${alias}" does not exist on this machine: ${repo}`);
         try {
-          const job = ctx.jobs.create({ repo, title, ...(body && { body }) });
-          chatOf.set(job.id, chat);
+          const job = await createFor(chat, { repo, title, ...(body && { body }) });
           await ctx.state.set(`chat:${job.id}`, chat);
           say([chat], `Job ${short(job.id)} started: ${title}\nRepo ${alias}. Send /status ${short(job.id)} any time.`);
         } catch (err) {
@@ -413,13 +430,13 @@ export function createTelegramChannel(options: TelegramChannelOptions = {}): Plu
         if (!arg) {
           const jobs = (await jobsOf(chat)).reverse();
           if (jobs.length === 0) return say([chat], 'No jobs yet. Try /dev.');
-          const lines = jobs.slice(0, STATUS_LIMIT).map(jobLine);
+          const lines = await Promise.all(jobs.slice(0, STATUS_LIMIT).map(jobLine));
           if (jobs.length > STATUS_LIMIT) lines.push(`... and ${jobs.length - STATUS_LIMIT} more`);
           return say([chat], lines.join('\n'));
         }
         const job = await findJob(chat, arg);
         if (typeof job === 'string') return say([chat], job);
-        const waiting = waitingFor(job);
+        const waiting = await waitingFor(job);
         const lines = [`${short(job.id)}  ${human(job.status)}  ${ago(now() - Date.parse(job.createdAt))}`, one(job.title, 200), job.repo];
         if (waiting) lines.push(`Waiting for your ${waiting}.`);
         say([chat], lines.join('\n'));
@@ -429,7 +446,7 @@ export function createTelegramChannel(options: TelegramChannelOptions = {}): Plu
         if (!arg) return say([chat], 'Usage: /history <jobId>');
         const job = await findJob(chat, arg);
         if (typeof job === 'string') return say([chat], job);
-        const stages = ctx.jobs.stages(job.id);
+        const stages = await ctx.jobs.stages(job.id);
         say([chat], [`${short(job.id)}  ${human(job.status)}  ${job.title}`, ...stages.map(stageLine)].join('\n'));
       }
 
@@ -443,12 +460,12 @@ export function createTelegramChannel(options: TelegramChannelOptions = {}): Plu
           const active = (await jobsOf(chat)).filter((j) => !ENDED.includes(j.status));
           if (active.length === 0) return say([chat], 'No active jobs to cancel.');
           if (active.length > 1) {
-            return say([chat], [`${active.length} jobs are active. Send /cancel <jobId> with one of these:`, ...active.reverse().map(jobLine)].join('\n'));
+            return say([chat], [`${active.length} jobs are active. Send /cancel <jobId> with one of these:`, ...(await Promise.all(active.reverse().map(jobLine)))].join('\n'));
           }
           job = active[0]!;
         }
         if (ENDED.includes(job.status)) return say([chat], `Job ${short(job.id)} is already ${job.status}.`);
-        const waiting = ctx.jobs.stages(job.id).find((s) => s.name.startsWith('approve-') && s.status === 'running');
+        const waiting = (await ctx.jobs.stages(job.id)).find((s) => s.name.startsWith('approve-') && s.status === 'running');
         if (waiting) {
           // Same path as pressing Deny, so the pipeline closes the approval stage itself.
           ctx.emit('approval.denied', { jobId: job.id, kind: waiting.name.slice(8) }, job.id);
@@ -484,7 +501,7 @@ export function createTelegramChannel(options: TelegramChannelOptions = {}): Plu
         if (!pending) return;
         // Not yet linked, or linked part way: linkRetry can be run again for the same job.
         let orphan: Job | undefined;
-        for (const j of ctx.jobs.list()) {
+        for (const j of await ctx.jobs.list()) {
           if (j.id === old.id || j.createdAt < pending.at || j.repo !== old.repo || j.title !== old.title || j.body !== old.body) continue;
           const of = await ctx.state.get(`retry-of:${j.id}`);
           if (of === undefined || of === old.id) {
@@ -512,7 +529,7 @@ export function createTelegramChannel(options: TelegramChannelOptions = {}): Plu
           return say([chat], `Could not check whether job ${short(old.id)} was already retried. Look at /status, then send /retry ${short(old.id)} again.`);
         }
         // One live retry per job. An earlier retry that ended failed or cancelled does not count, so a retry can be tried again.
-        const earlier = ((await ctx.state.get<string[]>(`retries:${old.id}`)) ?? []).map((id) => ctx.jobs.get(id)).filter((j): j is Job => !!j);
+        const earlier = (await Promise.all(((await ctx.state.get<string[]>(`retries:${old.id}`)) ?? []).map((id) => ctx.jobs.get(id)))).filter((j): j is Job => !!j);
         const blocking = earlier.reverse().find((j) => j.status !== 'failed' && j.status !== 'cancelled');
         if (blocking) return say([chat], `Job ${short(blocking.id)} already retried this one and is ${human(blocking.status)}. Use /status ${short(blocking.id)}.`);
         if (!existsSync(old.repo)) return say([chat], `The repo for job ${short(old.id)} is not on this machine any more: ${one(old.repo, 200)}`);
@@ -522,7 +539,7 @@ export function createTelegramChannel(options: TelegramChannelOptions = {}): Plu
           // A new job: it plans again and asks for its own plan approval. Nothing of the old job's approvals or scope is carried over.
           let job: Job;
           try {
-            job = ctx.jobs.create({ repo: old.repo, title: old.title, ...(old.body && { body: old.body }) });
+            job = await createFor(chat, { repo: old.repo, title: old.title, ...(old.body && { body: old.body }) });
           } catch (err) {
             // The create itself failed and was handled: no job exists, so the mark must not outlive this attempt.
             try {
@@ -563,8 +580,8 @@ export function createTelegramChannel(options: TelegramChannelOptions = {}): Plu
             reply_markup: { inline_keyboard: [] },
           });
 
-        const job = ctx.jobs.get(jobId);
-        const waiting = job?.status === 'awaiting_approval' && ctx.jobs.stages(jobId).some((s) => s.name === `approve-${kind}` && s.status === 'running');
+        const job = await ctx.jobs.get(jobId);
+        const waiting = job?.status === 'awaiting_approval' && (await ctx.jobs.stages(jobId)).some((s) => s.name === `approve-${kind}` && s.status === 'running');
         if (!waiting) {
           await reply('That approval is no longer open.');
           await edit('Expired: the job is not waiting for this any more.').catch(() => undefined);

@@ -8,7 +8,7 @@ import { createKernel, type Kernel } from '@bulig/core';
 import { definePlugin } from '@bulig/plugin-sdk';
 import github from '../../github/src/index.ts';
 import pipeline from '../src/index.ts';
-import { fakeHuman, logger } from './harness.ts';
+import { fakeHuman, logger, settle } from './harness.ts';
 
 // The real pipeline and the real github plugin on a real git repo. Only the worker is fake: it edits files in the
 // job worktree the way Claude and the tools it runs would, including the file a test runner leaves behind.
@@ -97,9 +97,12 @@ describe('scope guard end to end: a job told "README only"', () => {
       return 'ok';
     });
     await r.k.start();
+    await settle(r.k);
     const job = r.k.jobs.create({ repo: r.repo, title: 'Update the README', body: 'README only' });
+    await settle(r.k);
     await waitUntil(() => r.human.requests.some((e) => (e.payload as { kind: string }).kind === 'plan'));
     r.human.grant(job.id, 'plan');
+    await settle(r.k);
     await waitUntil(() => r.k.jobs.get(job.id)!.status === 'awaiting_approval' && r.human.requests.some((e) => (e.payload as { kind: string }).kind === 'merge'));
 
     expect(r.seenStages).toEqual(['plan', 'critique', 'build', 'test', 'build', 'test', 'docs', 'review']);
@@ -120,9 +123,12 @@ describe('scope guard end to end: a job told "README only"', () => {
       return stage === 'review' ? PASS : 'ok';
     });
     await r.k.start();
+    await settle(r.k);
     const job = r.k.jobs.create({ repo: r.repo, title: 'Update the README', body: 'README only' });
+    await settle(r.k);
     await waitUntil(() => r.human.requests.some((e) => (e.payload as { kind: string }).kind === 'plan'));
     r.human.grant(job.id, 'plan');
+    await settle(r.k);
     await waitUntil(() => r.k.jobs.get(job.id)!.status === 'failed');
     const failed = r.k.history(job.id).find((e) => e.type === 'pipeline.failed')!.payload as { reason: string; outOfScope: string[] };
     expect(failed.outOfScope).toEqual([JUNK]);

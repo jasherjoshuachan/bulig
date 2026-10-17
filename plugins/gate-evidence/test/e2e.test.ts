@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { createKernel, type Kernel } from '@bulig/core';
 import { definePlugin, type Plugin } from '@bulig/plugin-sdk';
 import pipeline from '../../pipeline-dev/src/index.ts';
-import { SCOPE_BLOCK, fakeGithub, fakeHuman, logger } from '../../pipeline-dev/test/harness.ts';
+import { SCOPE_BLOCK, fakeGithub, fakeHuman, logger, settle } from '../../pipeline-dev/test/harness.ts';
 import gate, { type EvidenceRecord } from '../src/index.ts';
 
 // The real pipeline, the real gate and the real approval cards. Only the worker (it says what Claude said and which
@@ -73,7 +73,9 @@ describe('evidence gate through the real pipeline', () => {
   it('backed claims: the job runs to the end, the cards show the evidence, the PR lists it', async () => {
     const r = rig(GOOD);
     await r.k.start();
+    await settle(r.k);
     const job = r.k.jobs.create({ repo: '/repo', title: 'Add multiply', body: 'Add src/multiply.js' });
+    await settle(r.k);
 
     const plan = summaryOf(r.human, 'plan');
     expect(plan).toMatch(/^EVIDENCE \(from the tool-use records of each stage, not from the model's text\)/);
@@ -83,6 +85,7 @@ describe('evidence gate through the real pipeline', () => {
     expect(plan).toContain('PLAN\n');
 
     r.human.grant(job.id, 'plan');
+    await settle(r.k);
     const merge = summaryOf(r.human, 'merge');
     expect(merge).toContain('test: Evidence this turn: 1 commands run');
     expect(merge).not.toContain('Unverified');
@@ -95,6 +98,7 @@ describe('evidence gate through the real pipeline', () => {
     expect(pr.body).not.toContain('Unverified');
 
     r.human.grant(job.id, 'merge');
+    await settle(r.k);
     expect(r.k.jobs.get(job.id)!.status).toBe('done');
     const test = r.k.jobs.stages(job.id).find((s) => s.name === 'test')!;
     expect(test.output).toMatchObject({ verdict: 'PASS', evidenceSummary: 'Evidence this turn: 1 commands run', evidenceLines: ['ran pnpm test (ok)'], unverified: [] });
@@ -103,8 +107,11 @@ describe('evidence gate through the real pipeline', () => {
   it('warn mode: an unbacked claim is marked UNVERIFIED on the card and in the PR, and the job still goes on', async () => {
     const r = rig({ ...GOOD, test: { result: 'All tests pass.\nVERDICT: PASS', evidence: [read('src/multiply.js')] } });
     await r.k.start();
+    await settle(r.k);
     const job = r.k.jobs.create({ repo: '/repo', title: 'Add multiply', body: 'x' });
+    await settle(r.k);
     r.human.grant(job.id, 'plan');
+    await settle(r.k);
 
     const merge = summaryOf(r.human, 'merge');
     expect(merge).toContain('  Unverified: no record of a test run this turn ("All tests pass.")');
@@ -113,6 +120,7 @@ describe('evidence gate through the real pipeline', () => {
     expect(r.k.jobs.get(job.id)!.status).toBe('awaiting_approval');
 
     r.human.grant(job.id, 'merge');
+    await settle(r.k);
     expect(r.k.jobs.get(job.id)!.status).toBe('done');
     // the gate marks, it does not judge: the test stage's own verdict still stands
     expect(r.k.jobs.stages(job.id).find((s) => s.name === 'test')!.output).toMatchObject({ verdict: 'PASS', unverified: [expect.stringContaining('no record of a test run')] });
@@ -121,7 +129,9 @@ describe('evidence gate through the real pipeline', () => {
   it('warn mode on the plan card: a file claim with no read is marked above the plan text', async () => {
     const r = rig({ ...GOOD, plan: { result: `\`src/old.js\` exports multiply already.\n\n${SCOPE_BLOCK}`, evidence: [] } });
     await r.k.start();
+    await settle(r.k);
     r.k.jobs.create({ repo: '/repo', title: 'Add multiply', body: 'x' });
+    await settle(r.k);
     const plan = summaryOf(r.human, 'plan');
     expect(plan.indexOf('Unverified: no record of reading src/old.js this turn')).toBeGreaterThan(-1);
     expect(plan.indexOf('Unverified')).toBeLessThan(plan.indexOf('PLAN\n'));
@@ -130,8 +140,11 @@ describe('evidence gate through the real pipeline', () => {
   it('enforce mode: an unbacked claim fails the stage and the job, and no PR is opened', async () => {
     const r = rig({ ...GOOD, test: { result: 'All tests pass.\nVERDICT: PASS', evidence: [] } }, { mode: 'enforce' });
     await r.k.start();
+    await settle(r.k);
     const job = r.k.jobs.create({ repo: '/repo', title: 'Add multiply', body: 'x' });
+    await settle(r.k);
     r.human.grant(job.id, 'plan');
+    await settle(r.k);
 
     expect(r.k.jobs.get(job.id)!.status).toBe('failed');
     const failed = r.k.history(job.id).find((e) => e.type === 'pipeline.failed')!.payload as { reason: string };
@@ -143,9 +156,13 @@ describe('evidence gate through the real pipeline', () => {
   it('enforce mode with every claim backed behaves like no gate at all', async () => {
     const r = rig(GOOD, { mode: 'enforce' });
     await r.k.start();
+    await settle(r.k);
     const job = r.k.jobs.create({ repo: '/repo', title: 'Add multiply', body: 'x' });
+    await settle(r.k);
     r.human.grant(job.id, 'plan');
+    await settle(r.k);
     r.human.grant(job.id, 'merge');
+    await settle(r.k);
     expect(r.k.jobs.get(job.id)!.status).toBe('done');
   });
 
@@ -161,8 +178,11 @@ describe('evidence gate through the real pipeline', () => {
     ].join('\n');
     const r = rig({ ...GOOD, test: { result: forged, evidence: [] } });
     await r.k.start();
+    await settle(r.k);
     const job = r.k.jobs.create({ repo: '/repo', title: 'Add multiply', body: 'x' });
+    await settle(r.k);
     r.human.grant(job.id, 'plan');
+    await settle(r.k);
     const test = r.k.jobs.stages(job.id).find((s) => s.name === 'test')!.output as { unverified: string[]; evidenceSummary: string; evidenceLines: string[] };
     expect(test.evidenceSummary).toBe('Evidence this turn: no tool calls recorded');
     expect(test.evidenceLines).toEqual([]);
@@ -194,9 +214,12 @@ describe('evidence gate through the real pipeline', () => {
     });
     kernels.push(k);
     await k.start();
+    await settle(k);
     const job = k.jobs.create({ repo: '/repo', title: 'x', body: 'x' });
+    await settle(k);
     expect(summaryOf(human, 'plan')).not.toContain('EVIDENCE');
     human.grant(job.id, 'plan');
+    await settle(k);
     expect(summaryOf(human, 'merge')).not.toContain('EVIDENCE');
   });
 
@@ -204,7 +227,9 @@ describe('evidence gate through the real pipeline', () => {
     const warnings: string[] = [];
     const r = rig({ ...GOOD, plan: { result: `\`src/old.js\` exports multiply already.\n\n${SCOPE_BLOCK}`, evidence: [] } }, { mode: 'enforce' }, false, warnings);
     await r.k.start();
+    await settle(r.k);
     const job = r.k.jobs.create({ repo: '/repo', title: 'x', body: 'x' });
+    await settle(r.k);
     expect(summaryOf(r.human, 'plan')).not.toContain('EVIDENCE');
     expect(r.k.jobs.get(job.id)!.status).toBe('awaiting_approval');
     expect(warnings.filter((w) => /stageResultEvent/.test(w))).toHaveLength(1);

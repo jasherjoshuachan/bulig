@@ -7,7 +7,7 @@ import { z } from 'zod';
 export const SDK_VERSION = '1';
 
 /** The full release of the contract. v1 candidate until the freeze is tagged. */
-export const SDK_RELEASE = '1.0.0-rc.3';
+export const SDK_RELEASE = '1.0.0-rc.4';
 
 /**
  * Majors the kernel loads. "0" is the pre-freeze contract: it loads unchanged, with a deprecation warning, and is
@@ -145,16 +145,22 @@ export interface BuligEvent {
 
 // ---------- plugin API ----------
 
-/** The narrow job API a plugin gets. No raw database access. */
+/**
+ * The narrow job API a plugin gets. No raw database access.
+ *
+ * Every call is async because the record behind it can be a database server. A write resolves only when it is
+ * durable, so a plugin that awaits it can trust it. A call that breaks a rule (a missing capability, a job that is
+ * already finished) rejects with the same error it used to throw.
+ */
 export interface JobsApi {
-  create(input: { repo: string; title: string; body?: string }): Job;
-  get(id: string): Job | undefined;
-  list(filter?: { status?: JobStatus }): Job[];
-  setStatus(id: string, status: JobStatus): Job;
+  create(input: { repo: string; title: string; body?: string }): Promise<Job>;
+  get(id: string): Promise<Job | undefined>;
+  list(filter?: { status?: JobStatus }): Promise<Job[]>;
+  setStatus(id: string, status: JobStatus): Promise<Job>;
   /** Every stage of a job, oldest first. Lets a plugin rebuild its position after a restart. */
-  stages(jobId: string): Stage[];
-  startStage(jobId: string, name: string): Stage;
-  finishStage(stageId: string, status: Exclude<StageStatus, 'running'>, output?: unknown): Stage;
+  stages(jobId: string): Promise<Stage[]>;
+  startStage(jobId: string, name: string): Promise<Stage>;
+  finishStage(stageId: string, status: Exclude<StageStatus, 'running'>, output?: unknown): Promise<Stage>;
 }
 
 /**

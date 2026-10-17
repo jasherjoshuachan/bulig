@@ -1,7 +1,7 @@
-import { DEPRECATED_SDK_MAJORS, type Job, type JobsApi, type Logger, type Plugin } from '@bulig/plugin-sdk';
+import { DEPRECATED_SDK_MAJORS, type Job, type Logger, type Plugin } from '@bulig/plugin-sdk';
 import { Bus } from './bus.ts';
 import { DEFAULT_EVENT_CAPABILITIES } from './capabilities.ts';
-import { buildContext, selectPlugins, type LoadedPlugin } from './loader.ts';
+import { buildContext, selectPlugins, type KernelJobs, type LoadedPlugin } from './loader.ts';
 import { Store } from './store.ts';
 
 export interface KernelOptions {
@@ -28,7 +28,8 @@ export function createKernel(options: KernelOptions) {
   const logger = options.logger ?? defaultLogger;
 
   // Job changes go through here so the kernel always announces them.
-  const jobs: JobsApi = {
+  // Synchronous for now: the store is. Plugins get an async view of it from the loader.
+  const jobs: KernelJobs = {
     create(input) {
       const job = store.createJob(input);
       bus.emit({ type: 'job.created', source: 'kernel', jobId: job.id, payload: job });

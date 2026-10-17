@@ -6,7 +6,7 @@ import { createKernel, type Kernel } from '@bulig/core';
 import { createTelegramChannel } from '../../channel-telegram/src/index.ts';
 import { FakeTelegram, until } from '../../channel-telegram/test/fake-telegram.ts';
 import pipeline from '../src/index.ts';
-import { fakeGithub, fakeWorker, logger, type Script } from './harness.ts';
+import { fakeGithub, fakeWorker, logger, type Script, settle } from './harness.ts';
 
 const CHAT = 4242;
 const TOKEN_ENV = 'TEST_COMMANDS_E2E_TG_TOKEN';
@@ -38,6 +38,7 @@ async function rig(script: Script) {
   });
   kernels.push(k);
   await k.start();
+  await settle(k);
   return { k, fake, root, sent };
 }
 

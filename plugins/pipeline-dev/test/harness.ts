@@ -190,3 +190,6 @@ export function boot(dbPath: string, plugins: Plugin[], config: PipelineConfig =
 
 export const types = (k: Kernel, jobId: string) => k.history(jobId).map((e) => e.type);
 export const stageNames = (k: Kernel, jobId: string) => k.jobs.stages(jobId).map((s) => `${s.name}:${s.status}`);
+
+/** Wait until every handler has finished. Plugin job calls are async, so the pipeline needs a few ticks to come to rest after a trigger. */
+export const settle = (k: Kernel): Promise<void> => k.bus.idle();

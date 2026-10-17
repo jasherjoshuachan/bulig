@@ -41,36 +41,42 @@ export async function startFake(): Promise<FakeTelegram> {
 export function driver() {
   const box: { ctx?: PluginContext } = {};
   const seen: BuligEvent[] = [];
+  /** Set by a test to act the moment the kernel announces a new job, before the call that created it has returned. */
+  const hooks: { created?: (e: BuligEvent) => void } = {};
   const plugin: Plugin = definePlugin({
     manifest: {
       name: 'driver',
       version: '0.1.0',
       sdk: '1',
       description: 'test driver',
-      subscribes: ['approval.granted', 'approval.denied', 'cancel.requested'],
+      subscribes: ['approval.granted', 'approval.denied', 'cancel.requested', 'job.created'],
       needs: ['jobs.write'],
       emits: ['approval.requested', 'stage.completed', 'stage.failed', 'pr.opened', 'pr.merged', 'merge.refused', 'merge.failed', 'pipeline.failed'],
     },
     register(ctx) {
       box.ctx = ctx;
+      ctx.on('job.created', (e) => hooks.created?.(e));
       ctx.on('approval.granted', (e) => void seen.push(e));
       ctx.on('approval.denied', (e) => void seen.push(e));
       // Plays the pipeline, which is the one plugin allowed to end a job.
-      ctx.on('cancel.requested', (e) => void (e.jobId && ctx.jobs.setStatus(e.jobId, 'cancelled')));
+      ctx.on('cancel.requested', async (e) => {
+        if (e.jobId) await ctx.jobs.setStatus(e.jobId, 'cancelled');
+      });
     },
   });
   return {
     plugin,
     seen,
+    hooks,
     get ctx(): PluginContext {
       return box.ctx!;
     },
     /** Put a job into the state the pipeline leaves it in when it asks for an approval. */
-    waitForApproval(kind: 'plan' | 'merge', extra: Record<string, unknown> = {}) {
-      const job = box.ctx!.jobs.create({ repo: '/r', title: 'Fix the thing' });
-      box.ctx!.jobs.setStatus(job.id, 'running');
-      box.ctx!.jobs.startStage(job.id, `approve-${kind}`);
-      box.ctx!.jobs.setStatus(job.id, 'awaiting_approval');
+    async waitForApproval(kind: 'plan' | 'merge', extra: Record<string, unknown> = {}) {
+      const job = await box.ctx!.jobs.create({ repo: '/r', title: 'Fix the thing' });
+      await box.ctx!.jobs.setStatus(job.id, 'running');
+      await box.ctx!.jobs.startStage(job.id, `approve-${kind}`);
+      await box.ctx!.jobs.setStatus(job.id, 'awaiting_approval');
       box.ctx!.emit('approval.requested', { jobId: job.id, kind, summary: 'PLAN\nDo it', ...extra }, job.id);
       return job;
     },

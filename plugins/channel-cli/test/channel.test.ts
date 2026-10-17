@@ -97,7 +97,7 @@ describe('channel-cli plugin', () => {
     });
     const { k, channel } = boot(['channel.send:terminal', 'approval.grant'], createCliChannel({ write: (l) => lines.push(l) }), [src]);
     await k.start();
-    const job = channel.submit({ repo: '/r', title: 'Add multiply', body: 'details' });
+    const job = await channel.submit({ repo: '/r', title: 'Add multiply', body: 'details' });
     expect(k.jobs.get(job.id)!.body).toBe('details');
     k.jobs.setStatus(job.id, 'running');
     (src as unknown as { emit: (t: string, p: unknown, j: string) => void }).emit('stage.requested', { stage: 'plan', model: 'opus', mode: 'readonly' }, job.id);
@@ -134,7 +134,7 @@ describe('channel-cli plugin', () => {
   it('grant and deny become approval events for the job', async () => {
     const { k, channel } = boot(['channel.send:terminal', 'approval.grant']);
     await k.start();
-    const job = channel.submit({ repo: '/r', title: 't' });
+    const job = await channel.submit({ repo: '/r', title: 't' });
     channel.grant(job.id, 'plan');
     channel.deny(job.id);
     const mine = k.history(job.id).filter((e) => e.source === 'channel-cli');

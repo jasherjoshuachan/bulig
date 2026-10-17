@@ -198,9 +198,16 @@ async function openSession(
 /** Wait until the job comes to rest. Polls the store, which only this process writes. */
 async function drive(kernel: Kernel, jobId: string, io: Io): Promise<Job> {
   for (;;) {
-    const job = kernel.jobs.get(jobId);
+    let job = kernel.jobs.get(jobId);
     if (!job) throw new Error(`job ${jobId} vanished`);
-    if (RESTING.includes(job.status)) return job;
+    if (RESTING.includes(job.status)) {
+      // Plugins reach jobs through async calls, so the handlers that the last event started may not have run yet.
+      // Let them finish before believing that the job is at rest.
+      await kernel.bus.idle(2000);
+      job = kernel.jobs.get(jobId);
+      if (!job) throw new Error(`job ${jobId} vanished`);
+      if (RESTING.includes(job.status)) return job;
+    }
     await new Promise((r) => setTimeout(r, io.pollMs ?? 150));
   }
 }
@@ -223,7 +230,7 @@ async function cmdRun(args: string[], io: Io): Promise<number> {
 
   const session = await openSession(config, io, false);
   try {
-    const job = session.channel.submit({ repo, title: values.title, ...(values.issue && { body: values.issue }) });
+    const job = await session.channel.submit({ repo, title: values.title, ...(values.issue && { body: values.issue }) });
     io.out(`bulig: started job ${job.id}`);
     return finish(await drive(session.kernel, job.id, io), io);
   } finally {

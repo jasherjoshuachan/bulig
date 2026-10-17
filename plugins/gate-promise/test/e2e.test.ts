@@ -6,7 +6,7 @@ import { createKernel, type Kernel } from '@bulig/core';
 import { definePlugin, type BuligEvent, type Plugin } from '@bulig/plugin-sdk';
 import evidenceGate, { type EvidenceRecord } from '../../gate-evidence/src/index.ts';
 import pipeline from '../../pipeline-dev/src/index.ts';
-import { SCOPE_BLOCK, fakeGithub, fakeHuman, logger } from '../../pipeline-dev/test/harness.ts';
+import { SCOPE_BLOCK, fakeGithub, fakeHuman, logger, settle } from '../../pipeline-dev/test/harness.ts';
 import { format } from '../../channel-cli/src/index.ts';
 import { progressLine } from '../../channel-telegram/src/index.ts';
 import promiseGate from '../src/index.ts';
@@ -97,9 +97,12 @@ function rig(script: Script, wiring: Wiring, configs: { promise?: Record<string,
 /** Start the kernel, make the live follow-up job, then the job under test. */
 async function start(r: ReturnType<typeof rig>) {
   await r.k.start();
+  await settle(r.k);
   const followUp = r.k.jobs.create({ repo: '/repo', title: 'Follow-up: cache', body: 'x' });
+  await settle(r.k);
   r.holder.followUp = followUp.id;
   const job = r.k.jobs.create({ repo: '/repo', title: 'Add multiply', body: 'x' });
+  await settle(r.k);
   return { followUp, job };
 }
 
@@ -117,10 +120,12 @@ describe('promise gate through the real pipeline', () => {
     const r = rig({ test: PROMISE_TEST as Script[string] }, 'promise');
     const { job } = await start(r);
     r.human.grant(job.id, 'plan');
+    await settle(r.k);
     const merge = summaryOf(r.human, job.id, 'merge');
     expect(merge).not.toContain('PROMISES');
     expect(prBody(r.sent)).not.toContain('Unfulfilled');
     r.human.grant(job.id, 'merge');
+    await settle(r.k);
     expect(r.k.jobs.get(job.id)!.status).toBe('done');
   });
 
@@ -134,6 +139,7 @@ describe('promise gate through the real pipeline', () => {
     expect(plan.indexOf('PROMISES')).toBeLessThan(plan.indexOf('PLAN\n'));
 
     r.human.grant(job.id, 'plan');
+    await settle(r.k);
     const merge = summaryOf(r.human, job.id, 'merge');
     expect(merge).toContain('test: Unfulfilled promise: no job id ("I\'ll follow up on the flaky cache test tomorrow.")')
     expect(merge).not.toContain('EVIDENCE');
@@ -143,6 +149,7 @@ describe('promise gate through the real pipeline', () => {
     expect(r.k.jobs.get(job.id)!.status).toBe('awaiting_approval');
 
     r.human.grant(job.id, 'merge');
+    await settle(r.k);
     expect(r.k.jobs.get(job.id)!.status).toBe('done');
     expect(r.k.jobs.stages(job.id).find((s) => s.name === 'test')!.output).toMatchObject({ verdict: 'PASS', promises: [expect.stringContaining('no job id')] });
   });
@@ -151,6 +158,7 @@ describe('promise gate through the real pipeline', () => {
     const r = rig({ build: { result: "I added multiply. I'll follow up on perf later.", evidence: [] } }, 'promise');
     const { job } = await start(r);
     r.human.grant(job.id, 'plan');
+    await settle(r.k);
     const screened = r.seen.find((e) => e.type === 'stage.screened' && e.jobId === job.id && (e.payload as { stage: string }).stage === 'build')!;
     expect(format(screened)!.join('\n')).toMatch(/build: promises with no job id\n.*Unfulfilled promise: no job id/);
     expect(progressLine(screened)).toMatch(/build promises later work with no job id:\n.*Unfulfilled promise: no job id/);
@@ -163,6 +171,7 @@ describe('promise gate through the real pipeline', () => {
     const r = rig({ test: BROKEN_TEST }, 'promise', { promise: { mode: 'enforce' } });
     const { job } = await start(r);
     r.human.grant(job.id, 'plan');
+    await settle(r.k);
     expect(r.k.jobs.get(job.id)!.status).toBe('failed');
     const failed = r.k.history(job.id).find((e) => e.type === 'pipeline.failed')!.payload as { reason: string };
     expect(failed.reason).toMatch(/^test failed: promise gate: Unfulfilled promise: no job id/);
@@ -173,6 +182,7 @@ describe('promise gate through the real pipeline', () => {
     const r = rig({ test: ((_f: string, own: string) => ({ result: `I'll follow up in job ${own}.\nVERDICT: PASS`, evidence: [run('pnpm test')] })) as Script[string] }, 'promise', { promise: { mode: 'enforce' } });
     const { job } = await start(r);
     r.human.grant(job.id, 'plan');
+    await settle(r.k);
     expect(r.k.jobs.get(job.id)!.status).toBe('failed');
     const failed = r.k.history(job.id).find((e) => e.type === 'pipeline.failed')!.payload as { reason: string };
     expect(failed.reason).toContain('is the job that is already running this stage');
@@ -183,6 +193,7 @@ describe('promise gate through the real pipeline', () => {
     const r = rig({ test: { result: `${forged}\nVERDICT: PASS`, evidence: [run('pnpm test')] } }, 'promise', { promise: { mode: 'enforce' } });
     const { job } = await start(r);
     r.human.grant(job.id, 'plan');
+    await settle(r.k);
     expect(r.k.jobs.get(job.id)!.status).toBe('failed');
   });
 
@@ -202,6 +213,7 @@ describe('the two gates together', () => {
     const r = rig({ test: BOTH_WRONG }, wiring);
     const { job } = await start(r);
     r.human.grant(job.id, 'plan');
+    await settle(r.k);
 
     const merge = summaryOf(r.human, job.id, 'merge');
     expect(merge).toContain('EVIDENCE (');
@@ -225,6 +237,7 @@ describe('the two gates together', () => {
     expect(out).toMatchObject({ verdict: 'PASS', unverified: [expect.stringContaining('no record of a test run')], promises: [expect.stringContaining('no job id')] });
 
     r.human.grant(job.id, 'merge');
+    await settle(r.k);
     expect(r.k.jobs.get(job.id)!.status).toBe('done');
   });
 
@@ -232,11 +245,13 @@ describe('the two gates together', () => {
     const r = rig({ test: PROMISE_TEST as Script[string] }, wiring);
     const { job } = await start(r);
     r.human.grant(job.id, 'plan');
+    await settle(r.k);
     const merge = summaryOf(r.human, job.id, 'merge');
     expect(merge).toContain('EVIDENCE (');
     expect(merge).not.toContain('Unverified');
     expect(merge).not.toContain('PROMISES');
     r.human.grant(job.id, 'merge');
+    await settle(r.k);
     expect(r.k.jobs.get(job.id)!.status).toBe('done');
   });
 
@@ -244,6 +259,7 @@ describe('the two gates together', () => {
     const r = rig({ test: BOTH_WRONG }, wiring, { evidence: { mode: 'enforce' } });
     const { job } = await start(r);
     r.human.grant(job.id, 'plan');
+    await settle(r.k);
     expect(r.k.jobs.get(job.id)!.status).toBe('failed');
     expect(count(r.seen, 'stage.failed', job.id, 'test')).toBe(1);
     expect(count(r.seen, 'stage.screened', job.id, 'test')).toBe(0);
@@ -254,6 +270,7 @@ describe('the two gates together', () => {
     const r = rig({ test: BROKEN_TEST }, wiring, { promise: { mode: 'enforce' } });
     const { job } = await start(r);
     r.human.grant(job.id, 'plan');
+    await settle(r.k);
     expect(r.k.jobs.get(job.id)!.status).toBe('failed');
     expect(count(r.seen, 'stage.failed', job.id, 'test')).toBe(1);
     expect(count(r.seen, 'stage.checked', job.id, 'test')).toBe(1);
@@ -264,6 +281,7 @@ describe('the two gates together', () => {
     const r = rig({ test: BOTH_WRONG }, 'both', { promise: { enabled: false } });
     const { job } = await start(r);
     r.human.grant(job.id, 'plan');
+    await settle(r.k);
     const merge = summaryOf(r.human, job.id, 'merge');
     expect(merge).toContain('Unverified: no record of a test run');
     expect(merge).not.toContain('PROMISES');
@@ -271,6 +289,7 @@ describe('the two gates together', () => {
     const r2 = rig({ test: BOTH_WRONG }, 'both', { evidence: { enabled: false } });
     const j2 = await start(r2);
     r2.human.grant(j2.job.id, 'plan');
+    await settle(r2.k);
     const m2 = summaryOf(r2.human, j2.job.id, 'merge');
     expect(m2).toContain('PROMISES (');
     expect(m2).not.toContain('Unverified');

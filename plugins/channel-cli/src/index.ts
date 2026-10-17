@@ -12,7 +12,7 @@ export interface CliChannelOptions {
 export interface CliChannel {
   plugin: Plugin;
   /** Create a job. Only works once the kernel has started. */
-  submit(input: { repo: string; title: string; body?: string }): Job;
+  submit(input: { repo: string; title: string; body?: string }): Promise<Job>;
   grant(jobId: string, kind: ApprovalKind): void;
   deny(jobId: string): void;
 }

@@ -57,7 +57,12 @@ const jsonOk = (v: unknown): boolean => {
   }
 };
 
-/** An in-memory job API with the same permission rules as the kernel. Breaking one is recorded as a finding. */
+type SyncJobs = { [K in keyof JobsApi]: JobsApi[K] extends (...args: infer A) => Promise<infer R> ? (...args: A) => R : never };
+
+/**
+ * An in-memory job API with the same permission rules as the kernel. Breaking one is recorded as a finding.
+ * The rules run in the same tick as the call, as in the kernel; a broken rule rejects instead of throwing.
+ */
 function fakeJobs(manifest: Manifest, caps: ReadonlySet<string>, rec: Recording): JobsApi & { seed(j: SeedJob): Job } {
   const jobs = new Map<string, Job>();
   const stages: Stage[] = [];
@@ -74,7 +79,7 @@ function fakeJobs(manifest: Manifest, caps: ReadonlySet<string>, rec: Recording)
     if (!j) throw new Error(`no job ${id}`);
     return j;
   };
-  const api: JobsApi & { seed(j: SeedJob): Job } = {
+  const api: SyncJobs & { seed(j: SeedJob): Job } = {
     create(input) {
       const t = now();
       const job: Job = { id: fakeJobId(jobs.size + 1), repo: input.repo, title: input.title, body: input.body ?? '', status: 'queued', createdAt: t, updatedAt: t };
@@ -123,7 +128,16 @@ function fakeJobs(manifest: Manifest, caps: ReadonlySet<string>, rec: Recording)
       return { ...raw };
     },
   };
-  return api;
+  return {
+    create: async (input) => api.create(input),
+    get: async (id) => api.get(id),
+    list: async (filter) => api.list(filter),
+    setStatus: async (id, status) => api.setStatus(id, status),
+    stages: async (jobId) => api.stages(jobId),
+    startStage: async (jobId, name) => api.startStage(jobId, name),
+    finishStage: async (stageId, status, output) => api.finishStage(stageId, status, output),
+    seed: api.seed,
+  };
 }
 
 /** The kernel, minus SQLite: one plugin, in memory, strict about everything its manifest does not say. */

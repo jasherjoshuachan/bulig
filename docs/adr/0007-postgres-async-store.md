@@ -24,4 +24,12 @@ The kernel's `Store` has 14 public methods, all synchronous. The plugin-facing `
 
 ## In my words (Jasher)
 
-_To be written by Jasher before the Postgres adapter is built._
+I'm moving the record to Postgres for what a desk drawer can't do. More than one worker needs to use it at once, a file needs a lock while someone is working on it, and I need backups I can restore from. Running on the server comes with that. It isn't the reason by itself.
+
+It costs something and I'm paying it now. Every call to the jobs API becomes async, 45 places across six plugins, and `pipeline-dev` is the biggest rewrite. I would rather do that while the SDK is a release candidate than keep a synchronous API with a copy in memory, because a crash can lose that copy. I made the same choice for `ctx.state`.
+
+SQLite stays as the second adapter, for tests and for anyone trying Bulig with nothing to install. One test suite has to pass on both.
+
+The new database lives next to client production files, and Bulig must never put those at risk. So it gets its own cluster, its own role and its own limits. Nothing live depends on it until a restore has been tested.
+
+This ADR is only about the record. Claims and leases, approvals, identity and the rest each get their own ADR when they are built. How the existing Mac database moves over is not decided here.

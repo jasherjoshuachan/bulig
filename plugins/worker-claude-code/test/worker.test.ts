@@ -849,6 +849,16 @@ describe('a job that ends while its stage is still starting (slow store)', () =>
     }
   });
 
+  it('leaves the stage running, for the next start to pick up, when the job cannot be read because the worker is shutting down', async () => {
+    const t = bare();
+    const stage = t.handlers.get('stage.requested')!(t.event('stage.requested', req({ stage: 'build', mode: 'edit' })));
+    await tick();
+    await t.w.stop?.();
+    t.reads[0]!.reject(new Error('Store call "jobs" came after the kernel stopped'));
+    await stage;
+    expect(t.emitted).toEqual([]);
+  });
+
   it('fails the stage, rather than leaving it running for good, when the job cannot be read', async () => {
     const t = bare();
     const stage = t.handlers.get('stage.requested')!(t.event('stage.requested', req({ stage: 'build', mode: 'edit' })));

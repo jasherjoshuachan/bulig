@@ -2,7 +2,7 @@ import { DEPRECATED_SDK_MAJORS, type BuligEvent, type Logger, type Plugin } from
 import { Bus } from './bus.ts';
 import { DEFAULT_EVENT_CAPABILITIES } from './capabilities.ts';
 import { buildContext, selectPlugins, type JobsTx, type KernelJobs, type LoadedPlugin } from './loader.ts';
-import { StoreQueue, type StoreTx } from './queue.ts';
+import { StoreBrokenError, StoreQueue, type QueueTx } from './queue.ts';
 import { SqliteStore } from './sqlite-store.ts';
 import type { Store } from './store.ts';
 
@@ -13,6 +13,11 @@ export interface KernelOptions {
   store?: Store;
   /** How long one task on the store queue may take before it is given up on and the queue moves on. Default 30000. */
   storeTimeoutMs?: number;
+  /**
+   * How long a task may be stuck inside one store call before the kernel gives up on the record: it stops writing,
+   * refuses every later store call, and logs one error. Default 120000, never less than storeTimeoutMs.
+   */
+  storeBrokenMs?: number;
   plugins: Plugin[];
   enabled: string[];
   grants?: Record<string, string[]>;
@@ -34,13 +39,19 @@ export function createKernel(options: KernelOptions) {
   if (!store) throw new Error('createKernel needs a dbPath or a store');
   const logger = options.logger ?? defaultLogger;
   // Every store call in the kernel goes through this one queue (ADR 0001: the kernel is the only writer, one at a time).
-  const queue = new StoreQueue(store, options.storeTimeoutMs ?? 30_000);
-  const bus = new Bus(queue, { ...DEFAULT_EVENT_CAPABILITIES, ...options.eventCapabilities }, (err, input) =>
-    logger.error(`Could not write event "${input.type}" to the log, so it was not delivered`, err),
-  );
+  const queue = new StoreQueue(store, {
+    timeoutMs: options.storeTimeoutMs ?? 30_000,
+    brokenMs: options.storeBrokenMs ?? 120_000,
+    onBroken: (err) => logger.error(`${err.message} Nothing more will be written or delivered until it is restarted.`),
+  });
+  const bus = new Bus(queue, { ...DEFAULT_EVENT_CAPABILITIES, ...options.eventCapabilities }, (err, input) => {
+    // Once the queue is broken one error already said so. Every event after it would only repeat it.
+    if (err instanceof StoreBrokenError) return;
+    logger.error(`Could not write event "${input.type}" to the log: it was not written and not delivered`, err);
+  });
 
   // The job calls as they run on one task of the queue. A change and the event that announces it are written in the same task.
-  const inTask = (tx: StoreTx): JobsTx => ({
+  const inTask = (tx: QueueTx): JobsTx => ({
     async create(input) {
       const job = await tx.createJob(input);
       await bus.record(tx, { type: 'job.created', source: 'kernel', jobId: job.id, payload: job });

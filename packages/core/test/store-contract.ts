@@ -194,6 +194,95 @@ export function describeStoreContract(name: string, make: () => Promise<StoreHan
       expect((await store.getJob(job.id))?.status).toBe('done');
     });
 
+    it('rejects an event payload with no JSON form, and stores nothing for it', async () => {
+      const { store } = await fresh();
+      await expect(store.appendEvent({ type: 'a.b', source: 'x', payload: () => 1 })).rejects.toThrow(/not JSON/);
+      await expect(store.appendEvent({ type: 'a.b', source: 'x', payload: Symbol('s') })).rejects.toThrow();
+      expect(await store.eventsAfter()).toEqual([]);
+      expect((await store.appendEvent({ type: 'a.b', source: 'x', payload: undefined })).payload).toBeNull();
+    });
+
+    it('rejects stage output with no JSON form, and leaves the stage running', async () => {
+      const { store } = await fresh();
+      const job = await store.createJob({ repo: 'r', title: 't' });
+      const stage = await store.startStage(job.id, 'build');
+      await expect(store.finishStage(stage.id, 'passed', () => 1)).rejects.toThrow(/not JSON/);
+      expect(await store.getStage(stage.id)).toMatchObject({ status: 'running', endedAt: null, output: null });
+    });
+
+    it('keeps insertion order for jobs, stages and events made in quick succession, even when their timestamps tie', async () => {
+      const { store } = await fresh();
+      const titles: string[] = [];
+      for (let i = 0; i < 40; i++) {
+        titles.push(`job-${i}`);
+        await store.createJob({ repo: 'r', title: `job-${i}` });
+      }
+      expect((await store.listJobs()).map((j) => j.title)).toEqual(titles);
+      const job = (await store.listJobs())[0]!;
+      const names: string[] = [];
+      for (let i = 0; i < 40; i++) {
+        names.push(`stage-${i}`);
+        await store.startStage(job.id, `stage-${i}`);
+      }
+      expect((await store.listStages(job.id)).map((s) => s.name)).toEqual(names);
+      // Made without waiting between them, so they are applied back to back.
+      const made = await Promise.all(Array.from({ length: 40 }, (_, i) => store.createJob({ repo: 'r', title: `quick-${i}` })));
+      expect((await store.listJobs()).slice(40).map((j) => j.id)).toEqual(made.map((j) => j.id));
+    });
+
+    describe('transaction', () => {
+      it('keeps what a committed transaction wrote, and hands back its result', async () => {
+        const { store } = await fresh();
+        const result = await store.transaction(async (tx) => {
+          const job = await tx.createJob({ repo: 'r', title: 'in a transaction' });
+          await tx.appendEvent({ type: 'job.created', source: 'x', jobId: job.id, payload: null });
+          expect((await tx.getJob(job.id))?.title).toBe('in a transaction'); // it sees its own writes
+          return job.id;
+        });
+        expect((await store.getJob(result))?.title).toBe('in a transaction');
+        expect(await store.eventsForJob(result)).toHaveLength(1);
+      });
+
+      it('keeps nothing of a transaction that rejects, and passes the error on', async () => {
+        const { store } = await fresh();
+        const before = await store.createJob({ repo: 'r', title: 'before' });
+        await expect(
+          store.transaction(async (tx) => {
+            await tx.createJob({ repo: 'r', title: 'doomed' });
+            await tx.setJobStatus(before.id, 'running');
+            await tx.setState('p', 'k', 1);
+            await tx.appendEvent({ type: 'a.b', source: 'x', payload: null });
+            throw new Error('boom');
+          }),
+        ).rejects.toThrow('boom');
+        expect((await store.listJobs()).map((j) => j.title)).toEqual(['before']);
+        expect((await store.getJob(before.id))?.status).toBe('queued');
+        expect(await store.getState('p', 'k')).toBeUndefined();
+        expect(await store.eventsAfter()).toEqual([]);
+      });
+
+      it('keeps nothing when a call inside it rejects and the function lets that through', async () => {
+        const { store } = await fresh();
+        await expect(
+          store.transaction(async (tx) => {
+            await tx.createJob({ repo: 'r', title: 'doomed' });
+            await tx.setJobStatus('nope', 'done');
+          }),
+        ).rejects.toThrow(/No such job/);
+        expect(await store.listJobs()).toEqual([]);
+      });
+
+      it('works again after one was rolled back, and one after another commits in order', async () => {
+        const { store } = await fresh();
+        await store.transaction(async () => {
+          throw new Error('first fails');
+        }).catch(() => {});
+        await store.transaction((tx) => tx.createJob({ repo: 'r', title: 'a' }));
+        await store.transaction((tx) => tx.createJob({ repo: 'r', title: 'b' }));
+        expect((await store.listJobs()).map((j) => j.title)).toEqual(['a', 'b']);
+      });
+    });
+
     it('keeps everything across a reopen', async () => {
       const h = await fresh();
       const job = await h.store.createJob({ repo: 'r', title: 't', body: 'b' });

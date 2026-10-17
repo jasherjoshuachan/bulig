@@ -623,6 +623,8 @@ export function createWorker() {
           try {
             state = jobId ? (await ctx.jobs.get(jobId))?.status : undefined;
           } catch (err) {
+            // Shutting down: the stage stays running and is picked up on resume, as for any stage that was cut off.
+            if (stopping) return;
             // The store did not answer. Say so and fail the stage, so the pipeline can fail the job instead of waiting on a stage that will never report.
             ctx.emit('stage.failed', { stage: req.stage, error: `could not read the job, so the stage did not start: ${err instanceof Error ? err.message : String(err)}` }, jobId);
             return;

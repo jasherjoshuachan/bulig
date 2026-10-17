@@ -11,12 +11,20 @@ import type { BuligEvent, Job, JobStatus, Stage, StageStatus } from '@bulig/plug
  * - Lists come back oldest first: jobs and stages by creation, events by `seq`.
  * - `seq` only goes up, and an event is readable as soon as `appendEvent` resolves.
  * - Opening a store that already has data runs only the migrations it has not seen.
+ * - Values that go in as JSON (event payloads, stage output, plugin state) must have a JSON form. A call with one that
+ *   has none rejects and stores nothing.
+ * - `transaction` is all or nothing. Calls made on the handle it passes commit together when the function resolves and
+ *   are all undone when it rejects. An adapter holds one connection for the whole transaction. The caller does not
+ *   start a second one, or use the store outside it, until it has finished (the kernel's queue sees to that).
  */
 export interface Store {
   /** How many numbered migrations this store has applied. */
   schemaVersion(): Promise<number>;
   /** Release the engine. No call may follow. */
   close(): Promise<void>;
+
+  /** Run `fn` as one transaction. Resolves with its result after the commit; rejects, with nothing kept, if `fn` rejects or the commit fails. */
+  transaction<T>(fn: (tx: StoreTx) => Promise<T>): Promise<T>;
 
   // ----- jobs -----
   createJob(input: { repo: string; title: string; body?: string }): Promise<Job>;
@@ -44,3 +52,6 @@ export interface Store {
   eventsAfter(afterSeq?: number): Promise<BuligEvent[]>;
   eventsForJob(jobId: string): Promise<BuligEvent[]>;
 }
+
+/** The calls available inside a transaction: the store without `close` and without starting another transaction. */
+export type StoreTx = Omit<Store, 'close' | 'transaction'>;

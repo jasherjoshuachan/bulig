@@ -1,4 +1,4 @@
-import type { Store } from '../src/index.ts';
+import type { Store, StoreTx } from '../src/index.ts';
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
@@ -29,21 +29,28 @@ const at = (v: number | ((m: string, n: number) => number) | undefined, m: strin
 export function slowStore(inner: Store, options: SlowOptions = {}): SlowStore {
   let n = 0;
   const wrapped = { applied: [] as string[], logged: new Set<string>() } as unknown as Record<string, unknown> & SlowStore;
+  // The same delays apply to calls made inside a transaction, which is where the kernel makes all of them.
+  const delayed = (target: StoreTx) => {
+    const out: Record<string, unknown> = {};
+    for (const name of METHODS) {
+      out[name] = async (...args: unknown[]) => {
+        const call = ++n;
+        const wait = at(options.before, name, call);
+        if (wait > 0) await sleep(wait);
+        if (options.hang?.(name, args, call)) return new Promise(() => {});
+        wrapped.applied.push(name);
+        const result = await (target[name] as (...a: unknown[]) => Promise<unknown>)(...args);
+        if (name === 'appendEvent') wrapped.logged.add((result as { id: string }).id);
+        const later = at(options.after, name, call);
+        if (later > 0) await sleep(later);
+        return result;
+      };
+    }
+    return out as unknown as StoreTx;
+  };
+  Object.assign(wrapped, delayed(inner));
   const methods = wrapped as Record<string, unknown>;
-  for (const name of METHODS) {
-    methods[name] = async (...args: unknown[]) => {
-      const call = ++n;
-      const wait = at(options.before, name, call);
-      if (wait > 0) await sleep(wait);
-      if (options.hang?.(name, args, call)) return new Promise(() => {});
-      wrapped.applied.push(name);
-      const result = await (inner[name] as (...a: unknown[]) => Promise<unknown>)(...args);
-      if (name === 'appendEvent') wrapped.logged.add((result as { id: string }).id);
-      const later = at(options.after, name, call);
-      if (later > 0) await sleep(later);
-      return result;
-    };
-  }
+  methods.transaction = <T>(fn: (tx: StoreTx) => Promise<T>) => inner.transaction((tx) => fn(delayed(tx)));
   methods.close = () => inner.close();
   return wrapped;
 }

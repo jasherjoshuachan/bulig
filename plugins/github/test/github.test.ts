@@ -679,10 +679,11 @@ describe('merge.requested', () => {
     expect(h.seen.some((e) => e.type === 'pr.merged' || e.type === 'merge.refused' || e.type === 'merge.failed')).toBe(false);
   });
 
-  it('says the merge did not happen, instead of going quiet, when the job cannot be read (store call stuck)', async () => {
+  it('says the merge did not happen, instead of going quiet, when the job cannot be read in time (store call late)', async () => {
     let stuck = false;
     const h = await setup({ checksPollMs: 20, checksWaitMs: 60_000 }, undefined, {
-      store: (inner) => slowStore(inner, { hang: (m) => stuck && m === 'getJob' }),
+      // The first read after the merge is asked for answers 200 ms late. Later reads are quick.
+      store: (inner) => slowStore(inner, { before: (m) => (stuck && m === 'getJob' ? ((stuck = false), 200) : 0) }),
       storeTimeoutMs: 80,
     });
     const pr = await openPr(h);

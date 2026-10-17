@@ -1,5 +1,5 @@
 import { CapabilityDeniedError, matchesPattern, type BuligEvent, type EventHandler } from '@bulig/plugin-sdk';
-import type { StoreQueue, StoreTx } from './queue.ts';
+import type { QueueTx, StoreQueue } from './queue.ts';
 
 interface Subscription {
   plugin: string;
@@ -17,10 +17,10 @@ export interface EmitInput {
 /**
  * ADR 0002 with an async store: write to the log first, then deliver, in log order.
  *
- * Every event is written by a task on the kernel's store queue. The task writes it, then hands it to the
- * subscribers before the task ends, so no later write can come between a write and its delivery. Because the queue
- * runs one task at a time in the order they were queued, delivery order is log order, and a handler never sees an
- * event that is not in the log yet. An event emitted from inside a handler is queued behind the task that is
+ * Every event is written by a task on the kernel's store queue, inside the task's transaction. Subscribers hear it
+ * only after that transaction has committed, and before the next task starts. The queue runs one task at a time in the
+ * order they were queued, so delivery order is commit order is log order, and a handler never sees an event that is
+ * not in the log. An event whose task rolled back (a timeout, a failed write) is never delivered. An event emitted from inside a handler is queued behind the task that is
  * delivering the current one, so it is written and delivered after it.
  *
  * Handlers are started, not awaited. The worker's handler runs a Claude process for up to 20 minutes, and the next
@@ -36,7 +36,7 @@ export class Bus {
     private queue: StoreQueue,
     /** Event type -> the capability a plugin needs to emit it. */
     private eventCapabilities: Readonly<Record<string, string>> = {},
-    /** Told when an event could not be written (the store timed out or failed). Nothing was delivered for it. */
+    /** Told when an event was not written (the store timed out or failed, and the task rolled back). Nothing was delivered for it. */
     private onError: (err: unknown, input: EmitInput) => void = () => {},
   ) {}
 
@@ -45,8 +45,8 @@ export class Bus {
   }
 
   /**
-   * Queue an event. The promise settles with the event once it is in the log and delivered, or rejects if the write
-   * failed. Nobody has to wait on it: a failed write is also reported to `onError`.
+   * Queue an event. The promise settles with the event once it is committed to the log and delivered, or rejects if it
+   * was not written. Nobody has to wait on it: a failed write is also reported to `onError`.
    */
   emit(input: EmitInput): Promise<BuligEvent> {
     const written = this.queue.run(`emit ${input.type}`, (tx) => this.record(tx, input));
@@ -68,17 +68,17 @@ export class Bus {
   }
 
   /**
-   * Write an event and deliver it from inside a task that is already running on the queue. The kernel uses this when a
-   * state change and its event must be one step: nothing queued before or after can land between them.
+   * Write an event from inside a task that is already running on the queue, and deliver it once that task commits. The
+   * kernel uses this when a state change and its event must be one step: they commit together or not at all.
    */
-  async record(tx: StoreTx, input: EmitInput): Promise<BuligEvent> {
+  async record(tx: QueueTx, input: EmitInput): Promise<BuligEvent> {
     const event = await tx.appendEvent({
       type: input.type,
       source: input.source,
       payload: input.payload ?? null,
       ...(input.jobId !== undefined && { jobId: input.jobId }),
     });
-    this.dispatch(event);
+    tx.afterCommit(() => this.dispatch(event));
     return event;
   }
 

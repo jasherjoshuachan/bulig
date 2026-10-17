@@ -1,7 +1,7 @@
 import Database from 'better-sqlite3';
 import { randomUUID } from 'node:crypto';
 import type { BuligEvent, Job, JobStatus, Stage, StageStatus } from '@bulig/plugin-sdk';
-import type { Store } from './store.ts';
+import type { Store, StoreTx } from './store.ts';
 
 // Each entry upgrades the schema by one version. Never edit an old entry; add a new one.
 const MIGRATIONS: string[] = [
@@ -99,6 +99,27 @@ export class SqliteStore implements Store {
     this.db.close();
   }
 
+  /**
+   * BEGIN IMMEDIATE, run `fn`, then COMMIT; ROLLBACK if `fn` or the commit fails. There is one connection, so the
+   * calls `fn` makes are the transaction's. That only stays true while nothing else uses this store until it ends,
+   * which the kernel's queue guarantees. Written by hand rather than with db.transaction(), which cannot wait on a promise.
+   */
+  async transaction<T>(fn: (tx: StoreTx) => Promise<T>): Promise<T> {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const result = await fn(this);
+      this.db.exec('COMMIT');
+      return result;
+    } catch (err) {
+      try {
+        if (this.db.inTransaction) this.db.exec('ROLLBACK');
+      } catch {
+        // The original error is the one to report.
+      }
+      throw err;
+    }
+  }
+
   // ----- jobs -----
 
   async createJob(input: { repo: string; title: string; body?: string }): Promise<Job> {
@@ -175,9 +196,11 @@ export class SqliteStore implements Store {
   }
 
   async finishStage(id: string, status: Exclude<StageStatus, 'running'>, output?: unknown): Promise<Stage> {
+    const json = output === undefined ? null : JSON.stringify(output);
+    if (json === undefined) throw new Error(`Output of stage ${id} is not JSON`);
     const res = this.db
       .prepare('UPDATE stages SET status = ?, ended_at = ?, output = ? WHERE id = ?')
-      .run(status, new Date().toISOString(), output === undefined ? null : JSON.stringify(output), id);
+      .run(status, new Date().toISOString(), json, id);
     if (res.changes === 0) throw new Error(`No such stage: ${id}`);
     return this.requireStage(id);
   }
@@ -204,9 +227,11 @@ export class SqliteStore implements Store {
   async appendEvent(e: { type: string; jobId?: string; source: string; payload: unknown }): Promise<BuligEvent> {
     const id = randomUUID();
     const at = new Date().toISOString();
+    const json = e.payload === undefined ? null : JSON.stringify(e.payload);
+    if (json === undefined) throw new Error(`Payload of event "${e.type}" is not JSON`);
     const res = this.db
       .prepare('INSERT INTO events (id, type, job_id, source, payload, at) VALUES (?, ?, ?, ?, ?, ?)')
-      .run(id, e.type, e.jobId ?? null, e.source, e.payload === undefined ? null : JSON.stringify(e.payload), at);
+      .run(id, e.type, e.jobId ?? null, e.source, json, at);
     return toEvent(this.db.prepare('SELECT * FROM events WHERE seq = ?').get(res.lastInsertRowid) as EventRow);
   }
 

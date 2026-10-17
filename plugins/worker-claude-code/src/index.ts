@@ -596,7 +596,8 @@ export function createWorker() {
         }
         if (stopping) return; // shutting down: start nothing. The stage stays running and is picked up on resume.
         const jobId = event.jobId;
-        const state = jobId ? ctx.jobs.get(jobId)?.status : undefined;
+        const state = jobId ? (await ctx.jobs.get(jobId))?.status : undefined;
+        if (stopping) return; // stop() may have come in while the job was being read
         if (state === 'cancelled' || state === 'failed') {
           ctx.emit('stage.failed', { stage: req.stage, error: `the job is ${state}, so the stage did not start` }, jobId);
           return;

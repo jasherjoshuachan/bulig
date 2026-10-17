@@ -109,18 +109,18 @@ describe('needs rule', () => {
     expect(await messages({ load, scenarios: [{ name: 'go', events: [{ type: 'kernel.started' }] }] })).toMatch(/needs "approval.grant"/);
   });
   it('fails ending a job without jobs.write', async () => {
-    const load = () => make({ subscribes: ['kernel.started'] }, (ctx) => ctx.on('kernel.started', () => {
+    const load = () => make({ subscribes: ['kernel.started'] }, (ctx) => ctx.on('kernel.started', async () => {
       try {
-        ctx.jobs.setStatus(J1, 'done');
+        await ctx.jobs.setStatus(J1, 'done');
       } catch {}
     }));
     const opts = { load, scenarios: [{ name: 'go', jobs: [{ repo: 'r', title: 't' }], events: [{ type: 'kernel.started' }] }] };
     expect(await messages(opts)).toMatch(/used "jobs.write" to set a job done without declaring it/);
   });
   it('fails opening an approval stage without jobs.write', async () => {
-    const load = () => make({ subscribes: ['kernel.started'] }, (ctx) => ctx.on('kernel.started', () => {
+    const load = () => make({ subscribes: ['kernel.started'] }, (ctx) => ctx.on('kernel.started', async () => {
       try {
-        ctx.jobs.startStage(J1, 'approve-plan');
+        await ctx.jobs.startStage(J1, 'approve-plan');
       } catch {}
     }));
     expect(await messages({ load, scenarios: [{ name: 'go', jobs: [{ repo: 'r', title: 't' }], events: [{ type: 'kernel.started' }] }] })).toMatch(/open the "approve-plan" stage/);
@@ -128,9 +128,9 @@ describe('needs rule', () => {
   it('passes the same calls once jobs.write is declared and required', async () => {
     const load = () => make({ subscribes: ['kernel.started'], needs: ['jobs.write'] }, (ctx) => {
       ctx.require('jobs.write');
-      ctx.on('kernel.started', () => {
-        ctx.jobs.startStage(J1, 'approve-plan');
-        ctx.jobs.setStatus(J1, 'done');
+      ctx.on('kernel.started', async () => {
+        await ctx.jobs.startStage(J1, 'approve-plan');
+        await ctx.jobs.setStatus(J1, 'done');
       });
     });
     expect(await broken({ load, scenarios: [{ name: 'go', jobs: [{ repo: 'r', title: 't' }], events: [{ type: 'kernel.started' }] }] })).toEqual([]);

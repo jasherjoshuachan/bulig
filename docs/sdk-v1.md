@@ -1,6 +1,6 @@
 # Plugin SDK v1 (release candidate)
 
-This is the contract between the kernel and a plugin. `@bulig/plugin-sdk` is version `1.0.0-rc.3`. A manifest that sets `"sdk": "1"` is promising to follow this page, and the kernel promises to keep honouring it.
+This is the contract between the kernel and a plugin. `@bulig/plugin-sdk` is version `1.0.0-rc.4`. A manifest that sets `"sdk": "1"` is promising to follow this page, and the kernel promises to keep honouring it.
 
 The page is split by how much Bulig is willing to promise:
 
@@ -48,10 +48,10 @@ Rules the kernel applies when it loads a manifest, and the conformance suite app
 | `emit(type, payload?, jobId?)` | stable | Throws `UndeclaredEventError` unless `type` is in `manifest.emits`. Throws `CapabilityDeniedError` if the type is gated (section 5) and the plugin lacks the capability. The payload must be JSON. The event is stored first, then delivered. |
 | `require(cap)` | stable | Throws `CapabilityDeniedError` unless `cap` is in `needs` and granted in config. Call it in `register()` so a missing grant stops the start. |
 | `can(cap)` | stable | `true` when the plugin holds `cap`. No plugin uses it yet. |
-| `jobs.create/get/list` | stable | Read jobs, and create one. Creating one makes the kernel emit `job.created`. |
-| `jobs.setStatus` | stable | Ending a job (`done`, `failed`, `cancelled`) or moving it out of `awaiting_approval` needs `jobs.write`. A finished job is final. |
-| `jobs.stages(jobId)` | stable | Every stage of a job, oldest first. |
-| `jobs.startStage/finishStage` | experimental | Open or close a stage. Stages whose name starts with `approve-` need `jobs.write`. That prefix is a string convention the permission check relies on. It should become a field. |
+| `jobs.create/get/list` | stable | Read jobs, and create one. Creating one makes the kernel emit `job.created`. Async (`Promise`), because the record behind them can be a database server. Changed from sync during the release candidate (`1.0.0-rc.4`, ADR 0007), the same way `state` was. |
+| `jobs.setStatus` | stable | Ending a job (`done`, `failed`, `cancelled`) or moving it out of `awaiting_approval` needs `jobs.write`. A finished job is final. Async: a refused call rejects with `CapabilityDeniedError` and the same message it used to throw. Always `await` it. |
+| `jobs.stages(jobId)` | stable | Every stage of a job, oldest first. Async. |
+| `jobs.startStage/finishStage` | experimental | Open or close a stage. Stages whose name starts with `approve-` need `jobs.write`. That prefix is a string convention the permission check relies on. It should become a field. Async: a refused call rejects. Always `await` both, because a write resolves only when it is durable. |
 | `state.get/set` | stable | The plugin's own key-value store. Both calls are async (`Promise`), because the record behind them can be a database server. `set` resolves only when the value is durable, so a plugin that awaits it can save a position and then act. JSON values only: a value that is not JSON rejects. Survives a restart. Other plugins' keys are invisible. Always `await` `set`: a rejection nobody handles ends a Node 22 process, and the conformance suite cannot see a forgotten `await`. Made async before the freeze, while one plugin used it. |
 | `log.debug/info/warn/error` | stable | |
 | `config` | experimental | The plugin's own object from `pluginConfig`, untyped. The manifest has no config schema yet, so every plugin validates its own config in `register()`. The conformance suite checks that an invalid config is refused clearly. A `configSchema` manifest field is the likely fix. |
@@ -178,7 +178,7 @@ The names and the refused/failed meaning are stable because channels depend on t
 
 - The kernel loads a plugin whose `sdk` is in `SUPPORTED_SDK_MAJORS` (today `0` and `1`) and refuses any other with `SdkVersionMismatchError`.
 - A plugin written for major N keeps working on every release of major N, unchanged, without edits to its manifest.
-- The package version of `@bulig/plugin-sdk` is full semver (`1.0.0-rc.3`). The minor and patch numbers are for humans and release notes; plugins never declare them.
+- The package version of `@bulig/plugin-sdk` is full semver (`1.0.0-rc.4`). The minor and patch numbers are for humans and release notes; plugins never declare them.
 - A plugin that needs something added in a later minor checks for it at runtime, or says so in its own docs. There is no `sdkMin` field. Add one only if that turns out to hurt.
 
 A **breaking change** (needs major 2) is any of these, for something marked stable:

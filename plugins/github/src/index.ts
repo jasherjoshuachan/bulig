@@ -502,8 +502,8 @@ export default definePlugin({
       const wait = new AbortController();
       if (event.jobId) waits.set(event.jobId, wait);
       // The job ended while we waited, or the plugin is stopping: nothing more happens, and the approval is spent.
-      const over = () => {
-        const status = event.jobId ? ctx.jobs.get(event.jobId)?.status : undefined;
+      const over = async () => {
+        const status = event.jobId ? (await ctx.jobs.get(event.jobId))?.status : undefined;
         return wait.signal.aborted || status === 'cancelled' || status === 'failed' || status === 'done';
       };
       try {
@@ -574,10 +574,10 @@ export default definePlugin({
         const pollMs = Math.max(cfg.checksPollMs ?? 15_000, 1);
         const deadline = Date.now() + waitMs;
         for (;;) {
-          if (over()) return;
+          if (await over()) return;
           if (!(await gate())) return;
           const got = await readChecks();
-          if ('error' in got) return over() ? undefined : giveUp(`could not read checks: ${got.error}`);
+          if ('error' in got) return (await over()) ? undefined : giveUp(`could not read checks: ${got.error}`);
           const list = got.list;
           if (list.length === 0) {
             if (!cfg.allowNoChecks) return giveUp('the PR has no checks and allowNoChecks is off. Turn it on or add a check, then run the job again.');
@@ -598,7 +598,7 @@ export default definePlugin({
           }
           await nap(Math.min(pollMs, left), wait.signal);
         }
-        if (over()) return;
+        if (await over()) return;
 
         // From a worktree, gh can merge and then fail to switch branches. Trust the PR state, not the exit code.
         // --match-head-commit pins the merge to the approved commit: a push that races the merge makes gh refuse.
@@ -616,7 +616,7 @@ export default definePlugin({
         await tidy(cwd, worktree, branch, baseRef);
         ctx.emit('pr.merged', { number }, event.jobId);
       } catch (err) {
-        if (!over()) refuse(message(err));
+        if (!(await over())) refuse(message(err));
       } finally {
         if (event.jobId && waits.get(event.jobId) === wait) waits.delete(event.jobId);
       }

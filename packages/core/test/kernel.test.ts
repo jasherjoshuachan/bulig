@@ -317,10 +317,10 @@ describe('loader', () => {
     const { plugin, box } = probe();
     const k = kernelWith({ plugins: [plugin] });
     await k.start();
-    const job = box.ctx!.jobs.create({ repo: 'r', title: 't' });
-    const stage = box.ctx!.jobs.startStage(job.id, 'plan');
-    expect(box.ctx!.jobs.finishStage(stage.id, 'passed', { ok: 1 }).status).toBe('passed');
-    expect(box.ctx!.jobs.stages(job.id).map((s) => s.name)).toEqual(['plan']);
+    const job = await box.ctx!.jobs.create({ repo: 'r', title: 't' });
+    const stage = await box.ctx!.jobs.startStage(job.id, 'plan');
+    expect((await box.ctx!.jobs.finishStage(stage.id, 'passed', { ok: 1 })).status).toBe('passed');
+    expect((await box.ctx!.jobs.stages(job.id)).map((s) => s.name)).toEqual(['plan']);
     expect(Object.keys(box.ctx!.jobs).sort()).toEqual(
       ['create', 'finishStage', 'get', 'list', 'setStatus', 'stages', 'startStage'],
     );
@@ -373,38 +373,54 @@ describe('jobs.write gates the writes that decide an outcome', () => {
     // The pipeline's side of the story, done with the kernel's own ungated API.
     const stage = k.jobs.startStage(job.id, 'approve-plan');
     k.jobs.setStatus(job.id, 'awaiting_approval');
-    expect(() => ctx.jobs.finishStage(stage.id, 'passed')).toThrow(CapabilityDeniedError);
-    expect(() => ctx.jobs.finishStage(stage.id, 'passed')).toThrow(/jobs\.write/);
-    expect(() => ctx.jobs.setStatus(job.id, 'running')).toThrow(/jobs\.write/);
-    expect(() => ctx.jobs.startStage(job.id, 'approve-merge')).toThrow(/jobs\.write/);
+    await expect(ctx.jobs.finishStage(stage.id, 'passed')).rejects.toThrow(CapabilityDeniedError);
+    await expect(ctx.jobs.finishStage(stage.id, 'passed')).rejects.toThrow(/jobs\.write/);
+    await expect(ctx.jobs.setStatus(job.id, 'running')).rejects.toThrow(/jobs\.write/);
+    await expect(ctx.jobs.startStage(job.id, 'approve-merge')).rejects.toThrow(/jobs\.write/);
     expect(k.jobs.get(job.id)!.status).toBe('awaiting_approval');
     expect(k.jobs.stages(job.id).find((s) => s.id === stage.id)!.status).toBe('running');
+  });
+
+  it('a denied job call rejects with the same error and message, and never throws at the call', async () => {
+    const { k, ctx, job } = await setup({}, []);
+    // The call itself must not throw: the refusal arrives as a rejected promise.
+    const ended = ctx.jobs.setStatus(job.id, 'done');
+    expect(ended).toBeInstanceOf(Promise);
+    await expect(ended).rejects.toBeInstanceOf(CapabilityDeniedError);
+    await expect(ctx.jobs.setStatus(job.id, 'cancelled')).rejects.toThrow('Plugin "demo" was denied "jobs.write" (needed to set a job cancelled)');
+    const opened = ctx.jobs.startStage(job.id, 'approve-plan');
+    expect(opened).toBeInstanceOf(Promise);
+    await expect(opened).rejects.toBeInstanceOf(CapabilityDeniedError);
+    await expect(opened).rejects.toThrow('Plugin "demo" was denied "jobs.write" (needed to open the "approve-plan" stage)');
+    // Nothing was written.
+    expect(k.jobs.get(job.id)!.status).toBe('running');
+    expect(k.jobs.stages(job.id)).toEqual([]);
   });
 
   it('a rogue plugin cannot end a job with any terminal status', async () => {
     const { k, ctx, job } = await setup({}, []);
     for (const status of ['done', 'failed', 'cancelled'] as const) {
-      expect(() => ctx.jobs.setStatus(job.id, status)).toThrow(CapabilityDeniedError);
+      await expect(ctx.jobs.setStatus(job.id, status)).rejects.toThrow(CapabilityDeniedError);
     }
     expect(k.jobs.get(job.id)!.status).toBe('running');
   });
 
   it('declared but not granted is refused too, and ordinary work stays open', async () => {
     const { k, ctx, job } = await setup({ demo: [] }, ['jobs.write']);
-    expect(() => ctx.jobs.setStatus(job.id, 'done')).toThrow(/jobs\.write/);
-    const stage = ctx.jobs.startStage(job.id, 'build');
-    expect(() => ctx.jobs.finishStage(stage.id, 'passed')).not.toThrow();
-    expect(ctx.jobs.get(job.id)!.id).toBe(job.id);
+    await expect(ctx.jobs.setStatus(job.id, 'done')).rejects.toThrow(/jobs\.write/);
+    const stage = await ctx.jobs.startStage(job.id, 'build');
+    await expect(ctx.jobs.finishStage(stage.id, 'passed')).resolves.toBeDefined();
+    expect((await ctx.jobs.get(job.id))!.id).toBe(job.id);
     expect(k.jobs.get(job.id)!.status).toBe('running');
   });
 
   it('a plugin that declares and is granted jobs.write can do all of it', async () => {
     const { k, ctx, job } = await setup({ demo: ['jobs.write'] }, ['jobs.write']);
-    const stage = ctx.jobs.startStage(job.id, 'approve-merge');
-    ctx.jobs.setStatus(job.id, 'awaiting_approval');
-    ctx.jobs.finishStage(stage.id, 'passed');
-    ctx.jobs.setStatus(job.id, 'running');
-    ctx.jobs.setStatus(job.id, 'done');
+    const stage = await ctx.jobs.startStage(job.id, 'approve-merge');
+    await ctx.jobs.setStatus(job.id, 'awaiting_approval');
+    await ctx.jobs.finishStage(stage.id, 'passed');
+    await ctx.jobs.setStatus(job.id, 'running');
+    await ctx.jobs.setStatus(job.id, 'done');
     expect(k.jobs.get(job.id)!.status).toBe('done');
   });
 });
@@ -437,11 +453,11 @@ describe('terminal is final', () => {
       const job = k.jobs.create({ repo: 'r', title: 't' });
       k.jobs.setStatus(job.id, end);
       for (const to of ['running', 'queued', 'awaiting_approval'] as const) {
-        expect(() => box.ctx!.jobs.setStatus(job.id, to)).toThrow(CapabilityDeniedError);
-        expect(() => box.ctx!.jobs.setStatus(job.id, to)).toThrow(/final/);
+        await expect(box.ctx!.jobs.setStatus(job.id, to)).rejects.toThrow(CapabilityDeniedError);
+        await expect(box.ctx!.jobs.setStatus(job.id, to)).rejects.toThrow(/final/);
       }
       // Moving to another end state is a reopen of the first one too.
-      expect(() => box.ctx!.jobs.setStatus(job.id, end === 'done' ? 'failed' : 'done')).toThrow(/final/);
+      await expect(box.ctx!.jobs.setStatus(job.id, end === 'done' ? 'failed' : 'done')).rejects.toThrow(/final/);
       expect(k.jobs.get(job.id)!.status).toBe(end);
     }
   });
@@ -452,6 +468,6 @@ describe('terminal is final', () => {
     await k.start();
     const job = k.jobs.create({ repo: 'r', title: 't' });
     k.jobs.setStatus(job.id, 'running');
-    expect(() => box.ctx!.jobs.setStatus(job.id, 'cancelled')).toThrow(/jobs\.write/);
+    await expect(box.ctx!.jobs.setStatus(job.id, 'cancelled')).rejects.toThrow(/jobs\.write/);
   });
 });

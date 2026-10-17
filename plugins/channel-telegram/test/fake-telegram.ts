@@ -119,9 +119,9 @@ export class FakeTelegram {
 }
 
 /** Wait until a condition holds. Fails the test with the message when it never does. */
-export async function until(check: () => boolean, what: string, ms = 5000): Promise<void> {
+export async function until(check: () => boolean | Promise<boolean>, what: string, ms = 5000): Promise<void> {
   const end = Date.now() + ms;
-  while (!check()) {
+  while (!(await check())) {
     if (Date.now() > end) throw new Error(`timed out waiting for: ${what}`);
     await new Promise((r) => setTimeout(r, 5));
   }

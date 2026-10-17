@@ -97,9 +97,9 @@ export default definePlugin({
 
     /** Edit stages whose Claude run is done and whose commit is still being made. Lost on a restart, which just reruns the stage. */
     const committing = new Map<string, { stage: string; status: 'passed' | 'failed'; out: StageOutput }>();
-    const stagesOf = (jobId: string) => ctx.jobs.stages(jobId).filter((s) => !outputOf(s).interrupted);
+    const stagesOf = async (jobId: string) => (await ctx.jobs.stages(jobId)).filter((s) => !outputOf(s).interrupted);
     const lastOf = (stages: Stage[], name: string) => [...stages].reverse().find((s) => s.name === name);
-    const runningStage = (jobId: string, name: string) => ctx.jobs.stages(jobId).find((s) => s.name === name && s.status === 'running');
+    const runningStage = async (jobId: string, name: string) => (await ctx.jobs.stages(jobId)).find((s) => s.name === name && s.status === 'running');
     const textOf = (stages: Stage[], name: string) => outputOf(lastOf(stages, name) ?? ({ output: null } as Stage)).result ?? '';
 
     /**
@@ -128,31 +128,31 @@ export default definePlugin({
      * waits until no stage of the job is still running: a Claude that is being stopped would otherwise write into,
      * or recreate, a worktree that was just removed. Every stage that closes calls this again.
      */
-    function cleanupIfIdle(jobId: string): void {
+    async function cleanupIfIdle(jobId: string): Promise<void> {
       if (cfg.keepFailedWorktrees || cleanupAsked.has(jobId)) return;
-      const job = ctx.jobs.get(jobId);
+      const job = await ctx.jobs.get(jobId);
       if (!job || (job.status !== 'failed' && job.status !== 'cancelled')) return;
-      const stages = ctx.jobs.stages(jobId);
+      const stages = await ctx.jobs.stages(jobId);
       // A stage waiting for a person has no process behind it, so it does not hold the cleanup up.
       if (stages.some((s) => s.status === 'running' && !s.name.startsWith('approve-'))) return;
       const wt = lastOf(stages.filter((s) => !outputOf(s).interrupted), 'worktree');
       const branch = wt?.status === 'passed' ? outputOf(wt).branch : undefined;
       if (typeof branch !== 'string' || !branch) return;
       cleanupAsked.add(jobId);
-      for (const s of stages) if (s.status === 'running') ctx.jobs.finishStage(s.id, 'failed', { cancelled: true });
+      for (const s of stages) if (s.status === 'running') await ctx.jobs.finishStage(s.id, 'failed', { cancelled: true });
       ctx.emit('worktree.cleanup.requested', { repoPath: job.repo, branch }, jobId);
     }
 
     /** Close a stage, then see whether that was the last thing holding up a cleanup. */
-    function finish(s: Stage, status: 'passed' | 'failed', output?: unknown): void {
-      ctx.jobs.finishStage(s.id, status, output);
-      cleanupIfIdle(s.jobId);
+    async function finish(s: Stage, status: 'passed' | 'failed', output?: unknown): Promise<void> {
+      await ctx.jobs.finishStage(s.id, status, output);
+      await cleanupIfIdle(s.jobId);
     }
 
-    function fail(jobId: string, reason: string, extra: Record<string, unknown> = {}): void {
-      const job = ctx.jobs.get(jobId);
+    async function fail(jobId: string, reason: string, extra: Record<string, unknown> = {}): Promise<void> {
+      const job = await ctx.jobs.get(jobId);
       if (!job || job.status === 'failed' || job.status === 'done' || job.status === 'cancelled') return;
-      ctx.jobs.setStatus(jobId, 'failed');
+      await ctx.jobs.setStatus(jobId, 'failed');
       ctx.emit('pipeline.failed', { reason, ...extra }, jobId);
     }
 
@@ -163,16 +163,32 @@ export default definePlugin({
       return Array.isArray(scope) && scope.length > 0 ? scope : undefined;
     };
 
-    /** Run a handler's body; if it throws, the job fails with the reason instead of hanging. */
-    function guard(jobId: string | undefined, body: () => void): void {
+    /**
+     * Every handler body runs through this one queue, so a handler runs to completion before the next one starts, in the
+     * order the bus delivered the events. Job calls are async, so without it two events for one job could be worked on
+     * at once, and the state machine below (stage records, decide, advance) was never built for that. A failure is
+     * passed on to whoever waits for the run, and never stops the queue.
+     */
+    let queue: Promise<unknown> = Promise.resolve();
+    function serial<T>(body: () => T | Promise<T>): Promise<T> {
+      const run = queue.then(body);
+      queue = run.catch(() => undefined);
+      return run;
+    }
+
+    /** Run a body now; if it throws, the job fails with the reason instead of hanging. */
+    async function attempt(jobId: string | undefined, body: () => void | Promise<void>): Promise<void> {
       try {
-        body();
+        await body();
       } catch (err) {
         const reason = err instanceof Error ? err.message : String(err);
         ctx.log.error(`pipeline-dev: ${reason}`);
-        if (jobId) fail(jobId, reason);
+        if (jobId) await fail(jobId, reason);
       }
     }
+
+    /** A handler's body, in its turn on the queue, with a failure turned into a failed job. */
+    const guard = (jobId: string | undefined, body: () => void | Promise<void>): Promise<void> => serial(() => attempt(jobId, body));
 
     /** The PR's record of what each stage did and which claims had no record behind them. Nothing when no gate ran. */
     function evidenceSection(stages: Stage[]): string[] {
@@ -188,28 +204,28 @@ export default definePlugin({
       ];
     }
 
-    function advance(jobId: string): void {
-      const job = ctx.jobs.get(jobId);
+    async function advance(jobId: string): Promise<void> {
+      const job = await ctx.jobs.get(jobId);
       if (!job) return;
-      const action = decide(job, stagesOf(jobId), maxBuilds);
-      perform(job, action);
+      const action = decide(job, await stagesOf(jobId), maxBuilds);
+      await perform(job, action);
     }
 
-    function perform(job: Job, action: Action): void {
-      const stages = stagesOf(job.id);
+    async function perform(job: Job, action: Action): Promise<void> {
+      const stages = await stagesOf(job.id);
       switch (action.kind) {
         case 'wait':
           return;
         case 'done':
-          if (job.status !== 'done') ctx.jobs.setStatus(job.id, 'done');
+          if (job.status !== 'done') await ctx.jobs.setStatus(job.id, 'done');
           return;
         case 'cancelled':
-          if (job.status !== 'cancelled') ctx.jobs.setStatus(job.id, 'cancelled');
+          if (job.status !== 'cancelled') await ctx.jobs.setStatus(job.id, 'cancelled');
           return;
         case 'fail':
-          return fail(job.id, action.reason, action.outOfScope ? { outOfScope: action.outOfScope } : {});
+          return await fail(job.id, action.reason, action.outOfScope ? { outOfScope: action.outOfScope } : {});
         case 'worktree': {
-          ctx.jobs.startStage(job.id, 'worktree');
+          await ctx.jobs.startStage(job.id, 'worktree');
           const branch = `${prefix}/${slug(job.title)}-${job.id.slice(0, 8)}`;
           ctx.emit('worktree.requested', { repoPath: job.repo, branch }, job.id);
           return;
@@ -219,7 +235,7 @@ export default definePlugin({
           const name = action.name;
           const scope = scopeOf(stages);
           // Nothing that edits files runs without an approved scope on record.
-          if (!READONLY.has(name) && !scope) return fail(job.id, `the approved plan has no recorded SCOPE, so ${name} was not run`);
+          if (!READONLY.has(name) && !scope) return await fail(job.id, `the approved plan has no recorded SCOPE, so ${name} was not run`);
           const prompt = renderPrompt(name, {
             scope: scopeLines(scope),
             title: job.title,
@@ -230,7 +246,7 @@ export default definePlugin({
             sha: String(outputOf(lastOf(stages, 'docs') ?? ({ output: null } as Stage)).sha ?? ''),
             feedback: action.feedback ? `\nThis is a retry. Fix these problems first:\n\n${clip(action.feedback)}\n` : '',
           });
-          ctx.jobs.startStage(job.id, name);
+          await ctx.jobs.startStage(job.id, name);
           ctx.emit(
             'stage.requested',
             {
@@ -246,8 +262,8 @@ export default definePlugin({
         }
         case 'approve': {
           const stageName = `approve-${action.which}`;
-          ctx.jobs.startStage(job.id, stageName);
-          ctx.jobs.setStatus(job.id, 'awaiting_approval');
+          await ctx.jobs.startStage(job.id, stageName);
+          await ctx.jobs.setStatus(job.id, 'awaiting_approval');
           if (action.which === 'plan') {
             const summary = withEvidence(evidenceBlock(stages, ['plan', 'critique']), `PLAN\n${textOf(stages, 'plan')}\n\nCRITIQUE\n${textOf(stages, 'critique')}`);
             ctx.emit('approval.requested', { jobId: job.id, kind: 'plan', summary: clip(summary, 4000), scope: scopeOf(stages) ?? [] }, job.id);
@@ -274,7 +290,7 @@ export default definePlugin({
         case 'pr': {
           const wt = outputOf(lastOf(stages, 'worktree')!);
           const reviewed = outputOf(lastOf(stages, 'docs')!);
-          ctx.jobs.startStage(job.id, 'pr');
+          await ctx.jobs.startStage(job.id, 'pr');
           const warned = [...new Set(stages.flatMap((st) => outputOf(st).scopeWarning ?? []))];
           const body = [
             job.body ? `## Task\n\n${job.body}` : `## Task\n\n${job.title}`,
@@ -294,7 +310,7 @@ export default definePlugin({
         case 'merge': {
           const wt = outputOf(lastOf(stages, 'worktree')!);
           const pr = outputOf(lastOf(stages, 'pr')!);
-          ctx.jobs.startStage(job.id, 'merge');
+          await ctx.jobs.startStage(job.id, 'merge');
           ctx.emit('merge.requested', { cwd: String(wt.cwd), branch: String(wt.branch), number: pr.number, headSha: pr.headSha }, job.id);
           return;
         }
@@ -303,90 +319,92 @@ export default definePlugin({
 
     // ----- resume -----
 
-    ctx.on('kernel.started', () => {
-      if (cfg.resume === false) return;
-      for (const job of ctx.jobs.list()) {
-        if (Array.isArray(cfg.resume) && !cfg.resume.includes(job.id)) continue;
-        if (job.status === 'failed' || job.status === 'cancelled') {
-          // The job ended while a stage was running and the process died before the stage closed. Close it, and
-          // the cleanup that was waiting for it can go ahead.
-          guard(job.id, () => {
-            for (const s of ctx.jobs.stages(job.id)) {
-              if (s.status === 'running') finish(s, 'failed', { interrupted: true, reason: 'interrupted', error: 'process stopped mid-stage' });
+    ctx.on('kernel.started', () =>
+      serial(async () => {
+        if (cfg.resume === false) return;
+        for (const job of await ctx.jobs.list()) {
+          if (Array.isArray(cfg.resume) && !cfg.resume.includes(job.id)) continue;
+          if (job.status === 'failed' || job.status === 'cancelled') {
+            // The job ended while a stage was running and the process died before the stage closed. Close it, and
+            // the cleanup that was waiting for it can go ahead.
+            await attempt(job.id, async () => {
+              for (const s of await ctx.jobs.stages(job.id)) {
+                if (s.status === 'running') await finish(s, 'failed', { interrupted: true, reason: 'interrupted', error: 'process stopped mid-stage' });
+              }
+            });
+            continue;
+          }
+          if (job.status !== 'queued' && job.status !== 'running') continue;
+          await attempt(job.id, async () => {
+            // A stage still marked running belongs to a process that is gone. Mark it, and it runs again.
+            let mayHaveHalfDoneEdits = false;
+            for (const s of await ctx.jobs.stages(job.id)) {
+              if (s.status !== 'running') continue;
+              await finish(s, 'failed', { interrupted: true, reason: 'interrupted', error: 'process stopped mid-stage' });
+              if (EDITING.has(s.name)) mayHaveHalfDoneEdits = true;
             }
+            if (job.status === 'queued') await ctx.jobs.setStatus(job.id, 'running');
+            // Throw away what the dead stage left on disk. Finished edit stages were committed, so this only costs the cut-off one.
+            const wt = lastOf(await stagesOf(job.id), 'worktree');
+            if (mayHaveHalfDoneEdits && wt?.status === 'passed' && outputOf(wt).cwd) {
+              await ctx.jobs.startStage(job.id, 'reset');
+              ctx.emit('worktree.reset.requested', { cwd: String(outputOf(wt).cwd) }, job.id);
+              return;
+            }
+            await advance(job.id);
           });
-          continue;
         }
-        if (job.status !== 'queued' && job.status !== 'running') continue;
-        guard(job.id, () => {
-          // A stage still marked running belongs to a process that is gone. Mark it, and it runs again.
-          let mayHaveHalfDoneEdits = false;
-          for (const s of ctx.jobs.stages(job.id)) {
-            if (s.status !== 'running') continue;
-            finish(s, 'failed', { interrupted: true, reason: 'interrupted', error: 'process stopped mid-stage' });
-            if (EDITING.has(s.name)) mayHaveHalfDoneEdits = true;
-          }
-          if (job.status === 'queued') ctx.jobs.setStatus(job.id, 'running');
-          // Throw away what the dead stage left on disk. Finished edit stages were committed, so this only costs the cut-off one.
-          const wt = lastOf(stagesOf(job.id), 'worktree');
-          if (mayHaveHalfDoneEdits && wt?.status === 'passed' && outputOf(wt).cwd) {
-            ctx.jobs.startStage(job.id, 'reset');
-            ctx.emit('worktree.reset.requested', { cwd: String(outputOf(wt).cwd) }, job.id);
-            return;
-          }
-          advance(job.id);
-        });
-      }
-    });
+      }),
+    );
 
     // ----- the graph -----
 
     ctx.on('job.created', (e: BuligEvent) => {
-      guard(e.jobId, () => {
+      return guard(e.jobId, async () => {
         if (!e.jobId) return;
-        ctx.jobs.setStatus(e.jobId, 'running');
-        advance(e.jobId);
+        await ctx.jobs.setStatus(e.jobId, 'running');
+        await advance(e.jobId);
       });
     });
 
     ctx.on('worktree.ready', (e) => {
-      guard(e.jobId, () => {
-        const s = e.jobId && runningStage(e.jobId, 'worktree');
+      return guard(e.jobId, async () => {
+        const s = e.jobId && await runningStage(e.jobId, 'worktree');
         if (!e.jobId || !s) return;
         const p = e.payload as { cwd: string; branch: string };
-        finish(s, 'passed', { cwd: p.cwd, branch: p.branch });
-        advance(e.jobId);
+        await finish(s, 'passed', { cwd: p.cwd, branch: p.branch });
+        await advance(e.jobId);
       });
     });
 
     ctx.on('worktree.failed', (e) => {
-      guard(e.jobId, () => {
-        const s = e.jobId && runningStage(e.jobId, 'worktree');
+      return guard(e.jobId, async () => {
+        const s = e.jobId && await runningStage(e.jobId, 'worktree');
         if (!e.jobId || !s) return;
         const error = (e.payload as { error?: string }).error ?? 'unknown';
-        finish(s, 'failed', { error });
-        fail(e.jobId, `worktree failed: ${error}`);
+        await finish(s, 'failed', { error });
+        await fail(e.jobId, `worktree failed: ${error}`);
       });
     });
 
     // An edit stage is not finished until its work is committed. That commit is the checkpoint a restart
     // resets to, and after the last one (docs) it is the commit the reviewer judges and the PR must match.
     ctx.on('worktree.reset.done', (e) => {
-      guard(e.jobId, () => {
-        const s = e.jobId && runningStage(e.jobId, 'reset');
+      return guard(e.jobId, async () => {
+        const s = e.jobId && await runningStage(e.jobId, 'reset');
         if (!e.jobId || !s) return;
-        finish(s, 'passed', e.payload);
-        advance(e.jobId);
+        await finish(s, 'passed', e.payload);
+        await advance(e.jobId);
       });
     });
 
     ctx.on('worktree.reset.failed', (e) => {
-      guard(e.jobId, () => {
-        const s = e.jobId && runningStage(e.jobId, 'reset');
+      return guard(e.jobId, async () => {
+        const s = e.jobId && await runningStage(e.jobId, 'reset');
         if (!e.jobId || !s) return;
         const error = (e.payload as { error?: string }).error ?? 'unknown';
-        finish(s, 'failed', { error });
-        fail(e.jobId, `could not reset the worktree after the restart: ${error}`);
+        await finish(s, 'failed', { error });
+        await fail(e.jobId, `could not reset the worktree after the restart: ${error}`);
       });
     });
 
@@ -394,50 +412,50 @@ export default definePlugin({
     ctx.on('job.status', (e) => {
       const to = (e.payload as { to?: string } | null)?.to;
       if (!e.jobId || (to !== 'failed' && to !== 'cancelled')) return;
-      guard(e.jobId, () => cleanupIfIdle(e.jobId!));
+      return guard(e.jobId, () => cleanupIfIdle(e.jobId!));
     });
 
     // A channel asks to stop a job. Ending a job needs jobs.write, which only this plugin holds.
     ctx.on('cancel.requested', (e) => {
-      guard(e.jobId, () => {
-        const job = e.jobId ? ctx.jobs.get(e.jobId) : undefined;
+      return guard(e.jobId, async () => {
+        const job = e.jobId ? await ctx.jobs.get(e.jobId) : undefined;
         if (!job || job.status === 'done' || job.status === 'failed' || job.status === 'cancelled') return;
         // A stage waiting for a person is closed here. A running Claude is stopped by the worker, which also hears job.status.
-        for (const s of ctx.jobs.stages(job.id)) if (s.status === 'running' && s.name.startsWith('approve-')) finish(s, 'failed', { cancelled: true });
-        ctx.jobs.setStatus(job.id, 'cancelled');
+        for (const s of await ctx.jobs.stages(job.id)) if (s.status === 'running' && s.name.startsWith('approve-')) await finish(s, 'failed', { cancelled: true });
+        await ctx.jobs.setStatus(job.id, 'cancelled');
       });
     });
 
     ctx.on('commit.done', (e) => {
-      guard(e.jobId, () => {
+      return guard(e.jobId, async () => {
         const wait = e.jobId ? committing.get(e.jobId) : undefined;
-        const s = e.jobId && wait && runningStage(e.jobId, wait.stage);
+        const s = e.jobId && wait && await runningStage(e.jobId, wait.stage);
         if (!e.jobId || !wait || !s) return;
         committing.delete(e.jobId);
         const p = e.payload as { sha: string; base: string; outOfScope?: unknown };
         const warned = Array.isArray(p.outOfScope) ? p.outOfScope.filter((x): x is string => typeof x === 'string') : [];
-        finish(s, wait.status, { ...wait.out, sha: p.sha, base: p.base, ...(warned.length && { scopeWarning: warned }) });
-        advance(e.jobId);
+        await finish(s, wait.status, { ...wait.out, sha: p.sha, base: p.base, ...(warned.length && { scopeWarning: warned }) });
+        await advance(e.jobId);
       });
     });
 
     ctx.on('commit.failed', (e) => {
-      guard(e.jobId, () => {
+      return guard(e.jobId, async () => {
         const wait = e.jobId ? committing.get(e.jobId) : undefined;
-        const s = e.jobId && wait && runningStage(e.jobId, wait.stage);
+        const s = e.jobId && wait && await runningStage(e.jobId, wait.stage);
         if (!e.jobId || !wait || !s) return;
         committing.delete(e.jobId);
         const p = e.payload as { error?: string; outOfScope?: unknown };
         // Files outside the approved scope are not a crash: it counts as a failed attempt, and the build stage is told which files.
         const files = Array.isArray(p.outOfScope) ? p.outOfScope.filter((x): x is string => typeof x === 'string') : [];
         if (files.length) {
-          finish(s, 'failed', { ...wait.out, outOfScope: files });
-          advance(e.jobId);
+          await finish(s, 'failed', { ...wait.out, outOfScope: files });
+          await advance(e.jobId);
           return;
         }
         const error = p.error ?? 'unknown';
-        finish(s, 'failed', { error: `commit failed: ${error}` });
-        fail(e.jobId, `${wait.stage} could not be committed: ${error}`);
+        await finish(s, 'failed', { error: `commit failed: ${error}` });
+        await fail(e.jobId, `${wait.stage} could not be committed: ${error}`);
       });
     });
 
@@ -454,9 +472,9 @@ export default definePlugin({
     }
 
     ctx.on(resultEvent, (e) => {
-      guard(e.jobId, () => {
+      return guard(e.jobId, async () => {
         const p = e.payload as { stage: string; result?: string; sessionId?: string; costUsd?: number; evidenceSummary?: unknown; evidenceLines?: unknown; unverified?: unknown; promises?: unknown };
-        const s = e.jobId && runningStage(e.jobId, p.stage);
+        const s = e.jobId && await runningStage(e.jobId, p.stage);
         if (!e.jobId || !s) return;
         const result = p.result ?? '';
         const out: StageOutput = { result, sessionId: p.sessionId, costUsd: p.costUsd };
@@ -487,19 +505,19 @@ export default definePlugin({
             if (!verdict) out.result = `${result}\n\n(The ${p.stage} stage did not end with a VERDICT line, so it counts as a fail.)`;
           }
         }
-        const live = ctx.jobs.get(e.jobId);
+        const live = await ctx.jobs.get(e.jobId);
         const ended = live?.status === 'failed' || live?.status === 'cancelled';
         if (!READONLY.has(p.stage as ClaudeStage) && !ended) {
           // Hold the result until the work is committed.
-          const wt = outputOf(lastOf(stagesOf(e.jobId), 'worktree')!);
+          const wt = outputOf(lastOf(await stagesOf(e.jobId), 'worktree')!);
           committing.set(e.jobId, { stage: p.stage, status, out });
-          const job = ctx.jobs.get(e.jobId);
+          const job = await ctx.jobs.get(e.jobId);
           ctx.emit(
             'commit.requested',
             {
               cwd: String(wt.cwd),
               message: `${job?.title ?? 'work'} (${p.stage})`,
-              scope: scopeOf(stagesOf(e.jobId)) ?? [],
+              scope: scopeOf(await stagesOf(e.jobId)) ?? [],
               scopeAllow,
               scopeMode,
               allowBroadScope: allowBroad,
@@ -508,92 +526,92 @@ export default definePlugin({
           );
           return;
         }
-        finish(s, status, out);
-        advance(e.jobId);
+        await finish(s, status, out);
+        await advance(e.jobId);
       });
     });
 
     ctx.on('stage.failed', (e) => {
-      guard(e.jobId, () => {
+      return guard(e.jobId, async () => {
         const p = e.payload as { stage: string; error?: string };
-        const s = e.jobId && runningStage(e.jobId, p.stage);
+        const s = e.jobId && await runningStage(e.jobId, p.stage);
         if (!e.jobId || !s) return;
         const error = p.error ?? 'unknown';
-        finish(s, 'failed', { error });
-        fail(e.jobId, `${p.stage} failed: ${error}`);
+        await finish(s, 'failed', { error });
+        await fail(e.jobId, `${p.stage} failed: ${error}`);
       });
     });
 
     ctx.on('approval.granted', (e) => {
-      guard(e.jobId, () => {
+      return guard(e.jobId, async () => {
         const p = e.payload as { jobId?: string; kind?: string };
         const jobId = e.jobId ?? p.jobId;
-        const s = jobId && p.kind && runningStage(jobId, `approve-${p.kind}`);
+        const s = jobId && p.kind && await runningStage(jobId, `approve-${p.kind}`);
         if (!jobId || !s) return;
-        finish(s, 'passed', { grantedBy: e.source });
-        ctx.jobs.setStatus(jobId, 'running');
-        advance(jobId);
+        await finish(s, 'passed', { grantedBy: e.source });
+        await ctx.jobs.setStatus(jobId, 'running');
+        await advance(jobId);
       });
     });
 
     ctx.on('approval.denied', (e) => {
-      guard(e.jobId, () => {
+      return guard(e.jobId, async () => {
         const p = e.payload as { jobId?: string };
         const jobId = e.jobId ?? p.jobId;
-        const s = jobId && ctx.jobs.stages(jobId).find((x) => x.name.startsWith('approve-') && x.status === 'running');
+        const s = jobId && (await ctx.jobs.stages(jobId)).find((x) => x.name.startsWith('approve-') && x.status === 'running');
         if (!jobId || !s) return;
-        finish(s, 'failed', { deniedBy: e.source });
-        ctx.jobs.setStatus(jobId, 'cancelled');
+        await finish(s, 'failed', { deniedBy: e.source });
+        await ctx.jobs.setStatus(jobId, 'cancelled');
       });
     });
 
     ctx.on('pr.opened', (e) => {
-      guard(e.jobId, () => {
-        const s = e.jobId && runningStage(e.jobId, 'pr');
+      return guard(e.jobId, async () => {
+        const s = e.jobId && await runningStage(e.jobId, 'pr');
         if (!e.jobId || !s) return;
         const p = e.payload as { url: string; number: number; headSha: string };
-        finish(s, 'passed', { url: p.url, number: p.number, headSha: p.headSha });
-        advance(e.jobId);
+        await finish(s, 'passed', { url: p.url, number: p.number, headSha: p.headSha });
+        await advance(e.jobId);
       });
     });
 
     ctx.on('pr.failed', (e) => {
-      guard(e.jobId, () => {
-        const s = e.jobId && runningStage(e.jobId, 'pr');
+      return guard(e.jobId, async () => {
+        const s = e.jobId && await runningStage(e.jobId, 'pr');
         if (!e.jobId || !s) return;
         const error = (e.payload as { error?: string }).error ?? 'unknown';
-        finish(s, 'failed', { error });
-        fail(e.jobId, `pr failed: ${error}`);
+        await finish(s, 'failed', { error });
+        await fail(e.jobId, `pr failed: ${error}`);
       });
     });
 
     ctx.on('merge.refused', (e) => {
-      guard(e.jobId, () => {
-        const s = e.jobId && runningStage(e.jobId, 'merge');
+      return guard(e.jobId, async () => {
+        const s = e.jobId && await runningStage(e.jobId, 'merge');
         if (!e.jobId || !s) return;
         const reason = (e.payload as { reason?: string }).reason ?? 'unknown';
-        finish(s, 'failed', { refused: reason });
-        advance(e.jobId);
+        await finish(s, 'failed', { refused: reason });
+        await advance(e.jobId);
       });
     });
 
     // The merge can never go through (the PR was closed, or merged at a different commit). Do not ask again.
     ctx.on('merge.failed', (e) => {
-      guard(e.jobId, () => {
-        const s = e.jobId && runningStage(e.jobId, 'merge');
+      return guard(e.jobId, async () => {
+        const s = e.jobId && await runningStage(e.jobId, 'merge');
         if (!e.jobId || !s) return;
         const reason = (e.payload as { reason?: string }).reason ?? 'unknown';
-        finish(s, 'failed', { error: reason });
-        fail(e.jobId, `merge failed: ${reason}`);
+        await finish(s, 'failed', { error: reason });
+        await fail(e.jobId, `merge failed: ${reason}`);
       });
     });
 
     ctx.on('pr.merged', (e) => {
-      guard(e.jobId, () => {
-        const s = e.jobId && runningStage(e.jobId, 'merge');
+      return guard(e.jobId, async () => {
+        const s = e.jobId && await runningStage(e.jobId, 'merge');
         if (!e.jobId || !s) return;
-        finish(s, 'passed', e.payload);
-        advance(e.jobId);
+        await finish(s, 'passed', e.payload);
+        await advance(e.jobId);
       });
     });
   },

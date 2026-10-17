@@ -20,6 +20,9 @@ import {
 import type { Bus } from './bus.ts';
 import { JOBS_WRITE, TERMINAL_STATUSES, effectiveCapabilities, isApprovalStage } from './capabilities.ts';
 
+/** The kernel's own job object: the same seven calls as the plugin API, but synchronous. Plugins never see this one. */
+export type KernelJobs = { [K in keyof JobsApi]: JobsApi[K] extends (...args: infer A) => Promise<infer R> ? (...args: A) => R : never };
+
 export interface LoadOptions {
   plugins: Plugin[];
   /** Names of plugins to run. Anything else is skipped. */
@@ -27,7 +30,7 @@ export interface LoadOptions {
   grants: Record<string, string[]>;
   pluginConfig: Record<string, Record<string, unknown>>;
   bus: Bus;
-  jobs: JobsApi;
+  jobs: KernelJobs;
   /** Name of a stage by id. Used to tell approval stages from the rest. */
   stageName?: (stageId: string) => string | undefined;
   /** Reads and writes one plugin's state. The kernel passes the store. */
@@ -75,13 +78,18 @@ export function selectPlugins(plugins: Plugin[], enabled: string[]): LoadedPlugi
  * jobs.write: opening or closing an approval stage, ending a job, or moving a job out of awaiting_approval.
  * A plugin without it cannot approve, cancel or finish work, even though it holds the API.
  */
-function gateJobs(name: string, caps: ReadonlySet<string>, jobs: JobsApi, stageName: (id: string) => string | undefined): JobsApi {
+function gateJobs(name: string, caps: ReadonlySet<string>, jobs: KernelJobs, stageName: (id: string) => string | undefined): JobsApi {
   const need = (what: string) => {
     if (!caps.has(JOBS_WRITE)) throw new CapabilityDeniedError(`Plugin "${name}" was denied "${JOBS_WRITE}" (needed to ${what})`);
   };
+  // async functions run their body up to the first await at once, so every check and the write behind it happen in the
+  // same tick, as they did when the calls were synchronous. A failed check rejects instead of throwing.
   return {
-    ...jobs,
-    setStatus(id, status) {
+    create: async (input) => jobs.create(input),
+    get: async (id) => jobs.get(id),
+    list: async (filter) => jobs.list(filter),
+    stages: async (jobId) => jobs.stages(jobId),
+    async setStatus(id, status) {
       const current = jobs.get(id)?.status;
       // Terminal is final: no plugin may reopen a done, failed or cancelled job, because that undoes a person's cancel.
       if (current !== undefined && TERMINAL_STATUSES.includes(current) && current !== status) {
@@ -91,11 +99,11 @@ function gateJobs(name: string, caps: ReadonlySet<string>, jobs: JobsApi, stageN
       else if (jobs.get(id)?.status === 'awaiting_approval') need('move a job out of awaiting_approval');
       return jobs.setStatus(id, status);
     },
-    startStage(jobId, stage) {
+    async startStage(jobId, stage) {
       if (isApprovalStage(stage)) need(`open the "${stage}" stage`);
       return jobs.startStage(jobId, stage);
     },
-    finishStage(stageId, status, output) {
+    async finishStage(stageId, status, output) {
       const stage = stageName(stageId);
       if (isApprovalStage(stage)) need(`finish the "${stage}" stage`);
       return jobs.finishStage(stageId, status, output);

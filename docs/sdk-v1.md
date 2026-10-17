@@ -191,6 +191,8 @@ A **breaking change** (needs major 2) is any of these, for something marked stab
 
 These are **not** breaking: adding a manifest field with a default, an event, an optional payload field, a capability, an export, a job status or a stage name; fixing a bug where the code did less than this page says; and anything marked experimental.
 
+**While the SDK is a release candidate** (`1.0.0-rc.N`), the maintainer may still change items marked stable, including their types or their sync or async shape. Each such change is recorded in an ADR and in the pull request that makes it, and the freeze takes effect at `1.0.0` final. Once `1.0.0` is out, the rules above apply to everything marked stable.
+
 ## 8. Deprecation
 
 These windows are confirmed (Jasher, 12 Oct 2026; [ADR 0006](adr/0006-sdk-v1.md)). They are the rule, not a proposal.

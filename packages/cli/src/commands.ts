@@ -366,7 +366,7 @@ function connectionString(config: Pick<BuligConfig, 'store'>, io: Io): string {
     assertPostgresUrl(url);
   } catch {
     // Never repeat the value: it may hold a password.
-    throw new UserError(`The environment variable "${name}" does not hold a Postgres connection string. It must start with postgres:// or postgresql://.`);
+    throw new UserError(`The environment variable "${name}" does not hold a usable Postgres connection string. It must start with postgres:// or postgresql:// and name a host (or a host= parameter).`);
   }
   return url;
 }

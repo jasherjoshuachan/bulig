@@ -283,7 +283,7 @@ describePg('PostgresStore', () => {
       });
 
       it('refuses a string with no host, because the driver would dial localhost on the default port; it only parses, it opens nothing', () => {
-        for (const bad of ['postgres://', 'postgres:///bulig', 'postgresql://u:S3cretPW@/db', 'postgres://?sslmode=disable', 'postgres://u:S3cretPW@:5432/db', 'postgresql:///db?host=']) {
+        for (const bad of ['postgres://', 'postgres:///bulig', 'postgresql://u:S3cretPW@/db', 'postgres://?sslmode=disable', 'postgres://u:S3cretPW@:5432/db', 'postgresql:///db?host=', 'postgres:///db&host=x', 'postgres:///db/&host=/tmp', 'postgres://u:S3cretPW@/db&host=evil']) {
           let message = '';
           try {
             new PostgresStore(bad);

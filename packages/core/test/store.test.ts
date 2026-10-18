@@ -6,7 +6,7 @@ import { SqliteStore } from '../src/index.ts';
 import { tempDb } from './helpers.ts';
 import { describeStoreContract, type StoreHandle } from './store-contract.ts';
 
-// The shared behaviour every adapter has to show. The Postgres adapter will run the same function.
+// The shared behaviour every adapter has to show. postgres-store.test.ts runs the same function for PostgresStore.
 describeStoreContract(
   'SqliteStore',
   async (): Promise<StoreHandle> => {

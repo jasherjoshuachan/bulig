@@ -17,7 +17,7 @@ export BULIG_DATABASE_URL='postgresql://bulig_role@db-host:5432/bulig'
 { "store": { "kind": "postgres", "urlEnv": "BULIG_DATABASE_URL" } }
 ```
 
-The config refuses a connection string in `urlEnv`, and refuses a `url` key, so a password cannot end up in the file by mistake. The variable's value must start with `postgres://` or `postgresql://`; anything else is refused with an error that does not repeat it. No SQLite file is made.
+The config refuses a connection string in `urlEnv`, and refuses a `url` key, so a password cannot end up in the file by mistake. The variable's value must start with `postgres://` or `postgresql://` and name a host (or give a `host=` parameter in the query string, which can be a socket folder); anything else is refused with an error that does not repeat it. A string with no host would make the driver dial localhost on the default port, so it is refused rather than guessed. No SQLite file is made.
 
 ## One writer
 
@@ -61,7 +61,7 @@ To use a server that already runs, set `BULIG_PG_TEST_URL` to a connection strin
 BULIG_PG_TEST_URL='postgresql://postgres:secret@127.0.0.1:5432/postgres' pnpm test
 ```
 
-If the test run gets SIGINT, SIGTERM or SIGHUP, or exits any way that runs JavaScript, the cluster is stopped and its folder deleted. SIGKILL cannot be caught, so a cluster can be left behind; each folder holds `owner.pid`, and the next run that makes a cluster sweeps any `bulig-pg-*` folder whose owner process is gone (`sweepStaleClusters` in `packages/core/test/pg-cluster.ts`). The sweep sends a signal only to a process it can prove is that folder's postmaster (a `postgres` whose command line has exactly `-D <folder>/data`), then deletes the folder. If `postmaster.pid` names a live process that is not that postmaster, it signals nothing, waits for nothing, leaves the folder and says so once. It never uses `pg_ctl` on a folder it did not just prove, and never touches a folder without `owner.pid` or with a live owner.
+If the test run gets SIGINT, SIGTERM or SIGHUP, or exits any way that runs JavaScript, the cluster is stopped and its folder deleted. SIGKILL cannot be caught, so a cluster can be left behind; each folder holds `owner.pid`, and the next run that makes a cluster sweeps any `bulig-pg-*` folder whose owner process is gone (`sweepStaleClusters` in `packages/core/test/pg-cluster.ts`). The sweep sends a signal only to a process that passes a check: its executable is named `postgres` and its command line has exactly `-D <folder>/data`. That is a check of the name and arguments, not proof of identity, but only something started on that random folder can match it. Then it deletes the folder. If `postmaster.pid` names a live process that fails the check, it signals nothing, waits for nothing, leaves the folder and says so once. It never uses `pg_ctl` on a leftover folder, and never touches a folder without `owner.pid` or with a live owner.
 
 With neither `initdb` and `pg_ctl` nor `BULIG_PG_TEST_URL`, the Postgres suites skip and print `Postgres suites skipped: ...`. `scripts/verify.sh` notes the skip, and fails on it when `CI` is set.
 

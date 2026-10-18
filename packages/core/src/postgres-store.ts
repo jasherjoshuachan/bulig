@@ -109,7 +109,10 @@ export function assertPostgresUrl(url: string): void {
   if (!m) throw new Error(CONNECTION_STRING_HELP);
   const authority = m[1]!;
   const host = authority.slice(authority.lastIndexOf('@') + 1).replace(/:\d*$/, '');
-  const hostParam = /[?&]host=([^&]+)/.exec(m[2]!)?.[1];
+  // Only the query string (after the first `?`) can name a host: an `&host=` inside the path is part of the database name.
+  const rest = m[2]!;
+  const q = rest.indexOf('?');
+  const hostParam = q === -1 ? undefined : /(?:^|&)host=([^&]+)/.exec(rest.slice(q + 1))?.[1];
   if (!host && !hostParam) throw new Error(CONNECTION_STRING_HELP);
 }
 const CONNECTION_STRING_HELP = 'The Postgres connection string must start with postgres:// or postgresql:// and name a host (for example postgresql://user@host/database)';
@@ -140,7 +143,9 @@ export interface PostgresStoreOptions {
  * transaction has to stay on a single connection. The pg client queues queries in the order they were made, which is
  * what the port promises for calls made one after another.
  *
- * The connection opens, and the schema is brought up to date, on the first call (or in `PostgresStore.open`, which waits
+ * The connection opens on the first call (or in `PostgresStore.open`, which waits for it). A writer also brings the schema up
+ * to date then; a reader never creates or upgrades it and refuses a missing or older schema (SchemaNotReadyError). The line
+ * below is about the constructor:
  * for it). The constructor does not touch the network, so `createKernel`, which is not async, can take a store as it is.
  * The connection string is the caller's: it is never logged here, never read from a file, and never stored anywhere else.
  *

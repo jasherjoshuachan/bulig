@@ -25,7 +25,7 @@ import { bins, pgSupport } from './pg-support.ts';
  *   SIGHUP: the same cleanup runs, then a signal is passed on so the process still ends the way it would have.
  * - SIGKILL (and a power cut) cannot be caught. The cluster and its folder stay behind. Each folder holds `owner.pid`, the
  *   pid of the process that made it, so the next run that makes a cluster calls `sweepStaleClusters()` first. It signals a
- *   process only when it can prove the process is the postmaster of that very folder, and otherwise signals nothing (rules
+ *   process only when it passes a check that it is the postmaster of that very folder (name and arguments), and otherwise signals nothing (rules
  *   on `sweepStaleClusters`). Folders without `owner.pid`, and folders whose owner is alive, are never touched.
  */
 
@@ -111,7 +111,7 @@ const commandOf = (pid: number): string | undefined => {
  * True only when `pid` is a live postgres process started with exactly `-D <data>`. A pid in a leftover postmaster.pid proves
  * nothing by itself: after a crash or a reboot it can belong to any process, including another cluster's postmaster.
  */
-function isPostmasterOf(pid: number, data: string): boolean {
+export function isPostmasterOf(pid: number, data: string): boolean {
   const command = commandOf(pid);
   if (!command) return false;
   const exe = command.split(/\s+/)[0] ?? '';

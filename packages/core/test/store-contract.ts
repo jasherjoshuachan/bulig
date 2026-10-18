@@ -19,7 +19,7 @@ export interface StoreContractOptions {
 }
 
 /**
- * The behaviour every Store adapter must show (ADR 0007). SqliteStore runs it today; the Postgres adapter runs it next.
+ * The behaviour every Store adapter must show (ADR 0007). SqliteStore runs it in store.test.ts and PostgresStore in postgres-store.test.ts.
  * It must not lean on one engine: no file paths, no row ids, no sync calls, no exact event numbers.
  */
 export function describeStoreContract(name: string, make: () => Promise<StoreHandle>, options: StoreContractOptions): void {

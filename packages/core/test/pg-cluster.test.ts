@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import pg from 'pg';
-import { sweepStaleClusters } from './pg-cluster.ts';
+import { isPostmasterOf, sweepStaleClusters } from './pg-cluster.ts';
 import { bins } from './pg-support.ts';
 import { startPgServer } from './pg-throwaway.ts';
 
@@ -56,10 +56,14 @@ describe.skipIf(!canRun)('a throwaway cluster is taken down', () => {
     // Never leave one behind, whatever a test did.
     for (const c of children.splice(0)) {
       c.proc.kill('SIGKILL');
-      try {
-        process.kill(c.postmaster, 'SIGQUIT');
-      } catch {
-        // gone already
+      // Signal the recorded postmaster only if it is still that cluster's postmaster: by now it is usually gone, and its
+      // pid could belong to another process. Anything left is the sweep's job, which runs the same check.
+      if (isPostmasterOf(c.postmaster, join(c.dir, 'data'))) {
+        try {
+          process.kill(c.postmaster, 'SIGQUIT');
+        } catch {
+          // gone already
+        }
       }
     }
     sweepStaleClusters();

@@ -3,7 +3,7 @@ import { dirname, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import { createCliChannel, type CliChannel } from '@bulig/channel-cli';
 import telegram from '@bulig/channel-telegram';
-import { createKernel, SqliteStore, type Kernel, type Store } from '@bulig/core';
+import { createKernel, PostgresStore, SqliteStore, type Kernel, type Store } from '@bulig/core';
 import gate from '@bulig/gate-evidence';
 import gatePromise from '@bulig/gate-promise';
 import github from '@bulig/github';
@@ -18,6 +18,8 @@ export interface Io {
   err(line: string): void;
   cwd: string;
   home: string;
+  /** Where `store.urlEnv` is looked up. Default process.env. */
+  env?: Record<string, string | undefined>;
   /** How often to look at the job while driving it, in ms. */
   pollMs?: number;
   /** Called with a cleanup function that must run if the process is interrupted. */
@@ -158,9 +160,10 @@ async function openSession(
   assertWiring(plugins, config.enabled, pluginConfig, pluginsFor === terminalPlugins ? ['channel-telegram'] : []);
   mkdirSync(dirname(config.dbPath), { recursive: true });
   const release = acquireLock(config.dbPath);
+  const store = io.openStore ? io.openStore(config.dbPath) : config.store.kind === 'postgres' ? new PostgresStore(connectionString(config, io)) : undefined;
   const kernel = createKernel({
     dbPath: config.dbPath,
-    ...(io.openStore && { store: io.openStore(config.dbPath) }),
+    ...(store && { store }),
     plugins,
     enabled: config.enabled,
     grants: config.grants,
@@ -255,7 +258,7 @@ async function cmdApprove(args: string[], io: Io): Promise<number> {
   const [idArg, kind, ...extra] = args;
   if (!idArg || (kind !== 'plan' && kind !== 'merge') || extra.length) throw new UserError('usage: bulig approve <jobId> <plan|merge>');
   const { config } = loadConfig(io.cwd, io.home);
-  const { job, stages } = await lookup(config, idArg);
+  const { job, stages } = await lookup(config, io, idArg);
   const waiting = stages.find((s) => s.name.startsWith('approve-') && s.status === 'running');
   if (job.status !== 'awaiting_approval' || !waiting) {
     throw new UserError(`job ${job.id} is ${job.status.replace('_', ' ')}, not waiting for an approval`);
@@ -277,7 +280,7 @@ async function cmdDeny(args: string[], io: Io): Promise<number> {
   const [idArg, ...extra] = args;
   if (!idArg || extra.length) throw new UserError('usage: bulig deny <jobId>');
   const { config } = loadConfig(io.cwd, io.home);
-  const { job } = await lookup(config, idArg);
+  const { job } = await lookup(config, io, idArg);
   if (job.status !== 'awaiting_approval') throw new UserError(`job ${job.id} is ${job.status.replace('_', ' ')}, not waiting for an approval`);
   const session = await openSession(config, io, false, job.id);
   try {
@@ -293,7 +296,7 @@ async function cmdResume(args: string[], io: Io): Promise<number> {
   const [idArg, ...extra] = args;
   if (!idArg || extra.length) throw new UserError('usage: bulig resume <jobId>');
   const { config } = loadConfig(io.cwd, io.home);
-  const { job } = await lookup(config, idArg);
+  const { job } = await lookup(config, io, idArg);
   if (job.status !== 'running' && job.status !== 'queued') throw new UserError(`job ${job.id} is ${job.status.replace('_', ' ')}; only running jobs resume`);
   const session = await openSession(config, io, [job.id], job.id);
   try {
@@ -332,19 +335,35 @@ async function cmdServe(args: string[], io: Io): Promise<number> {
 
 // ---------- reading ----------
 
-function dbPathFor(io: Io): string {
+/** The config the read commands need: the store only. With no config file at all they look at the default SQLite file. */
+function storeConfigFor(io: Io): Pick<BuligConfig, 'store' | 'dbPath'> {
   try {
-    return loadConfig(io.cwd, io.home).config.dbPath;
+    const { config } = loadConfig(io.cwd, io.home);
+    return { store: config.store, dbPath: config.dbPath };
   } catch (err) {
-    if (err instanceof ConfigError && err.message.startsWith('No config found')) return defaultDbPath(io.home);
+    if (err instanceof ConfigError && err.message.startsWith('No config found')) return { store: { kind: 'sqlite' }, dbPath: defaultDbPath(io.home) };
     throw err;
   }
 }
 
-async function readStore<T>(io: Io, fn: (store: Store) => Promise<T>): Promise<T> {
-  const dbPath = dbPathFor(io);
-  if (!existsSync(dbPath)) throw new UserError(`no database at ${dbPath} yet. Run a job first.`);
-  const store = new SqliteStore(dbPath);
+/** The Postgres connection string, from the variable the config names. Never from the config file itself. */
+function connectionString(config: Pick<BuligConfig, 'store'>, io: Io): string {
+  if (config.store.kind !== 'postgres') throw new Error('connectionString is only for a postgres store');
+  const name = config.store.urlEnv;
+  const url = (io.env ?? process.env)[name];
+  if (!url) throw new UserError(`store.urlEnv is "${name}", but that environment variable is not set. Set it to the Postgres connection string.`);
+  return url;
+}
+
+/** Open the store the kernel is configured with, read from it through the port, and close it. These reads do not go through the kernel queue. */
+async function withConfiguredStore<T>(config: Pick<BuligConfig, 'store' | 'dbPath'>, io: Io, fn: (store: Store) => Promise<T>): Promise<T> {
+  let store: Store;
+  if (config.store.kind === 'postgres') {
+    store = new PostgresStore(connectionString(config, io));
+  } else {
+    if (!existsSync(config.dbPath)) throw new UserError(`no database at ${config.dbPath} yet. Run a job first.`);
+    store = new SqliteStore(config.dbPath);
+  }
   try {
     return await fn(store);
   } finally {
@@ -352,19 +371,17 @@ async function readStore<T>(io: Io, fn: (store: Store) => Promise<T>): Promise<T
   }
 }
 
+const readStore = <T>(io: Io, fn: (store: Store) => Promise<T>): Promise<T> => withConfiguredStore(storeConfigFor(io), io, fn);
+
 /** Find a job by full id or a unique prefix. */
-async function lookup(config: BuligConfig, idArg: string): Promise<{ job: Job; stages: Stage[] }> {
-  if (!existsSync(config.dbPath)) throw new UserError(`no database at ${config.dbPath} yet. Run a job first.`);
-  const store = new SqliteStore(config.dbPath);
-  try {
+function lookup(config: BuligConfig, io: Io, idArg: string): Promise<{ job: Job; stages: Stage[] }> {
+  return withConfiguredStore(config, io, async (store) => {
     const matches = (await store.listJobs()).filter((j) => j.id === idArg || j.id.startsWith(idArg));
     if (matches.length === 0) throw new UserError(`no job starts with "${idArg}"`);
     if (matches.length > 1) throw new UserError(`"${idArg}" matches ${matches.length} jobs; type more of the id`);
     const job = matches[0]!;
     return { job, stages: await store.listStages(job.id) };
-  } finally {
-    await store.close();
-  }
+  });
 }
 
 const pad = (s: string, n: number) => (s.length >= n ? s : s + ' '.repeat(n - s.length));

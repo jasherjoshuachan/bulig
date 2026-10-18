@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { SqliteStore } from '@bulig/core';
+import { describePg, usePgServer, type PgDatabase } from '../../core/test/pg-throwaway.ts';
 import { slowStore } from '../../core/test/slow-store.ts';
 import { acquireLock, loadConfig, runCli, type Io } from '../src/index.ts';
 
@@ -370,5 +371,102 @@ describe('a config that also enables Telegram, used from the terminal', () => {
       const r = await w.run(...argv);
       expect(r.err, argv[0]).not.toMatch(/not registered/);
     }
+  });
+});
+
+describe('store config', () => {
+  const load = (w: ReturnType<typeof world>, c: unknown) => {
+    writeFileSync(join(w.cwd, 'bulig.config.json'), JSON.stringify(c));
+    return loadConfig(w.cwd, w.home).config;
+  };
+
+  it('uses SQLite when the config says nothing about a store, so existing configs keep working', () => {
+    const w = world();
+    expect(loadConfig(w.cwd, w.home).config.store).toEqual({ kind: 'sqlite' });
+    expect(load(w, {}).store).toEqual({ kind: 'sqlite' });
+    expect(load(w, { store: { kind: 'sqlite' } }).store).toEqual({ kind: 'sqlite' });
+  });
+
+  it('takes Postgres with the name of the variable that holds the connection string', () => {
+    const w = world();
+    expect(load(w, { store: { kind: 'postgres', urlEnv: 'BULIG_DATABASE_URL' } }).store).toEqual({ kind: 'postgres', urlEnv: 'BULIG_DATABASE_URL' });
+  });
+
+  it('refuses a connection string in the file, in any shape', () => {
+    const w = world();
+    expect(() => load(w, { store: { kind: 'postgres', url: 'postgres://u:p@h/db' } })).toThrow(/Bad config/);
+    expect(() => load(w, { store: { kind: 'postgres', urlEnv: 'postgres://u:p@h/db' } })).toThrow(/name of an environment variable/);
+    expect(() => load(w, { store: { kind: 'postgres' } })).toThrow(/Bad config/);
+    expect(() => load(w, { store: { kind: 'mysql' } })).toThrow(/Bad config/);
+    expect(() => load(w, { store: { kind: 'sqlite', urlEnv: 'X' } })).toThrow(/Bad config/);
+  });
+});
+
+describePg('the CLI on Postgres', () => {
+  const server = usePgServer();
+  const dbs: PgDatabase[] = [];
+  afterEach(async () => {
+    for (const d of dbs.splice(0)) await d.drop();
+  });
+  const pgWorld = async () => {
+    const db = await server().newDatabase();
+    dbs.push(db);
+    const w = world({ store: { kind: 'postgres', urlEnv: 'BULIG_TEST_DATABASE_URL' } });
+    w.io.env = { BULIG_TEST_DATABASE_URL: db.url };
+    return { w, db };
+  };
+
+  it('runs a whole job, and status, history, approve and deny all read it through the configured store', async () => {
+    const { w } = await pgWorld();
+    const run = await w.run('run', '--repo', w.repo, '--title', 'Add multiply function', '--issue', 'Add src/multiply.js exporting multiply(a,b)');
+    expect(run.err).toBe('');
+    expect(run.code).toBe(0);
+    const id = jobIdFrom(run.out);
+    expect(run.out).toContain('approval needed: plan');
+
+    const status = await w.run('status');
+    expect(status.err).toBe('');
+    expect(status.out).toContain(`${id.slice(0, 8)}  awaiting_approval`);
+
+    // Each command below is a new process in real life: it finds the job in Postgres and carries on from what is stored.
+    const plan = await w.run('approve', id.slice(0, 8), 'plan');
+    expect(plan.err).toBe('');
+    expect(plan.out).toContain('approval needed: merge');
+    const merge = await w.run('approve', id.slice(0, 8), 'merge');
+    expect(merge.err).toBe('');
+    expect(merge.out).toContain('is done');
+
+    const detail = await w.run('status', id.slice(0, 8));
+    expect(detail.out).toContain('status   done');
+    expect(detail.out).toMatch(/merge\s+1\s+passed/);
+    const history = await w.run('history', id.slice(0, 8));
+    expect(history.err).toBe('');
+    expect(history.out).toContain('pr.merged');
+
+    // The record lives in Postgres alone: no SQLite file was made.
+    expect(existsSync(w.config.dbPath)).toBe(false);
+  });
+
+  it('deny finds the job in Postgres too', async () => {
+    const { w } = await pgWorld();
+    const id = jobIdFrom((await w.run('run', '--repo', w.repo, '--title', 'Add multiply function', '--issue', 'x')).out);
+    const denied = await w.run('deny', id);
+    expect(denied.err).toBe('');
+    expect((await w.run('status', id)).out).toContain('status   cancelled');
+  });
+
+  it('says what is wrong when the variable is not set, and does not touch SQLite', async () => {
+    const { w } = await pgWorld();
+    w.io.env = {};
+    for (const argv of [['status'], ['history', 'abc'], ['approve', 'abc', 'plan']]) {
+      const r = await w.run(...argv);
+      expect(r.code).toBe(2);
+      expect(r.err).toContain('BULIG_TEST_DATABASE_URL');
+      expect(r.err).toContain('not set');
+    }
+    const run = await w.run('run', '--repo', w.repo, '--title', 't');
+    expect(run.code).toBe(2);
+    expect(run.err).toContain('BULIG_TEST_DATABASE_URL');
+    expect(existsSync(w.config.dbPath)).toBe(false);
   });
 });

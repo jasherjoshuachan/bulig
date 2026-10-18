@@ -6,6 +6,21 @@ on:
 jobs:
   verify:
     runs-on: ubuntu-latest
+    # The Postgres suites (ADR 0007) run against this service. The password is for a container that lives for this job only.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: bulig-ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      BULIG_PG_TEST_URL: postgresql://postgres:bulig-ci@127.0.0.1:5432/postgres
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4

@@ -118,6 +118,19 @@ describePg('PostgresStore', () => {
         expect(await lost(tx(a, (t) => t.assertLease('a', live.generation)))).toBe('LeaseLostError');
       });
 
+      it('the database itself allows one live claim per job stage and one event per id, whatever the code above it does', async () => {
+        const db = await freshDb();
+        const a = await open(db.url);
+        const job = await a.createJob({ repo: 'r', title: 't' });
+        await a.startStage(job.id, 'build');
+        const insert = `INSERT INTO claims (job_id, stage, generation, attempt, claimed_at) VALUES ('${job.id}', 'build', 0, 2, now())`;
+        await expect(peek(db.url, insert)).rejects.toThrow(/claims_live/);
+        await peek(db.url, `UPDATE claims SET released_at = now() WHERE job_id = '${job.id}'`);
+        await peek(db.url, insert);
+        await a.appendEvent({ id: 'evt-1', type: 'a.b', source: 'x', payload: null });
+        await expect(peek(db.url, "INSERT INTO events (id, type, source, at) VALUES ('evt-1', 'a.b', 'x', now())")).rejects.toThrow(/events_id/);
+      });
+
       it('two writers racing to start one stage: exactly one wins, the other is told it is claimed', async () => {
         const db = await freshDb();
         const a = await open(db.url);

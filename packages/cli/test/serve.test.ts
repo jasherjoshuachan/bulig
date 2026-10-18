@@ -217,6 +217,38 @@ describe('bulig serve', () => {
     expect(existsSync(`${w.dbPath}.lock`)).toBe(false);
   });
 
+  it('also exits non-zero when a task finds the lease gone before the heartbeat does', async () => {
+    const w = await world();
+    let stopped = 0;
+    // Every renewal says "renewed" but renews nothing, so the lease runs out and a rival takes it. Only a task can notice.
+    const openStore = (dbPath: string) => {
+      const real = new SqliteStore(dbPath);
+      const wrapped = Object.create(real) as SqliteStore;
+      Object.assign(wrapped, {
+        transaction: real.transaction.bind(real),
+        close: real.close.bind(real),
+        abort: real.abort?.bind(real),
+        schemaVersion: real.schemaVersion.bind(real),
+        acquireLease: real.acquireLease.bind(real),
+        releaseLease: real.releaseLease.bind(real),
+        renewLease: () => Promise.resolve(true),
+      });
+      return wrapped;
+    };
+    const s = serve(w, [createTelegramChannel(), fakeWorker(undefined, () => void stopped++), fakeGithub(), pipeline], { openStore, lease: { ttlMs: 600, heartbeatMs: 100 } });
+    await until(() => s.out.some((l) => l.includes('serving')), 'serve to start');
+    await new Promise((r) => setTimeout(r, 700));
+    const rival = new SqliteStore(w.dbPath);
+    try {
+      await rival.acquireLease('rival', 60_000);
+      expect(await s.done).toBe(1);
+    } finally {
+      await rival.close();
+    }
+    expect(stopped).toBe(1);
+    expect(s.err.filter((l) => /lost the executor lease/.test(l))).toHaveLength(1);
+  });
+
   it('exits with a clear message when the token is not in the environment', async () => {
     const w = await world({ token: false });
     const s = serve(w, [createTelegramChannel(), fakeWorker(), fakeGithub(), pipeline]);

@@ -178,7 +178,8 @@ for (const adapter of ADAPTERS) {
       const store = await adapter.make();
       // The heartbeat is told "renewed" but nothing is renewed, so the lease runs out for real and a rival takes it.
       const liar = withLease(store, { renewLease: async () => true });
-      const { k, errors } = kernelOn(liar, { leaseHolder: 'kernel-a', leaseTtlMs: 400, leaseHeartbeatMs: 80 });
+      const lost: string[] = [];
+      const { k, errors } = kernelOn(liar, { leaseHolder: 'kernel-a', leaseTtlMs: 400, leaseHeartbeatMs: 80, onLeaseLost: (r) => void lost.push(r) });
       await k.start();
       await sleep(600);
       const rival = await adapter.peek();
@@ -188,6 +189,34 @@ for (const adapter of ADAPTERS) {
       await expect(k.jobs.create({ repo: 'r', title: 'and again' })).rejects.toBeInstanceOf(StoreBrokenError);
       expect(await rival.listJobs()).toEqual([]);
       expect(errors.join('\n')).toMatch(/executor lease was lost/);
+      // The task noticed, not the heartbeat. The owner (serve) must still be told, once, so the process stops.
+      expect(lost).toHaveLength(1);
+    });
+
+    it('tells the owner exactly once when the heartbeat and a task both find the lease gone', async () => {
+      const store = await adapter.make();
+      let mode: 'ok' | 'late-refusal' = 'ok';
+      let renewalInFlight = false;
+      const bothSee = withLease(store, {
+        renewLease: (h, g, t) => {
+          if (mode === 'ok') return Promise.resolve(true);
+          renewalInFlight = true;
+          return new Promise<boolean>((r) => setTimeout(() => r(false), 40));
+        },
+      });
+      const lost: string[] = [];
+      const { k } = kernelOn(bothSee, { leaseHolder: 'kernel-a', leaseTtlMs: 400, leaseHeartbeatMs: 80, onLeaseLost: (r) => void lost.push(r) });
+      await k.start();
+      await sleep(600); // the lease runs out behind a renewal that claimed to work
+      const rival = await adapter.peek();
+      await rival.acquireLease('rival', 60_000);
+      mode = 'late-refusal';
+      // Wait until a renewal is in flight, then let a task reach its own check before that renewal answers.
+      for (let i = 0; i < 100 && !renewalInFlight; i++) await sleep(5);
+      expect(renewalInFlight).toBe(true);
+      await expect(k.jobs.create({ repo: 'r', title: 'late write' })).rejects.toBeInstanceOf(StoreBrokenError);
+      await sleep(150); // the renewal now answers "refused" as well
+      expect(lost).toHaveLength(1);
     });
 
     it('stops renewing the lease once the queue is broken for another reason (a store call that never returns)', async () => {

@@ -41,7 +41,7 @@ A claim is the key to one room. Only one key per room can be out at a time, and 
 ## Consequences
 
 - A kernel that dies mid-build costs up to 30 s before the next one can start, unless the first one shut down cleanly, in which case `stop()` hands the lease back and the next one starts at once. Until a standby exists, systemd's restart delay hides most of that.
-- A kernel that loses its lease stops writing and logs one loud error. Jasher's rule is "stop writing at once", so `bulig serve` uses `onLeaseLost`: it logs one clear line, stops the plugins (which ends every running Claude process, the same path as Ctrl-C), and exits non-zero so a supervisor restarts it. The next start resumes from the record. The fence still covers the gap: a report that arrives before the processes are gone bounces off it.
+- A kernel that loses its lease stops writing and logs one loud error. It does not matter which part notices first: the heartbeat (a refused, failed or late renewal) or a queued task whose own lease check fails (a laptop that slept past the 30 s). Both end in `onLeaseLost`, which fires exactly once. Jasher's rule is "stop writing at once", so `bulig serve` uses `onLeaseLost`: it logs one clear line, stops the plugins (which ends every running Claude process, the same path as Ctrl-C), and exits non-zero so a supervisor restarts it. The next start resumes from the record. The fence still covers the gap: a report that arrives before the processes are gone bounces off it.
 - The fence covers the record. It cannot recall a `git push` or a `gh pr create` already sent. That is why those effects are guarded where they happen (above), and why `gh` answering "already exists" is still handled.
 - `finishStage` on a stage that is already finished now rejects. Before, it overwrote the output. No plugin did it on purpose. One pipeline test did, to fake an old record, and now writes the file directly.
 - A stage that was running before this change has no claim row. It finishes as it used to, and a restart closes it. There is no backfill, because a backfill would fail on a record that already has two running stages with one name.
@@ -54,7 +54,7 @@ A claim is the key to one room. Only one key per room can be out at a time, and 
 ## Known limits
 
 - **Resume compares wall-clock time.** `pipeline-dev`'s `leftByOldKernel` compares a stage's `startedAt` with `Date.now()` taken when the plugin registered. That is safe on one machine, which is today. Before a second machine runs a kernel (build-order step 4) it must compare claim generations instead, because two machines' clocks can disagree.
-- A non-lease break of the queue (a store call stuck past `storeBrokenMs`) stops writing and now stops the heartbeat, but `serve` does not exit for it. Only a lost lease does.
+- A non-lease break of the queue (a store call stuck past `storeBrokenMs`) stops writing and now stops the heartbeat, but `serve` does not exit for it. Only a lost lease does. A lost lease ends `serve` whichever path found it: the queue marks the break with the `LeaseLostError` as its `cause`, and the kernel passes that on to `onLeaseLost`, guarded so it fires once.
 
 ## Assumed (to confirm)
 

@@ -5,7 +5,7 @@ import { DEFAULT_EVENT_CAPABILITIES } from './capabilities.ts';
 import { buildContext, selectPlugins, type JobsTx, type KernelJobs, type LoadedPlugin } from './loader.ts';
 import { StoreBrokenError, StoreQueue, type QueueTx } from './queue.ts';
 import { SqliteStore } from './sqlite-store.ts';
-import { LeaseHeldError, type Store } from './store.ts';
+import { LeaseHeldError, LeaseLostError, type Store } from './store.ts';
 
 export interface KernelOptions {
   /** Where the SQLite file lives. Used when no `store` is given. */
@@ -69,6 +69,8 @@ export function createKernel(options: KernelOptions) {
       // A kernel that has given up on the record must not go on renewing the lease: it would keep a standby out for nothing.
       if (heartbeat) clearInterval(heartbeat);
       heartbeat = undefined;
+      // A task that found the lease gone before the heartbeat did is a lost lease too: the process must stop, not just the queue.
+      if (err.cause instanceof LeaseLostError) tellLeaseLost(err.cause.message);
     },
   });
   const bus = new Bus(queue, { ...DEFAULT_EVENT_CAPABILITIES, ...options.eventCapabilities }, (err, input) => {
@@ -140,13 +142,21 @@ export function createKernel(options: KernelOptions) {
     }
   }
 
+  /** Tell the owner the lease is gone, once, whichever path (the heartbeat or a task's own check) noticed first. */
+  let leaseLostTold = false;
+  function tellLeaseLost(reason: string): void {
+    if (leaseLostTold) return;
+    leaseLostTold = true;
+    options.onLeaseLost?.(reason);
+  }
+
   /** Stop writing at once: a kernel that cannot show it holds the lease must not change the record. */
   function loseLease(reason: string): void {
     if (heartbeat) clearInterval(heartbeat);
     heartbeat = undefined;
     // The queue's onBroken says it loudly, once, in the log.
     queue.breakNow(`The executor lease was lost: ${reason}.`, 'heartbeat', 'renewLease');
-    options.onLeaseLost?.(reason);
+    tellLeaseLost(reason);
   }
 
   function startHeartbeat(gen: number): void {

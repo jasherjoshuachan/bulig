@@ -35,8 +35,10 @@ export class StoreBrokenError extends Error {
     public readonly call: string,
     /** The task that was refused because of this, when the error is the answer to one. */
     public readonly refused?: string,
+    /** Why the store broke, when a known error did it. A LeaseLostError here marks the break as a lost lease. */
+    cause?: unknown,
   ) {
-    super(refused === undefined ? message : `Store call "${refused}" was not made: ${message}`);
+    super(refused === undefined ? message : `Store call "${refused}" was not made: ${message}`, cause === undefined ? undefined : { cause });
     this.name = 'StoreBrokenError';
   }
 }
@@ -324,6 +326,8 @@ export class StoreQueue {
             `The executor lease was lost (${err.message}). The kernel has stopped writing. The task "${label}" wrote nothing.`,
             label,
             call,
+            undefined,
+            err,
           );
           abandon(broken);
           this.breakWith(broken);

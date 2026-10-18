@@ -1,6 +1,7 @@
 import { createRequire } from 'node:module';
 import { describe, expect, it } from 'vitest';
 import type { Stage } from '@bulig/plugin-sdk';
+import { SqliteStore, type Store, type StoreTx } from '@bulig/core';
 import { decide, parseVerdict, renderPrompt } from '../src/index.ts';
 import { boot, fakeGithub, fakeHuman, fakeWorker, newDb, openApproval, raw, stageNames, types, type Script, type Sent, settle } from './harness.ts';
 
@@ -585,19 +586,60 @@ describe('resume after a restart', () => {
     expect((await r.k.jobs.get(job.id))!.status).not.toBe('failed');
   });
 
-  it('a repeated event that asks for a stage already claimed is a duplicate, not a failure: no second attempt, and the job carries on', async () => {
-    const r = rig({ plan: () => 'hang' });
-    await r.k.start();
-    await settle(r.k);
-    const job = await jobOf(r.k);
-    await settle(r.k);
-    expect((await r.k.jobs.stages(job.id)).map((s) => `${s.name}:${s.status}`)).toEqual(['worktree:passed', 'plan:running']);
-    // job.created arrives a second time (a repeated delivery): the pipeline would start plan again.
-    await r.k.bus.emit({ type: 'job.created', source: 'kernel', jobId: job.id, payload: job });
-    await settle(r.k);
-    expect(r.worker.filter((s) => s.stage === 'plan')).toHaveLength(1);
-    expect((await r.k.jobs.stages(job.id)).map((s) => `${s.name}:${s.status}`)).toEqual(['worktree:passed', 'plan:running']);
-    expect((await r.k.jobs.get(job.id))!.status).toBe('running');
+  it('a start that finds its stage already claimed (a rival got in between the read and the write) is a duplicate, not a failure: the job carries on', async () => {
+    // A rival kernel opens plan after this one has read that the job is ready for it and before its own startStage lands.
+    const inner = new SqliteStore(newDb());
+    let armed: string | undefined;
+    let rivalled = false;
+    const store = Object.create(inner) as Store;
+    Object.assign(store, {
+      close: inner.close.bind(inner),
+      abort: inner.abort?.bind(inner),
+      schemaVersion: inner.schemaVersion.bind(inner),
+      acquireLease: inner.acquireLease.bind(inner),
+      renewLease: inner.renewLease.bind(inner),
+      releaseLease: inner.releaseLease.bind(inner),
+      transaction: async <T,>(fn: (tx: StoreTx) => Promise<T>) => {
+        if (armed && !rivalled) {
+          rivalled = true;
+          const jobId = armed;
+          // The rival holds the same generation (a stalled twin of this kernel), so its claim is live, not a leftover to take over.
+          await inner.transaction(async (tx) => {
+            await tx.assertLease('kernel-under-test', 1);
+            await tx.startStage(jobId, 'plan');
+          });
+        }
+        return inner.transaction((tx) =>
+          fn(
+            new Proxy(tx, {
+              get(target, prop) {
+                if (prop === 'listStages') {
+                  return async (jobId: string) => {
+                    const stages = await target.listStages(jobId);
+                    if (stages.some((s) => s.name === 'worktree' && s.status === 'passed') && !stages.some((s) => s.name === 'plan')) armed = jobId;
+                    return stages;
+                  };
+                }
+                const v = (target as unknown as Record<string | symbol, unknown>)[prop];
+                return typeof v === 'function' ? v.bind(target) : v;
+              },
+            }),
+          ),
+        );
+      },
+    });
+    const warnings: string[] = [];
+    const worker: Sent[] = [];
+    const k = boot('unused', [fakeWorker({}, worker), fakeGithub([]), fakeHuman().plugin], {}, { store, leaseHolder: 'kernel-under-test', logger: { debug() {}, info() {}, warn: (m: string) => void warnings.push(m), error() {} } });
+    await k.start();
+    await settle(k);
+    const job = await jobOf(k);
+    await settle(k);
+    expect(rivalled).toBe(true);
+    expect(warnings.join('\n')).toMatch(/already claimed/);
+    expect(worker).toEqual([]); // nothing was asked for twice
+    expect((await k.jobs.get(job.id))!.status).toBe('running'); // and the job was not failed for it
+    expect((await k.jobs.stages(job.id)).map((s) => `${s.name}:${s.status}`)).toEqual(['worktree:passed', 'plan:running']);
   });
 
   it('a new process continues from the plan approval', async () => {

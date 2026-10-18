@@ -389,7 +389,7 @@ export class SqliteStore implements Store {
     const res = this.db
       .prepare('INSERT INTO events (id, type, job_id, source, payload, at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO NOTHING')
       .run(id, e.type, e.jobId ?? null, e.source, json, at);
-    if (res.changes === 0) throw new DuplicateEventError(id);
+    if (res.changes === 0) throw new DuplicateEventError(id, toEvent(this.db.prepare('SELECT * FROM events WHERE id = ?').get(id) as EventRow));
     return toEvent(this.db.prepare('SELECT * FROM events WHERE seq = ?').get(res.lastInsertRowid) as EventRow);
   }
 

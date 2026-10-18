@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { DEPRECATED_SDK_MAJORS, type BuligEvent, type Logger, type Plugin } from '@bulig/plugin-sdk';
-import { Bus } from './bus.ts';
+import { Bus, ReplayedError, type Cause } from './bus.ts';
 import { DEFAULT_EVENT_CAPABILITIES } from './capabilities.ts';
 import { buildContext, selectPlugins, type JobsTx, type KernelJobs, type LoadedPlugin } from './loader.ts';
 import { StoreBrokenError, StoreQueue, type QueueTx } from './queue.ts';
@@ -80,10 +80,16 @@ export function createKernel(options: KernelOptions) {
   });
 
   // The job calls as they run on one task of the queue. A change and the event that announces it are written in the same task.
-  const inTask = (tx: QueueTx): JobsTx => ({
+  // `cause` is the handler run that asked for the change, if one did: the event that announces it gets its id from there.
+  // If that event is already in the log the whole task is a replay: it is rolled back and the call answers with the record as it is.
+  const inTask = (tx: QueueTx, cause: Cause | undefined): JobsTx => ({
     async create(input) {
       const job = await tx.createJob(input);
-      await bus.record(tx, { type: 'job.created', source: 'kernel', jobId: job.id, payload: job });
+      await bus.record(tx, { type: 'job.created', source: 'kernel', jobId: job.id, payload: job }, cause).catch((err: unknown) => {
+        // The job the first run made, not the one this rolled-back task just made.
+        if (err instanceof ReplayedError) err.result = err.existing.payload;
+        throw err;
+      });
       return job;
     },
     get: (id) => tx.getJob(id),
@@ -91,7 +97,11 @@ export function createKernel(options: KernelOptions) {
     async setStatus(id, status) {
       const before = await tx.getJob(id);
       const job = await tx.setJobStatus(id, status);
-      await bus.record(tx, { type: 'job.status', source: 'kernel', jobId: id, payload: { from: before?.status, to: status } });
+      await bus.record(tx, { type: 'job.status', source: 'kernel', jobId: id, payload: { from: before?.status, to: status } }, cause).catch((err: unknown) => {
+        // The job as the first run left it (or a later change did), not the status this rolled-back task just set.
+        if (err instanceof ReplayedError) err.result = before;
+        throw err;
+      });
       return job;
     },
     stages: (jobId) => tx.listStages(jobId),
@@ -99,7 +109,13 @@ export function createKernel(options: KernelOptions) {
     finishStage: (id, status, output) => tx.finishStage(id, status, output),
     stageName: async (id) => (await tx.getStage(id))?.name,
   });
-  const atomic: KernelJobs['atomic'] = (fn) => queue.run('jobs', (tx) => fn(inTask(tx)));
+  const atomic: KernelJobs['atomic'] = (fn) => {
+    const cause = bus.currentCause();
+    return queue.run('jobs', (tx) => fn(inTask(tx, cause))).catch((err: unknown) => {
+      if (err instanceof ReplayedError && err.result !== undefined) return err.result as Awaited<ReturnType<typeof fn>>;
+      throw err;
+    });
+  };
   const jobs: KernelJobs = {
     atomic,
     create: (input) => atomic((t) => t.create(input)),

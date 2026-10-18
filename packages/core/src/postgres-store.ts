@@ -615,7 +615,10 @@ export class PostgresStore implements Store {
       `INSERT INTO events (id, type, job_id, source, payload, at) VALUES ($1, $2, $3, $4, $5::jsonb, $6) ON CONFLICT (id) DO NOTHING RETURNING ${EVENT_COLS}`,
       [id, e.type, e.jobId ?? null, e.source, json, new Date().toISOString()],
     );
-    if (res.rows.length === 0) throw new DuplicateEventError(id);
+    if (res.rows.length === 0) {
+      const held = await this.query<EventRow>(`SELECT ${EVENT_COLS} FROM events WHERE id = $1`, [id]);
+      throw new DuplicateEventError(id, held.rows[0] && toEvent(held.rows[0]));
+    }
     return toEvent(res.rows[0]!);
   }
 

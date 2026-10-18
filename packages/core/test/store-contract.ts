@@ -623,6 +623,7 @@ export function describeStoreContract(name: string, make: () => Promise<StoreHan
         expect(first.id).toBe('evt-1');
         const err = await store.appendEvent({ id: 'evt-1', type: 'a.b', source: 'x', payload: { n: 2 } }).catch((e: unknown) => e);
         expect(err).toBeInstanceOf(DuplicateEventError);
+        expect((err as DuplicateEventError).existing).toEqual(first); // the event already held, so a caller can hand it back
         expect((await store.eventsAfter()).map((e) => e.payload)).toEqual([{ n: 1 }]);
       });
 

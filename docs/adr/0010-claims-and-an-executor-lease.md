@@ -48,7 +48,7 @@ A claim is the key to one room. Only one key per room can be out at a time, and 
 - Two kernels on one SQLite file are still kept apart by the file lock (ADR 0001), not by row locks. The lease works on SQLite inside one process and across restarts, but a takeover does not wait for the other process's open transaction, as it does on Postgres. SQLite is for tests and for trying Bulig, so this is accepted.
 - Tests: the contract suite runs every lease, claim and event-id case on both adapters. A kernel suite covers the heartbeat, including one that a slow task must not starve. A chaos test kills a kernel mid-build and starts another on the same record, with a kernel that is alive but stalled as the second case, and expects one PR, no lost event, exactly one `stage.requested` per stage attempt, and exactly one `stage.completed` per build attempt that finished.
 - SDK `1.0.0-rc.6`. Plugins can now see a rejection named `StageClaimedError` or `StageNotClaimedError` from `startStage` and `finishStage`, and `stage.requested` carries an optional `stageId`.
-- Not yet: derive event ids from their cause (the event or stage attempt that led to them) so a handler run twice writes one event. Until then the unique index never fires.
+- Event ids from their cause: decided in the addendum of 18 Oct 2026, below.
 - Not decided here: a standby kernel that watches and takes over, wake-ups, and what a plugin does when it learns it lost the lease.
 
 ## Known limits
@@ -71,3 +71,23 @@ These were outside the three answers above. Each has the cautious default, and e
 9. **A missing `stageId` means the old behaviour** in `worker-claude-code` and `github`, so another pipeline that does not send it still works. It also means a pipeline that forgets it gets no protection.
 10. **The Postgres takeover waits at most 10 s** for the old holder's open transactions (`lock_timeout`). After that, `acquireLease` fails and the kernel does not start.
 11. **No `claimStage`, `releaseClaim` or `expireClaims` on the Store.** `startStage` and `finishStage` do it in the same transaction, which is what "atomically" asked for. A claim whose job never resumes (a cancelled job whose stage was left running) stays live until something finishes that stage.
+
+## Addendum, 18 Oct 2026: step 1 close-out
+
+### Decided: event ids come from their cause
+
+Until now `bus.record` never passed an id, so the unique index on `events.id` never fired. Now an event written while a handler is handling event E gets the id `sha256(E.id, handler, ordinal, type)`, shaped as a UUID (version 8, so it cannot be mistaken for a random v4).
+
+- **handler** is the plugin's name and the order of the subscription (`demo#0`), so two plugins, or two handlers of one plugin, that react to E and emit the same type get different ids.
+- **ordinal** counts the events the run has written so far (a job event the kernel writes for a handler's `jobs.create` or `jobs.setStatus` counts too), so a run that emits the same type twice gets two ids.
+- The run is known from an `AsyncLocalStorage` set around the handler. It is read when the write is asked for, so a continuation inside the handler (an `await`, a timer the handler started) still belongs to that run.
+- An event with no cause keeps a random id: `kernel.started`, input from outside the kernel, anything emitted outside a handler. `bus.emit` takes an optional `id` for a source that has a stable one. No plugin can pass it.
+- **A duplicate id means the write is already done.** `appendEvent` still rejects with `DuplicateEventError` (which now carries the event the log holds). The bus turns that into a `ReplayedError`, and the whole task that met it is rolled back: nothing it wrote stays and nothing is delivered. This is the rule for every task, not only for the first event. The call that asked answers as a success: `emit` and `emitCommitted` with the stored event, `jobs.create` with the job the first run made, `jobs.setStatus` with the job as it is now. The handler carries on with the next line.
+- Nothing replays events today, so in production this changes no result yet: ids are different and nothing collides. It is the base for a standby that re-delivers an event, and the tests deliver one twice to prove it.
+- Plugin-visible: ids of handler-caused events are no longer random. No type changed, so the SDK version is unchanged for this item.
+
+## Assumed (to confirm), added 18 Oct 2026
+
+12. **A replay rolls back the whole task, not only the event.** The alternative (keep the rest of the task, skip the event) would let a replayed `jobs.create` make a second job.
+13. **Ordinals depend on the order a handler's emits reach the queue.** A handler that fires emits in parallel without awaiting still gets the same ids on a replay, because the queue keeps call order. A handler whose emits happen in a different order on a second run gets different ids for them and writes them again. That is the safe side: a missed dedup, never a lost event.
+14. **channel-telegram does not use `update_id` as an event id.** It would need a way for a plugin to name an id, which is an SDK change, and the channel already saves the offset before it handles an update, so an update is handled at most once. Left alone.

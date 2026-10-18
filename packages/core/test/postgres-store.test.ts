@@ -1,10 +1,13 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import pg from 'pg';
 import { parse as parseConnectionString } from 'pg-connection-string';
-import { assertPostgresUrl, OtherWriterError, PostgresStore, SchemaNotReadyError, type PostgresStoreOptions, StoreBrokenError, StoreFatalError, StoreTimeoutError } from '../src/index.ts';
+import { assertPostgresUrl, OtherWriterError, PostgresStore, SchemaNotReadyError, StageClaimedError, type PostgresStoreOptions, type StoreTx, StoreBrokenError, StoreFatalError, StoreTimeoutError } from '../src/index.ts';
 import { kernelWith, probe } from './helpers.ts';
 import { describePg, usePgServer, type PgDatabase } from './pg-throwaway.ts';
 import { describeStoreContract, type StoreHandle } from './store-contract.ts';
+
+/** How many migrations the current code applies. */
+const LATEST = 6;
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
@@ -43,7 +46,7 @@ describePg('PostgresStore', () => {
       };
       return handle;
     },
-    { schemaVersion: 3 },
+    { schemaVersion: LATEST },
   );
 
   // What belongs to Postgres alone.
@@ -76,6 +79,110 @@ describePg('PostgresStore', () => {
     };
     const raw = (s: PostgresStore) => s as unknown as { connected(): Promise<pg.Client> };
 
+    describe('the executor lease and claims on a real server (ADR 0010)', () => {
+      const lost = (p: Promise<unknown>) => p.then(() => 'resolved', (e: unknown) => (e instanceof Error ? e.name : 'rejected'));
+      /** Run `fn` as a transaction of this store. */
+      const tx = <T>(s: PostgresStore, fn: (t: StoreTx) => Promise<T>) => s.transaction(fn);
+
+      it('a takeover waits for a transaction that asserted the old lease, and then that transaction commits; a renewal never waits', async () => {
+        const db = await freshDb();
+        const a = await open(db.url);
+        const rival = await open(db.url, { mode: 'reader' }); // a second connection that may write, standing in for the next kernel
+        const live = await a.acquireLease('a', 60_000);
+
+        let release!: () => void;
+        const hold = new Promise<void>((r) => (release = r));
+        let asserted!: () => void;
+        const ready = new Promise<void>((r) => (asserted = r));
+        const inflight = tx(a, async (t) => {
+          await t.assertLease('a', live.generation);
+          asserted();
+          await hold;
+          await t.createJob({ repo: 'r', title: 'written under the old generation' });
+        });
+        await ready;
+        // A renewal (non-key update) goes through while the transaction is open.
+        expect(await a.renewLease('a', live.generation, 60_000)).toBe(true);
+        // Make the lease look run out (by hand, so the test need not wait), so the takeover path is open to the next kernel.
+        await peek(db.url, "UPDATE executor_lease SET expires_at = now() - interval '1 second'");
+        let taken = false;
+        const takeover = rival.acquireLease('b', 60_000).then((r) => ((taken = true), r));
+        await sleep(300);
+        expect(taken).toBe(false); // waiting for the open transaction
+        release();
+        await inflight;
+        const got = await takeover;
+        expect(got.generation).toBe(live.generation + 1);
+        expect((await a.listJobs()).map((j) => j.title)).toEqual(['written under the old generation']);
+        // and now the old holder's next assertion bounces
+        expect(await lost(tx(a, (t) => t.assertLease('a', live.generation)))).toBe('LeaseLostError');
+      });
+
+      it('two writers racing to start one stage: exactly one wins, the other is told it is claimed', async () => {
+        const db = await freshDb();
+        const a = await open(db.url);
+        const b = await open(db.url, { mode: 'reader' });
+        const job = await a.createJob({ repo: 'r', title: 't' });
+        for (let round = 0; round < 5; round++) {
+          const name = `stage-${round}`;
+          const results = await Promise.allSettled([tx(a, (t) => t.startStage(job.id, name)), tx(b, (t) => t.startStage(job.id, name))]);
+          expect(results.map((r) => r.status).sort()).toEqual(['fulfilled', 'rejected']);
+          const err = (results.find((r) => r.status === 'rejected') as PromiseRejectedResult).reason;
+          expect(err).toBeInstanceOf(StageClaimedError);
+        }
+        expect(await peek(db.url, "SELECT count(*)::int AS n FROM claims WHERE released_at IS NULL")).toEqual([{ n: 5 }]);
+        expect(await peek(db.url, 'SELECT count(*)::int AS n FROM stages')).toEqual([{ n: 5 }]);
+      });
+
+      it('does not wait on a claim row another transaction is changing (SKIP LOCKED); it is refused when that claim turns out to be live', async () => {
+        const db = await freshDb();
+        const a = await open(db.url);
+        const b = await open(db.url, { mode: 'reader' });
+        const job = await a.createJob({ repo: 'r', title: 't' });
+        const first = await a.startStage(job.id, 'build');
+        let release!: () => void;
+        const hold = new Promise<void>((r) => (release = r));
+        let locked!: () => void;
+        const ready = new Promise<void>((r) => (locked = r));
+        // 'a' finishes the stage and keeps the transaction open: the claim row is locked.
+        const finishing = tx(a, async (t) => {
+          await t.finishStage(first.id, 'passed');
+          locked();
+          await hold;
+        });
+        await ready;
+        // 'a' has not committed, so 'b' still sees a live claim, but it is locked. The select skips it; the insert then waits on the unique index.
+        let done = false;
+        const starting = lost(tx(b, (t) => t.startStage(job.id, 'build'))).then((r) => ((done = true), r));
+        await sleep(300);
+        expect(done).toBe(false); // waiting on the index, not on the select
+        release();
+        await finishing;
+        // The commit released the old claim, so the insert goes through after all: no live claim is left to collide with.
+        expect(await starting).toBe('resolved');
+        expect(await peek(db.url, 'SELECT count(*)::int AS n FROM claims WHERE released_at IS NULL')).toEqual([{ n: 1 }]);
+      });
+
+      it('moves a renewal through a second connection, so a transaction that is busy on the first never holds it up', async () => {
+        const db = await freshDb();
+        const s = await open(db.url);
+        const { generation } = await s.acquireLease('a', 60_000);
+        let release!: () => void;
+        const hold = new Promise<void>((r) => (release = r));
+        const slow = tx(s, async (t) => {
+          await t.assertLease('a', generation);
+          await t.getJob('nope');
+          await hold;
+        });
+        await sleep(50);
+        const started = Date.now();
+        expect(await s.renewLease('a', generation, 60_000)).toBe(true);
+        expect(Date.now() - started).toBeLessThan(500);
+        release();
+        await slow;
+      });
+    });
+
     it('the constructor does not touch the network, and a store that cannot connect rejects its first call', async () => {
       const s = new PostgresStore('postgresql://nobody@127.0.0.1:1/none');
       stores.push(s);
@@ -88,7 +195,7 @@ describePg('PostgresStore', () => {
     it('keeps the schema version in a table of its own, and a missing job is a rejection, not a throw', async () => {
       const db = await freshDb();
       const s = await open(db.url);
-      expect(await peek(db.url, 'SELECT version FROM bulig_schema')).toEqual([{ version: 3 }]);
+      expect(await peek(db.url, 'SELECT version FROM bulig_schema')).toEqual([{ version: LATEST }]);
       let promise: Promise<unknown> | undefined;
       expect(() => (promise = s.setJobStatus('nope', 'done'))).not.toThrow();
       await expect(promise).rejects.toThrow(/No such job/);
@@ -100,7 +207,7 @@ describePg('PostgresStore', () => {
       const job = await a.createJob({ repo: 'r', title: 't' });
       const b = await open(db.url, { mode: 'reader' });
       expect((await b.getJob(job.id))?.title).toBe('t');
-      expect(await peek(db.url, 'SELECT version FROM bulig_schema')).toEqual([{ version: 3 }]);
+      expect(await peek(db.url, 'SELECT version FROM bulig_schema')).toEqual([{ version: LATEST }]);
       await peek(db.url, 'UPDATE bulig_schema SET version = 99');
       await expect(PostgresStore.open(db.url, { mode: 'reader' })).rejects.toThrow(/schema version 99/);
     });
@@ -112,7 +219,7 @@ describePg('PostgresStore', () => {
       expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
       const lost = results.find((r) => r.status === 'rejected') as PromiseRejectedResult;
       expect(lost.reason).toBeInstanceOf(OtherWriterError);
-      expect(await peek(db.url, 'SELECT version FROM bulig_schema')).toEqual([{ version: 3 }]);
+      expect(await peek(db.url, 'SELECT version FROM bulig_schema')).toEqual([{ version: LATEST }]);
     });
 
     describe('a reader never migrates', () => {
@@ -129,15 +236,16 @@ describePg('PostgresStore', () => {
         const db = await freshDb();
         await (await open(db.url)).close();
         await peek(db.url, 'UPDATE bulig_schema SET version = 2');
-        await peek(db.url, 'DROP TABLE plugin_state'); // what version 2 looked like
+        await peek(db.url, 'DROP TABLE plugin_state, executor_lease, claims'); // what version 2 looked like
+        await peek(db.url, 'DROP INDEX events_id');
         const err = await PostgresStore.open(db.url, { mode: 'reader' }).catch((e: unknown) => e);
         expect(err).toBeInstanceOf(SchemaNotReadyError);
         expect((err as SchemaNotReadyError).reason).toBe('old');
-        expect((err as Error).message).toMatch(/schema version 2 and this Bulig needs 3\. Start the kernel/);
+        expect((err as Error).message).toMatch(new RegExp(`schema version 2 and this Bulig needs ${LATEST}\\. Start the kernel`));
         expect(await peek(db.url, 'SELECT version FROM bulig_schema')).toEqual([{ version: 2 }]);
         expect(await peek(db.url, "SELECT to_regclass('plugin_state') IS NULL AS missing")).toEqual([{ missing: true }]);
         const writer = await open(db.url);
-        expect(await writer.schemaVersion()).toBe(3);
+        expect(await writer.schemaVersion()).toBe(LATEST);
         await (await open(db.url, { mode: 'reader' })).schemaVersion();
       });
 
@@ -259,7 +367,7 @@ describePg('PostgresStore', () => {
         await (await open(db.url)).close();
         await peek(db.url, 'UPDATE bulig_schema SET version = 99');
         await expect(PostgresStore.open(db.url)).rejects.toThrow(/schema version 99/);
-        await peek(db.url, 'UPDATE bulig_schema SET version = 3');
+        await peek(db.url, `UPDATE bulig_schema SET version = ${LATEST}`);
         await open(db.url); // would be refused if the failed start had kept the lock
       });
     });

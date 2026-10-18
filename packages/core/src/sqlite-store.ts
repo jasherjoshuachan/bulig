@@ -3,7 +3,17 @@ import { randomUUID } from 'node:crypto';
 import type { BuligEvent, Job, JobStatus, Stage, StageStatus } from '@bulig/plugin-sdk';
 import { storableJson } from '@bulig/text';
 import { eventSeq, text } from './store-text.ts';
-import { StoreFatalError, type Store, type StoreTx } from './store.ts';
+import {
+  DuplicateEventError,
+  LEASE_LOST_OUTPUT,
+  LeaseHeldError,
+  LeaseLostError,
+  StageClaimedError,
+  StageNotClaimedError,
+  StoreFatalError,
+  type Store,
+  type StoreTx,
+} from './store.ts';
 
 // Each entry upgrades the schema by one version. Never edit an old entry; add a new one.
 const MIGRATIONS: string[] = [
@@ -47,14 +57,48 @@ const MIGRATIONS: string[] = [
     value JSON NOT NULL,
     PRIMARY KEY (plugin, key)
   );`,
+  // 4: the executor lease (ADR 0010). One row. expires_at is milliseconds since 1970 on SQLite's own clock (see NOW).
+  `CREATE TABLE executor_lease (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    holder TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL
+  );`,
+  // 5: one claim per stage of a job (ADR 0010). A claim that is not released is live, and only one may be live.
+  `CREATE TABLE claims (
+    job_id TEXT NOT NULL REFERENCES jobs(id),
+    stage TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    attempt INTEGER NOT NULL,
+    claimed_at TEXT NOT NULL,
+    released_at TEXT,
+    release_reason TEXT,
+    PRIMARY KEY (job_id, stage, attempt)
+  );
+  CREATE UNIQUE INDEX claims_live ON claims(job_id, stage) WHERE released_at IS NULL;`,
+  // 6: an event id is a key. Handlers that run twice for one event can no longer both write it.
+  `CREATE UNIQUE INDEX events_id ON events(id);`,
 ];
 
+/**
+ * The lease's clock. SQLite has no now() that moves inside a transaction, but its own 'now' is the host clock read at the
+ * moment of the statement, which is the same source for every process using this file on this machine. Every lease
+ * statement reads it in SQL, never from JavaScript, so acquire, renew and assert all use one source. Milliseconds since 1970.
+ */
+const NOW = "CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)";
+
+interface ClaimRow { job_id: string; stage: string; generation: number; attempt: number; claimed_at: string; released_at: string | null; release_reason: string | null }
 interface JobRow { id: string; repo: string; title: string; body: string; status: JobStatus; created_at: string; updated_at: string }
 interface StageRow {
   id: string; job_id: string; name: string; status: StageStatus; attempt: number;
   started_at: string; ended_at: string | null; output: string | null;
 }
 interface EventRow { seq: number; id: string; type: string; job_id: string | null; source: string; payload: string | null; at: string }
+
+/** A lease that lasts a positive whole number of milliseconds. */
+function ttl(ms: number): void {
+  if (!Number.isSafeInteger(ms) || ms <= 0) throw new Error('A lease lasts a positive whole number of milliseconds');
+}
 
 const toJob = (r: JobRow): Job => ({
   id: r.id, repo: r.repo, title: r.title, body: r.body, status: r.status, createdAt: r.created_at, updatedAt: r.updated_at,
@@ -75,6 +119,11 @@ const toEvent = (r: EventRow): BuligEvent => ({
  */
 export class SqliteStore implements Store {
   private db: Database.Database;
+  /** Set while a transaction is open: the generation its writes are fenced with (ADR 0010). Undefined means unfenced, generation 0. */
+  private fence: { holder: string; generation: number } | undefined;
+  private inTx = false;
+  /** The newest renewal made while a transaction was open on this connection. If that transaction rolls back it is made again. */
+  private renewedInTx: { holder: string; generation: number; ttlMs: number } | undefined;
 
   constructor(dbPath: string) {
     this.db = new Database(dbPath);
@@ -117,19 +166,85 @@ export class SqliteStore implements Store {
    */
   async transaction<T>(fn: (tx: StoreTx) => Promise<T>): Promise<T> {
     this.db.exec('BEGIN IMMEDIATE');
+    this.inTx = true;
+    this.fence = undefined;
+    this.renewedInTx = undefined;
     try {
       const result = await fn(this);
       this.db.exec('COMMIT');
+      this.inTx = false;
+      this.fence = undefined;
       return result;
     } catch (err) {
+      this.inTx = false;
+      this.fence = undefined;
       try {
         if (this.db.inTransaction) this.db.exec('ROLLBACK');
+        // A renewal made while this transaction was open went down with it. The lease must not lose time to that.
+        const again = this.renewedInTx as { holder: string; generation: number; ttlMs: number } | undefined;
+        this.renewedInTx = undefined;
+        if (again && this.db.open) this.renewNow(again.holder, again.generation, again.ttlMs);
       } catch (rollbackErr) {
         // The transaction may still be open. Nothing can be said about what the record holds.
         throw new StoreFatalError(`ROLLBACK failed after "${err instanceof Error ? err.message : String(err)}", so a transaction may be left open`, { cause: rollbackErr });
       }
       throw err;
     }
+  }
+
+  // ----- executor lease (ADR 0010) -----
+
+  async acquireLease(holder: string, ttlMs: number): Promise<{ generation: number }> {
+    holder = text('lease holder', holder);
+    ttl(ttlMs);
+    // One statement: take the row if there is none, if it ran out, or if it is ours. Otherwise nothing changes.
+    const row = this.db
+      .prepare(
+        `INSERT INTO executor_lease (id, holder, generation, expires_at) VALUES (1, ?, 1, ${NOW} + ?)
+         ON CONFLICT (id) DO UPDATE SET holder = excluded.holder, generation = executor_lease.generation + 1, expires_at = excluded.expires_at
+         WHERE executor_lease.holder = excluded.holder OR executor_lease.expires_at <= ${NOW}
+         RETURNING generation`,
+      )
+      .get(holder, ttlMs) as { generation: number } | undefined;
+    if (row) return { generation: row.generation };
+    const held = this.db.prepare('SELECT holder, expires_at FROM executor_lease WHERE id = 1').get() as { holder: string; expires_at: number };
+    throw new LeaseHeldError(held.holder, new Date(held.expires_at));
+  }
+
+  async renewLease(holder: string, generation: number, ttlMs: number): Promise<boolean> {
+    holder = text('lease holder', holder);
+    ttl(ttlMs);
+    const ok = this.renewNow(holder, generation, ttlMs);
+    // On this one connection a renewal made during a transaction is part of it. Remember it, in case that transaction rolls back.
+    if (ok && this.db.inTransaction) this.renewedInTx = { holder, generation, ttlMs };
+    return ok;
+  }
+
+  private renewNow(holder: string, generation: number, ttlMs: number): boolean {
+    const res = this.db
+      .prepare(`UPDATE executor_lease SET expires_at = ${NOW} + ? WHERE id = 1 AND holder = ? AND generation = ? AND expires_at > ${NOW}`)
+      .run(ttlMs, holder, generation);
+    return res.changes === 1;
+  }
+
+  async releaseLease(holder: string, generation: number): Promise<void> {
+    holder = text('lease holder', holder);
+    // The generation stays, so the next holder's number is still higher than every one before it.
+    this.db.prepare(`UPDATE executor_lease SET expires_at = 0 WHERE id = 1 AND holder = ? AND generation = ?`).run(holder, generation);
+  }
+
+  async assertLease(holder: string, generation: number): Promise<void> {
+    holder = text('lease holder', holder);
+    const row = this.db.prepare(`SELECT holder, generation, expires_at > ${NOW} AS live FROM executor_lease WHERE id = 1`).get() as
+      | { holder: string; generation: number; live: number }
+      | undefined;
+    if (!row) throw new LeaseLostError(holder, generation, 'no lease has been taken on this record');
+    if (row.holder !== holder || row.generation !== generation) {
+      throw new LeaseLostError(holder, generation, `the lease is now "${row.holder}" at generation ${row.generation}`);
+    }
+    if (!row.live) throw new LeaseLostError(holder, generation, 'the lease ran out');
+    // SQLite has one writer: this transaction holds the write lock, so a takeover through this file waits for it by itself.
+    if (this.inTx) this.fence = { holder, generation };
   }
 
   // ----- jobs -----
@@ -182,13 +297,27 @@ export class SqliteStore implements Store {
   async startStage(jobId: string, name: string): Promise<Stage> {
     jobId = text('job id', jobId); name = text('stage name', name);
     this.requireJob(jobId);
+    const generation = this.fence?.generation ?? 0;
+    const now = new Date().toISOString();
+    const live = this.db.prepare('SELECT * FROM claims WHERE job_id = ? AND stage = ? AND released_at IS NULL').get(jobId, name) as ClaimRow | undefined;
+    if (live) {
+      // A claim of this generation or a newer one is somebody's work in progress. An older one belongs to a kernel that lost its lease.
+      if (live.generation >= generation) throw new StageClaimedError(jobId, name, live.attempt, live.generation);
+      this.db.prepare("UPDATE claims SET released_at = ?, release_reason = 'lease-lost' WHERE job_id = ? AND stage = ? AND attempt = ?").run(now, jobId, name, live.attempt);
+      this.db
+        .prepare("UPDATE stages SET status = 'failed', ended_at = ?, output = ? WHERE job_id = ? AND name = ? AND attempt = ? AND status = 'running'")
+        .run(now, JSON.stringify(LEASE_LOST_OUTPUT), jobId, name, live.attempt);
+    }
     const prev = this.db
       .prepare('SELECT COUNT(*) AS n FROM stages WHERE job_id = ? AND name = ?')
       .get(jobId, name) as { n: number };
     const id = randomUUID();
     this.db
       .prepare('INSERT INTO stages (id, job_id, name, status, attempt, started_at) VALUES (?, ?, ?, ?, ?, ?)')
-      .run(id, jobId, name, 'running', prev.n + 1, new Date().toISOString());
+      .run(id, jobId, name, 'running', prev.n + 1, now);
+    this.db
+      .prepare('INSERT INTO claims (job_id, stage, generation, attempt, claimed_at) VALUES (?, ?, ?, ?, ?)')
+      .run(jobId, name, generation, prev.n + 1, now);
     return this.requireStage(id);
   }
 
@@ -218,10 +347,15 @@ export class SqliteStore implements Store {
     id = text('stage id', id); status = text('status', status);
     const json = output === undefined ? null : storableJson(output);
     if (json === undefined) throw new Error(`Output of stage ${id} is not JSON`);
-    const res = this.db
-      .prepare('UPDATE stages SET status = ?, ended_at = ?, output = ? WHERE id = ?')
-      .run(status, new Date().toISOString(), json, id);
-    if (res.changes === 0) throw new Error(`No such stage: ${id}`);
+    const stage = this.requireStage(id);
+    const claim = this.db.prepare('SELECT * FROM claims WHERE job_id = ? AND stage = ? AND attempt = ?').get(stage.jobId, stage.name, stage.attempt) as ClaimRow | undefined;
+    const now = new Date().toISOString();
+    if (claim) {
+      // The attempt number is the fence: an attempt whose claim was taken over or already released cannot write its end.
+      if (claim.released_at !== null) throw new StageNotClaimedError(id, `attempt ${stage.attempt} no longer holds the claim (released: ${claim.release_reason})`);
+      this.db.prepare("UPDATE claims SET released_at = ?, release_reason = 'finished' WHERE job_id = ? AND stage = ? AND attempt = ?").run(now, stage.jobId, stage.name, stage.attempt);
+    }
+    this.db.prepare('UPDATE stages SET status = ?, ended_at = ?, output = ? WHERE id = ?').run(status, now, json, id);
     return this.requireStage(id);
   }
 
@@ -246,15 +380,16 @@ export class SqliteStore implements Store {
 
   // ----- events -----
 
-  async appendEvent(e: { type: string; jobId?: string; source: string; payload: unknown }): Promise<BuligEvent> {
-    e = { ...e, type: text('event type', e.type), source: text('event source', e.source), ...(e.jobId !== undefined && { jobId: text('job id', e.jobId) }) };
-    const id = randomUUID();
+  async appendEvent(e: { id?: string; type: string; jobId?: string; source: string; payload: unknown }): Promise<BuligEvent> {
+    e = { ...e, type: text('event type', e.type), source: text('event source', e.source), ...(e.jobId !== undefined && { jobId: text('job id', e.jobId) }), ...(e.id !== undefined && { id: text('event id', e.id) }) };
+    const id = e.id ?? randomUUID();
     const at = new Date().toISOString();
     const json = e.payload === undefined ? null : storableJson(e.payload);
     if (json === undefined) throw new Error(`Payload of event "${e.type}" is not JSON`);
     const res = this.db
-      .prepare('INSERT INTO events (id, type, job_id, source, payload, at) VALUES (?, ?, ?, ?, ?, ?)')
+      .prepare('INSERT INTO events (id, type, job_id, source, payload, at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO NOTHING')
       .run(id, e.type, e.jobId ?? null, e.source, json, at);
+    if (res.changes === 0) throw new DuplicateEventError(id);
     return toEvent(this.db.prepare('SELECT * FROM events WHERE seq = ?').get(res.lastInsertRowid) as EventRow);
   }
 

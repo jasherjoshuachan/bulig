@@ -370,7 +370,7 @@ for (const adapter of ADAPTERS) {
         });
         const closing = queue.close();
         await expect(queue.run('late', (tx) => tx.schemaVersion())).rejects.toBeInstanceOf(StoreClosedError);
-        expect(await first).toBe(3);
+        expect(await first).toBe(6);
         await closing;
       });
     });

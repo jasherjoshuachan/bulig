@@ -1,4 +1,4 @@
-import { StoreFatalError, type Store, type StoreTx } from './store.ts';
+import { LeaseLostError, StoreFatalError, type Store, type StoreTx } from './store.ts';
 
 export type { StoreTx };
 
@@ -66,6 +66,12 @@ export interface QueueOptions {
   onCloseCutShort?: (ms: number) => void;
 }
 
+/** The executor lease a queue's tasks are fenced with (ADR 0010). */
+export interface Fence {
+  holder: string;
+  generation: number;
+}
+
 interface Started {
   outcome: Promise<unknown>;
   /** Settles when the task is over: its calls have come back and it has committed or rolled back. */
@@ -88,6 +94,11 @@ interface Started {
  *   after, is refused with StoreBrokenError and nothing more is written or delivered. A kernel that cannot tell what
  *   its record holds stops changing it.
  *
+ * - With a fence (setFence), every task, reads included, first asks the store whether the lease is still ours, inside its
+ *   own transaction. Reads are fenced too because it is the simplest rule to hold: a kernel that has lost the lease
+ *   should not be answering from a record someone else now owns. A lease that is gone breaks the queue the same way a
+ *   stuck call does (StoreBrokenError), so there is one fail-closed state and not two.
+ *
  * A task must not wait on another task: that would wait on itself.
  */
 export class StoreQueue {
@@ -95,6 +106,9 @@ export class StoreQueue {
   private waiting = 0;
   private closed = false;
   private broken: StoreBrokenError | undefined;
+  private fence: Fence | undefined;
+  /** The task running now, so a break that comes from outside (the heartbeat) can end it. */
+  private active: { abandon(err: StoreBrokenError): void } | undefined;
   private readonly timeoutMs: number;
   private readonly brokenMs: number;
   private readonly closeMs: number;
@@ -116,6 +130,23 @@ export class StoreQueue {
   /** Set once the queue has given up on the store. */
   get brokenError(): StoreBrokenError | undefined {
     return this.broken;
+  }
+
+  /** From now on every task asks the store whether `fence` still holds the executor lease before it does anything else. */
+  setFence(fence: Fence | undefined): void {
+    this.fence = fence;
+  }
+
+  /**
+   * Give up on the store from outside: the lease could not be renewed, so this kernel may no longer write. The task that is
+   * running is told, everything waiting and everything later is refused, and the adapter is asked to stop what is in flight.
+   */
+  breakNow(message: string, task: string, call: string): StoreBrokenError {
+    if (this.broken) return this.broken;
+    const err = new StoreBrokenError(message, task, call);
+    this.active?.abandon(err);
+    this.breakWith(err);
+    return err;
   }
 
   run<T>(label: string, task: (tx: QueueTx) => Promise<T> | T): Promise<T> {
@@ -181,7 +212,7 @@ export class StoreQueue {
     if (this.broken) {
       return { outcome: Promise.reject(this.refusal(label)), finished: Promise.resolve() };
     }
-    const lease = { expired: false };
+    const deadline = { expired: false };
     const hooks: (() => void)[] = [];
     let settleOutcome!: { resolve(v: unknown): void; reject(e: unknown): void };
     const outcome = new Promise<unknown>((resolve, reject) => (settleOutcome = { resolve, reject }));
@@ -194,7 +225,7 @@ export class StoreQueue {
     // The store call the task is inside, for the error that names it.
     let call = 'none';
     const check = () => {
-      if (lease.expired) {
+      if (deadline.expired) {
         call = 'rollback';
         throw timeout;
       }
@@ -202,26 +233,32 @@ export class StoreQueue {
     // Past this point the transaction is committing. The caller waits for the commit's answer instead of the clock.
     let committing = false;
     let abandoned = false;
+    const abandon = (err: StoreBrokenError) => {
+      if (abandoned) return;
+      deadline.expired = true;
+      abandoned = true;
+      settleOutcome.reject(err);
+      release();
+    };
+    this.active = { abandon };
     const shortTimer = setTimeout(() => {
       if (committing) return;
-      lease.expired = true;
+      deadline.expired = true;
       settleOutcome.reject(timeout);
     }, this.timeoutMs);
     const longTimer = setTimeout(() => {
-      lease.expired = true;
-      abandoned = true;
       const err = new StoreBrokenError(
         `The record is unusable: store call "${call}" (inside task "${label}") did not come back within ${this.brokenMs} ms. The kernel has stopped writing. What that task changed may or may not have been kept; the in-flight work was told to stop.`,
         label,
         call,
       );
-      settleOutcome.reject(err);
-      release();
+      abandon(err);
       this.breakWith(err);
     }, this.brokenMs);
     const clear = () => {
       clearTimeout(shortTimer);
       clearTimeout(longTimer);
+      if (this.active?.abandon === abandon) this.active = undefined;
     };
 
     const guard = (raw: StoreTx): QueueTx => {
@@ -243,9 +280,16 @@ export class StoreQueue {
       return tx as unknown as QueueTx;
     };
 
+    // Taken now, so a lease that is gone cannot be picked up again by a task already on its way.
+    const fence = this.fence;
     let running: Promise<unknown>;
     try {
       running = this.store.transaction(async (raw) => {
+        if (fence) {
+          call = 'assertLease';
+          await raw.assertLease(fence.holder, fence.generation);
+          check();
+        }
         const value = await task(guard(raw));
         check();
         call = 'commit';
@@ -274,6 +318,17 @@ export class StoreQueue {
       },
       (err: unknown) => {
         clear();
+        if (err instanceof LeaseLostError && !abandoned) {
+          // The lease is gone. Nothing of this task was written. This kernel may not write again.
+          const broken = new StoreBrokenError(
+            `The executor lease was lost (${err.message}). The kernel has stopped writing. The task "${label}" wrote nothing.`,
+            label,
+            call,
+          );
+          abandon(broken);
+          this.breakWith(broken);
+          return;
+        }
         if (err instanceof StoreFatalError && !abandoned) {
           // Rollback or commit failed: a transaction may be open. Stop at once, not at the next task's BEGIN.
           abandoned = true;

@@ -13,6 +13,8 @@ export interface StageRequest {
   model: string;
   mode: StageMode;
   cwd: string;
+  /** The stage attempt this run is for (ADR 0010). When present, the run starts only while that attempt is the running one. */
+  stageId?: string;
 }
 
 export interface WorkerConfig {
@@ -518,7 +520,8 @@ function isRequest(p: unknown): p is StageRequest {
     typeof r.prompt === 'string' &&
     typeof r.model === 'string' &&
     typeof r.cwd === 'string' &&
-    (r.mode === 'readonly' || r.mode === 'edit')
+    (r.mode === 'readonly' || r.mode === 'edit') &&
+    (r.stageId === undefined || typeof r.stageId === 'string')
   );
 }
 
@@ -636,6 +639,23 @@ export function createWorker() {
           if (state === 'cancelled' || state === 'failed' || (jobId && endedWhileStarting.has(jobId))) {
             ctx.emit('stage.failed', { stage: req.stage, error: `the job is ${state === 'cancelled' || state === 'failed' ? state : 'ending'}, so the stage did not start` }, jobId);
             return;
+          }
+          // A request for an attempt that is no longer the running one (the stage finished, or another kernel took it over) is a
+          // repeat. Running Claude again would do the same work twice in the same worktree, so nothing starts and nothing is said.
+          if (req.stageId !== undefined && jobId) {
+            let live: boolean;
+            try {
+              live = (await ctx.jobs.stages(jobId)).some((s) => s.id === req.stageId && s.status === 'running');
+            } catch (err) {
+              if (stopping) return;
+              ctx.emit('stage.failed', { stage: req.stage, error: `could not read the stages, so the stage did not start: ${err instanceof Error ? err.message : String(err)}` }, jobId);
+              return;
+            }
+            if (stopping) return;
+            if (!live) {
+              ctx.log.warn(`worker-claude-code: stage ${req.stage} (${req.stageId}) of job ${jobId} is not the running attempt, so no Claude was started`);
+              return;
+            }
           }
           let spawned: ChildProcess | undefined;
           const out = await run(bin, buildArgs(req, cfg.extraArgs, cfg.allowDomains), req.cwd, timeoutMs, buildEnv(process.env, cfg.passEnv), children, (child) => {

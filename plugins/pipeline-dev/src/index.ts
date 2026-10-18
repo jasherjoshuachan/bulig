@@ -96,6 +96,13 @@ export default definePlugin({
       throw new Error(`pipeline-dev: stageResultEvent must be "stage.completed", "stage.checked" or "stage.screened", not ${JSON.stringify(resultEvent)}`);
     }
 
+    /**
+     * When this copy of the plugin started. A stage that began after it belongs to this kernel and holds a live claim, so resume
+     * leaves it alone (ADR 0010); one that began before was left by a kernel that is gone.
+     */
+    const registeredAt = Date.now();
+    const leftByOldKernel = (s: Stage) => s.status === 'running' && Date.parse(s.startedAt) <= registeredAt;
+
     /** Edit stages whose Claude run is done and whose commit is still being made. Lost on a restart, which just reruns the stage. */
     const committing = new Map<string, { stage: string; status: 'passed' | 'failed'; out: StageOutput }>();
     const stagesOf = async (jobId: string) => (await ctx.jobs.stages(jobId)).filter((s) => !outputOf(s).interrupted);
@@ -213,6 +220,11 @@ export default definePlugin({
       try {
         await body();
       } catch (err) {
+        // The stage is already claimed by a live worker (ADR 0010). Asking for it again is a duplicate, not a failure of the job.
+        if (err instanceof Error && err.name === 'StageClaimedError') {
+          ctx.log.warn(`pipeline-dev: ${err.message}. Nothing was started.`);
+          return;
+        }
         const reason = err instanceof Error ? err.message : String(err);
         ctx.log.error(`pipeline-dev: ${reason}`);
         if (jobId) await fail(jobId, reason);
@@ -284,6 +296,8 @@ export default definePlugin({
             'stage.requested',
             {
               stage: name,
+              // The attempt this request is for (ADR 0010). A worker that finds it is no longer the running one does nothing.
+              stageId: opened.id,
               prompt,
               model: STRONG.has(name) ? strong : standard,
               mode: READONLY.has(name) ? 'readonly' : 'edit',
@@ -363,7 +377,7 @@ export default definePlugin({
             // the cleanup that was waiting for it can go ahead.
             await attempt(job.id, async () => {
               for (const s of await ctx.jobs.stages(job.id)) {
-                if (s.status === 'running') await finish(s, 'failed', { interrupted: true, reason: 'interrupted', error: 'process stopped mid-stage' });
+                if (leftByOldKernel(s)) await finish(s, 'failed', { interrupted: true, reason: 'interrupted', error: 'process stopped mid-stage' });
               }
             });
             continue;
@@ -373,7 +387,7 @@ export default definePlugin({
             // A stage still marked running belongs to a process that is gone. Mark it, and it runs again.
             let mayHaveHalfDoneEdits = false;
             for (const s of await ctx.jobs.stages(job.id)) {
-              if (s.status !== 'running') continue;
+              if (!leftByOldKernel(s)) continue;
               await finish(s, 'failed', { interrupted: true, reason: 'interrupted', error: 'process stopped mid-stage' });
               if (EDITING.has(s.name)) mayHaveHalfDoneEdits = true;
             }
@@ -551,6 +565,8 @@ export default definePlugin({
               'commit.requested',
               {
                 cwd: String(wt.cwd),
+                // The attempt this commit is for (ADR 0010): the github plugin makes one commit per attempt, however often it is asked.
+                stageId: s.id,
                 message: `${job?.title ?? 'work'} (${p.stage})`,
                 scope: scopeOf(await stagesOf(e.jobId)) ?? [],
                 scopeAllow,

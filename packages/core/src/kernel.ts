@@ -1,10 +1,11 @@
+import { randomUUID } from 'node:crypto';
 import { DEPRECATED_SDK_MAJORS, type BuligEvent, type Logger, type Plugin } from '@bulig/plugin-sdk';
 import { Bus } from './bus.ts';
 import { DEFAULT_EVENT_CAPABILITIES } from './capabilities.ts';
 import { buildContext, selectPlugins, type JobsTx, type KernelJobs, type LoadedPlugin } from './loader.ts';
 import { StoreBrokenError, StoreQueue, type QueueTx } from './queue.ts';
 import { SqliteStore } from './sqlite-store.ts';
-import type { Store } from './store.ts';
+import { LeaseHeldError, type Store } from './store.ts';
 
 export interface KernelOptions {
   /** Where the SQLite file lives. Used when no `store` is given. */
@@ -20,6 +21,22 @@ export interface KernelOptions {
   storeBrokenMs?: number;
   /** How long stop() waits for the store's own close() before it stops waiting and says so. Default 10000. */
   storeCloseMs?: number;
+  /**
+   * Who this kernel is to the executor lease (ADR 0010). Default: a new name every time a kernel is made, so a restarted kernel is
+   * never mistaken for the one that died. Two kernels must not share a name: the lease would treat them as one.
+   */
+  leaseHolder?: string;
+  /** How long the executor lease lasts after each renewal. Default 30000. */
+  leaseTtlMs?: number;
+  /** How often the lease is renewed. Default 10000. Must be well under leaseTtlMs. */
+  leaseHeartbeatMs?: number;
+  /**
+   * How long start() waits for another kernel's lease to run out before it gives up. Default leaseTtlMs + 5000, which is long
+   * enough for a lease that was just renewed by a kernel that then died.
+   */
+  leaseWaitMs?: number;
+  /** Told once, when the lease is lost or cannot be renewed and the kernel has stopped writing. The process should exit and be restarted. */
+  onLeaseLost?: (reason: string) => void;
   plugins: Plugin[];
   enabled: string[];
   grants?: Record<string, string[]>;
@@ -39,6 +56,7 @@ const defaultLogger: Logger = {
 export function createKernel(options: KernelOptions) {
   const store = options.store ?? (options.dbPath !== undefined ? new SqliteStore(options.dbPath) : undefined);
   if (!store) throw new Error('createKernel needs a dbPath or a store');
+  const record: Store = store;
   const logger = options.logger ?? defaultLogger;
   // Every store call in the kernel goes through this one queue (ADR 0001: the kernel is the only writer, one at a time).
   const queue = new StoreQueue(store, {
@@ -88,6 +106,68 @@ export function createKernel(options: KernelOptions) {
 
   let loaded: LoadedPlugin[] = [];
 
+  // ----- the executor lease (ADR 0010) -----
+  const holder = options.leaseHolder ?? `kernel-${randomUUID()}`;
+  const ttlMs = options.leaseTtlMs ?? 30_000;
+  const heartbeatMs = options.leaseHeartbeatMs ?? 10_000;
+  const waitMs = options.leaseWaitMs ?? ttlMs + 5_000;
+  if (heartbeatMs * 2 > ttlMs) throw new Error(`leaseHeartbeatMs (${heartbeatMs}) must be less than half of leaseTtlMs (${ttlMs}), so one missed beat does not lose the lease`);
+  let generation: number | undefined;
+  let heartbeat: NodeJS.Timeout | undefined;
+  let beating = false;
+
+  /** Take the lease, waiting for an old one to run out if its holder died. */
+  async function takeLease(): Promise<number> {
+    const giveUpAt = Date.now() + waitMs;
+    let told = false;
+    for (;;) {
+      try {
+        return (await record.acquireLease(holder, ttlMs)).generation;
+      } catch (err) {
+        if (!(err instanceof LeaseHeldError) || Date.now() >= giveUpAt) throw err;
+        if (!told) {
+          told = true;
+          logger.warn(`${err.message} Waiting for it to run out (at most ${waitMs} ms).`);
+        }
+        const until = err.expiresAt ? err.expiresAt.getTime() - Date.now() : 0;
+        await new Promise((r) => setTimeout(r, Math.min(Math.max(until + 20, 50), 1_000)));
+      }
+    }
+  }
+
+  /** Stop writing at once: a kernel that cannot show it holds the lease must not change the record. */
+  function loseLease(reason: string): void {
+    if (heartbeat) clearInterval(heartbeat);
+    heartbeat = undefined;
+    // The queue's onBroken says it loudly, once, in the log.
+    queue.breakNow(`The executor lease was lost: ${reason}.`, 'heartbeat', 'renewLease');
+    options.onLeaseLost?.(reason);
+  }
+
+  function startHeartbeat(gen: number): void {
+    heartbeat = setInterval(() => {
+      if (beating) return;
+      beating = true;
+      // The renewal goes straight to the store, not through the queue: a long task must not be able to hold it up. A renewal
+      // that has not come back by the next beat counts as failed, because the lease would soon run out behind it.
+      let timer: NodeJS.Timeout | undefined;
+      const stuck = new Promise<'stuck'>((resolve) => (timer = setTimeout(() => resolve('stuck'), heartbeatMs)));
+      Promise.race([record.renewLease(holder, gen, ttlMs), stuck])
+        .then(
+          (ok) => {
+            if (ok === 'stuck') loseLease(`the renewal did not come back within ${heartbeatMs} ms`);
+            else if (!ok) loseLease('it ran out or another kernel took it, so the renewal was refused');
+          },
+          (err: unknown) => loseLease(`the renewal failed: ${err instanceof Error ? err.message : String(err)}`),
+        )
+        .finally(() => {
+          clearTimeout(timer);
+          beating = false;
+        });
+    }, heartbeatMs);
+    heartbeat.unref();
+  }
+
   return {
     jobs,
     bus,
@@ -107,6 +187,10 @@ export function createKernel(options: KernelOptions) {
         },
         logger,
       };
+      // Before any plugin runs: nothing may be changed in the record until this kernel holds the lease.
+      generation = await takeLease();
+      queue.setFence({ holder, generation });
+      startHeartbeat(generation);
       for (const { manifest } of loaded) {
         if (DEPRECATED_SDK_MAJORS.includes(manifest.sdk)) {
           logger.warn(`Plugin "${manifest.name}" targets sdk ${manifest.sdk}, which is deprecated. Set "sdk" to "1" after it passes the conformance suite.`);
@@ -133,6 +217,11 @@ export function createKernel(options: KernelOptions) {
       }
       // Let handlers that are still working (a git command, a killed Claude run) finish before the log closes.
       await bus.idle();
+      if (heartbeat) clearInterval(heartbeat);
+      heartbeat = undefined;
+      // Hand the lease back once the queued work is done, so the next kernel need not wait for it to run out.
+      await queue.idle();
+      if (generation !== undefined) await record.releaseLease(holder, generation).catch(() => {});
       await queue.close();
     },
   };

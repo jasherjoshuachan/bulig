@@ -1,7 +1,11 @@
+import { createRequire } from 'node:module';
 import { describe, expect, it } from 'vitest';
 import type { Stage } from '@bulig/plugin-sdk';
 import { decide, parseVerdict, renderPrompt } from '../src/index.ts';
 import { boot, fakeGithub, fakeHuman, fakeWorker, newDb, openApproval, raw, stageNames, types, type Script, type Sent, settle } from './harness.ts';
+
+// better-sqlite3 belongs to @bulig/core, not to this plugin: load it the way core does.
+const Database = createRequire(new URL('../../../packages/core/package.json', import.meta.url))('better-sqlite3') as typeof import('better-sqlite3');
 
 const PASS = 'All good.\nVERDICT: PASS';
 const FAIL = (why: string) => `${why}\nVERDICT: FAIL`;
@@ -563,6 +567,39 @@ describe('resume after a restart', () => {
     expect((await stageNames(second.k, job.id)).filter((s) => s.startsWith('approve-merge'))).toEqual(['approve-merge:passed']);
   });
 
+  it('a stage this kernel is already running is not closed and run a second time when kernel.started comes (a live claim is left alone)', async () => {
+    const r = rig({ build: () => 'hang' });
+    await r.k.start();
+    await settle(r.k);
+    const job = await jobOf(r.k);
+    await settle(r.k);
+    r.human.grant(job.id, 'plan');
+    await settle(r.k);
+    const running = (await r.k.jobs.stages(job.id)).filter((s) => s.name === 'build');
+    expect(running.map((s) => s.status)).toEqual(['running']);
+    // Resume looks at a stage that began after this kernel started. That is a live claim, not the leftovers of a dead kernel.
+    await r.k.bus.emit({ type: 'kernel.started', source: 'kernel', payload: { plugins: [] } });
+    await settle(r.k);
+    expect(r.worker.filter((s) => s.stage === 'build')).toHaveLength(1);
+    expect((await r.k.jobs.stages(job.id)).filter((s) => s.name === 'build').map((s) => `${s.attempt}:${s.status}`)).toEqual(['1:running']);
+    expect((await r.k.jobs.get(job.id))!.status).not.toBe('failed');
+  });
+
+  it('a repeated event that asks for a stage already claimed is a duplicate, not a failure: no second attempt, and the job carries on', async () => {
+    const r = rig({ plan: () => 'hang' });
+    await r.k.start();
+    await settle(r.k);
+    const job = await jobOf(r.k);
+    await settle(r.k);
+    expect((await r.k.jobs.stages(job.id)).map((s) => `${s.name}:${s.status}`)).toEqual(['worktree:passed', 'plan:running']);
+    // job.created arrives a second time (a repeated delivery): the pipeline would start plan again.
+    await r.k.bus.emit({ type: 'job.created', source: 'kernel', jobId: job.id, payload: job });
+    await settle(r.k);
+    expect(r.worker.filter((s) => s.stage === 'plan')).toHaveLength(1);
+    expect((await r.k.jobs.stages(job.id)).map((s) => `${s.name}:${s.status}`)).toEqual(['worktree:passed', 'plan:running']);
+    expect((await r.k.jobs.get(job.id))!.status).toBe('running');
+  });
+
   it('a new process continues from the plan approval', async () => {
     const db = newDb();
     const first = rig({}, {}, {}, db);
@@ -939,7 +976,11 @@ describe('scope guard: the plan declares its scope', () => {
     const job = await jobOf(r.k);
     await settle(r.k);
     const plan = (await r.k.jobs.stages(job.id)).find((s) => s.name === 'plan')!;
-    (await r.k.jobs.finishStage(plan.id, 'passed', { result: 'An old plan with no scope recorded' }));
+    // An older job's plan was written before scopes existed. Write it that way into the file, under the kernel: the store itself
+    // (rightly) refuses to finish a stage twice, so the kernel's API cannot make an old record.
+    const file = new Database(r.db);
+    file.prepare('UPDATE stages SET output = ? WHERE id = ?').run(JSON.stringify({ result: 'An old plan with no scope recorded' }), plan.id);
+    file.close();
     r.human.grant(job.id, 'plan');
     await settle(r.k);
     expect(r.worker.map((s) => s.stage)).toEqual(['plan', 'critique']);

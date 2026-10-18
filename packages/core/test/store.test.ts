@@ -26,7 +26,7 @@ describeStoreContract(
     };
     return handle;
   },
-  { schemaVersion: 3 },
+  { schemaVersion: 6 },
 );
 
 // What belongs to SQLite alone.

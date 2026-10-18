@@ -13,8 +13,10 @@ export interface CliChannel {
   plugin: Plugin;
   /** Create a job. Only works once the kernel has started. */
   submit(input: { repo: string; title: string; body?: string }): Promise<Job>;
-  grant(jobId: string, kind: ApprovalKind): void;
-  deny(jobId: string): void;
+  /** Grant the approval stage `stageId`. The pipeline ignores it unless that stage is the one open now. */
+  grant(jobId: string, kind: ApprovalKind, stageId: string): void;
+  /** Deny the approval stage `stageId`. The pipeline ignores it unless that stage is the one open now. */
+  deny(jobId: string, stageId: string): void;
 }
 
 const short = (id?: string) => (id ?? '--------').slice(0, 8);
@@ -76,8 +78,10 @@ export function format(e: BuligEvent): string[] | undefined {
       }
       const summary = String(p.summary ?? '').trim().split('\n').slice(0, 14);
       for (const s of summary) head.push(`${tag}   | ${s.slice(0, 160)}`);
-      head.push(`${tag}   approve: bulig approve ${id} ${kind}`);
-      head.push(`${tag}   deny:    bulig deny ${id}`);
+      // The commands name this approval stage, so a line copied from an earlier question cannot answer a later one.
+      const stage = String(p.stageId ?? '');
+      head.push(`${tag}   approve: bulig approve ${id} ${kind} ${stage}`);
+      head.push(`${tag}   deny:    bulig deny ${id} ${stage}`);
       return head;
     }
     default:
@@ -146,8 +150,8 @@ export function createCliChannel(opts: CliChannelOptions = {}): CliChannel {
   return {
     plugin,
     submit: (input) => need().jobs.create(input),
-    grant: (jobId, kind) => need().emit('approval.granted', { jobId, kind }, jobId),
-    deny: (jobId) => need().emit('approval.denied', { jobId }, jobId),
+    grant: (jobId, kind, stageId) => need().emit('approval.granted', { jobId, kind, stageId }, jobId),
+    deny: (jobId, stageId) => need().emit('approval.denied', { jobId, stageId }, jobId),
   };
 }
 

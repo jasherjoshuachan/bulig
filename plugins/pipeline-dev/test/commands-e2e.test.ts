@@ -61,7 +61,8 @@ describe('/cancel and /retry with the real pipeline', () => {
     await until(() => r.k.jobs.list().length === 1, 'job');
     const old = r.k.jobs.list()[0]!;
     await until(() => r.fake.texts(CHAT).some((t) => t.includes('approval needed: plan')), 'plan card', 15000);
-    r.fake.press(CHAT, 1, 'card', `ap:${old.id}:plan`);
+    const oldCard = r.fake.of('sendMessage').find((c) => String(c.params.text).includes('approval needed: plan'))!;
+    r.fake.press(CHAT, 1, 'card', (oldCard.params.reply_markup as { inline_keyboard: { callback_data: string }[][] }).inline_keyboard[0]![0]!.callback_data);
     await until(() => r.k.jobs.get(old.id)!.status === 'failed', 'the job to fail', 15000);
     const oldStages = r.k.jobs.stages(old.id).map((s) => `${s.name}:${s.status}`);
     expect(oldStages).toContain('approve-plan:passed');

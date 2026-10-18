@@ -135,11 +135,12 @@ describe('channel-cli plugin', () => {
     const { k, channel } = boot(['channel.send:terminal', 'approval.grant']);
     await k.start();
     const job = await channel.submit({ repo: '/r', title: 't' });
-    channel.grant(job.id, 'plan');
-    channel.deny(job.id);
+    channel.grant(job.id, 'plan', 'stage-1');
+    channel.deny(job.id, 'stage-2');
     const mine = k.history(job.id).filter((e) => e.source === 'channel-cli');
     expect(mine.map((e) => e.type)).toEqual(['approval.granted', 'approval.denied']);
-    expect(mine[0]!.payload).toEqual({ jobId: job.id, kind: 'plan' });
+    expect(mine[0]!.payload).toEqual({ jobId: job.id, kind: 'plan', stageId: 'stage-1' });
+    expect(mine[1]!.payload).toEqual({ jobId: job.id, stageId: 'stage-2' });
   });
 
   it('will not start without approval.grant, because it emits approvals', async () => {

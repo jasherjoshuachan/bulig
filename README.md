@@ -83,14 +83,14 @@ You need `claude` (Claude Code, signed in) and `gh` (signed in, with a token tha
 cp bulig.config.example.json bulig.config.json     # then edit it
 pnpm bulig run --repo ../my-project --title "Add multiply function" \
   --issue "Add src/multiply.js exporting multiply(a,b) with tests"
-pnpm bulig approve <jobId> plan      # after you have read the plan
-pnpm bulig approve <jobId> merge     # after you have read the PR
-pnpm bulig deny <jobId>              # to stop at either gate
+pnpm bulig approve <jobId> plan <stageId>     # after you have read the plan
+pnpm bulig approve <jobId> merge <stageId>    # after you have read the PR
+pnpm bulig deny <jobId> <stageId>             # to stop at either gate
 pnpm bulig status [jobId]
 pnpm bulig history <jobId>
 ```
 
-A job id can be shortened to any unique start of it. If a process dies mid-stage, `pnpm bulig resume <jobId>` picks the job up again. The cut-off stage is marked failed with the reason `interrupted`, the job worktree is put back to its last commit (`git reset --hard` and `git clean -fd`, inside that job's worktree only), and the stage runs again. Edit stages end in a commit, so only the work of the stage that was cut off is lost. When Bulig stops, it sends SIGTERM to the Claude sessions it started and SIGKILL to any that are still alive 10 seconds later (`stopGraceMs` in the worker config).
+A job id can be shortened to any unique start of it. The stage id is printed with each question and must be given in full: it names the question you are answering, so a command copied from an earlier question (say, a merge approval from before a refused merge) is refused as expired. If a process dies mid-stage, `pnpm bulig resume <jobId>` picks the job up again. The cut-off stage is marked failed with the reason `interrupted`, the job worktree is put back to its last commit (`git reset --hard` and `git clean -fd`, inside that job's worktree only), and the stage runs again. Edit stages end in a commit, so only the work of the stage that was cut off is lost. When Bulig stops, it sends SIGTERM to the Claude sessions it started and SIGKILL to any that are still alive 10 seconds later (`stopGraceMs` in the worker config).
 
 Every Claude stage runs inside Claude Code's own Bash sandbox, switched on with `--settings`. A command a stage runs, and anything that command starts (`node`, `npm`, `pnpm`), can reach only the Anthropic API and the npm registry; GitHub is refused. If the sandbox cannot start (on Linux it needs `bubblewrap` and `socat`), the stage fails rather than running without it. Add more hosts with `allowDomains` in the `worker-claude-code` config (a GitHub host there is ignored). Each stage also gets an empty `GH_CONFIG_DIR` and no git credentials. When a job is cancelled or fails, the Claude process running for that job is stopped first, and its worktree is removed only after that stage has ended. [ADR 0003](docs/adr/0003-capability-manifest.md) lists what the OS enforces and what is only a name.
 
@@ -110,7 +110,7 @@ worker       stage.completed plan                a fresh claude session; the pla
 pipeline     stage.requested critique (opus, readonly)
 worker       stage.completed critique            another fresh session
 pipeline     approval.requested plan { scope }   job -> awaiting_approval, the process exits. The card lists the files the job may change
-you          bulig approve <jobId> plan
+you          bulig approve <jobId> plan <stageId>
 channel      approval.granted
 pipeline     stage.requested build (sonnet, edit)
 worker       stage.completed build
@@ -126,7 +126,7 @@ worker       stage.completed review              a FAIL here loops back to build
 pipeline     pr.requested { expectSha }
 github       pr.opened { url, number, headSha }  pushes the branch and opens the PR, but only if HEAD is the reviewed commit
 pipeline     approval.requested merge            job -> awaiting_approval, the process exits
-you          bulig approve <jobId> merge
+you          bulig approve <jobId> merge <stageId>
 channel      approval.granted
 pipeline     merge.requested
 github       pr.merged                           only if the head is still headSha and no check is red or pending
@@ -224,7 +224,7 @@ In the chat:
 | `/retry <jobId>` | Starts a new job from a failed or cancelled job (same repo, title and issue text). It plans again and asks for its own plan approval; nothing from the old job's approvals or scope is reused. A job that is done or still active is refused. A job that already has a live or finished retry is refused too, and the reply names that retry and its state; it can be retried again only when every earlier retry failed or was cancelled. Retrying a failed retry works and links to it. If a crash left a retry job created but not linked, the next `/retry` of the same job finds it, links it and refuses. |
 | `/help` | The list above. |
 
-When a job needs you, the bot sends the plan or the PR with **Approve** and **Deny** buttons. Tapping one edits the message to show the decision. A button for an approval that is no longer open answers "expired" and does nothing. A job id can be shortened to any unique start of it.
+When a job needs you, the bot sends the plan or the PR with **Approve** and **Deny** buttons. Tapping one edits the message to show the decision. A button for an approval that is no longer open answers "expired" and does nothing. Each card names its own question, so a card left in another chat cannot answer a later question of the same kind (after a refused merge, only the new card can approve the retry), and a card sent before Bulig named its questions is always expired ([ADR 0008](docs/adr/0008-approval-names-its-stage.md)). A job id can be shortened to any unique start of it.
 
 Only one Bulig process may use a database, so stop `serve` before you use `bulig run` or `bulig approve`. When `serve` stops (Ctrl-C or SIGTERM) it exits cleanly, and the next start picks up unfinished jobs. The bot remembers its place in your chat in the database, so a restart does not replay old commands. If Telegram limits the bot, it waits as long as Telegram asks; on network errors it backs off and tries again.
 

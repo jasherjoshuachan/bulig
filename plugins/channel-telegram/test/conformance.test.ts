@@ -1,4 +1,5 @@
 import { describeConformance, fakeJobId } from '@bulig/plugin-sdk/conformance';
+import { stageRef } from './harness.ts';
 import { createTelegramChannel } from '../src/index.ts';
 
 // A test value for this file only. The harness never lets a request leave the machine.
@@ -12,7 +13,9 @@ const button = (data: string) => ({ update_id: id++, callback_query: { id: 'q1',
 const say = (id: number, text: string) => ({ update_id: id, message: { message_id: id, text, chat: { id: 1 }, from: { id: 7 } } });
 
 // Telegram answers the first getUpdates with the taps and commands below, and holds every later poll open.
-const updates = [button(`ap:${J1}:plan`), button(`dn:${J1}:plan`), say(11, '/dev demo Add a thing'), say(12, `/cancel ${J2}`)];
+// The seeded job's approve-plan stage is the fake store's first stage.
+const S1 = '00000000-0000-4000-9000-000000000001';
+const updates = [button(`ap:${J1}:plan:${stageRef(S1)}`), button(`dn:${J1}:plan:${stageRef(S1)}`), say(11, '/dev demo Add a thing'), say(12, `/cancel ${J2}`)];
 const respondToFetch = (url: string, _init: unknown, n: number) => {
   if (url.endsWith('/getUpdates')) return n === 1 ? { ok: true, result: updates } : undefined;
   return { ok: true, result: { message_id: 1 } };
@@ -37,7 +40,7 @@ describeConformance('channel-telegram', {
       name: 'taps, commands and progress',
       jobs: seeded,
       events: [
-        { type: 'approval.requested', jobId: J1, payload: { jobId: J1, kind: 'plan', summary: 'PLAN', scope: ['a.md'] } },
+        { type: 'approval.requested', jobId: J1, payload: { jobId: J1, kind: 'plan', stageId: S1, summary: 'PLAN', scope: ['a.md'] } },
         { type: 'stage.completed', jobId: J1, payload: { stage: 'test', result: 'VERDICT: PASS' } },
         { type: 'stage.failed', jobId: J1, payload: { stage: 'build', error: 'x' } },
         { type: 'pr.opened', jobId: J1, payload: { url: 'https://example.test/1' } },

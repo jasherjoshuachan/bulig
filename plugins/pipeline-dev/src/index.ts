@@ -262,11 +262,11 @@ export default definePlugin({
         }
         case 'approve': {
           const stageName = `approve-${action.which}`;
-          await ctx.jobs.startStage(job.id, stageName);
+          const asked = await ctx.jobs.startStage(job.id, stageName);
           await ctx.jobs.setStatus(job.id, 'awaiting_approval');
           if (action.which === 'plan') {
             const summary = withEvidence(evidenceBlock(stages, ['plan', 'critique']), `PLAN\n${textOf(stages, 'plan')}\n\nCRITIQUE\n${textOf(stages, 'critique')}`);
-            ctx.emit('approval.requested', { jobId: job.id, kind: 'plan', summary: clip(summary, 4000), scope: scopeOf(stages) ?? [] }, job.id);
+            ctx.emit('approval.requested', { jobId: job.id, kind: 'plan', stageId: asked.id, summary: clip(summary, 4000), scope: scopeOf(stages) ?? [] }, job.id);
           } else {
             const pr = outputOf(lastOf(stages, 'pr')!);
             const review = textOf(stages, 'review');
@@ -275,6 +275,7 @@ export default definePlugin({
               {
                 jobId: job.id,
                 kind: 'merge',
+                stageId: asked.id,
                 url: pr.url,
                 headSha: pr.headSha,
                 summary: clip(
@@ -544,10 +545,11 @@ export default definePlugin({
 
     ctx.on('approval.granted', (e) => {
       return guard(e.jobId, async () => {
-        const p = e.payload as { jobId?: string; kind?: string };
+        const p = e.payload as { jobId?: string; kind?: string; stageId?: unknown };
         const jobId = e.jobId ?? p.jobId;
         const s = jobId && p.kind && await runningStage(jobId, `approve-${p.kind}`);
         if (!jobId || !s) return;
+        if (p.stageId !== s.id) return void ignoreStale('grant', jobId, s, p.stageId, e.source);
         await finish(s, 'passed', { grantedBy: e.source });
         await ctx.jobs.setStatus(jobId, 'running');
         await advance(jobId);
@@ -556,14 +558,24 @@ export default definePlugin({
 
     ctx.on('approval.denied', (e) => {
       return guard(e.jobId, async () => {
-        const p = e.payload as { jobId?: string };
+        const p = e.payload as { jobId?: string; stageId?: unknown };
         const jobId = e.jobId ?? p.jobId;
         const s = jobId && (await ctx.jobs.stages(jobId)).find((x) => x.name.startsWith('approve-') && x.status === 'running');
         if (!jobId || !s) return;
+        if (p.stageId !== s.id) return void ignoreStale('deny', jobId, s, p.stageId, e.source);
         await finish(s, 'failed', { deniedBy: e.source });
         await ctx.jobs.setStatus(jobId, 'cancelled');
       });
     });
+
+    /**
+     * A grant or deny must carry the id of the approval stage that is open now. One that names another stage, or none
+     * (a card sent before stage ids existed), was meant for an earlier question. It changes nothing.
+     */
+    function ignoreStale(what: string, jobId: string, s: Stage, ref: unknown, source: string): void {
+      const named = typeof ref === 'string' && ref !== '' ? `stage ${ref.slice(0, 36)}` : 'no stage';
+      ctx.log.warn(`pipeline-dev: ignored a ${what} from ${source} for job ${jobId}: it names ${named}, but the open question is ${s.name} ${s.id}. The card has expired.`);
+    }
 
     ctx.on('pr.opened', (e) => {
       return guard(e.jobId, async () => {

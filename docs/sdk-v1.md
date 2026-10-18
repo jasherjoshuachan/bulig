@@ -149,10 +149,12 @@ The gate chain is part of the contract: a gate reads one stage event, forwards e
 
 | Event | Needs | Payload | Status |
 |---|---|---|---|
-| `approval.requested` | none | `{ jobId, kind: "plan"\|"merge", summary: string, scope?: string[], url?, headSha? }` | stable. `scope` is set for `plan`, `url` and `headSha` for `merge`. |
-| `approval.granted` | `approval.grant` | `{ jobId, kind: "plan"\|"merge" }` | stable |
-| `approval.denied` | `approval.grant` | `{ jobId, kind? }` | stable. `kind` is optional: the terminal channel denies without it. |
+| `approval.requested` | none | `{ jobId, kind: "plan"\|"merge", stageId?: string, summary: string, scope?: string[], url?, headSha? }` | stable. `stageId` is the id of the approval stage this question opened; `pipeline-dev` always sets it. `scope` is set for `plan`, `url` and `headSha` for `merge`. |
+| `approval.granted` | `approval.grant` | `{ jobId, kind: "plan"\|"merge", stageId?: string }` | stable. `stageId` names the question being answered. |
+| `approval.denied` | `approval.grant` | `{ jobId, kind?, stageId?: string }` | stable. `kind` is optional: the terminal channel denies without it. |
 | `cancel.requested` | `approval.grant` | `{ jobId }` | stable |
+
+**A grant or deny answers one question.** `pipeline-dev` acts on `approval.granted` or `approval.denied` only when its `stageId` is the full id of the approval stage that is open now (for a grant, the open `approve-<kind>` stage). Anything else is ignored and logged: a grant for an earlier question of the same kind (a card left in a second chat after a merge was refused and asked again), and a grant or deny with no `stageId` at all, such as a Telegram card sent before this field existed. Those cards show as expired. The field is optional in the payload, so an event without it still validates, but it changes nothing. A channel copies `stageId` from the `approval.requested` it shows, never from the job's current stages, or it would answer a question the person has not seen. Where a channel cannot carry the whole id (Telegram button data is 64 bytes), it carries a short reference, turns it back into the full id itself, and emits the full id. See [ADR 0008](adr/0008-approval-names-its-stage.md).
 
 ### Pull request and merge events (pipeline and github)
 

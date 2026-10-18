@@ -72,6 +72,8 @@ function world(configOverride: Record<string, unknown> = {}) {
 }
 
 const jobIdFrom = (text: string) => /started job ([0-9a-f-]{36})/.exec(text)![1]!;
+/** The approval stage id printed with the newest question of a kind, as in `bulig approve <id> <kind> <stageId>`. */
+const stageFrom = (out: string, kind: 'plan' | 'merge'): string => [...out.matchAll(new RegExp(`bulig approve \\S+ ${kind} (\\S+)`, 'g'))].at(-1)![1]!;
 
 describe('with gate-evidence enabled', () => {
   it('the CLI points the pipeline at the gate, so an unbacked claim is marked on the screen and the job still finishes in warn mode', async () => {
@@ -84,13 +86,13 @@ describe('with gate-evidence enabled', () => {
     expect(run.out).toMatch(/\| EVIDENCE \(from the tool-use records/);
     expect(run.out).toContain('| plan: Evidence this turn: no tool calls recorded');
 
-    const plan = await w.run('approve', id, 'plan');
+    const plan = await w.run('approve', id, 'plan', stageFrom(run.out, 'plan'));
     expect(plan.err).toBe('');
     expect(plan.out).toContain('test: claims with no evidence (Evidence this turn: no tool calls recorded)');
     expect(plan.out).toContain('Unverified: no record of a test run this turn ("ran npm test, 2 passed")');
     expect(plan.out).toContain('approval needed: merge');
 
-    const merge = await w.run('approve', id, 'merge');
+    const merge = await w.run('approve', id, 'merge', stageFrom(plan.out, 'merge'));
     expect(merge.out).toContain('is done');
   });
 
@@ -101,7 +103,7 @@ describe('with gate-evidence enabled', () => {
     });
     const run = await w.run('run', '--repo', w.repo, '--title', 'Add multiply function', '--issue', 'Add src/multiply.js');
     const id = jobIdFrom(run.out);
-    const plan = await w.run('approve', id, 'plan');
+    const plan = await w.run('approve', id, 'plan', stageFrom(run.out, 'plan'));
     expect(plan.out).toMatch(/job failed: test failed: evidence gate: Unverified: no record of a test run this turn/);
     expect(plan.out).not.toContain('PR opened');
   });
@@ -126,7 +128,7 @@ describe('a whole job through the CLI', () => {
     expect(status.out).toContain('Add multiply function');
 
     // A short id works, and the second process continues from the stored state.
-    const plan = await w.run('approve', id.slice(0, 8), 'plan');
+    const plan = await w.run('approve', id.slice(0, 8), 'plan', stageFrom(run.out, 'plan'));
     expect(plan.err).toBe('');
     expect(plan.code).toBe(0);
     for (const s of ['build: started (sonnet, edit)', 'test: started', 'docs: started', 'review: started (opus, readonly)', 'PR opened:', 'approval needed: merge']) {
@@ -134,7 +136,7 @@ describe('a whole job through the CLI', () => {
     }
     expect(git(w.origin, 'show', `${git(w.origin, 'branch', '--list', 'bulig/*').replace(/^[* ]+/, '')}:src/multiply.js`)).toContain('a * b');
 
-    const merge = await w.run('approve', id, 'merge');
+    const merge = await w.run('approve', id, 'merge', stageFrom(plan.out, 'merge'));
     expect(merge.code).toBe(0);
     expect(merge.out).toContain('PR merged');
     expect(merge.out).toContain('is done');
@@ -160,7 +162,7 @@ describe('a whole job through the CLI', () => {
     const w = world();
     const run = await w.run('run', '--repo', w.repo, '--title', 'Try it');
     const id = jobIdFrom(run.out);
-    const deny = await w.run('deny', id);
+    const deny = await w.run('deny', id, stageFrom(run.out, 'plan'));
     expect(deny.code).toBe(0);
     expect(deny.out).toContain('is cancelled');
     expect((await w.run('status', id)).out).toContain('status   cancelled');
@@ -172,13 +174,37 @@ describe('a whole job through the CLI', () => {
 
   it('approving the wrong kind, or a finished job, is refused before anything starts', async () => {
     const w = world();
-    const id = jobIdFrom((await w.run('run', '--repo', w.repo, '--title', 'T')).out);
-    const wrong = await w.run('approve', id, 'merge');
+    const run = await w.run('run', '--repo', w.repo, '--title', 'T');
+    const id = jobIdFrom(run.out);
+    const stage = stageFrom(run.out, 'plan');
+    const wrong = await w.run('approve', id, 'merge', stage);
     expect(wrong.code).toBe(2);
     expect(wrong.err).toMatch(/waiting for the plan approval, not merge/);
-    await w.run('deny', id);
-    const late = await w.run('approve', id, 'plan');
+    await w.run('deny', id, stage);
+    const late = await w.run('approve', id, 'plan', stage);
     expect(late.err).toMatch(/cancelled, not waiting/);
+  });
+
+  it('an approve or deny must name the open approval stage by its full id', async () => {
+    const w = world();
+    const run = await w.run('run', '--repo', w.repo, '--title', 'T');
+    const id = jobIdFrom(run.out);
+    const stage = stageFrom(run.out, 'plan');
+    expect(run.out).toContain(`bulig deny ${id} ${stage}`);
+    for (const argv of [['approve', id, 'plan'], ['deny', id]]) {
+      const r = await w.run(...argv);
+      expect(r.code).toBe(2);
+      expect(r.err).toContain(`name the approval stage you are answering. Job ${id} is waiting for the plan approval, stage ${stage}`);
+    }
+    // Another stage's id (a line copied from an earlier question), or a prefix of this one, has expired.
+    for (const other of ['00000000-0000-4000-9000-000000000001', stage.slice(0, 12)]) {
+      for (const argv of [['approve', id, 'plan', other], ['deny', id, other]]) {
+        const r = await w.run(...argv);
+        expect(r.code).toBe(2);
+        expect(r.err).toContain(`stage ${other} is not the open question, so it has expired`);
+      }
+    }
+    expect((await w.run('status', id)).out).toContain('status   awaiting_approval');
   });
 
   it('a worker failure leaves the job failed and the exit code 1', async () => {

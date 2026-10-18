@@ -40,8 +40,8 @@ const USAGE = `bulig: a small kernel for Claude Code agent work
 Usage:
   bulig serve
   bulig run --repo <path> --title <text> [--issue <text>]
-  bulig approve <jobId> <plan|merge>
-  bulig deny <jobId>
+  bulig approve <jobId> <plan|merge> <stageId>
+  bulig deny <jobId> <stageId>
   bulig resume <jobId>
   bulig status [jobId]
   bulig history <jobId>
@@ -265,8 +265,8 @@ async function cmdRun(args: string[], io: Io): Promise<number> {
 }
 
 async function cmdApprove(args: string[], io: Io): Promise<number> {
-  const [idArg, kind, ...extra] = args;
-  if (!idArg || (kind !== 'plan' && kind !== 'merge') || extra.length) throw new UserError('usage: bulig approve <jobId> <plan|merge>');
+  const [idArg, kind, stageArg, ...extra] = args;
+  if (!idArg || (kind !== 'plan' && kind !== 'merge') || extra.length) throw new UserError('usage: bulig approve <jobId> <plan|merge> <stageId>');
   const { config } = loadConfig(io.cwd, io.home);
   const { job, stages } = await lookup(config, io, idArg);
   const waiting = stages.find((s) => s.name.startsWith('approve-') && s.status === 'running');
@@ -276,10 +276,11 @@ async function cmdApprove(args: string[], io: Io): Promise<number> {
   if (waiting.name !== `approve-${kind}`) {
     throw new UserError(`job ${job.id} is waiting for the ${waiting.name.slice(8)} approval, not ${kind}`);
   }
+  checkStage(job.id, waiting, stageArg);
 
   const session = await openSession(config, io, [job.id], job.id);
   try {
-    session.channel.grant(job.id, kind);
+    session.channel.grant(job.id, kind, waiting.id);
     return finish(await drive(session.kernel, job.id, io), io);
   } finally {
     await session.close();
@@ -287,18 +288,31 @@ async function cmdApprove(args: string[], io: Io): Promise<number> {
 }
 
 async function cmdDeny(args: string[], io: Io): Promise<number> {
-  const [idArg, ...extra] = args;
-  if (!idArg || extra.length) throw new UserError('usage: bulig deny <jobId>');
+  const [idArg, stageArg, ...extra] = args;
+  if (!idArg || extra.length) throw new UserError('usage: bulig deny <jobId> <stageId>');
   const { config } = loadConfig(io.cwd, io.home);
-  const { job } = await lookup(config, io, idArg);
-  if (job.status !== 'awaiting_approval') throw new UserError(`job ${job.id} is ${job.status.replace('_', ' ')}, not waiting for an approval`);
+  const { job, stages } = await lookup(config, io, idArg);
+  const waiting = stages.find((s) => s.name.startsWith('approve-') && s.status === 'running');
+  if (job.status !== 'awaiting_approval' || !waiting) throw new UserError(`job ${job.id} is ${job.status.replace('_', ' ')}, not waiting for an approval`);
+  checkStage(job.id, waiting, stageArg);
   const session = await openSession(config, io, false, job.id);
   try {
-    session.channel.deny(job.id);
+    session.channel.deny(job.id, waiting.id);
     return finish(await drive(session.kernel, job.id, io), io);
   } finally {
     await session.close();
   }
+}
+
+/**
+ * An approve or deny names the approval stage it answers by its full id, as printed with the question. A command copied
+ * from an earlier question of the same kind names another stage, and is refused. No prefixes: stage ids from one store
+ * can share their first characters.
+ */
+function checkStage(jobId: string, waiting: { id: string; name: string }, stageArg: string | undefined): void {
+  const what = `the ${waiting.name.slice(8)} approval, stage ${waiting.id}`;
+  if (!stageArg) throw new UserError(`name the approval stage you are answering. Job ${jobId} is waiting for ${what}. See the open stage with: bulig history ${jobId}`);
+  if (stageArg !== waiting.id) throw new UserError(`stage ${stageArg} is not the open question, so it has expired. Job ${jobId} is waiting for ${what}. See the open stage with: bulig history ${jobId}`);
 }
 
 /** Pick up a job whose process died mid-stage. */
@@ -439,7 +453,8 @@ function printStages(stages: Stage[], io: Io): void {
     const o = (s.output && typeof s.output === 'object' ? s.output : {}) as Record<string, unknown>;
     const cost = typeof o.costUsd === 'number' ? `$${o.costUsd.toFixed(4)}` : '-';
     const session = typeof o.sessionId === 'string' ? o.sessionId : '-';
-    const note = o.interrupted ? ' (interrupted)' : typeof o.verdict === 'string' ? ` ${o.verdict}` : '';
+    // An approval stage shows its id: `bulig approve` and `bulig deny` name it.
+    const note = s.name.startsWith('approve-') ? ` stage ${s.id}` : o.interrupted ? ' (interrupted)' : typeof o.verdict === 'string' ? ` ${o.verdict}` : '';
     io.out(`${pad(s.name, 15)}${pad(String(s.attempt), 5)}${pad(s.status, 9)}${pad(secs(s.startedAt, s.endedAt), 9)}${pad(cost, 9)}${session}${note}`);
   }
 }
@@ -465,7 +480,7 @@ async function cmdHistory(args: string[], io: Io): Promise<number> {
 function summary(payload: unknown): string {
   if (payload === null || typeof payload !== 'object') return cell(payload);
   const p = payload as Record<string, unknown>;
-  const pick = ['stage', 'kind', 'url', 'number', 'headSha', 'branch', 'reason', 'error', 'from', 'to', 'sessionId', 'costUsd'];
+  const pick = ['stage', 'kind', 'stageId', 'url', 'number', 'headSha', 'branch', 'reason', 'error', 'from', 'to', 'sessionId', 'costUsd'];
   const parts = pick.filter((k) => p[k] !== undefined).map((k) => `${k}=${clipText(String(p[k]).replace(/\s+/g, ' '), 60)}`);
   return parts.join(' ');
 }

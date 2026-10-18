@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { Stage } from '@bulig/plugin-sdk';
 import { decide, parseVerdict, renderPrompt } from '../src/index.ts';
-import { boot, fakeGithub, fakeHuman, fakeWorker, newDb, raw, stageNames, types, type Script, type Sent, settle } from './harness.ts';
+import { boot, fakeGithub, fakeHuman, fakeWorker, newDb, openApproval, raw, stageNames, types, type Script, type Sent, settle } from './harness.ts';
 
 const PASS = 'All good.\nVERDICT: PASS';
 const FAIL = (why: string) => `${why}\nVERDICT: FAIL`;
@@ -579,7 +579,8 @@ describe('resume after a restart', () => {
     // Starting up alone must not run anything: the job is waiting on a person.
     expect(second.worker).toHaveLength(0);
     expect((await second.k.jobs.get(job.id))!.status).toBe('awaiting_approval');
-    second.human.grant(job.id, 'plan');
+    // The card was sent by the first process; the person answers it, so the grant names its stage.
+    second.human.grant(job.id, 'plan', await openApproval(second.k, job.id));
     await settle(second.k);
     expect(second.worker.map((s) => s.stage)).toEqual(['build', 'test', 'docs', 'review']);
     expect(second.worker[0]!.cwd).toBe(`/fake/wt/${job.id}`);
@@ -591,7 +592,7 @@ describe('resume after a restart', () => {
     await third.k.start();
     await settle(third.k);
     expect(third.github).toHaveLength(0);
-    third.human.grant(job.id, 'merge');
+    third.human.grant(job.id, 'merge', await openApproval(third.k, job.id));
     await settle(third.k);
     expect(third.github.map((g) => g.type)).toEqual(['merge.requested']);
     expect(third.github[0]!.payload).toMatchObject({ number: 1, headSha: 'abc1234' });

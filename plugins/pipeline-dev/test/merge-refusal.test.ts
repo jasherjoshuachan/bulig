@@ -77,11 +77,18 @@ async function rig(ghConfig: Record<string, unknown> = {}) {
   await settle(k);
 
   const cards = (kind: string) => fake.texts(CHAT).filter((t) => t.includes(`approval needed: ${kind}`));
+  /** The Approve button data on every card with buttons for one kind, oldest first. */
+  const approveButtons = (jobId: string, kind: string): string[] =>
+    fake
+      .of('sendMessage')
+      .map((c) => (c.params.reply_markup as { inline_keyboard?: { callback_data: string }[][] } | undefined)?.inline_keyboard?.[0]?.[0]?.callback_data)
+      .filter((d): d is string => typeof d === 'string' && d.startsWith(`ap:${jobId}:${kind}:`));
+  // Tap Approve on the nth card of that kind, as the person would.
   const approve = async (jobId: string, kind: 'plan' | 'merge', nth: number) => {
-    await until(() => cards(kind).length >= nth, `${kind} card ${nth}`, 15000);
-    fake.press(CHAT, 1, 'card', `ap:${jobId}:${kind}`);
+    await until(() => approveButtons(jobId, kind).length >= nth, `${kind} card ${nth}`, 15000);
+    fake.press(CHAT, 1, 'card', approveButtons(jobId, kind)[nth - 1]!);
   };
-  return { k, repo, fake, setState, calls, cards, approve };
+  return { k, repo, fake, setState, calls, cards, approve, approveButtons };
 }
 
 const mergeCalls = (r: Awaited<ReturnType<typeof rig>>) => r.calls().filter((c) => c.args[1] === 'merge');

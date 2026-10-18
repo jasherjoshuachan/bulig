@@ -155,8 +155,8 @@ export default definePlugin({
      * act on it second; if the second write is lost, nobody is told, and the job would wait for ever. So a lost event
      * is an error here, and the handler's guard turns it into a failed job with this reason. If failing the job cannot be
      * written either, the job stays as it is until the next start, where resume handles a running job. A job that is
-     * waiting for an approval nobody was asked for is not picked up again: re-asking is left out until an approval is
-     * bound to the exact stage it was asked for (an old card must not approve a later question).
+     * waiting for an approval nobody was asked for is not picked up again. Approvals are now bound to the exact stage
+     * they were asked for (ADR 0008), so asking again on start would be safe, but it is not done yet.
      */
     async function announce(type: string, payload: unknown, jobId: string): Promise<void> {
       try {
@@ -295,11 +295,11 @@ export default definePlugin({
         }
         case 'approve': {
           const stageName = `approve-${action.which}`;
-          await ctx.jobs.startStage(job.id, stageName);
+          const asked = await ctx.jobs.startStage(job.id, stageName);
           await ctx.jobs.setStatus(job.id, 'awaiting_approval');
           if (action.which === 'plan') {
             const summary = withEvidence(evidenceBlock(stages, ['plan', 'critique']), `PLAN\n${textOf(stages, 'plan')}\n\nCRITIQUE\n${textOf(stages, 'critique')}`);
-            await announce('approval.requested', { jobId: job.id, kind: 'plan', summary: clip(summary, 4000), scope: scopeOf(stages) ?? [] }, job.id);
+            await announce('approval.requested', { jobId: job.id, kind: 'plan', stageId: asked.id, summary: clip(summary, 4000), scope: scopeOf(stages) ?? [] }, job.id);
           } else {
             const pr = outputOf(lastOf(stages, 'pr')!);
             const review = textOf(stages, 'review');
@@ -308,6 +308,7 @@ export default definePlugin({
               {
                 jobId: job.id,
                 kind: 'merge',
+                stageId: asked.id,
                 url: pr.url,
                 headSha: pr.headSha,
                 summary: clip(
@@ -584,10 +585,11 @@ export default definePlugin({
 
     ctx.on('approval.granted', (e) => {
       return guard(e.jobId, async () => {
-        const p = e.payload as { jobId?: string; kind?: string };
+        const p = e.payload as { jobId?: string; kind?: string; stageId?: unknown };
         const jobId = e.jobId ?? p.jobId;
         const s = jobId && p.kind && await runningStage(jobId, `approve-${p.kind}`);
         if (!jobId || !s) return;
+        if (p.stageId !== s.id) return void ignoreStale('grant', jobId, s, p.stageId, e.source);
         await finish(s, 'passed', { grantedBy: e.source });
         await ctx.jobs.setStatus(jobId, 'running');
         await advance(jobId);
@@ -596,14 +598,24 @@ export default definePlugin({
 
     ctx.on('approval.denied', (e) => {
       return guard(e.jobId, async () => {
-        const p = e.payload as { jobId?: string };
+        const p = e.payload as { jobId?: string; stageId?: unknown };
         const jobId = e.jobId ?? p.jobId;
         const s = jobId && (await ctx.jobs.stages(jobId)).find((x) => x.name.startsWith('approve-') && x.status === 'running');
         if (!jobId || !s) return;
+        if (p.stageId !== s.id) return void ignoreStale('deny', jobId, s, p.stageId, e.source);
         await finish(s, 'failed', { deniedBy: e.source });
         await ctx.jobs.setStatus(jobId, 'cancelled');
       });
     });
+
+    /**
+     * A grant or deny must carry the id of the approval stage that is open now. One that names another stage, or none
+     * (a card sent before stage ids existed), was meant for an earlier question. It changes nothing.
+     */
+    function ignoreStale(what: string, jobId: string, s: Stage, ref: unknown, source: string): void {
+      const named = typeof ref === 'string' && ref !== '' ? `stage ${shortLine(ref, 36)}` : 'no stage';
+      ctx.log.warn(`pipeline-dev: ignored a ${what} from ${source} for job ${jobId}: it names ${named}, but the open question is ${s.name} ${s.id}. The card has expired.`);
+    }
 
     ctx.on('pr.opened', (e) => {
       return guard(e.jobId, async () => {

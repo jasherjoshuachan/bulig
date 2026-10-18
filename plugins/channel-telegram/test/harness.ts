@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -37,6 +38,9 @@ export async function startFake(): Promise<FakeTelegram> {
   return f;
 }
 
+/** What a card's buttons carry after the kind to name the approval stage: 12 characters of a sha256 of the stage id. */
+export const stageRef = (stageId: string): string => createHash('sha256').update(stageId).digest('base64url').slice(0, 12);
+
 /** A plugin that plays the rest of Bulig: it announces events and records approvals. */
 export function driver() {
   const box: { ctx?: PluginContext } = {};
@@ -75,10 +79,10 @@ export function driver() {
     async waitForApproval(kind: 'plan' | 'merge', extra: Record<string, unknown> = {}) {
       const job = await box.ctx!.jobs.create({ repo: '/r', title: 'Fix the thing' });
       await box.ctx!.jobs.setStatus(job.id, 'running');
-      await box.ctx!.jobs.startStage(job.id, `approve-${kind}`);
+      const stage = await box.ctx!.jobs.startStage(job.id, `approve-${kind}`);
       await box.ctx!.jobs.setStatus(job.id, 'awaiting_approval');
-      box.ctx!.emit('approval.requested', { jobId: job.id, kind, summary: 'PLAN\nDo it', ...extra }, job.id);
-      return job;
+      box.ctx!.emit('approval.requested', { jobId: job.id, kind, stageId: stage.id, summary: 'PLAN\nDo it', ...extra }, job.id);
+      return { ...job, stageId: stage.id, ref: stageRef(stage.id) };
     },
   };
 }

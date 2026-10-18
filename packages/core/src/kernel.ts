@@ -213,6 +213,8 @@ export function createKernel(options: KernelOptions) {
     history: (jobId: string): Promise<BuligEvent[]> => bus.history(jobId),
 
     async start(): Promise<void> {
+      // A start after a failed one is a new attempt: the process is not on its way out any more.
+      ending = false;
       // Validate everything before any plugin runs.
       loaded = selectPlugins(options.plugins, options.enabled);
       const shared = {

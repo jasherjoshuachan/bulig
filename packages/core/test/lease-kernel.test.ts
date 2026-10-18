@@ -134,6 +134,26 @@ for (const adapter of ADAPTERS) {
       expect((await (await adapter.peek()).acquireLease('kernel-b', 5_000)).generation).toBe(2);
     });
 
+    it('treats a start after a failed start as a new attempt, so a lease lost then is still reported to the owner', async () => {
+      const store = await adapter.make();
+      const lost: string[] = [];
+      let refuse = false;
+      const flaky = withLease(store, { renewLease: async (h, g, t) => (refuse ? false : store.renewLease(h, g, t)) });
+      let attempts = 0;
+      const shaky: Plugin = {
+        manifest: manifest({ name: 'shaky', sdk: '1' }),
+        register() {
+          if (attempts++ === 0) throw new Error('first try fails');
+        },
+      };
+      const { k } = kernelOn(flaky, { plugins: [shaky], enabled: ['shaky'], leaseHolder: 'kernel-a', leaseTtlMs: 1_000, leaseHeartbeatMs: 60, onLeaseLost: (r) => void lost.push(r) });
+      await expect(k.start()).rejects.toThrow('first try fails');
+      await k.start();
+      refuse = true;
+      await sleep(250);
+      expect(lost).toHaveLength(1);
+    });
+
     it('keeps the lease alive while stop() drains the queue, so a clean stop with slow queued work reports no lost lease', async () => {
       const store = await adapter.make();
       const lost: string[] = [];

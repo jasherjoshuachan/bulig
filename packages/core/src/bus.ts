@@ -74,7 +74,9 @@ export class Bus {
   private inflight = new Map<Promise<void>, number>();
   private lastDelivered = 0;
   /** The handler run the current code is inside, so an emit knows which event caused it. */
-  private causes = new AsyncLocalStorage<Cause>();
+  private causes = new AsyncLocalStorage<Cause | undefined>();
+  /** How many handlers each plugin has subscribed so far, so a handler's key counts within its own plugin. */
+  private perPlugin = new Map<string, number>();
 
   constructor(
     private queue: StoreQueue,
@@ -85,7 +87,11 @@ export class Bus {
   ) {}
 
   subscribe(plugin: string, pattern: string, handler: EventHandler): void {
-    this.subs.push({ plugin, key: `${plugin}#${this.subs.length}`, pattern, handler });
+    // Numbered within the plugin, not across the bus: enabling another plugin, or a change in how many handlers another plugin
+    // has, must not move this plugin's keys, because the keys are part of event ids that outlive a restart.
+    const n = this.perPlugin.get(plugin) ?? 0;
+    this.perPlugin.set(plugin, n + 1);
+    this.subs.push({ plugin, key: `${plugin}#${n}`, pattern, handler });
   }
 
   /** The handler run this call is inside, if any. Taken when a write is asked for, so it is the caller's and not the queue's. */
@@ -194,29 +200,40 @@ export class Bus {
   }
 
   private dispatch(event: BuligEvent): void {
-    const seq = event.seq ?? this.lastDelivered;
-    this.lastDelivered = seq;
-    for (const sub of this.subs) {
-      if (!matchesPattern(sub.pattern, event.type)) continue;
-      try {
-        const cause: Cause = { eventId: event.id, handler: sub.key, next: 0 };
-        const result = this.causes.run(cause, () => sub.handler(event));
-        if (result) {
-          const tracked: Promise<void> = result.catch((err: unknown) => this.fail(sub, event, err));
-          const forget = () => void this.inflight.delete(tracked);
-          this.inflight.set(tracked, seq);
-          tracked.then(forget, forget);
+    // Dispatch runs in the async context of whoever caused the commit, which may be another handler's run. Leave that context
+    // first: the handlers each get a cause of their own below, and the failure path (and the hookup of its .catch) must have none,
+    // or a plugin.error would be recorded as an event the emitting handler caused and take one of its ordinals.
+    // This is run(undefined), not exit(): on Node 22, exit() lets the outer store come back after the first nested run(), so the
+    // .catch hookup below would still carry the emitter's cause (reproduced on 22.23.3).
+    this.causes.run(undefined, () => {
+      const seq = event.seq ?? this.lastDelivered;
+      this.lastDelivered = seq;
+      for (const sub of this.subs) {
+        if (!matchesPattern(sub.pattern, event.type)) continue;
+        try {
+          const cause: Cause = { eventId: event.id, handler: sub.key, next: 0 };
+          const result = this.causes.run(cause, () => sub.handler(event));
+          if (result) {
+            const tracked: Promise<void> = result.catch((err: unknown) => this.fail(sub, event, err));
+            const forget = () => void this.inflight.delete(tracked);
+            this.inflight.set(tracked, seq);
+            tracked.then(forget, forget);
+          }
+        } catch (err) {
+          this.fail(sub, event, err);
         }
-      } catch (err) {
-        this.fail(sub, event, err);
       }
-    }
+    });
   }
 
   private fail(sub: Subscription, event: BuligEvent, err: unknown): void {
     // A broken plugin.error handler must not loop forever.
     if (event.type === 'plugin.error') return;
+    // The id comes from the event and the subscriber, not from a random draw: if the same subscriber fails again on the same
+    // event (a redelivery), the second plugin.error is a duplicate of the first and is dropped, where a random id would log it twice.
+    // The cost is that a later failure with a different message is not recorded; the first one is.
     void this.emit({
+      id: derivedEventId(event.id, `failed:${sub.key}`, 0, 'plugin.error'),
       type: 'plugin.error',
       source: 'kernel',
       jobId: event.jobId,

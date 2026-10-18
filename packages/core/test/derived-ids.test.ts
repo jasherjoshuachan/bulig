@@ -32,7 +32,7 @@ describe('derivedEventId', () => {
 for (const adapter of adapters) {
   describe.skipIf(adapter.skip)(`events caused by a handler, with ${adapter.name}`, () => {
     /** A plugin whose handler for demo.go writes two events, makes a job, and moves it on. `runs` records what each run was told. */
-    function setup(store: Store, extra: Plugin[] = []) {
+    function setup(store: Store, extra: Plugin[] = [], before: Plugin[] = []) {
       const runs: { job: Job; moved: Job }[] = [];
       const heard: string[] = [];
       const errors: string[] = [];
@@ -52,7 +52,7 @@ for (const adapter of adapters) {
           ctx.on('plugin.error', (e) => void errors.push(JSON.stringify(e.payload)));
         },
       };
-      const k = createKernel({ store, plugins: [demo, ...extra], enabled: ['demo', ...extra.map((p) => p.manifest.name)], logger: quiet });
+      const k = createKernel({ store, plugins: [...before, demo, ...extra], enabled: [...before, demo, ...extra].map((p) => p.manifest.name), logger: quiet });
       cleanups.push(() => k.stop());
       return { k, runs, heard, errors };
     }
@@ -125,6 +125,89 @@ for (const adapter of adapters) {
       const all = await k.bus.replay();
       expect(all.filter((e) => e.type === 'demo.one')).toHaveLength(4);
       expect(new Set(all.map((e) => e.id)).size).toBe(all.length);
+    });
+
+    it('records a failing subscriber as the kernel and not as the handler that emitted: no cause, no ordinal taken, and a redelivery changes nothing', async () => {
+      const store = await adapter.make();
+      const a: Plugin = {
+        manifest: manifest({ name: 'a', sdk: '1', subscribes: ['demo.go'], emits: ['demo.one', 'demo.two'] }),
+        register(ctx: PluginContext) {
+          ctx.on('demo.go', async () => {
+            await ctx.emitCommitted('demo.one', { n: 1 });
+            await ctx.emitCommitted('demo.two', { n: 2 });
+          });
+        },
+      };
+      const b: Plugin = {
+        manifest: manifest({ name: 'b', sdk: '1', subscribes: ['demo.one'] }),
+        register(ctx: PluginContext) {
+          ctx.on('demo.one', () => {
+            throw new Error('b broke');
+          });
+        },
+      };
+      const k = createKernel({ store, plugins: [a, b], enabled: ['a', 'b'], logger: quiet });
+      cleanups.push(() => k.stop());
+      // Watch the cause that is current when the kernel asks for a plugin.error: it must be none.
+      const causeAtFail: unknown[] = [];
+      const realEmit = k.bus.emit.bind(k.bus);
+      k.bus.emit = ((input, options) => {
+        if (input.type === 'plugin.error') causeAtFail.push(k.bus.currentCause());
+        return realEmit(input, options);
+      }) as typeof k.bus.emit;
+      await k.start();
+      await k.bus.emit({ type: 'demo.go', source: 'test' });
+      await k.bus.idle();
+      const first = await k.bus.replay();
+      const go = first.find((e) => e.type === 'demo.go')!;
+      const one = first.find((e) => e.type === 'demo.one')!;
+      const two = first.find((e) => e.type === 'demo.two')!;
+      const error = first.find((e) => e.type === 'plugin.error')!;
+      expect(causeAtFail).toEqual([undefined]);
+      expect(one.id).toBe(derivedEventId(go.id, 'a#0', 0, 'demo.one'));
+      expect(two.id).toBe(derivedEventId(go.id, 'a#0', 1, 'demo.two')); // the failure did not take ordinal 1 from a
+      expect(error.id).not.toBe(derivedEventId(go.id, 'a#0', 1, 'demo.two'));
+      expect(error.payload).toMatchObject({ plugin: 'b', eventId: one.id, message: 'b broke' });
+
+      redeliver(k, go);
+      await k.bus.idle();
+      const second = await k.bus.replay();
+      expect(second.map((e) => e.id)).toEqual(first.map((e) => e.id)); // same ids, no second demo.two, no second plugin.error
+      expect(second.filter((e) => e.type === 'demo.two')).toHaveLength(1);
+
+      // The same subscriber failing on the same event again is the same plugin.error, and is written once.
+      redeliver(k, one);
+      await k.bus.idle();
+      expect((await k.bus.replay()).map((e) => e.id)).toEqual(first.map((e) => e.id));
+      expect(causeAtFail).toEqual([undefined, undefined]);
+    });
+
+    it('keeps a plugin\'s handler keys when another plugin is enabled, so ids written before a restart still match after it', async () => {
+      const idsWith = async (before: Plugin[]) => {
+        const store = await adapter.make();
+        const { k } = setup(store, [], before);
+        await k.start();
+        const go = await k.bus.emit({ type: 'demo.go', source: 'test' });
+        await k.bus.idle();
+        const events = await k.bus.replay();
+        await k.stop();
+        return { go, ids: events.filter((e) => e.type.startsWith('demo.') && e.type !== 'demo.go').map((e) => e.id) };
+      };
+      const first = await idsWith([]);
+      const early: Plugin = {
+        manifest: manifest({ name: 'early', sdk: '1', subscribes: ['demo.go', 'demo.one'] }),
+        register(ctx: PluginContext) {
+          ctx.on('demo.go', () => {});
+          ctx.on('demo.one', () => {});
+        },
+      };
+      // Registered ahead of demo, so under the old global numbering demo's handlers would have moved from #0 to #2.
+      const second = await idsWith([early]);
+      // Ids derive from the go event's id, which is random, so compare against the derivation for each run's own go event.
+      for (const run of [first, second]) {
+        const expected = [0, 1, 2].map((n) => derivedEventId(run.go.id, 'demo#0', n, ['demo.one', 'demo.two', 'demo.one'][n]!));
+        expect(run.ids).toEqual(expected);
+      }
     });
 
     it('leaves events with no cause on random ids', async () => {

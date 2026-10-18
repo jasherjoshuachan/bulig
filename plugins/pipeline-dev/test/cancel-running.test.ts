@@ -22,9 +22,9 @@ afterEach(async () => {
 });
 
 const git = (cwd: string, ...args: string[]) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
-const waitFor = async (cond: () => boolean, what: string, ms = 15000) => {
+const waitFor = async (cond: () => boolean | Promise<boolean>, what: string, ms = 15000) => {
   const end = Date.now() + ms;
-  while (!cond()) {
+  while (!(await cond())) {
     if (Date.now() > end) throw new Error(`timed out waiting for ${what}`);
     await new Promise((r) => setTimeout(r, 15));
   }
@@ -75,7 +75,7 @@ async function rig() {
 describe('cancelling a job while a stage is running', () => {
   it('kills that job\'s Claude first, then removes the worktree, which is never recreated', async () => {
     const r = await rig();
-    const job = r.k.jobs.create({ repo: r.repo, title: 'Slow build', body: 'FAKE:linger' });
+    const job = (await r.k.jobs.create({ repo: r.repo, title: 'Slow build', body: 'FAKE:linger' }));
     await waitFor(() => r.human.requests.some((e) => (e.payload as { kind: string }).kind === 'plan'), 'the plan approval');
     r.human.grant(job.id, 'plan');
     await waitFor(() => existsSync(r.mark) && /PID/.test(readFileSync(r.mark, 'utf8')), 'the build stage to start');
@@ -84,17 +84,17 @@ describe('cancelling a job while a stage is running', () => {
     expect(existsSync(wt)).toBe(true);
     expect(alive(pid)).toBe(true);
 
-    r.k.jobs.setStatus(job.id, 'cancelled');
+    (await r.k.jobs.setStatus(job.id, 'cancelled'));
 
     // The child has been told to stop but is still busy for a moment. Nothing may touch the worktree yet.
     await waitFor(() => readFileSync(r.mark, 'utf8').includes('TERM'), 'SIGTERM to arrive');
     expect(alive(pid)).toBe(true);
     expect(existsSync(wt)).toBe(true);
-    expect(r.k.history(job.id).map((e) => e.type)).not.toContain('worktree.cleanup.requested');
+    expect((await r.k.history(job.id)).map((e) => e.type)).not.toContain('worktree.cleanup.requested');
 
     // Then the child exits, its stage is closed, and only then is the worktree removed.
-    await waitFor(() => r.k.history(job.id).some((e) => e.type === 'worktree.cleaned'), 'the cleanup');
-    const types = r.k.history(job.id).map((e) => e.type);
+    await waitFor(async () => (await r.k.history(job.id)).some((e) => e.type === 'worktree.cleaned'), 'the cleanup');
+    const types = (await r.k.history(job.id)).map((e) => e.type);
     expect(readFileSync(r.mark, 'utf8')).toContain('WROTE'); // it did write into the worktree before it died
     expect(alive(pid)).toBe(false);
     expect(types.indexOf('stage.failed')).toBeGreaterThan(-1);
@@ -106,7 +106,7 @@ describe('cancelling a job while a stage is running', () => {
     // Give anything still alive a moment to bring the path back. Nothing does.
     await new Promise((res) => setTimeout(res, 700));
     expect(existsSync(wt)).toBe(false);
-    expect(r.k.jobs.get(job.id)!.status).toBe('cancelled');
-    expect(r.k.jobs.stages(job.id).some((s) => s.status === 'running')).toBe(false);
+    expect((await r.k.jobs.get(job.id))!.status).toBe('cancelled');
+    expect((await r.k.jobs.stages(job.id)).some((s) => s.status === 'running')).toBe(false);
   });
 });

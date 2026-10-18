@@ -67,7 +67,7 @@ async function rig() {
 describe('a card left over from an earlier question', () => {
   it('cannot approve the merge question that opens again after a refusal', async () => {
     const r = await rig();
-    const job = r.k.jobs.create({ repo: '/fake/repo', title: 'Add a thing' });
+    const job = await r.k.jobs.create({ repo: '/fake/repo', title: 'Add a thing' });
     await settle(r.k);
 
     // The plan card reaches both chats. Approve it in A.
@@ -81,13 +81,13 @@ describe('a card left over from an earlier question', () => {
     expect(staleB.chat).toBe(CHAT_B);
     expect(staleB.approve).toBe(mergeA.approve);
     expect(Buffer.byteLength(mergeA.approve)).toBeLessThanOrEqual(64);
-    const firstStage = openApproval(r.k, job.id)!;
+    const firstStage = (await openApproval(r.k, job.id))!;
     r.tap(mergeA, mergeA.approve);
 
     // The refusal opens a new approve-merge stage, and a new pair of cards with new button data.
     await until(() => r.cards('merge').length === 4, 'the renewed merge cards', 15000);
     await settle(r.k);
-    const renewedStage = openApproval(r.k, job.id)!;
+    const renewedStage = (await openApproval(r.k, job.id))!;
     expect(renewedStage).not.toBe(firstStage);
     expect(r.merges()).toBe(1);
     const renewed = r.cards('merge')[2]!;
@@ -107,7 +107,7 @@ describe('a card left over from an earlier question', () => {
     await until(() => r.fake.of('answerCallbackQuery').length === answersBefore + 2, 'the stale deny is answered', 15000);
     expect(r.fake.of('answerCallbackQuery').at(-1)!.params.text).toBe('That approval is no longer open.');
     await settle(r.k);
-    expect(r.k.history(job.id).filter((e) => e.source === 'channel-telegram' && e.type.startsWith('approval.'))).toHaveLength(2);
+    expect((await r.k.history(job.id)).filter((e) => e.source === 'channel-telegram' && e.type.startsWith('approval.'))).toHaveLength(2);
 
     // A channel that passes the old stage id, or none (a card from before stage ids), straight to the pipeline is ignored there too.
     r.human.grant(job.id, 'merge', firstStage);
@@ -115,29 +115,29 @@ describe('a card left over from an earlier question', () => {
     r.human.deny(job.id, firstStage);
     r.human.deny(job.id, null);
     await settle(r.k);
-    expect(r.k.jobs.get(job.id)!.status).toBe('awaiting_approval');
-    expect(openApproval(r.k, job.id)).toBe(renewedStage);
+    expect((await r.k.jobs.get(job.id))!.status).toBe('awaiting_approval');
+    expect((await openApproval(r.k, job.id))).toBe(renewedStage);
     expect(r.merges()).toBe(1);
-    expect(r.k.history(job.id).some((e) => e.type === 'pr.merged')).toBe(false);
+    expect((await r.k.history(job.id)).some((e) => e.type === 'pr.merged')).toBe(false);
 
     // Only the renewed card, which says the merge was refused, can approve it.
     r.tap(renewed, renewed.approve);
-    await until(() => r.k.jobs.get(job.id)!.status === 'done', 'the job to finish', 15000);
+    await until(async () => (await r.k.jobs.get(job.id))!.status === 'done', 'the job to finish', 15000);
     expect(r.merges()).toBe(2);
-    expect(r.k.history(job.id).filter((e) => e.type === 'pr.merged')).toHaveLength(1);
-    expect(r.k.jobs.stages(job.id).filter((s) => s.name === 'approve-merge').map((s) => s.status)).toEqual(['passed', 'passed']);
+    expect((await r.k.history(job.id)).filter((e) => e.type === 'pr.merged')).toHaveLength(1);
+    expect((await r.k.jobs.stages(job.id)).filter((s) => s.name === 'approve-merge').map((s) => s.status)).toEqual(['passed', 'passed']);
   });
 
   it('a grant that names the open stage of the other kind does nothing', async () => {
     const r = await rig();
-    const job = r.k.jobs.create({ repo: '/fake/repo', title: 'Add a thing' });
+    const job = await r.k.jobs.create({ repo: '/fake/repo', title: 'Add a thing' });
     await settle(r.k);
     await until(() => r.cards('plan').length === 2, 'two plan cards', 15000);
-    const planStage = openApproval(r.k, job.id)!;
+    const planStage = (await openApproval(r.k, job.id))!;
     // Right stage id, wrong kind: the pipeline looks for an open approve-merge stage and finds none.
     r.human.grant(job.id, 'merge', planStage);
     await settle(r.k);
-    expect(r.k.jobs.get(job.id)!.status).toBe('awaiting_approval');
-    expect(openApproval(r.k, job.id)).toBe(planStage);
+    expect((await r.k.jobs.get(job.id))!.status).toBe('awaiting_approval');
+    expect((await openApproval(r.k, job.id))).toBe(planStage);
   });
 });

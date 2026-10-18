@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach } from 'vitest';
-import { createKernel, type Kernel } from '@bulig/core';
+import { createKernel, type Kernel, type KernelOptions } from '@bulig/core';
 import { definePlugin, type BuligEvent, type Plugin } from '@bulig/plugin-sdk';
 import pipeline, { type PipelineConfig } from '../src/index.ts';
 
@@ -186,7 +186,7 @@ export function fakeHuman() {
 
 export const logger = { debug() {}, info() {}, warn() {}, error() {} };
 
-export function boot(dbPath: string, plugins: Plugin[], config: PipelineConfig = {}) {
+export function boot(dbPath: string, plugins: Plugin[], config: PipelineConfig = {}, kernelExtra: Partial<KernelOptions> = {}) {
   const k = createKernel({
     dbPath,
     plugins: [pipeline, ...plugins],
@@ -194,16 +194,17 @@ export function boot(dbPath: string, plugins: Plugin[], config: PipelineConfig =
     grants: { 'pipeline-dev': ['merge.request', 'jobs.write'], 'fake-human': ['approval.grant'] },
     pluginConfig: { 'pipeline-dev': config as Record<string, unknown> },
     logger,
+    ...kernelExtra,
   });
   kernels.push(k);
   return k;
 }
 
 /** The id of the approval stage open now for a job, read from the store: what a person sees when they look again. */
-export const openApproval = (k: Kernel, jobId: string): string | undefined => k.jobs.stages(jobId).find((s) => s.name.startsWith('approve-') && s.status === 'running')?.id;
+export const openApproval = async (k: Kernel, jobId: string): Promise<string | undefined> => (await k.jobs.stages(jobId)).find((s) => s.name.startsWith('approve-') && s.status === 'running')?.id;
 
-export const types = (k: Kernel, jobId: string) => k.history(jobId).map((e) => e.type);
-export const stageNames = (k: Kernel, jobId: string) => k.jobs.stages(jobId).map((s) => `${s.name}:${s.status}`);
+export const types = async (k: Kernel, jobId: string) => (await k.history(jobId)).map((e) => e.type);
+export const stageNames = async (k: Kernel, jobId: string) => (await k.jobs.stages(jobId)).map((s) => `${s.name}:${s.status}`);
 
 /** Wait until every handler has finished. Plugin job calls are async, so the pipeline needs a few ticks to come to rest after a trigger. */
 export const settle = (k: Kernel): Promise<void> => k.bus.idle();

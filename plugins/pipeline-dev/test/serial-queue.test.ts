@@ -37,7 +37,7 @@ async function scenario(slowMs: number | undefined) {
   const k = bootWith(slowMs === undefined ? pipeline : slowPipeline(slowMs), plugins);
   await k.start();
   await settle(k);
-  const job = k.jobs.create({ repo: '/repo', title: 'Add multiply', body: 'Add src/multiply.js' });
+  const job = (await k.jobs.create({ repo: '/repo', title: 'Add multiply', body: 'Add src/multiply.js' }));
   await settle(k);
   human.grant(job.id, 'plan');
   human.grant(job.id, 'plan');
@@ -46,9 +46,9 @@ async function scenario(slowMs: number | undefined) {
   human.grant(job.id, 'merge');
   await settle(k);
   return {
-    status: k.jobs.get(job.id)!.status,
-    stages: stageNames(k, job.id),
-    events: types(k, job.id),
+    status: (await k.jobs.get(job.id))!.status,
+    stages: (await stageNames(k, job.id)),
+    events: (await types(k, job.id)),
     worker: worker.map((s) => s.stage),
     github: github.map((g) => g.type),
   };

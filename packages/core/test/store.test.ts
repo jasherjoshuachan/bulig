@@ -1,87 +1,51 @@
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { Store } from '../src/index.ts';
+import { SqliteStore } from '../src/index.ts';
 import { tempDb } from './helpers.ts';
+import { describeStoreContract, type StoreHandle } from './store-contract.ts';
 
-describe('store', () => {
-  it('migrations are idempotent', () => {
+// The shared behaviour every adapter has to show. The Postgres adapter will run the same function.
+describeStoreContract(
+  'SqliteStore',
+  async (): Promise<StoreHandle> => {
+    const dir = mkdtempSync(join(tmpdir(), 'bulig-contract-'));
+    const path = join(dir, 'bulig.sqlite');
+    const handle: StoreHandle = {
+      store: new SqliteStore(path),
+      async reopen() {
+        await handle.store.close();
+        handle.store = new SqliteStore(path);
+        return handle.store;
+      },
+      async dispose() {
+        await handle.store.close().catch(() => {});
+        rmSync(dir, { recursive: true, force: true });
+      },
+    };
+    return handle;
+  },
+  { schemaVersion: 3 },
+);
+
+// What belongs to SQLite alone.
+describe('SqliteStore', () => {
+  it('a missing job is a rejection, not a throw before the promise exists', async () => {
+    const s = new SqliteStore(tempDb());
+    let promise: Promise<unknown> | undefined;
+    expect(() => (promise = s.setJobStatus('nope', 'done'))).not.toThrow();
+    await expect(promise).rejects.toThrow(/No such job/);
+    await s.close();
+  });
+
+  it('the same file can be opened twice in a row', async () => {
     const path = tempDb();
-    const a = new Store(path);
-    const job = a.createJob({ repo: 'r', title: 't' });
-    const v = a.schemaVersion;
-    a.close();
-    const b = new Store(path);
-    expect(b.schemaVersion).toBe(v);
-    expect(b.getJob(job.id)?.title).toBe('t');
-    b.close();
-  });
-
-  it('starts at the latest schema version', () => {
-    const s = new Store(tempDb());
-    expect(s.schemaVersion).toBe(3);
-    s.close();
-  });
-
-  it('job CRUD', () => {
-    const s = new Store(tempDb());
-    const job = s.createJob({ repo: 'bulig', title: 'first' });
-    expect(job.status).toBe('queued');
-    s.createJob({ repo: 'bulig', title: 'second' });
-    expect(s.setJobStatus(job.id, 'running').status).toBe('running');
-    expect(s.listJobs().map((j) => j.title)).toEqual(['first', 'second']);
-    expect(s.listJobs({ status: 'running' }).map((j) => j.id)).toEqual([job.id]);
-    expect(s.getJob('nope')).toBeUndefined();
-    expect(() => s.setJobStatus('nope', 'done')).toThrow(/No such job/);
-    s.close();
-  });
-
-  it('stage CRUD with attempt counting and JSON output', () => {
-    const s = new Store(tempDb());
-    const job = s.createJob({ repo: 'r', title: 't' });
-    const first = s.startStage(job.id, 'build');
-    expect(first).toMatchObject({ status: 'running', attempt: 1, endedAt: null, output: null });
-    const done = s.finishStage(first.id, 'failed', { reason: 'tests' });
-    expect(done).toMatchObject({ status: 'failed', output: { reason: 'tests' } });
-    expect(done.endedAt).not.toBeNull();
-    expect(s.startStage(job.id, 'build').attempt).toBe(2);
-    expect(s.startStage(job.id, 'test').attempt).toBe(1);
-    expect(s.listStages(job.id)).toHaveLength(3);
-    expect(() => s.startStage('nope', 'build')).toThrow(/No such job/);
-    s.close();
-  });
-
-  it('persists events in order with increasing seq', () => {
-    const s = new Store(tempDb());
-    const a = s.appendEvent({ type: 'a.one', source: 'x', payload: { n: 1 } });
-    const b = s.appendEvent({ type: 'a.two', source: 'x', payload: null });
-    const c = s.appendEvent({ type: 'a.three', source: 'x', payload: [3] });
-    expect([a.seq, b.seq, c.seq]).toEqual([1, 2, 3]);
-    expect(s.eventsAfter().map((e) => e.type)).toEqual(['a.one', 'a.two', 'a.three']);
-    expect(s.eventsAfter(1).map((e) => e.type)).toEqual(['a.two', 'a.three']);
-    expect(a.payload).toEqual({ n: 1 });
-    s.close();
-  });
-
-  it('a job keeps its body, and defaults to empty', () => {
-    const s = new Store(tempDb());
-    expect(s.createJob({ repo: 'r', title: 'a', body: 'details' }).body).toBe('details');
-    expect(s.createJob({ repo: 'r', title: 'b' }).body).toBe('');
-    s.close();
-  });
-
-  it('plugin state is scoped by plugin and survives a reopen', () => {
-    const path = tempDb();
-    const a = new Store(path);
-    expect(a.getState('p', 'offset')).toBeUndefined();
-    a.setState('p', 'offset', 41);
-    a.setState('p', 'offset', 42);
-    a.setState('p', 'obj', { a: [1, 2] });
-    a.setState('q', 'offset', 'other');
-    a.close();
-    const b = new Store(path);
-    expect(b.getState('p', 'offset')).toBe(42);
-    expect(b.getState('p', 'obj')).toEqual({ a: [1, 2] });
-    expect(b.getState('q', 'offset')).toBe('other');
-    expect(() => b.setState('p', 'bad', undefined)).toThrow(/not JSON/);
-    b.close();
+    const a = new SqliteStore(path);
+    const job = await a.createJob({ repo: 'r', title: 't' });
+    await a.close();
+    const b = new SqliteStore(path);
+    expect((await b.getJob(job.id))?.title).toBe('t');
+    await b.close();
   });
 });

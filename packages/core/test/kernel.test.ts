@@ -17,10 +17,10 @@ describe('events and subscriptions', () => {
   it('start emits kernel.started and jobs emit job.* events in order', async () => {
     const k = kernelWith({ plugins: [] });
     await k.start();
-    const job = k.jobs.create({ repo: 'r', title: 't' });
-    k.jobs.setStatus(job.id, 'running');
-    expect(types(k.bus.replay())).toEqual(['kernel.started', 'job.created', 'job.status']);
-    expect(k.bus.replay().map((e) => e.seq)).toEqual([1, 2, 3]);
+    const job = (await k.jobs.create({ repo: 'r', title: 't' }));
+    (await k.jobs.setStatus(job.id, 'running'));
+    expect(types((await k.bus.replay()))).toEqual(['kernel.started', 'job.created', 'job.status']);
+    expect((await k.bus.replay()).map((e) => e.seq)).toEqual([1, 2, 3]);
   });
 
   it('wildcard subscribe matches by prefix, exact only matches exactly', async () => {
@@ -38,8 +38,8 @@ describe('events and subscriptions', () => {
       ],
     });
     await k.start();
-    const job = k.jobs.create({ repo: 'r', title: 't' });
-    k.jobs.setStatus(job.id, 'done');
+    const job = (await k.jobs.create({ repo: 'r', title: 't' }));
+    (await k.jobs.setStatus(job.id, 'done'));
     expect(seen).toEqual(['job.created', 'job.status']);
     expect(exact).toEqual(['kernel.started']);
   });
@@ -66,6 +66,7 @@ describe('events and subscriptions', () => {
       ],
     });
     await k.start();
+    await k.bus.idle();
     expect(order).toEqual(['a handler done', 'b got a.hello from a']);
   });
 
@@ -75,7 +76,7 @@ describe('events and subscriptions', () => {
     await k.start();
     expect(() => box.ctx!.emit('demo.ok', 1)).not.toThrow();
     expect(() => box.ctx!.emit('demo.nope', 1)).toThrow(UndeclaredEventError);
-    expect(types(k.bus.replay())).not.toContain('demo.nope');
+    expect(types((await k.bus.replay()))).not.toContain('demo.nope');
   });
 
   it('undeclared subscribe throws', async () => {
@@ -109,10 +110,10 @@ describe('events and subscriptions', () => {
       ],
     });
     await k.start();
-    const job = k.jobs.create({ repo: 'r', title: 't' });
-    k.jobs.setStatus(job.id, 'running');
+    const job = (await k.jobs.create({ repo: 'r', title: 't' }));
+    (await k.jobs.setStatus(job.id, 'running'));
     expect(after).toEqual(['job.created', 'error:boom', 'job.status']);
-    const err = k.bus.replay().find((e) => e.type === 'plugin.error')!;
+    const err = (await k.bus.replay()).find((e) => e.type === 'plugin.error')!;
     expect(err.source).toBe('kernel');
     expect(err.payload).toMatchObject({ plugin: 'bad', eventType: 'job.created' });
   });
@@ -132,18 +133,18 @@ describe('events and subscriptions', () => {
     });
     await k.start();
     await new Promise((r) => setTimeout(r, 10));
-    expect(types(k.bus.replay())).toContain('plugin.error');
+    expect(types((await k.bus.replay()))).toContain('plugin.error');
   });
 
   it('history(jobId) returns only that job\'s events', async () => {
     const k = kernelWith({ plugins: [] });
     await k.start();
-    const a = k.jobs.create({ repo: 'r', title: 'a' });
-    const b = k.jobs.create({ repo: 'r', title: 'b' });
-    k.jobs.setStatus(a.id, 'running');
-    expect(types(k.history(a.id))).toEqual(['job.created', 'job.status']);
-    expect(types(k.history(b.id))).toEqual(['job.created']);
-    expect(k.history(a.id).every((e) => e.jobId === a.id)).toBe(true);
+    const a = (await k.jobs.create({ repo: 'r', title: 'a' }));
+    const b = (await k.jobs.create({ repo: 'r', title: 'b' }));
+    (await k.jobs.setStatus(a.id, 'running'));
+    expect(types((await k.history(a.id)))).toEqual(['job.created', 'job.status']);
+    expect(types((await k.history(b.id)))).toEqual(['job.created']);
+    expect((await k.history(a.id)).every((e) => e.jobId === a.id)).toBe(true);
   });
 });
 
@@ -219,8 +220,8 @@ describe('capabilities needed to emit an event', () => {
       expect(() => box.ctx!.emit(type, {}, 'j')).toThrow(/approval\.grant/);
     }
     expect(() => box.ctx!.emit('merge.requested', { number: 1 }, 'j')).toThrow(/merge\.request/);
-    expect(types(k.bus.replay())).not.toContain('approval.granted');
-    expect(types(k.bus.replay())).not.toContain('merge.requested');
+    expect(types((await k.bus.replay()))).not.toContain('approval.granted');
+    expect(types((await k.bus.replay()))).not.toContain('merge.requested');
   });
 
   it('declaring the event is not enough without declaring the capability, even if the config grants it', async () => {
@@ -274,7 +275,7 @@ describe('loader', () => {
     const k = kernelWith({ plugins: [mk('one'), mk('two'), mk('three')], enabled: ['one', 'three'] });
     await k.start();
     expect(ran).toEqual(['one', 'three']);
-    expect(types(k.bus.replay())).toContain('kernel.started');
+    expect(types((await k.bus.replay()))).toContain('kernel.started');
   });
 
   it('rejects duplicate plugin names', async () => {
@@ -363,22 +364,22 @@ describe('jobs.write gates the writes that decide an outcome', () => {
     const { plugin, box } = probe({ needs });
     const k = kernelWith({ plugins: [plugin], grants });
     await k.start();
-    const job = k.jobs.create({ repo: 'r', title: 't' });
-    k.jobs.setStatus(job.id, 'running');
+    const job = (await k.jobs.create({ repo: 'r', title: 't' }));
+    (await k.jobs.setStatus(job.id, 'running'));
     return { k, ctx: box.ctx!, job };
   }
 
   it('a rogue plugin cannot approve: it cannot finish or open an approval stage, or move a job out of awaiting_approval', async () => {
     const { k, ctx, job } = await setup({}, []);
     // The pipeline's side of the story, done with the kernel's own ungated API.
-    const stage = k.jobs.startStage(job.id, 'approve-plan');
-    k.jobs.setStatus(job.id, 'awaiting_approval');
+    const stage = (await k.jobs.startStage(job.id, 'approve-plan'));
+    (await k.jobs.setStatus(job.id, 'awaiting_approval'));
     await expect(ctx.jobs.finishStage(stage.id, 'passed')).rejects.toThrow(CapabilityDeniedError);
     await expect(ctx.jobs.finishStage(stage.id, 'passed')).rejects.toThrow(/jobs\.write/);
     await expect(ctx.jobs.setStatus(job.id, 'running')).rejects.toThrow(/jobs\.write/);
     await expect(ctx.jobs.startStage(job.id, 'approve-merge')).rejects.toThrow(/jobs\.write/);
-    expect(k.jobs.get(job.id)!.status).toBe('awaiting_approval');
-    expect(k.jobs.stages(job.id).find((s) => s.id === stage.id)!.status).toBe('running');
+    expect((await k.jobs.get(job.id))!.status).toBe('awaiting_approval');
+    expect((await k.jobs.stages(job.id)).find((s) => s.id === stage.id)!.status).toBe('running');
   });
 
   it('a denied job call rejects with the same error and message, and never throws at the call', async () => {
@@ -393,8 +394,8 @@ describe('jobs.write gates the writes that decide an outcome', () => {
     await expect(opened).rejects.toBeInstanceOf(CapabilityDeniedError);
     await expect(opened).rejects.toThrow('Plugin "demo" was denied "jobs.write" (needed to open the "approve-plan" stage)');
     // Nothing was written.
-    expect(k.jobs.get(job.id)!.status).toBe('running');
-    expect(k.jobs.stages(job.id)).toEqual([]);
+    expect((await k.jobs.get(job.id))!.status).toBe('running');
+    expect((await k.jobs.stages(job.id))).toEqual([]);
   });
 
   it('a rogue plugin cannot end a job with any terminal status', async () => {
@@ -402,7 +403,7 @@ describe('jobs.write gates the writes that decide an outcome', () => {
     for (const status of ['done', 'failed', 'cancelled'] as const) {
       await expect(ctx.jobs.setStatus(job.id, status)).rejects.toThrow(CapabilityDeniedError);
     }
-    expect(k.jobs.get(job.id)!.status).toBe('running');
+    expect((await k.jobs.get(job.id))!.status).toBe('running');
   });
 
   it('declared but not granted is refused too, and ordinary work stays open', async () => {
@@ -411,7 +412,7 @@ describe('jobs.write gates the writes that decide an outcome', () => {
     const stage = await ctx.jobs.startStage(job.id, 'build');
     await expect(ctx.jobs.finishStage(stage.id, 'passed')).resolves.toBeDefined();
     expect((await ctx.jobs.get(job.id))!.id).toBe(job.id);
-    expect(k.jobs.get(job.id)!.status).toBe('running');
+    expect((await k.jobs.get(job.id))!.status).toBe('running');
   });
 
   it('a plugin that declares and is granted jobs.write can do all of it', async () => {
@@ -421,7 +422,7 @@ describe('jobs.write gates the writes that decide an outcome', () => {
     await ctx.jobs.finishStage(stage.id, 'passed');
     await ctx.jobs.setStatus(job.id, 'running');
     await ctx.jobs.setStatus(job.id, 'done');
-    expect(k.jobs.get(job.id)!.status).toBe('done');
+    expect((await k.jobs.get(job.id))!.status).toBe('done');
   });
 });
 
@@ -432,7 +433,7 @@ describe('cancel.requested is gated like a denial', () => {
     await k.start();
     expect(() => box.ctx!.emit('cancel.requested', { jobId: 'j' }, 'j')).toThrow(CapabilityDeniedError);
     expect(() => box.ctx!.emit('cancel.requested', { jobId: 'j' }, 'j')).toThrow(/approval\.grant/);
-    expect(types(k.bus.replay())).not.toContain('cancel.requested');
+    expect(types((await k.bus.replay()))).not.toContain('cancel.requested');
   });
 
   it('a channel that holds approval.grant can still ask for a cancel', async () => {
@@ -450,15 +451,15 @@ describe('terminal is final', () => {
       const { plugin, box } = probe({ needs: ['jobs.write'] });
       const k = kernelWith({ plugins: [plugin], grants });
       await k.start();
-      const job = k.jobs.create({ repo: 'r', title: 't' });
-      k.jobs.setStatus(job.id, end);
+      const job = (await k.jobs.create({ repo: 'r', title: 't' }));
+      (await k.jobs.setStatus(job.id, end));
       for (const to of ['running', 'queued', 'awaiting_approval'] as const) {
         await expect(box.ctx!.jobs.setStatus(job.id, to)).rejects.toThrow(CapabilityDeniedError);
         await expect(box.ctx!.jobs.setStatus(job.id, to)).rejects.toThrow(/final/);
       }
       // Moving to another end state is a reopen of the first one too.
       await expect(box.ctx!.jobs.setStatus(job.id, end === 'done' ? 'failed' : 'done')).rejects.toThrow(/final/);
-      expect(k.jobs.get(job.id)!.status).toBe(end);
+      expect((await k.jobs.get(job.id))!.status).toBe(end);
     }
   });
 
@@ -466,8 +467,8 @@ describe('terminal is final', () => {
     const { plugin, box } = probe({ needs: ['jobs.write'] });
     const k = kernelWith({ plugins: [plugin], grants: {} });
     await k.start();
-    const job = k.jobs.create({ repo: 'r', title: 't' });
-    k.jobs.setStatus(job.id, 'running');
+    const job = (await k.jobs.create({ repo: 'r', title: 't' }));
+    (await k.jobs.setStatus(job.id, 'running'));
     await expect(box.ctx!.jobs.setStatus(job.id, 'cancelled')).rejects.toThrow(/jobs\.write/);
   });
 });

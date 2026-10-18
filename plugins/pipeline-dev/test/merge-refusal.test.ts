@@ -97,18 +97,18 @@ describe('a merge that cannot go through', () => {
   it('failing checks end the job with the reason, send one merge card, and show the check name in Telegram', async () => {
     const r = await rig();
     r.setState({ log: join(r.repo, '..', 'gh.log'), checks: [{ name: 'Typecheck & build', bucket: 'fail', link: 'https://example.test/runs/9' }] });
-    const job = r.k.jobs.create({ repo: r.repo, title: 'Add a thing' });
+    const job = (await r.k.jobs.create({ repo: r.repo, title: 'Add a thing' }));
     await settle(r.k);
 
     await r.approve(job.id, 'plan', 1);
     await r.approve(job.id, 'merge', 1);
-    await until(() => r.k.jobs.get(job.id)!.status === 'failed', 'the job to fail', 15000);
+    await until(async () => (await r.k.jobs.get(job.id))!.status === 'failed', 'the job to fail', 15000);
 
     // The user is not asked again, however long we wait, and nothing was merged.
     await new Promise((res) => setTimeout(res, 300));
     expect(r.cards('merge')).toHaveLength(1);
-    expect(r.k.history(job.id).filter((e) => e.type === 'merge.requested')).toHaveLength(1);
-    expect(r.k.history(job.id).some((e) => e.type === 'merge.refused')).toBe(false);
+    expect((await r.k.history(job.id)).filter((e) => e.type === 'merge.requested')).toHaveLength(1);
+    expect((await r.k.history(job.id)).some((e) => e.type === 'merge.refused')).toBe(false);
     expect(mergeCalls(r)).toHaveLength(0);
 
     // The reason reached Telegram, with the check name, the link and what to do.
@@ -118,11 +118,11 @@ describe('a merge that cannot go through', () => {
     expect(said[0]).toContain('https://example.test/runs/9');
 
     // The job failed with that reason, and its worktree and branch are gone.
-    const stages = r.k.jobs.stages(job.id);
+    const stages = (await r.k.jobs.stages(job.id));
     expect(stages.filter((s) => s.name === 'approve-merge')).toHaveLength(1);
     expect(stages.at(-1)).toMatchObject({ name: 'merge', status: 'failed' });
     expect(JSON.stringify(stages.at(-1)!.output)).toContain('checks failing: Typecheck & build');
-    await until(() => r.k.history(job.id).some((e) => e.type === 'worktree.cleaned'), 'the cleanup', 15000);
+    await until(async () => (await r.k.history(job.id)).some((e) => e.type === 'worktree.cleaned'), 'the cleanup', 15000);
     expect(existsSync(join(r.repo, '.worktrees', job.id))).toBe(false);
     expect(git(r.repo, 'branch', '--list', 'bulig/*')).toBe('');
   });
@@ -131,14 +131,14 @@ describe('a merge that cannot go through', () => {
     const r = await rig({ checksPollMs: 20, checksWaitMs: 20_000 });
     const pending = [{ name: 'ci', bucket: 'pending' }];
     r.setState({ log: join(r.repo, '..', 'gh.log'), checksSequence: [pending, pending, [{ name: 'ci', bucket: 'pass' }]] });
-    const job = r.k.jobs.create({ repo: r.repo, title: 'Add a thing' });
+    const job = (await r.k.jobs.create({ repo: r.repo, title: 'Add a thing' }));
     await settle(r.k);
 
     await r.approve(job.id, 'plan', 1);
     await r.approve(job.id, 'merge', 1);
-    await until(() => r.k.jobs.get(job.id)!.status === 'done', 'the job to finish', 15000);
+    await until(async () => (await r.k.jobs.get(job.id))!.status === 'done', 'the job to finish', 15000);
     expect(r.cards('merge')).toHaveLength(1);
     expect(mergeCalls(r)).toHaveLength(1);
-    expect(r.k.history(job.id).some((e) => e.type === 'merge.refused' || e.type === 'merge.failed')).toBe(false);
+    expect((await r.k.history(job.id)).some((e) => e.type === 'merge.refused' || e.type === 'merge.failed')).toBe(false);
   });
 });

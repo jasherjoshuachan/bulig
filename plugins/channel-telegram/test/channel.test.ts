@@ -1,6 +1,6 @@
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { Store } from '@bulig/core';
+import { SqliteStore } from '@bulig/core';
 import { progressLine, safeLink } from '../src/index.ts';
 import { boot, CHAT, shutdown, stageRef, startFake, tempDir, TOKEN_ENV } from './harness.ts';
 import { until } from './fake-telegram.ts';
@@ -132,10 +132,10 @@ describe('news about a new job while its chat link is still being saved', () => 
     const fake = await startFake();
     const repo = tempDir();
     // A slow save, as a database server would be: the value is written 300 ms after set is called.
-    const original = Store.prototype.setState;
-    vi.spyOn(Store.prototype, 'setState').mockImplementation(function (this: Store, plugin: string, key: string, value: unknown) {
+    const original = SqliteStore.prototype.setState;
+    vi.spyOn(SqliteStore.prototype, 'setState').mockImplementation(function (this: SqliteStore, plugin: string, key: string, value: unknown) {
       if (!key.startsWith('chat:')) return original.call(this, plugin, key, value);
-      return new Promise<void>((resolve) => setTimeout(() => resolve(original.call(this, plugin, key, value)), 300)) as unknown as void;
+      return new Promise<void>((resolve) => setTimeout(() => resolve(original.call(this, plugin, key, value)), 300));
     });
     const b = await boot(fake, { repos: { app: repo }, allowedChatIds: [CHAT, OTHER] });
     fake.say(CHAT, '/dev app Add multiply');
@@ -169,10 +169,10 @@ describe('news about a new job while its chat link is still being saved', () => 
     const OTHER = 777;
     const fake = await startFake();
     const repo = tempDir();
-    const original = Store.prototype.setState;
-    vi.spyOn(Store.prototype, 'setState').mockImplementation(function (this: Store, plugin: string, key: string, value: unknown) {
+    const original = SqliteStore.prototype.setState;
+    vi.spyOn(SqliteStore.prototype, 'setState').mockImplementation(function (this: SqliteStore, plugin: string, key: string, value: unknown) {
       if (!key.startsWith('chat:')) return original.call(this, plugin, key, value);
-      return new Promise<void>((resolve) => setTimeout(() => resolve(original.call(this, plugin, key, value)), 300)) as unknown as void;
+      return new Promise<void>((resolve) => setTimeout(() => resolve(original.call(this, plugin, key, value)), 300));
     });
     const b = await boot(fake, { repos: { app: repo }, allowedChatIds: [CHAT, OTHER] });
     fake.say(CHAT, '/dev app Add multiply');
@@ -847,7 +847,7 @@ describe('restarts', () => {
     await until(() => fake.of('getUpdates').some((c) => c.params.offset !== undefined), 'offset sent');
     const lastSeen = Math.max(...fake.of('getUpdates').map((c) => c.params.offset ?? 0));
     await shutdown(first);
-    expect(new Store(dbPath).getState('channel-telegram', 'offset')).toBe(lastSeen);
+    expect(await new SqliteStore(dbPath).getState('channel-telegram', 'offset')).toBe(lastSeen);
 
     const before = fake.of('getUpdates').length;
     const second = await boot(fake, { repos: { app: repo } }, { dbPath });
@@ -862,9 +862,9 @@ describe('restarts', () => {
     const dbPath = join(tempDir(), 'bulig.sqlite');
     // Simulate the crash: Telegram still holds update 100 unacknowledged, but our store already moved on.
     fake.say(CHAT, '/dev app Crash window');
-    const seed = new Store(dbPath);
-    seed.setState('channel-telegram', 'offset', 101);
-    seed.close();
+    const seed = new SqliteStore(dbPath);
+    await seed.setState('channel-telegram', 'offset', 101);
+    await seed.close();
     const b = await boot(fake, { repos: { app: repo } }, { dbPath });
     fake.say(CHAT, '/help');
     await until(() => fake.texts(CHAT).length === 1, 'help');
@@ -1062,7 +1062,7 @@ describe('/retry does not start a second job for the same one', () => {
     await until(() => replies(fake).length === 2, 'refusal after restart');
     expect(replies(fake)[1]).toContain('already retried this one and is running');
     expect(await b2.d.ctx.jobs.list()).toHaveLength(2);
-    expect(new Store(b.dbPath).getState('channel-telegram', `retry-of:${fresh.id}`)).toBe(old.id);
+    expect(await new SqliteStore(b.dbPath).getState('channel-telegram', `retry-of:${fresh.id}`)).toBe(old.id);
   });
 
   it('another chat cannot see the retry, and /status is unchanged', async () => {
@@ -1093,9 +1093,9 @@ describe('/retry does not start a second job for the same one', () => {
   describe('a failure between creating the retry and saving its link', () => {
     /** Make the first write of a link fail (`retry-of:` by default), the way a crash or a full disk between the steps would. */
     const breakLinkOnce = (prefix = 'retry-of:') => {
-      const original = Store.prototype.setState;
+      const original = SqliteStore.prototype.setState;
       let armed = true;
-      const spy = vi.spyOn(Store.prototype, 'setState').mockImplementation(function (this: Store, plugin: string, key: string, value: unknown) {
+      const spy = vi.spyOn(SqliteStore.prototype, 'setState').mockImplementation(function (this: SqliteStore, plugin: string, key: string, value: unknown) {
         if (armed && key.startsWith(prefix)) {
           armed = false;
           throw new Error('simulated crash before the link was saved');
@@ -1132,16 +1132,16 @@ describe('/retry does not start a second job for the same one', () => {
       await until(() => replies(fake).length === 2, 'refusal after restart');
       expect(replies(fake)[1]).toContain(`Job ${orphan.id.slice(0, 8)} already retried this one`);
       expect(await b2.d.ctx.jobs.list()).toHaveLength(2);
-      const store = new Store(b.dbPath);
-      expect(store.getState('channel-telegram', `retry-of:${orphan.id}`)).toBe(old.id);
-      expect(store.getState('channel-telegram', `chat:${orphan.id}`)).toBe(CHAT);
+      const store = new SqliteStore(b.dbPath);
+      expect(await store.getState('channel-telegram', `retry-of:${orphan.id}`)).toBe(old.id);
+      expect(await store.getState('channel-telegram', `chat:${orphan.id}`)).toBe(CHAT);
     });
 
     it('a failure before the job was created blocks nothing: the next /retry starts one', async () => {
       const { fake, b, old } = await failedJob();
-      const original = Store.prototype.createJob;
+      const original = SqliteStore.prototype.createJob;
       let armed = true;
-      vi.spyOn(Store.prototype, 'createJob').mockImplementation(function (this: Store, input) {
+      vi.spyOn(SqliteStore.prototype, 'createJob').mockImplementation(function (this: SqliteStore, input) {
         if (armed) {
           armed = false;
           throw new Error('simulated crash before the job was created');
@@ -1175,9 +1175,9 @@ describe('/retry does not start a second job for the same one', () => {
 
     it('a handled failure of the create itself leaves no mark, so a lookalike job made later is not taken for the retry', async () => {
       const { fake, b, old } = await failedJob();
-      const original = Store.prototype.createJob;
+      const original = SqliteStore.prototype.createJob;
       let armed = true;
-      vi.spyOn(Store.prototype, 'createJob').mockImplementation(function (this: Store, input) {
+      vi.spyOn(SqliteStore.prototype, 'createJob').mockImplementation(function (this: SqliteStore, input) {
         if (armed) {
           armed = false;
           throw new Error('simulated handled failure of create');
@@ -1214,15 +1214,15 @@ describe('/retry does not start a second job for the same one', () => {
           it(`${point.name}; second /retry after ${label}${restart ? ' and a restart' : ''}: ${point.orphan ? 'refused, no second job' : 'starts the one job'}`, async () => {
             const clock = { t: Date.now() };
             const { fake, b, old } = await failedJob('Add multiply', () => clock.t);
-            const originalSet = Store.prototype.setState;
-            const originalCreate = Store.prototype.createJob;
+            const originalSet = SqliteStore.prototype.setState;
+            const originalCreate = SqliteStore.prototype.createJob;
             let seen = 0;
-            vi.spyOn(Store.prototype, 'setState').mockImplementation(function (this: Store, plugin: string, key: string, value: unknown) {
+            vi.spyOn(SqliteStore.prototype, 'setState').mockImplementation(function (this: SqliteStore, plugin: string, key: string, value: unknown) {
               if (point.setState && key.startsWith(point.setState.prefix) && ++seen === point.setState.nth) throw new Error('simulated failure');
               return originalSet.call(this, plugin, key, value);
             });
             let createArmed = !!point.create;
-            vi.spyOn(Store.prototype, 'createJob').mockImplementation(function (this: Store, input) {
+            vi.spyOn(SqliteStore.prototype, 'createJob').mockImplementation(function (this: SqliteStore, input) {
               if (createArmed) {
                 createArmed = false;
                 throw new Error('simulated failure of create');
@@ -1252,9 +1252,9 @@ describe('/retry does not start a second job for the same one', () => {
 
     it('if the check for an earlier attempt itself fails, it refuses and says to look at /status, and creates nothing', async () => {
       const { fake, b, old } = await failedJob();
-      const original = Store.prototype.setState;
+      const original = SqliteStore.prototype.setState;
       let fails = 2; // the first attempt's links write, then the check's own write
-      vi.spyOn(Store.prototype, 'setState').mockImplementation(function (this: Store, plugin: string, key: string, value: unknown) {
+      vi.spyOn(SqliteStore.prototype, 'setState').mockImplementation(function (this: SqliteStore, plugin: string, key: string, value: unknown) {
         if (key.startsWith('retries:') && fails-- > 0) throw new Error('simulated failure');
         return original.call(this, plugin, key, value);
       });

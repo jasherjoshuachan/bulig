@@ -20,8 +20,22 @@ import {
 import type { Bus } from './bus.ts';
 import { JOBS_WRITE, TERMINAL_STATUSES, effectiveCapabilities, isApprovalStage } from './capabilities.ts';
 
-/** The kernel's own job object: the same seven calls as the plugin API, but synchronous. Plugins never see this one. */
-export type KernelJobs = { [K in keyof JobsApi]: JobsApi[K] extends (...args: infer A) => Promise<infer R> ? (...args: A) => R : never };
+/**
+ * What a task on the kernel's store queue sees of the jobs: the same calls as the plugin API, run directly on the task.
+ * Each write announces itself (job.created, job.status) inside the same task, so state and event are one step.
+ */
+export interface JobsTx extends JobsApi {
+  /** The name of a stage by id, or undefined if there is none. */
+  stageName(stageId: string): Promise<string | undefined>;
+}
+
+/**
+ * The kernel's own job object. It is the plugin API, plus `atomic`: run a function as one task on the store queue, so
+ * nothing else reads or writes between its first call and its last. Plugins never see this object, only the gated view.
+ */
+export interface KernelJobs extends JobsApi {
+  atomic<T>(fn: (tx: JobsTx) => Promise<T>): Promise<T>;
+}
 
 export interface LoadOptions {
   plugins: Plugin[];
@@ -31,10 +45,8 @@ export interface LoadOptions {
   pluginConfig: Record<string, Record<string, unknown>>;
   bus: Bus;
   jobs: KernelJobs;
-  /** Name of a stage by id. Used to tell approval stages from the rest. */
-  stageName?: (stageId: string) => string | undefined;
   /** Reads and writes one plugin's state. The kernel passes the store. */
-  state: { get(plugin: string, key: string): unknown | Promise<unknown>; set(plugin: string, key: string, value: unknown): void | Promise<void> };
+  state: { get(plugin: string, key: string): Promise<unknown>; set(plugin: string, key: string, value: unknown): Promise<void> };
   logger: Logger;
 }
 
@@ -77,37 +89,41 @@ export function selectPlugins(plugins: Plugin[], enabled: string[]): LoadedPlugi
  * The job API one plugin gets. Reading and ordinary stage work are open. Writes that decide an outcome need
  * jobs.write: opening or closing an approval stage, ending a job, or moving a job out of awaiting_approval.
  * A plugin without it cannot approve, cancel or finish work, even though it holds the API.
+ *
+ * A check that has to read before it decides runs together with its write as one task on the kernel's store queue
+ * (`atomic`), so no other write can land between the read and the write. A check that needs no read is made before
+ * anything is queued. A denied call rejects and writes nothing.
  */
-function gateJobs(name: string, caps: ReadonlySet<string>, jobs: KernelJobs, stageName: (id: string) => string | undefined): JobsApi {
+function gateJobs(name: string, caps: ReadonlySet<string>, jobs: KernelJobs): JobsApi {
   const need = (what: string) => {
     if (!caps.has(JOBS_WRITE)) throw new CapabilityDeniedError(`Plugin "${name}" was denied "${JOBS_WRITE}" (needed to ${what})`);
   };
-  // async functions run their body up to the first await at once, so every check and the write behind it happen in the
-  // same tick, as they did when the calls were synchronous. A failed check rejects instead of throwing.
   return {
-    create: async (input) => jobs.create(input),
-    get: async (id) => jobs.get(id),
-    list: async (filter) => jobs.list(filter),
-    stages: async (jobId) => jobs.stages(jobId),
-    async setStatus(id, status) {
-      const current = jobs.get(id)?.status;
-      // Terminal is final: no plugin may reopen a done, failed or cancelled job, because that undoes a person's cancel.
-      if (current !== undefined && TERMINAL_STATUSES.includes(current) && current !== status) {
-        throw new CapabilityDeniedError(`Plugin "${name}" may not move a job out of ${current}: ${current} is final`);
-      }
-      if (TERMINAL_STATUSES.includes(status)) need(`set a job ${status}`);
-      else if (jobs.get(id)?.status === 'awaiting_approval') need('move a job out of awaiting_approval');
-      return jobs.setStatus(id, status);
-    },
+    create: (input) => jobs.create(input),
+    get: (id) => jobs.get(id),
+    list: (filter) => jobs.list(filter),
+    stages: (jobId) => jobs.stages(jobId),
+    setStatus: (id, status) =>
+      jobs.atomic(async (tx) => {
+        const current = (await tx.get(id))?.status;
+        // Terminal is final: no plugin may reopen a done, failed or cancelled job, because that undoes a person's cancel.
+        if (current !== undefined && TERMINAL_STATUSES.includes(current) && current !== status) {
+          throw new CapabilityDeniedError(`Plugin "${name}" may not move a job out of ${current}: ${current} is final`);
+        }
+        if (TERMINAL_STATUSES.includes(status)) need(`set a job ${status}`);
+        else if (current === 'awaiting_approval') need('move a job out of awaiting_approval');
+        return tx.setStatus(id, status);
+      }),
     async startStage(jobId, stage) {
       if (isApprovalStage(stage)) need(`open the "${stage}" stage`);
       return jobs.startStage(jobId, stage);
     },
-    async finishStage(stageId, status, output) {
-      const stage = stageName(stageId);
-      if (isApprovalStage(stage)) need(`finish the "${stage}" stage`);
-      return jobs.finishStage(stageId, status, output);
-    },
+    finishStage: (stageId, status, output) =>
+      jobs.atomic(async (tx) => {
+        const stage = await tx.stageName(stageId);
+        if (isApprovalStage(stage)) need(`finish the "${stage}" stage`);
+        return tx.finishStage(stageId, status, output);
+      }),
   };
 }
 
@@ -128,6 +144,13 @@ export function buildContext(manifest: Manifest, opts: Omit<LoadOptions, 'plugin
       }
       opts.bus.emitFrom(name, caps, { type, payload, jobId });
     },
+    // Same checks, thrown at once (this is not an async function). Then the caller waits for the commit.
+    emitCommitted(type, payload, jobId) {
+      if (!manifest.emits.includes(type)) {
+        throw new UndeclaredEventError(`Plugin "${name}" did not declare emitting "${type}"`);
+      }
+      return opts.bus.emitFrom(name, caps, { type, payload, jobId }, { report: false }).then(() => undefined);
+    },
     can: (cap) => caps.has(cap),
     require(cap) {
       if (!caps.has(cap)) {
@@ -135,8 +158,7 @@ export function buildContext(manifest: Manifest, opts: Omit<LoadOptions, 'plugin
         throw new CapabilityDeniedError(`Plugin "${name}" was denied "${cap}" (${why})`);
       }
     },
-    jobs: gateJobs(name, caps, opts.jobs, opts.stageName ?? (() => undefined)),
-    // async functions run their body up to the first await at once, so a write starts the moment the plugin calls set.
+    jobs: gateJobs(name, caps, opts.jobs),
     state: {
       get: async (key: string) => opts.state.get(name, key),
       set: async (key: string, value: unknown) => {

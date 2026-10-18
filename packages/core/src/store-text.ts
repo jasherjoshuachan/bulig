@@ -8,7 +8,7 @@ import { wellFormed } from '@bulig/text';
  *   the two engines must store the same thing.
  * - Plain text columns and identifiers (repo, title, body, ids, names, keys, statuses, event types, sources): a NUL
  *   character is refused with a clear error, and a lone surrogate becomes U+FFFD (SQLite would keep it as three replacement
- *   characters and Postgres as one, so the text is made well formed first). Postgres cannot store it in TEXT, and SQLite would store it and then treat the
+ *   characters and Postgres as one, so the text is made well formed first). Postgres cannot store a NUL in TEXT, and SQLite would store it and then treat the
  *   text as ending there in places. These are names and keys, so quietly changing one would let two different names
  *   collide. Refusing is the safe answer, and it happens before the database, so a Postgres transaction is not abandoned
  *   by a server error halfway through.

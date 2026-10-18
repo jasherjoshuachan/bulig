@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import pg from 'pg';
+import { parse as parseConnectionString } from 'pg-connection-string';
 import { assertPostgresUrl, OtherWriterError, PostgresStore, SchemaNotReadyError, type PostgresStoreOptions, StoreBrokenError, StoreFatalError, StoreTimeoutError } from '../src/index.ts';
 import { kernelWith, probe } from './helpers.ts';
 import { describePg, usePgServer, type PgDatabase } from './pg-throwaway.ts';
@@ -283,7 +284,7 @@ describePg('PostgresStore', () => {
       });
 
       it('refuses a string with no host, because the driver would dial localhost on the default port; it only parses, it opens nothing', () => {
-        for (const bad of ['postgres://', 'postgres:///bulig', 'postgresql://u:S3cretPW@/db', 'postgres://?sslmode=disable', 'postgres://u:S3cretPW@:5432/db', 'postgresql:///db?host=', 'postgres:///db&host=x', 'postgres:///db/&host=/tmp', 'postgres://u:S3cretPW@/db&host=evil']) {
+        for (const bad of ['postgres://', 'postgres:///bulig', 'postgresql://u:S3cretPW@/db', 'postgres://?sslmode=disable', 'postgresql:///db?host=', 'postgres:///db&host=x', 'postgres:///db/&host=/tmp', 'postgres://u:S3cretPW@/db&host=evil', 'postgres:///db?host=h1&host=', 'postgres://u:S3cretPW@/db?host=/tmp&host=']) {
           let message = '';
           try {
             new PostgresStore(bad);
@@ -296,12 +297,48 @@ describePg('PostgresStore', () => {
         }
       });
 
+      it('accepts a string exactly when the driver itself would find a host, for every shape a reviewer tried', () => {
+        // The check asks the driver's own parser which host it will use. These are the shapes from the round 4 review:
+        // a ? or & inside userinfo or the path, encoded ?, & and =, empty and repeated host= (the last one wins, an empty
+        // last one falls back to the URL host), socket folders, upper-case schemes, IPv6.
+        const shapes = [
+          'postgres:///db&host=x', 'postgres://u?x@/db?host=evil', 'postgres:///db?x/?host=/tmp', 'postgres://u%3Fx@/db',
+          'postgres:///db%3Fhost=x', 'postgres:///db?a=1%26host=x', 'postgres:///db?host%3Dx', 'postgres:///db?host=',
+          'postgres:///db?host=&host=h2', 'postgres:///db?host=a&host=b', 'postgres:///db?host=h1&host=',
+          'postgres://u:S3cretPW@/db?host=/tmp&host=', 'postgresql://user@%2Ftmp/db', 'postgresql://%2Ftmp/db',
+          'postgres:///db?host=%2Ftmp', 'POSTGRES://h/db', 'PostgreSQL:///db?host=/tmp', 'postgres://[::1]/db',
+          'postgres://[::1]:5432/db', 'postgres://u@[::1]:/db', 'postgres://u@h/db?sslmode=disable&host=',
+          'postgres:///db#?host=x', 'postgres://', 'postgres:///bulig', 'postgres://?sslmode=disable',
+        ];
+        for (const url of shapes) {
+          let driverHost: string | null | undefined;
+          try {
+            driverHost = parseConnectionString(url).host;
+          } catch {
+            continue; // the driver cannot read it, so it can never dial with it
+          }
+          const accepted = (() => {
+            try {
+              assertPostgresUrl(url);
+              return true;
+            } catch {
+              return false;
+            }
+          })();
+          expect({ url, accepted }).toEqual({ url, accepted: Boolean(driverHost) });
+        }
+      });
+
       it('a string with a scheme that the driver cannot read fails without quoting it', async () => {
-        const s = new PostgresStore('postgresql://bulig:S3cretPW@[not-a-host/db');
-        stores.push(s);
-        const err = await s.getJob('x').catch((e: unknown) => e);
-        expect(err).toBeInstanceOf(Error);
-        expect(String((err as Error).message)).not.toContain('S3cretPW');
+        // An empty host with a port (`@:5432`) is not host-less to the driver: it cannot read the string at all, so it can
+        // never dial with it either.
+        for (const bad of ['postgresql://bulig:S3cretPW@[not-a-host/db', 'postgres://u:S3cretPW@:5432/db']) {
+          const s = new PostgresStore(bad);
+          stores.push(s);
+          const err = await s.getJob('x').catch((e: unknown) => e);
+          expect(err).toBeInstanceOf(Error);
+          expect(String((err as Error).message)).not.toContain('S3cretPW');
+        }
       });
     });
 

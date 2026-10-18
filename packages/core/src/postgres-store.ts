@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import pg from 'pg';
+import { parse as parseConnectionString } from 'pg-connection-string';
 import type { BuligEvent, Job, JobStatus, Stage, StageStatus } from '@bulig/plugin-sdk';
 import { storableJson } from '@bulig/text';
 import { eventSeq, text } from './store-text.ts';
@@ -99,21 +100,25 @@ export class OtherWriterError extends Error {
 }
 
 /**
- * Check a connection string without ever repeating it. It must start with postgres:// or postgresql://, and it must name a
- * host (or give a `host=` parameter, which can be a socket folder). A string with no scheme is read by the driver as a
+ * Check a connection string without ever repeating it. It must start with postgres:// or postgresql://, and the driver
+ * must end up with a host (a name, an address, or a socket folder). A string with no scheme is read by the driver as a
  * mess of pieces whose errors can quote part of it, including a password. A string with no host makes the driver dial
  * localhost on the default port, which is whatever Postgres happens to run there, so it is refused rather than guessed.
+ *
+ * The host is taken from the driver's own parser (pg-connection-string, the one pg uses), not worked out here: which
+ * `host=` wins, how an empty one falls back to the URL's host, and how a socket path is read are its rules, and two
+ * earlier home-made checks got them wrong. If the parser cannot read the string at all, this lets it through: the
+ * driver then refuses it before any connection, and the store reports only that it could not be read.
  */
 export function assertPostgresUrl(url: string): void {
-  const m = /^postgres(?:ql)?:\/\/([^/?#]*)([^#]*)/i.exec(url);
-  if (!m) throw new Error(CONNECTION_STRING_HELP);
-  const authority = m[1]!;
-  const host = authority.slice(authority.lastIndexOf('@') + 1).replace(/:\d*$/, '');
-  // Only the query string (after the first `?`) can name a host: an `&host=` inside the path is part of the database name.
-  const rest = m[2]!;
-  const q = rest.indexOf('?');
-  const hostParam = q === -1 ? undefined : /(?:^|&)host=([^&]+)/.exec(rest.slice(q + 1))?.[1];
-  if (!host && !hostParam) throw new Error(CONNECTION_STRING_HELP);
+  if (!/^postgres(?:ql)?:\/\//i.test(url)) throw new Error(CONNECTION_STRING_HELP);
+  let host: string | null | undefined;
+  try {
+    host = parseConnectionString(url).host;
+  } catch {
+    return;
+  }
+  if (!host) throw new Error(CONNECTION_STRING_HELP);
 }
 const CONNECTION_STRING_HELP = 'The Postgres connection string must start with postgres:// or postgresql:// and name a host (for example postgresql://user@host/database)';
 
@@ -144,9 +149,8 @@ export interface PostgresStoreOptions {
  * what the port promises for calls made one after another.
  *
  * The connection opens on the first call (or in `PostgresStore.open`, which waits for it). A writer also brings the schema up
- * to date then; a reader never creates or upgrades it and refuses a missing or older schema (SchemaNotReadyError). The line
- * below is about the constructor:
- * for it). The constructor does not touch the network, so `createKernel`, which is not async, can take a store as it is.
+ * to date then; a reader never creates or upgrades it and refuses a missing or older schema (SchemaNotReadyError). The
+ * constructor does not touch the network, so `createKernel`, which is not async, can take a store as it is.
  * The connection string is the caller's: it is never logged here, never read from a file, and never stored anywhere else.
  *
  * Differences from SQLite that callers can see:

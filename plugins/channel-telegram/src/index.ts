@@ -2,6 +2,7 @@ import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { definePlugin, type BuligEvent, type Job, type Plugin, type PluginContext, type Stage } from '@bulig/plugin-sdk';
 import { TelegramApi, TelegramError, defaultSleep, type FetchLike, type Sleep } from './api.ts';
+import { clipText } from '@bulig/text';
 
 export { TelegramApi, TelegramError } from './api.ts';
 
@@ -59,7 +60,7 @@ const SUBSCRIPTIONS = [
 ];
 
 const short = (id?: string) => (id ?? '--------').slice(0, 8);
-const one = (s: unknown, n = 200) => String(s ?? '').replace(/\s+/g, ' ').trim().slice(0, n);
+const one = (s: unknown, n = 200) => clipText(String(s ?? '').replace(/\s+/g, ' ').trim(), n);
 const MAX_FILE_LINES = 20;
 /** "- path" lines for a list of paths, cut at `max` with a count of the rest. Empty when the value is not a list of strings. */
 const bullets = (list: unknown, max: number): string[] => {
@@ -86,7 +87,7 @@ const chunkLines = (lines: string[], max: number): string[] => {
   if (cur) out.push(cur);
   return out;
 };
-const clip = (s: string) => (s.length > MAX_TEXT ? `${s.slice(0, MAX_TEXT - 20)}\n[cut]` : s);
+const clip = (s: string) => (s.length > MAX_TEXT ? `${clipText(s, MAX_TEXT - 20)}\n[cut]` : s);
 const usd = (n: unknown) => (typeof n === 'number' ? ` ($${n.toFixed(2)})` : '');
 const human = (status: string) => status.replace('_', ' ');
 const expandHome = (p: string) => (p === '~' ? homedir() : p.startsWith('~/') ? `${homedir()}/${p.slice(2)}` : p);

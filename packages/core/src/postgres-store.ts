@@ -1,6 +1,8 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import pg from 'pg';
 import type { BuligEvent, Job, JobStatus, Stage, StageStatus } from '@bulig/plugin-sdk';
+import { storableJson } from '@bulig/text';
+import { text } from './store-text.ts';
 import { StoreFatalError, type Store, type StoreTx } from './store.ts';
 
 // Each entry upgrades the schema by one version. Never edit an old entry once it has shipped; add a new one.
@@ -81,17 +83,37 @@ const STAGE_COLS = 'id, job_id, name, status, attempt, started_at, ended_at, out
 const EVENT_COLS = 'seq, id, type, job_id, source, payload, at';
 
 /**
- * JSONB cannot hold a NUL character (the escape \u0000 in JSON text), where SQLite's text column can. Left to the server it
- * would be an error in the middle of a transaction, and Postgres abandons the whole transaction on any error. Say so first.
- * An even number of backslashes before the escape means a literal backslash followed by text, which is fine.
+ * The session-level advisory lock a writer holds on its one connection for as long as it is open. Advisory locks belong to
+ * one database, so this is "one kernel writing to this database". The key is 64 bits taken from a fixed string. The
+ * migration lock above is a different, smaller key. A lock taken on a session is released by the server when the
+ * connection closes, however it closes.
  */
-const NUL_ESCAPE = /(?:^|[^\\])(?:\\\\)*\\u0000/;
-const jsonText = (value: unknown, what: string): string | undefined => {
-  const json = JSON.stringify(value);
-  if (json === undefined) return undefined;
-  if (NUL_ESCAPE.test(json)) throw new Error(`${what} contains a NUL character, which Postgres cannot keep in JSONB`);
-  return json;
-};
+const WRITER_LOCK = BigInt.asIntN(64, BigInt(`0x${createHash('sha256').update('bulig.kernel.writer').digest('hex').slice(0, 16)}`)).toString();
+
+/** Another kernel already holds the writer lock on this database. */
+export class OtherWriterError extends Error {
+  constructor() {
+    super('Another Bulig kernel is already writing to this database (it holds the writer lock). Only one kernel may write to a record. Stop the other one, or point this one at a different database.');
+    this.name = 'OtherWriterError';
+  }
+}
+
+/**
+ * Check the shape of a connection string without ever repeating it. A string with no scheme is read by the driver as a
+ * pieces-of-it mess, and its errors can quote part of it, including a password.
+ */
+export function assertPostgresUrl(url: string): void {
+  if (!/^postgres(?:ql)?:\/\//i.test(url)) throw new Error('The Postgres connection string must start with postgres:// or postgresql://');
+}
+
+export interface PostgresStoreOptions {
+  /**
+   * `writer` (the default) is the kernel's store: it takes the writer lock when it connects and keeps it until it closes, and
+   * opening fails with OtherWriterError if another writer holds it. `reader` never takes or waits for the lock; it is for
+   * short, read-only looks from outside the kernel, such as `bulig status`. A reader is not forced to be read-only.
+   */
+  mode?: 'writer' | 'reader';
+}
 
 /**
  * The Postgres adapter behind the Store port (ADR 0007).
@@ -109,7 +131,9 @@ const jsonText = (value: unknown, what: string): string | undefined => {
  *   (a missing job, a value with no JSON form) before they send anything, so those rejections leave the transaction usable,
  *   as they do in SQLite. A genuine database error does not: the transaction can only be rolled back. If a function
  *   carries on after one, `transaction` notices that the server undid it and rejects instead of reporting a commit.
- * - JSONB cannot hold a NUL character; see jsonText.
+ * - JSONB does not keep the order of an object's keys, and cannot hold NUL or a lone surrogate in a string. See store-text.ts:
+ *   both engines turn those two into U+FFFD in JSON, and refuse NUL in plain text columns. No caller depends on key order.
+ * - Only one writer per database: see PostgresStoreOptions.mode. SQLite has the file lock the CLI takes instead.
  * - There is no reconnect. If the connection drops, every later call rejects until the process starts again.
  */
 export class PostgresStore implements Store {
@@ -119,13 +143,17 @@ export class PostgresStore implements Store {
   /** The statement sent last. The next one waits for it: the driver's own queue is deprecated, and this keeps the order explicit. */
   private tail: Promise<unknown> = Promise.resolve();
 
-  constructor(private readonly connectionString: string) {
+  private readonly writer: boolean;
+
+  constructor(private readonly connectionString: string, options: PostgresStoreOptions = {}) {
     if (!connectionString) throw new Error('PostgresStore needs a connection string');
+    assertPostgresUrl(connectionString);
+    this.writer = (options.mode ?? 'writer') === 'writer';
   }
 
   /** Open the connection and apply any migrations it has not seen, then hand the store back. */
-  static async open<T extends PostgresStore>(this: new (connectionString: string) => T, connectionString: string): Promise<T> {
-    const store = new this(connectionString);
+  static async open<T extends PostgresStore>(this: new (connectionString: string, options?: PostgresStoreOptions) => T, connectionString: string, options?: PostgresStoreOptions): Promise<T> {
+    const store = new this(connectionString, options);
     try {
       await store.connected();
     } catch (err) {
@@ -145,16 +173,26 @@ export class PostgresStore implements Store {
   }
 
   private async connect(): Promise<pg.Client> {
-    const client = new pg.Client({
-      connectionString: this.connectionString,
-      application_name: 'bulig',
-      connectionTimeoutMillis: 10_000,
-      keepAlive: true,
-    });
+    let client: pg.Client;
+    try {
+      client = new pg.Client({
+        connectionString: this.connectionString,
+        application_name: 'bulig',
+        connectionTimeoutMillis: 10_000,
+        keepAlive: true,
+      });
+    } catch {
+      // The parser's own message can quote the string. Say only that it could not be read.
+      throw new Error('The Postgres connection string could not be read');
+    }
     // A connection that drops while idle emits 'error'. Unhandled, that would end the process. The next call fails on its own.
     client.on('error', () => {});
     try {
       await client.connect();
+      if (this.writer) {
+        const got = await client.query<{ ok: boolean }>('SELECT pg_try_advisory_lock($1::bigint) AS ok', [WRITER_LOCK]);
+        if (!got.rows[0]?.ok) throw new OtherWriterError();
+      }
       await migrate(client);
     } catch (err) {
       client.end().catch(() => {});
@@ -208,6 +246,9 @@ export class PostgresStore implements Store {
     if (this.ended) return; // closed before, or aborted (the socket is already gone)
     this.ended = 'closed';
     const client = this.client ?? (await this.starting?.catch(() => undefined));
+    // Give the writer lock back before hanging up, so a kernel that starts straight afterwards is not refused while the
+    // server is still tidying up the old session.
+    if (this.writer) await client?.query('SELECT pg_advisory_unlock($1::bigint)', [WRITER_LOCK]).catch(() => {});
     await client?.end();
   }
 
@@ -257,6 +298,7 @@ export class PostgresStore implements Store {
   // ----- jobs -----
 
   async createJob(input: { repo: string; title: string; body?: string }): Promise<Job> {
+    input = { repo: text('repo', input.repo), title: text('title', input.title), ...(input.body !== undefined && { body: text('body', input.body) }) };
     const now = new Date().toISOString();
     const res = await this.query<JobRow>(
       `INSERT INTO jobs (id, repo, title, body, status, created_at, updated_at) VALUES ($1, $2, $3, $4, 'queued', $5, $5) RETURNING ${JOB_COLS}`,
@@ -266,11 +308,13 @@ export class PostgresStore implements Store {
   }
 
   async getJob(id: string): Promise<Job | undefined> {
+    id = text('job id', id);
     const res = await this.query<JobRow>(`SELECT ${JOB_COLS} FROM jobs WHERE id = $1`, [id]);
     return res.rows[0] && toJob(res.rows[0]);
   }
 
   async listJobs(filter: { status?: JobStatus } = {}): Promise<Job[]> {
+    if (filter.status) filter = { status: text('status', filter.status) };
     const res = filter.status
       ? await this.query<JobRow>(`SELECT ${JOB_COLS} FROM jobs WHERE status = $1 ORDER BY created_at, ord`, [filter.status])
       : await this.query<JobRow>(`SELECT ${JOB_COLS} FROM jobs ORDER BY created_at, ord`);
@@ -278,6 +322,7 @@ export class PostgresStore implements Store {
   }
 
   async setJobStatus(id: string, status: JobStatus): Promise<Job> {
+    id = text('job id', id); status = text('status', status);
     const res = await this.query<JobRow>(`UPDATE jobs SET status = $2, updated_at = $3 WHERE id = $1 RETURNING ${JOB_COLS}`, [id, status, new Date().toISOString()]);
     if (res.rows.length === 0) throw new Error(`No such job: ${id}`);
     return toJob(res.rows[0]!);
@@ -286,6 +331,7 @@ export class PostgresStore implements Store {
   // ----- stages -----
 
   async startStage(jobId: string, name: string): Promise<Stage> {
+    jobId = text('job id', jobId); name = text('stage name', name);
     // One statement, so the job check, the attempt count and the insert cannot be split by another call, and a missing job
     // is an empty result rather than a foreign key error that would abandon the transaction.
     const res = await this.query<StageRow>(
@@ -300,17 +346,20 @@ export class PostgresStore implements Store {
   }
 
   async getStage(id: string): Promise<Stage | undefined> {
+    id = text('stage id', id);
     const res = await this.query<StageRow>(`SELECT ${STAGE_COLS} FROM stages WHERE id = $1`, [id]);
     return res.rows[0] && toStage(res.rows[0]);
   }
 
   async listStages(jobId: string): Promise<Stage[]> {
+    jobId = text('job id', jobId);
     const res = await this.query<StageRow>(`SELECT ${STAGE_COLS} FROM stages WHERE job_id = $1 ORDER BY started_at, ord`, [jobId]);
     return res.rows.map(toStage);
   }
 
   async finishStage(id: string, status: Exclude<StageStatus, 'running'>, output?: unknown): Promise<Stage> {
-    const json = output === undefined ? null : jsonText(output, `Output of stage ${id}`);
+    id = text('stage id', id); status = text('status', status);
+    const json = output === undefined ? null : storableJson(output);
     if (json === undefined) throw new Error(`Output of stage ${id} is not JSON`);
     const res = await this.query<StageRow>(
       `UPDATE stages SET status = $2, ended_at = $3, output = $4::jsonb WHERE id = $1 RETURNING ${STAGE_COLS}`,
@@ -323,12 +372,14 @@ export class PostgresStore implements Store {
   // ----- plugin state -----
 
   async getState(plugin: string, key: string): Promise<unknown> {
+    plugin = text('plugin name', plugin); key = text('state key', key);
     const res = await this.query<{ value: unknown }>('SELECT value FROM plugin_state WHERE plugin = $1 AND key = $2', [plugin, key]);
     return res.rows[0] === undefined ? undefined : res.rows[0].value;
   }
 
   async setState(plugin: string, key: string, value: unknown): Promise<void> {
-    const json = jsonText(value, `State value for "${key}"`);
+    plugin = text('plugin name', plugin); key = text('state key', key);
+    const json = storableJson(value);
     if (json === undefined) throw new Error(`State value for "${key}" is not JSON`);
     await this.query(
       'INSERT INTO plugin_state (plugin, key, value) VALUES ($1, $2, $3::jsonb) ON CONFLICT (plugin, key) DO UPDATE SET value = EXCLUDED.value',
@@ -339,7 +390,8 @@ export class PostgresStore implements Store {
   // ----- events -----
 
   async appendEvent(e: { type: string; jobId?: string; source: string; payload: unknown }): Promise<BuligEvent> {
-    const json = e.payload === undefined ? null : jsonText(e.payload, `Payload of event "${e.type}"`);
+    e = { ...e, type: text('event type', e.type), source: text('event source', e.source), ...(e.jobId !== undefined && { jobId: text('job id', e.jobId) }) };
+    const json = e.payload === undefined ? null : storableJson(e.payload);
     if (json === undefined) throw new Error(`Payload of event "${e.type}" is not JSON`);
     const res = await this.query<EventRow>(
       `INSERT INTO events (id, type, job_id, source, payload, at) VALUES ($1, $2, $3, $4, $5::jsonb, $6) RETURNING ${EVENT_COLS}`,
@@ -354,6 +406,7 @@ export class PostgresStore implements Store {
   }
 
   async eventsForJob(jobId: string): Promise<BuligEvent[]> {
+    jobId = text('job id', jobId);
     const res = await this.query<EventRow>(`SELECT ${EVENT_COLS} FROM events WHERE job_id = $1 ORDER BY seq`, [jobId]);
     return res.rows.map(toEvent);
   }

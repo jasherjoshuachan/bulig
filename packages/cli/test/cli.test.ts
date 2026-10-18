@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeAll, describe, expect, it } from 'vitest';
-import { SqliteStore } from '@bulig/core';
+import { PostgresStore, SqliteStore } from '@bulig/core';
 import { describePg, usePgServer, type PgDatabase } from '../../core/test/pg-throwaway.ts';
 import { slowStore } from '../../core/test/slow-store.ts';
 import { acquireLock, loadConfig, runCli, type Io } from '../src/index.ts';
@@ -453,6 +453,42 @@ describePg('the CLI on Postgres', () => {
     const denied = await w.run('deny', id);
     expect(denied.err).toBe('');
     expect((await w.run('status', id)).out).toContain('status   cancelled');
+  });
+
+  it('refuses a variable that is not a Postgres URL without repeating it, and leaves no lock behind', async () => {
+    const { w } = await pgWorld();
+    w.io.env = { BULIG_TEST_DATABASE_URL: 'bulig:S3cretPW@just-text' };
+    for (const argv of [['status'], ['run', '--repo', w.repo, '--title', 't']]) {
+      const r = await w.run(...argv);
+      expect(r.code).toBe(2);
+      expect(r.err).toContain('must start with postgres:// or postgresql://');
+      expect(r.err + r.out).not.toContain('S3cretPW');
+    }
+    // run resolved the URL before it locked anything, so a second try is not told "another process is using it".
+    expect(existsSync(`${w.config.dbPath}.lock`)).toBe(false);
+  });
+
+  it('a second kernel on the same database is refused even with a different dbPath, and its lock file is given back; reads still work', async () => {
+    const { w, db } = await pgWorld();
+    const first = await w.run('run', '--repo', w.repo, '--title', 'First', '--issue', 'x');
+    const id = jobIdFrom(first.out);
+    // Another kernel (another config, so another dbPath and another lock file) holds the database.
+    const other = await PostgresStore.open(db.url);
+    try {
+      const refused = await w.run('run', '--repo', w.repo, '--title', 'Second', '--issue', 'x');
+      expect(refused.code).toBe(2);
+      expect(refused.err).toMatch(/Another Bulig kernel is already writing to this database/);
+      expect(existsSync(`${w.config.dbPath}.lock`)).toBe(false);
+      // status and history only read: they are never refused.
+      const status = await w.run('status');
+      expect(status.code).toBe(0);
+      expect(status.out).toContain(id.slice(0, 8));
+      expect((await w.run('history', id.slice(0, 8))).code).toBe(0);
+    } finally {
+      await other.close();
+    }
+    const again = await w.run('run', '--repo', w.repo, '--title', 'Third', '--issue', 'x');
+    expect(again.code).toBe(0);
   });
 
   it('says what is wrong when the variable is not set, and does not touch SQLite', async () => {

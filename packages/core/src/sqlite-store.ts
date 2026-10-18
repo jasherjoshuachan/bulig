@@ -1,6 +1,8 @@
 import Database from 'better-sqlite3';
 import { randomUUID } from 'node:crypto';
 import type { BuligEvent, Job, JobStatus, Stage, StageStatus } from '@bulig/plugin-sdk';
+import { storableJson } from '@bulig/text';
+import { text } from './store-text.ts';
 import { StoreFatalError, type Store, type StoreTx } from './store.ts';
 
 // Each entry upgrades the schema by one version. Never edit an old entry; add a new one.
@@ -133,6 +135,7 @@ export class SqliteStore implements Store {
   // ----- jobs -----
 
   async createJob(input: { repo: string; title: string; body?: string }): Promise<Job> {
+    input = { repo: text('repo', input.repo), title: text('title', input.title), ...(input.body !== undefined && { body: text('body', input.body) }) };
     const now = new Date().toISOString();
     const id = randomUUID();
     this.db
@@ -146,6 +149,7 @@ export class SqliteStore implements Store {
   }
 
   private readJob(id: string): Job | undefined {
+    id = text('job id', id);
     const row = this.db.prepare('SELECT * FROM jobs WHERE id = ?').get(id) as JobRow | undefined;
     return row && toJob(row);
   }
@@ -157,6 +161,7 @@ export class SqliteStore implements Store {
   }
 
   async listJobs(filter: { status?: JobStatus } = {}): Promise<Job[]> {
+    if (filter.status) filter = { status: text('status', filter.status) };
     const rows = filter.status
       ? this.db.prepare('SELECT * FROM jobs WHERE status = ? ORDER BY created_at, rowid').all(filter.status)
       : this.db.prepare('SELECT * FROM jobs ORDER BY created_at, rowid').all();
@@ -164,6 +169,7 @@ export class SqliteStore implements Store {
   }
 
   async setJobStatus(id: string, status: JobStatus): Promise<Job> {
+    id = text('job id', id); status = text('status', status);
     const res = this.db
       .prepare('UPDATE jobs SET status = ?, updated_at = ? WHERE id = ?')
       .run(status, new Date().toISOString(), id);
@@ -174,6 +180,7 @@ export class SqliteStore implements Store {
   // ----- stages -----
 
   async startStage(jobId: string, name: string): Promise<Stage> {
+    jobId = text('job id', jobId); name = text('stage name', name);
     this.requireJob(jobId);
     const prev = this.db
       .prepare('SELECT COUNT(*) AS n FROM stages WHERE job_id = ? AND name = ?')
@@ -190,6 +197,7 @@ export class SqliteStore implements Store {
   }
 
   private readStage(id: string): Stage | undefined {
+    id = text('stage id', id);
     const row = this.db.prepare('SELECT * FROM stages WHERE id = ?').get(id) as StageRow | undefined;
     return row && toStage(row);
   }
@@ -201,12 +209,14 @@ export class SqliteStore implements Store {
   }
 
   async listStages(jobId: string): Promise<Stage[]> {
+    jobId = text('job id', jobId);
     const rows = this.db.prepare('SELECT * FROM stages WHERE job_id = ? ORDER BY started_at, rowid').all(jobId);
     return (rows as StageRow[]).map(toStage);
   }
 
   async finishStage(id: string, status: Exclude<StageStatus, 'running'>, output?: unknown): Promise<Stage> {
-    const json = output === undefined ? null : JSON.stringify(output);
+    id = text('stage id', id); status = text('status', status);
+    const json = output === undefined ? null : storableJson(output);
     if (json === undefined) throw new Error(`Output of stage ${id} is not JSON`);
     const res = this.db
       .prepare('UPDATE stages SET status = ?, ended_at = ?, output = ? WHERE id = ?')
@@ -218,6 +228,7 @@ export class SqliteStore implements Store {
   // ----- plugin state -----
 
   async getState(plugin: string, key: string): Promise<unknown> {
+    plugin = text('plugin name', plugin); key = text('state key', key);
     const row = this.db.prepare('SELECT value FROM plugin_state WHERE plugin = ? AND key = ?').get(plugin, key) as
       | { value: string }
       | undefined;
@@ -225,7 +236,8 @@ export class SqliteStore implements Store {
   }
 
   async setState(plugin: string, key: string, value: unknown): Promise<void> {
-    const json = JSON.stringify(value);
+    plugin = text('plugin name', plugin); key = text('state key', key);
+    const json = storableJson(value);
     if (json === undefined) throw new Error(`State value for "${key}" is not JSON`);
     this.db
       .prepare('INSERT INTO plugin_state (plugin, key, value) VALUES (?, ?, ?) ON CONFLICT(plugin, key) DO UPDATE SET value = excluded.value')
@@ -235,9 +247,10 @@ export class SqliteStore implements Store {
   // ----- events -----
 
   async appendEvent(e: { type: string; jobId?: string; source: string; payload: unknown }): Promise<BuligEvent> {
+    e = { ...e, type: text('event type', e.type), source: text('event source', e.source), ...(e.jobId !== undefined && { jobId: text('job id', e.jobId) }) };
     const id = randomUUID();
     const at = new Date().toISOString();
-    const json = e.payload === undefined ? null : JSON.stringify(e.payload);
+    const json = e.payload === undefined ? null : storableJson(e.payload);
     if (json === undefined) throw new Error(`Payload of event "${e.type}" is not JSON`);
     const res = this.db
       .prepare('INSERT INTO events (id, type, job_id, source, payload, at) VALUES (?, ?, ?, ?, ?, ?)')
@@ -252,6 +265,7 @@ export class SqliteStore implements Store {
   }
 
   async eventsForJob(jobId: string): Promise<BuligEvent[]> {
+    jobId = text('job id', jobId);
     const rows = this.db.prepare('SELECT * FROM events WHERE job_id = ? ORDER BY seq').all(jobId);
     return (rows as EventRow[]).map(toEvent);
   }

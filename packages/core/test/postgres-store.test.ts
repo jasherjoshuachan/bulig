@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import pg from 'pg';
-import { PostgresStore, StoreBrokenError, StoreFatalError, StoreTimeoutError } from '../src/index.ts';
+import { OtherWriterError, PostgresStore, type PostgresStoreOptions, StoreBrokenError, StoreFatalError, StoreTimeoutError } from '../src/index.ts';
 import { kernelWith, probe } from './helpers.ts';
 import { describePg, usePgServer, type PgDatabase } from './pg-throwaway.ts';
 import { describeStoreContract, type StoreHandle } from './store-contract.ts';
@@ -58,8 +58,8 @@ describePg('PostgresStore', () => {
       dbs.push(db);
       return db;
     };
-    const open = async (url: string) => {
-      const s = await PostgresStore.open(url);
+    const open = async (url: string, options?: PostgresStoreOptions) => {
+      const s = await PostgresStore.open(url, options);
       stores.push(s);
       return s;
     };
@@ -97,16 +97,16 @@ describePg('PostgresStore', () => {
       const db = await freshDb();
       const a = await open(db.url);
       const job = await a.createJob({ repo: 'r', title: 't' });
-      const b = await open(db.url);
+      const b = await open(db.url, { mode: 'reader' });
       expect((await b.getJob(job.id))?.title).toBe('t');
       expect(await peek(db.url, 'SELECT version FROM bulig_schema')).toEqual([{ version: 3 }]);
       await peek(db.url, 'UPDATE bulig_schema SET version = 99');
-      await expect(PostgresStore.open(db.url)).rejects.toThrow(/schema version 99/);
+      await expect(PostgresStore.open(db.url, { mode: 'reader' })).rejects.toThrow(/schema version 99/);
     });
 
     it('two processes opening a fresh database at the same moment both end up with one schema', async () => {
       const db = await freshDb();
-      const [a, b, c] = await Promise.all([open(db.url), open(db.url), open(db.url)]);
+      const [a, b, c] = await Promise.all([open(db.url), open(db.url, { mode: 'reader' }), open(db.url, { mode: 'reader' })]);
       expect(await Promise.all([a.schemaVersion(), b.schemaVersion(), c.schemaVersion()])).toEqual([3, 3, 3]);
       expect(await peek(db.url, 'SELECT count(*)::int AS n FROM bulig_schema')).toEqual([{ n: 1 }]);
     });
@@ -137,22 +137,10 @@ describePg('PostgresStore', () => {
         await expect(tx.startStage('nope', 'x')).rejects.toThrow(/No such job/);
         await expect(tx.finishStage('nope', 'passed')).rejects.toThrow(/No such stage/);
         await expect(tx.setState('p', 'k', undefined)).rejects.toThrow(/not JSON/);
-        await expect(tx.setState('p', 'k', 'a\u0000b')).rejects.toThrow(/NUL/);
+        await expect(tx.setState('p', 'k\u0000', 1)).rejects.toThrow(/NUL/);
         await tx.createJob({ repo: 'r', title: 'also kept' });
       });
       expect((await s.listJobs()).map((j) => j.title)).toEqual(['kept', 'also kept']);
-    });
-
-    it('rejects a NUL character in JSON values before it reaches the server, and still takes a backslash followed by u0000', async () => {
-      const db = await freshDb();
-      const s = await open(db.url);
-      await expect(s.appendEvent({ type: 'a.b', source: 'x', payload: { t: 'a\u0000b' } })).rejects.toThrow(/NUL/);
-      const job = await s.createJob({ repo: 'r', title: 't' });
-      const stage = await s.startStage(job.id, 'build');
-      await expect(s.finishStage(stage.id, 'passed', ['\u0000'])).rejects.toThrow(/NUL/);
-      await s.setState('p', 'k', 'literal \\u0000 text');
-      expect(await s.getState('p', 'k')).toBe('literal \\u0000 text');
-      expect(await s.eventsAfter()).toEqual([]);
     });
 
     it('a COMMIT that fails is fatal, and the transaction is not left open', async () => {
@@ -184,6 +172,83 @@ describePg('PostgresStore', () => {
       expect(err).toBeInstanceOf(StoreFatalError);
       expect((err as Error).message).toMatch(/ROLLBACK failed after "the function fails"/);
       expect((err as StoreFatalError).cause).toMatchObject({ message: 'rollback failed (simulated)' });
+    });
+
+    describe('the writer lock (one kernel writes to a database)', () => {
+      it('refuses a second writer while the first is open, and allows one after the first closes', async () => {
+        const db = await freshDb();
+        const first = await open(db.url);
+        await first.createJob({ repo: 'r', title: 'mine' });
+        const refused = await PostgresStore.open(db.url).then(() => 'opened', (e: unknown) => e);
+        expect(refused).toBeInstanceOf(OtherWriterError);
+        expect((refused as Error).message).toMatch(/Another Bulig kernel is already writing to this database/);
+        // The refused one wrote nothing and left no connection behind.
+        expect((await first.listJobs()).map((j) => j.title)).toEqual(['mine']);
+        await first.close();
+        const second = await open(db.url);
+        expect((await second.listJobs()).map((j) => j.title)).toEqual(['mine']);
+      });
+
+      it('a reader is never refused, while a writer is open or when there are several', async () => {
+        const db = await freshDb();
+        const writer = await open(db.url);
+        const job = await writer.createJob({ repo: 'r', title: 'seen' });
+        const readers = await Promise.all([open(db.url, { mode: 'reader' }), open(db.url, { mode: 'reader' })]);
+        for (const r of readers) expect((await r.getJob(job.id))?.title).toBe('seen');
+        // A reader does not hold the lock: closing the writer frees it even while readers stay open.
+        await writer.close();
+        await open(db.url);
+      });
+
+      it('a writer that was aborted gives the lock up when its connection drops', async () => {
+        const db = await freshDb();
+        const first = await open(db.url);
+        first.abort();
+        const end = Date.now() + 5000;
+        let second: PostgresStore | undefined;
+        while (!second && Date.now() < end) {
+          second = await open(db.url).catch(async (e: unknown) => {
+            if (!(e instanceof OtherWriterError)) throw e;
+            await sleep(50);
+            return undefined;
+          });
+        }
+        expect(second).toBeDefined();
+      });
+
+      it('a writer that fails to start (for example a newer database) does not keep the lock', async () => {
+        const db = await freshDb();
+        await (await open(db.url, { mode: 'reader' })).close();
+        await peek(db.url, 'UPDATE bulig_schema SET version = 99');
+        await expect(PostgresStore.open(db.url)).rejects.toThrow(/schema version 99/);
+        await peek(db.url, 'UPDATE bulig_schema SET version = 3');
+        await open(db.url); // would be refused if the failed start had kept the lock
+      });
+    });
+
+    describe('connection strings', () => {
+      it('refuses a string with no postgres:// or postgresql:// scheme, and never repeats it', () => {
+        for (const bad of ['bulig:S3cretPW@just-text', 'S3cretPW', 'mysql://u:S3cretPW@h/db', 'http://u:S3cretPW@h/db']) {
+          let message = '';
+          try {
+            new PostgresStore(bad);
+          } catch (e) {
+            message = (e as Error).message;
+          }
+          expect(message).toMatch(/must start with postgres:\/\/ or postgresql:\/\//);
+          expect(message).not.toContain('S3cretPW');
+        }
+        expect(() => new PostgresStore('postgres://u@h/db')).not.toThrow();
+        expect(() => new PostgresStore('PostgreSQL://u@h/db')).not.toThrow();
+      });
+
+      it('a string with a scheme that the driver cannot read fails without quoting it', async () => {
+        const s = new PostgresStore('postgresql://bulig:S3cretPW@[not-a-host/db');
+        stores.push(s);
+        const err = await s.getJob('x').catch((e: unknown) => e);
+        expect(err).toBeInstanceOf(Error);
+        expect(String((err as Error).message)).not.toContain('S3cretPW');
+      });
     });
 
     describe('abort()', () => {

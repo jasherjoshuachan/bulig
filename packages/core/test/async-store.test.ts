@@ -56,7 +56,7 @@ const ADAPTERS: Adapter[] = [
       return s;
     },
     async peek() {
-      const s = await PostgresStore.open(pgDb!.url);
+      const s = await PostgresStore.open(pgDb!.url, { mode: 'reader' });
       cleanups.push(() => s.close());
       return s;
     },

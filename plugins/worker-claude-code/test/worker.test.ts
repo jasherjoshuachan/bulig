@@ -320,6 +320,18 @@ describe('tool-use records', () => {
     expect(ev[0]!.target).not.toMatch(/[\n\u202e]/);
   });
 
+  it('a target is never cut through the middle of an emoji, wherever the limit falls', () => {
+    // The 300th character is the first half of a two-unit emoji: a plain slice would leave a lone surrogate, which a Postgres JSONB column refuses.
+    for (const pad of [284, 285, 296, 297, 298, 299]) {
+      const command = `git commit -m "${'x'.repeat(pad)}\u{1F916} Generated with Claude Code"`;
+      const target = evidenceFrom([use('t1', 'Bash', { command })])[0]!.target;
+      expect(target.length).toBeLessThanOrEqual(300);
+      expect(/[\ud800-\udfff]/.test(target.replace(/[\ud800-\udbff][\udc00-\udfff]/g, ''))).toBe(false);
+    }
+    const cut = evidenceFrom([use('t1', 'Bash', { command: `${'x'.repeat(299)}\u{1F916}` })])[0]!.target;
+    expect(cut).toBe('x'.repeat(299));
+  });
+
   it('a plain single-object output still parses and carries no records', () => {
     expect(parseClaudeOutput('{"result":"hi","is_error":false}').evidence).toBeUndefined();
   });

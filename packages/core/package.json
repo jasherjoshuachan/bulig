@@ -8,6 +8,7 @@
   },
   "dependencies": {
     "@bulig/plugin-sdk": "workspace:*",
+    "@bulig/text": "workspace:*",
     "better-sqlite3": "^12.4.0",
     "pg": "8.23.1"
   },

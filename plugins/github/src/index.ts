@@ -3,6 +3,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:pat
 import { definePlugin, type BuligEvent, type PluginContext } from '@bulig/plugin-sdk';
 import { isPlainRepoPath, isRepoPath, MAX_SCOPE_ENTRIES, matchesScope, normalizeScopeEntry } from '@bulig/scope';
 import { exec, type ExecResult } from './exec.ts';
+import { clipText } from '@bulig/text';
 
 export interface GithubConfig {
   /** The gh binary. Default "gh". */
@@ -260,7 +261,7 @@ export default definePlugin({
     const again = async (call: () => Promise<ExecResult>, signal?: AbortSignal): Promise<ExecResult> => {
       let r = await call();
       for (let n = 1; n < tries && r.code !== 0 && TRANSIENT.test(r.stderr + r.stdout); n++) {
-        ctx.log.warn(`github: temporary failure, trying again (${n}/${tries - 1})`, (r.stderr || r.stdout).trim().slice(0, 200));
+        ctx.log.warn(`github: temporary failure, trying again (${n}/${tries - 1})`, clipText((r.stderr || r.stdout).trim(), 200));
         await nap(delay * 2 ** (n - 1), signal);
         if (signal?.aborted) break;
         r = await call();
@@ -268,7 +269,7 @@ export default definePlugin({
       return r;
     };
     const must = (what: string, r: ExecResult): string => {
-      if (r.code !== 0) throw new StepError(`${what} failed (exit ${r.code}): ${(r.stderr || r.stdout).trim().slice(0, 500)}`);
+      if (r.code !== 0) throw new StepError(`${what} failed (exit ${r.code}): ${clipText((r.stderr || r.stdout).trim(), 500)}`);
       return r.stdout.trim();
     };
     const message = (err: unknown) => (err instanceof Error ? err.message : String(err));
@@ -380,7 +381,7 @@ export default definePlugin({
         const message = str(event.payload, 'message');
         const rules = readScopeRules(event.payload, cwd);
         const status = await runGit(cwd, ['status', '--porcelain=v1', '-z', '--untracked-files=all']);
-        if (status.code !== 0) throw new StepError(`git status failed (exit ${status.code}): ${(status.stderr || status.stdout).trim().slice(0, 500)}`);
+        if (status.code !== 0) throw new StepError(`git status failed (exit ${status.code}): ${clipText((status.stderr || status.stdout).trim(), 500)}`);
         const changed = parseStatusZ(status.stdout);
 
         const outside: string[] = [];
@@ -449,7 +450,7 @@ export default definePlugin({
         // If an earlier try actually made the PR, gh says so and prints its URL. Use that one.
         const out = made.code !== 0 && /already exists/i.test(made.stderr + made.stdout) ? made.stderr + made.stdout : must('gh pr create', made);
         const url = out.split('\n').map((l) => l.trim()).filter((l) => /^https?:\/\//.test(l)).pop();
-        if (!url) throw new StepError(`gh pr create did not print a PR URL: ${out.slice(0, 200)}`);
+        if (!url) throw new StepError(`gh pr create did not print a PR URL: ${clipText(out, 200)}`);
         const view = JSON.parse(must('gh pr view', await again(() => runGh(cwd, ['pr', 'view', url, '--json', 'number,headRefOid,url'])))) as {
           number: number;
           headRefOid: string;
@@ -567,7 +568,7 @@ export default definePlugin({
           }, wait.signal);
           if (list) return { list };
           if (/no checks reported/i.test(r.stderr + r.stdout)) return { list: [] };
-          return { error: (r.stderr || r.stdout).trim().slice(0, 300) };
+          return { error: clipText((r.stderr || r.stdout).trim(), 300) };
         };
 
         const waitMs = cfg.checksWaitMs ?? 900_000;
@@ -607,7 +608,7 @@ export default definePlugin({
           const state = await runGh(cwd, ['pr', 'view', n, '--json', 'state']);
           const merged = state.code === 0 && (JSON.parse(state.stdout) as { state: string }).state === 'MERGED';
           if (!merged) {
-            const why = `gh pr merge failed (exit ${merge.code}): ${(merge.stderr || merge.stdout).trim().slice(0, 400)}`;
+            const why = `gh pr merge failed (exit ${merge.code}): ${clipText((merge.stderr || merge.stdout).trim(), 400)}`;
             // A conflict stays a conflict until someone changes the branch, so asking again would loop.
             return PERMANENT_MERGE_FAILURE.test(merge.stderr + merge.stdout) ? giveUp(why) : refuse(why);
           }

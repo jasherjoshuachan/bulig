@@ -83,7 +83,7 @@ describePg('pipeline-dev on PostgresStore', () => {
     const story = await types(r.k, job.id);
     await r.k.stop();
 
-    const again = await PostgresStore.open(r.db.url);
+    const again = await PostgresStore.open(r.db.url, { mode: 'reader' });
     stores.push(again);
     expect((await again.getJob(job.id))!.status).toBe('done');
     expect((await again.listStages(job.id)).map((s) => `${s.name}:${s.status}`)).toEqual(stages);

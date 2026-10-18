@@ -96,8 +96,10 @@ describe('a card left over from an earlier question', () => {
 
     // The person in chat B never saw the refusal and taps the old card. It has expired: nothing is granted.
     const answersBefore = r.fake.of('answerCallbackQuery').length;
+    const editsBefore = r.fake.of('editMessageText').length;
     r.tap(staleB, staleB.approve);
-    await until(() => r.fake.of('answerCallbackQuery').length === answersBefore + 1, 'the stale tap is answered', 15000);
+    // The channel answers the tap first and edits the card after, so wait for both.
+    await until(() => r.fake.of('answerCallbackQuery').length === answersBefore + 1 && r.fake.of('editMessageText').length === editsBefore + 1, 'the stale tap is answered and the card edited', 15000);
     expect(r.fake.of('answerCallbackQuery').at(-1)!.params.text).toBe('That approval is no longer open.');
     expect(String(r.fake.of('editMessageText').at(-1)!.params.text)).toContain('Expired');
     // Deny on the old card has expired too: the job is not cancelled.

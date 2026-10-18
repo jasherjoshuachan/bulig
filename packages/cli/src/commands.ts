@@ -402,7 +402,8 @@ function printStages(stages: Stage[], io: Io): void {
     const o = (s.output && typeof s.output === 'object' ? s.output : {}) as Record<string, unknown>;
     const cost = typeof o.costUsd === 'number' ? `$${o.costUsd.toFixed(4)}` : '-';
     const session = typeof o.sessionId === 'string' ? o.sessionId : '-';
-    const note = o.interrupted ? ' (interrupted)' : typeof o.verdict === 'string' ? ` ${o.verdict}` : '';
+    // An approval stage shows its id: `bulig approve` and `bulig deny` name it.
+    const note = s.name.startsWith('approve-') ? ` stage ${s.id}` : o.interrupted ? ' (interrupted)' : typeof o.verdict === 'string' ? ` ${o.verdict}` : '';
     io.out(`${pad(s.name, 15)}${pad(String(s.attempt), 5)}${pad(s.status, 9)}${pad(secs(s.startedAt, s.endedAt), 9)}${pad(cost, 9)}${session}${note}`);
   }
 }
@@ -428,7 +429,7 @@ function cmdHistory(args: string[], io: Io): number {
 function summary(payload: unknown): string {
   if (payload === null || typeof payload !== 'object') return cell(payload);
   const p = payload as Record<string, unknown>;
-  const pick = ['stage', 'kind', 'url', 'number', 'headSha', 'branch', 'reason', 'error', 'from', 'to', 'sessionId', 'costUsd'];
+  const pick = ['stage', 'kind', 'stageId', 'url', 'number', 'headSha', 'branch', 'reason', 'error', 'from', 'to', 'sessionId', 'costUsd'];
   const parts = pick.filter((k) => p[k] !== undefined).map((k) => `${k}=${String(p[k]).replace(/\s+/g, ' ').slice(0, 60)}`);
   return parts.join(' ');
 }

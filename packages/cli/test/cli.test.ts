@@ -205,6 +205,10 @@ describe('a whole job through the CLI', () => {
       }
     }
     expect((await w.run('status', id)).out).toContain('status   awaiting_approval');
+    // Where the refusal points: history shows the open stage's id, on the stage row and on the question.
+    const history = (await w.run('history', id)).out;
+    expect(history).toMatch(new RegExp(`^approve-plan .* stage ${stage}$`, 'm'));
+    expect(history).toMatch(new RegExp(`approval.requested .*kind=plan stageId=${stage}`));
   });
 
   it('a worker failure leaves the job failed and the exit code 1', async () => {

@@ -25,7 +25,7 @@ On Postgres the fence is also a lock. `assertLease` reads the row `FOR KEY SHARE
 Effects outside the record are guarded where they happen, because the fence only covers the record:
 
 - `worker-claude-code` starts Claude for a `stage.requested` only if the stage named in `stageId` is the running attempt. Otherwise it does nothing and says nothing.
-- `github` makes one commit per stage attempt. The commit carries a `Bulig-Stage: <stageId>` trailer, and a request whose attempt already has a commit gets that commit back.
+- `github` makes one commit per stage attempt. The commit carries a `Bulig-Stage: <stageId>` trailer, and a request whose attempt already has a commit gets that commit back, with the files it holds outside the approved scope reported as a new commit's answer would (addendum of 18 Oct 2026).
 - `pipeline-dev` sends `stageId` with `stage.requested` and `commit.requested`, treats `StageClaimedError` as a duplicate and not as a failed job, and on resume leaves alone any running stage that holds a claim of this kernel's generation.
 
 ## Jasher's words (18 Oct 2026)
@@ -41,7 +41,7 @@ A claim is the key to one room. Only one key per room can be out at a time, and 
 ## Consequences
 
 - A kernel that dies mid-build costs up to 30 s before the next one can start, unless the first one shut down cleanly, in which case `stop()` hands the lease back and the next one starts at once. Until a standby exists, the supervisor's restart delay (launchd ThrottleInterval 30 s on the Mac, systemd on a server) hides most of that.
-- A kernel that loses its lease stops writing and logs one loud error. It does not matter which part notices first: the heartbeat (a refused, failed or late renewal) or a queued task whose own lease check fails (a laptop that slept past the 30 s). Both end in `onLeaseLost`, which fires exactly once. Jasher's rule is "stop writing at once", so `bulig serve` uses `onLeaseLost`: it logs one clear line, stops the plugins (which ends every running Claude process, the same path as Ctrl-C), and exits non-zero so a supervisor restarts it. The next start resumes from the record. The fence still covers the gap: a report that arrives before the processes are gone bounces off it.
+- A kernel that loses its lease stops writing and logs one loud error. It does not matter which part notices first: the heartbeat (a refused, failed or late renewal) or a queued task whose own lease check fails (a laptop that slept past the 30 s). Both end in `onLeaseLost`, which fires exactly once, and not at all once `stop()` has begun or a start has failed (addendum of 18 Oct 2026). Jasher's rule is "stop writing at once", so `bulig serve` uses `onLeaseLost`: it logs one clear line, stops the plugins (which ends every running Claude process, the same path as Ctrl-C), and exits non-zero so a supervisor restarts it. The next start resumes from the record. The fence still covers the gap: a report that arrives before the processes are gone bounces off it.
 - The fence covers the record. It cannot recall a `git push` or a `gh pr create` already sent. That is why those effects are guarded where they happen (above), and why `gh` answering "already exists" is still handled.
 - `finishStage` on a stage that is already finished now rejects. Before, it overwrote the output. No plugin did it on purpose. One pipeline test did, to fake an old record, and now writes the file directly.
 - A stage that was running before this change has no claim row. It finishes as it used to, and a restart closes it. There is no backfill, because a backfill would fail on a record that already has two running stages with one name.
@@ -101,3 +101,16 @@ Until now `bus.record` never passed an id, so the unique index on `events.id` ne
 12. **A replay rolls back the whole task, not only the event.** The alternative (keep the rest of the task, skip the event) would let a replayed `jobs.create` make a second job.
 13. **Ordinals depend on the order a handler's emits reach the queue.** A handler that fires emits in parallel without awaiting still gets the same ids on a replay, because the queue keeps call order. A handler whose emits happen in a different order on a second run gets different ids for them and writes them again. That is the safe side: a missed dedup, never a lost event.
 14. **channel-telegram does not use `update_id` as an event id.** It would need a way for a plugin to name an id, which is an SDK change, and the channel already saves the offset before it handles an update, so an update is handled at most once. Left alone.
+
+### Decided: three fixes from review
+
+- **A failed start lets go.** If a plugin throws in `register`, or `kernel.started` cannot be written, `start()` stops the heartbeat and hands the lease back before it rejects. Before, the heartbeat renewed a lease nothing was using until the process exited.
+- **`stop()` keeps the lease alive until the queue is empty.** The heartbeat is stopped after `queue.idle()`, not before. `bus.idle()` gives up after `stopWaitMs` (default 10000, a new kernel option so a test need not wait 10 s), and work still queued after that used to run with no renewals; a task that started after the lease ran out found it gone, and a clean Ctrl-C printed the lost-lease line and exited 1.
+- **No lost-lease exit while ending.** Once `stop()` has begun or a start has failed, `onLeaseLost` is not called. The log still says the lease was lost, loudly. The process is leaving either way, and a clean stop must not exit non-zero for it.
+- **`commit.done` for an existing commit carries `outOfScope`.** A repeated `commit.requested` for a stage attempt that already has a commit used to answer with the sha and base only, so a warn-mode run lost the list that goes into the PR body. It now reads the files the commit holds (`git diff-tree`) and judges them with the same rule as a new commit.
+
+## Assumed (to confirm), added 18 Oct 2026, continued
+
+15. **In enforce mode, a repeated request is refused if the commit it finds holds files outside the scope the request carries** (`commit.failed` with `outOfScope`, as a new commit would be). The alternative is to hand the commit back and report the files, which would let enforce mode pass out-of-scope files. It also means a repeated request without a valid scope is now refused, where before it got the commit back.
+16. **A lost lease while stopping is logged but not reported to the owner.** The alternative is to keep exit code 1 for it. A real loss during a clean stop (a rival took over while the queue drained) then exits 0 with the error in the log.
+17. **A failed start does not undo what registered.** Plugins that registered before the failure stay subscribed, and the queue keeps its fence, so a late write from one is refused (the lease is gone) and logged, not applied. `serve` exits on the rejected `start()` anyway.

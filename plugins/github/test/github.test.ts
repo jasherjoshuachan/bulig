@@ -1492,6 +1492,41 @@ describe('scope guard on commit.requested', () => {
     expect(committed(cwd)).toEqual(['README.md', 'test-results/.last-run.json']);
   });
 
+  it('a repeated request for a stage attempt that has a commit reports the commit\'s out-of-scope files, as the first answer did', async () => {
+    const h = await setup();
+    const cwd = await worktree(h, 'bulig/s-20b');
+    write(cwd, 'README.md');
+    write(cwd, 'test-results/.last-run.json');
+    const first = await commit(h, cwd, { scope: ['README.md'], scopeMode: 'warn', stageId: 'attempt-w' });
+    expect(first.type).toBe('commit.done');
+    expect((first.payload as { outOfScope?: string[] }).outOfScope).toEqual(['test-results/.last-run.json']);
+    const again = await commit(h, cwd, { scope: ['README.md'], scopeMode: 'warn', stageId: 'attempt-w' });
+    expect(again.type).toBe('commit.done');
+    expect(again.payload).toEqual(first.payload); // same sha, same base, same outOfScope
+  });
+
+  it('a repeated request for a commit that is fully in scope reports no outOfScope', async () => {
+    const h = await setup();
+    const cwd = await worktree(h, 'bulig/s-20c');
+    write(cwd, 'README.md');
+    const first = await commit(h, cwd, { scope: ['README.md'], scopeMode: 'warn', stageId: 'attempt-x' });
+    const again = await commit(h, cwd, { scope: ['README.md'], scopeMode: 'warn', stageId: 'attempt-x' });
+    expect(again.type).toBe('commit.done');
+    expect(again.payload).toEqual(first.payload);
+    expect(again.payload).not.toHaveProperty('outOfScope');
+  });
+
+  it('in enforce mode a repeated request does not hand back a commit that holds files outside the scope it now carries', async () => {
+    const h = await setup();
+    const cwd = await worktree(h, 'bulig/s-20d');
+    write(cwd, 'README.md');
+    write(cwd, 'extra.txt');
+    expect((await commit(h, cwd, { scope: ['README.md', 'extra.txt'], stageId: 'attempt-y' })).type).toBe('commit.done');
+    const again = await commit(h, cwd, { scope: ['README.md'], stageId: 'attempt-y' });
+    expect(again.type).toBe('commit.failed');
+    expect(failure(again).outOfScope).toEqual(['extra.txt']);
+  });
+
   it('warn mode still refuses an invalid scope and still never follows a symlink', async () => {
     const h = await setup();
     const cwd = await worktree(h, 'bulig/s-21');

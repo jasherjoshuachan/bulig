@@ -2,7 +2,7 @@ import type { BuligEvent, Job, JobStatus, Stage, StageStatus } from '@bulig/plug
 
 /**
  * The Store port (ADR 0007): everything the kernel keeps, behind promises. An adapter implements it for one engine
- * (SqliteStore today, Postgres next). Nothing here names an engine: no file path, no row id, no sync call.
+ * (SqliteStore and PostgresStore). Nothing here names an engine: no file path, no row id, no sync call.
  *
  * Rules every adapter follows, and the shared contract suite in packages/core/test checks:
  * - A call that fails rejects. It never throws before it returns a promise.

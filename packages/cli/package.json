@@ -14,6 +14,7 @@
     "@bulig/github": "workspace:*",
     "@bulig/pipeline-dev": "workspace:*",
     "@bulig/plugin-sdk": "workspace:*",
+    "@bulig/text": "workspace:*",
     "@bulig/worker-claude-code": "workspace:*",
     "tsx": "^4.20.0",
     "zod": "^4.1.0"

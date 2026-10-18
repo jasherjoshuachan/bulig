@@ -105,3 +105,18 @@ describe('the mark', () => {
     expect(promiseLine(p!, { rejected: { token: 'deadbeef', why: 'is not a job' } })).toBe('Unfulfilled promise: no live job id (deadbeef is not a job) ("I\'ll follow up.")');
   });
 });
+
+describe('the scan limit', () => {
+  it('never cuts an emoji in half: a promise at the limit comes out without a lone surrogate', async () => {
+    const { MAX_SCAN } = await import('../src/promises.ts');
+    const lone = (s: string) => /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/.test(s);
+    // "I will fix it later " then an emoji whose first half is the last character inside the limit.
+    const lead = 'I will fix it later ';
+    const text = `${'y'.repeat(MAX_SCAN - lead.length - 1 - 2)}. ${lead}\u{1F916} ok`;
+    expect(text.charCodeAt(MAX_SCAN - 1)).toBeGreaterThanOrEqual(0xd800);
+    expect(text.charCodeAt(MAX_SCAN - 1)).toBeLessThanOrEqual(0xdbff);
+    const found = findPromises(text);
+    expect(found.length).toBeGreaterThan(0);
+    for (const p of found) expect(lone(p.text)).toBe(false);
+  });
+});

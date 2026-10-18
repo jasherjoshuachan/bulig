@@ -2,6 +2,7 @@ import { definePlugin, type BuligEvent, type Job, type PluginContext, type Stage
 import { parseScopeBlock } from '@bulig/scope';
 import { CLAUDE_STAGES, decide, outputOf, parseVerdict, scopeLines, type Action, type ClaudeStage, type StageOutput } from './decide.ts';
 import { renderPrompt } from './prompts.ts';
+import { clipText } from '@bulig/text';
 
 export { decide, namedFiles, parseVerdict, type Action } from './decide.ts';
 export { renderPrompt } from './prompts.ts';
@@ -37,9 +38,9 @@ const EDITING = new Set(['build', 'test', 'docs', 'reset']);
 const STRONG = new Set<ClaudeStage>(['plan', 'critique', 'review']);
 const MAX_PROMPT_TEXT = 12_000;
 
-const clip = (s: string, n = MAX_PROMPT_TEXT) => (s.length > n ? `${s.slice(0, n)}\n[cut: ${s.length - n} more characters]` : s);
+const clip = (s: string, n = MAX_PROMPT_TEXT) => (s.length > n ? `${clipText(s, n)}\n[cut: ${s.length - n} more characters]` : s);
 /** One line, no hidden characters, cut at n. */
-const shortLine = (s: string, n: number) => s.replace(/[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u202a-\u202e\u2060\u2066-\u2069\ufeff]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, n);
+const shortLine = (s: string, n: number) => clipText(s.replace(/[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u202a-\u202e\u2060\u2066-\u2069\ufeff]+/g, ' ').replace(/\s+/g, ' ').trim(), n);
 /** The strings in a list, as short lines: at most `max` of them, each cut at n. */
 const lines = (v: unknown, max: number, n: number): string[] =>
   Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string').slice(0, max).map((x) => shortLine(x, n)) : [];

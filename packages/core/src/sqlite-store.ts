@@ -1,7 +1,7 @@
 import Database from 'better-sqlite3';
 import { randomUUID } from 'node:crypto';
 import type { BuligEvent, Job, JobStatus, Stage, StageStatus } from '@bulig/plugin-sdk';
-import type { Store, StoreTx } from './store.ts';
+import { StoreFatalError, type Store, type StoreTx } from './store.ts';
 
 // Each entry upgrades the schema by one version. Never edit an old entry; add a new one.
 const MIGRATIONS: string[] = [
@@ -95,6 +95,15 @@ export class SqliteStore implements Store {
     return this.db.pragma('user_version', { simple: true }) as number;
   }
 
+  /**
+   * SQLite's COMMIT is synchronous: it has finished before control returns to the event loop, so no commit of this
+   * connection can be in flight while the kernel waits on a stuck call. What can be in flight is a transaction that is
+   * still open while its function waits. Roll that back now, so a function that wakes up later finds no transaction to commit.
+   */
+  abort(): void {
+    if (this.db.open && this.db.inTransaction) this.db.exec('ROLLBACK');
+  }
+
   async close(): Promise<void> {
     this.db.close();
   }
@@ -113,8 +122,9 @@ export class SqliteStore implements Store {
     } catch (err) {
       try {
         if (this.db.inTransaction) this.db.exec('ROLLBACK');
-      } catch {
-        // The original error is the one to report.
+      } catch (rollbackErr) {
+        // The transaction may still be open. Nothing can be said about what the record holds.
+        throw new StoreFatalError(`ROLLBACK failed after "${err instanceof Error ? err.message : String(err)}", so a transaction may be left open`, { cause: rollbackErr });
       }
       throw err;
     }

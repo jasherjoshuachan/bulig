@@ -48,9 +48,11 @@ export class Bus {
    * Queue an event. The promise settles with the event once it is committed to the log and delivered, or rejects if it
    * was not written. Nobody has to wait on it: a failed write is also reported to `onError`.
    */
-  emit(input: EmitInput): Promise<BuligEvent> {
+  emit(input: EmitInput, options: { report?: boolean } = {}): Promise<BuligEvent> {
     const written = this.queue.run(`emit ${input.type}`, (tx) => this.record(tx, input));
-    written.catch((err: unknown) => this.onError(err, input));
+    // A caller that waits for the answer (emitCommitted) hears the failure itself; no need to log it as well.
+    if (options.report !== false) written.catch((err: unknown) => this.onError(err, input));
+    else written.catch(() => {});
     return written;
   }
 
@@ -59,12 +61,12 @@ export class Bus {
    * (declared in needs and granted in config), or nothing is written and nothing is dispatched.
    * That check throws here, in the caller's own call, before anything is queued.
    */
-  emitFrom(plugin: string, caps: ReadonlySet<string>, input: Omit<EmitInput, 'source'>): Promise<BuligEvent> {
+  emitFrom(plugin: string, caps: ReadonlySet<string>, input: Omit<EmitInput, 'source'>, options: { report?: boolean } = {}): Promise<BuligEvent> {
     const needed = Object.hasOwn(this.eventCapabilities, input.type) ? this.eventCapabilities[input.type] : undefined;
     if (needed && !caps.has(needed)) {
       throw new CapabilityDeniedError(`Plugin "${plugin}" was denied "${needed}" (needed to emit "${input.type}")`);
     }
-    return this.emit({ ...input, source: plugin });
+    return this.emit({ ...input, source: plugin }, options);
   }
 
   /**

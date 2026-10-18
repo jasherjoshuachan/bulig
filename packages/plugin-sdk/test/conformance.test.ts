@@ -75,6 +75,20 @@ describe('emits rule', () => {
   it('fails an undeclared emit, even when the plugin swallows the error', async () => {
     expect(await messages({ load: emitting('pr.opened', ['stage.checked']), scenarios: kick })).toMatch(/emitted "pr.opened" but did not declare it/);
   });
+  it('judges emitCommitted by the same rules as emit', async () => {
+    const load = () =>
+      make({ subscribes: ['kernel.started'], emits: ['stage.checked'] }, (ctx) => {
+        ctx.on('kernel.started', async () => {
+          await ctx.emitCommitted('stage.checked', { ok: true });
+          try {
+            await ctx.emitCommitted('pr.opened', {});
+          } catch {}
+        });
+      });
+    const report = await checkPlugin({ load, scenarios: kick });
+    expect(report.findings.map((f) => f.message)).toEqual(['[start] emitted "pr.opened" but did not declare it in emits']);
+    expect(report.unexercised).toEqual([]);
+  });
   it('fails a payload that is not JSON', async () => {
     const load = () => make({ subscribes: ['kernel.started'], emits: ['stage.checked'] }, (ctx) => ctx.on('kernel.started', () => ctx.emit('stage.checked', { n: 1n })));
     expect(await messages({ load, scenarios: kick })).toMatch(/not JSON/);

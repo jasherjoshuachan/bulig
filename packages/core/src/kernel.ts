@@ -18,6 +18,8 @@ export interface KernelOptions {
    * refuses every later store call, and logs one error. Default 120000, never less than storeTimeoutMs.
    */
   storeBrokenMs?: number;
+  /** How long stop() waits for the store's own close() before it stops waiting and says so. Default 10000. */
+  storeCloseMs?: number;
   plugins: Plugin[];
   enabled: string[];
   grants?: Record<string, string[]>;
@@ -42,6 +44,8 @@ export function createKernel(options: KernelOptions) {
   const queue = new StoreQueue(store, {
     timeoutMs: options.storeTimeoutMs ?? 30_000,
     brokenMs: options.storeBrokenMs ?? 120_000,
+    closeMs: options.storeCloseMs ?? 10_000,
+    onCloseCutShort: (ms) => logger.error(`The store did not close within ${ms} ms, so stop() stopped waiting for it. Its connection may still be open.`),
     onBroken: (err) => logger.error(`${err.message} Nothing more will be written or delivered until it is restarted.`),
   });
   const bus = new Bus(queue, { ...DEFAULT_EVENT_CAPABILITIES, ...options.eventCapabilities }, (err, input) => {

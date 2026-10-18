@@ -140,7 +140,7 @@ export default definePlugin({
       if (typeof branch !== 'string' || !branch) return;
       cleanupAsked.add(jobId);
       for (const s of stages) if (s.status === 'running') await ctx.jobs.finishStage(s.id, 'failed', { cancelled: true });
-      ctx.emit('worktree.cleanup.requested', { repoPath: job.repo, branch }, jobId);
+      await announce('worktree.cleanup.requested', { repoPath: job.repo, branch }, jobId);
     }
 
     /** Close a stage, then see whether that was the last thing holding up a cleanup. */
@@ -149,11 +149,39 @@ export default definePlugin({
       await cleanupIfIdle(s.jobId);
     }
 
+    /**
+     * Write an event and wait until it is committed. A state change is saved first and the event that tells someone to
+     * act on it second; if the second write is lost, nobody is told, and the job would wait for ever. So a lost event
+     * is an error here, and the handler's guard turns it into a failed job with this reason.
+     */
+    async function announce(type: string, payload: unknown, jobId: string): Promise<void> {
+      try {
+        await ctx.emitCommitted(type, payload, jobId);
+      } catch (err) {
+        throw new Error(`could not announce ${type}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+
+    /** `announce` for the event that follows startStage: if it is lost, close the stage that was just opened, so a job that fails because of it can be cleaned up. */
+    async function announceStage(stage: Stage, type: string, payload: unknown, jobId: string): Promise<void> {
+      try {
+        await announce(type, payload, jobId);
+      } catch (err) {
+        await finish(stage, 'failed', { error: err instanceof Error ? err.message : String(err) }).catch(() => {});
+        throw err;
+      }
+    }
+
     async function fail(jobId: string, reason: string, extra: Record<string, unknown> = {}): Promise<void> {
       const job = await ctx.jobs.get(jobId);
       if (!job || job.status === 'failed' || job.status === 'done' || job.status === 'cancelled') return;
       await ctx.jobs.setStatus(jobId, 'failed');
-      ctx.emit('pipeline.failed', { reason, ...extra }, jobId);
+      try {
+        await ctx.emitCommitted('pipeline.failed', { reason, ...extra }, jobId);
+      } catch (err) {
+        // The job is failed and that is on record. Only the announcement was lost, and there is no one left to tell.
+        ctx.log.error(`pipeline-dev: job ${jobId} failed ("${reason}") but pipeline.failed could not be written: ${err instanceof Error ? err.message : String(err)}`);
+      }
     }
 
     /** The scope the person approved with the plan. Undefined if the plan on record has none. */
@@ -204,6 +232,43 @@ export default definePlugin({
       ];
     }
 
+    /** The state key that says the person was asked for this approval stage. */
+    const askedKey = (stage: Stage) => `approval-asked:${stage.id}`;
+
+    /**
+     * Ask the person to approve. The question is written to the log before anything is recorded as asked, and it is
+     * recorded as asked only once the write is committed, so a restart can tell a question that was lost from one that was not.
+     */
+    async function requestApproval(job: Job, which: 'plan' | 'merge', stages: Stage[], approving: Stage, renewed: boolean): Promise<void> {
+      if (which === 'plan') {
+        const summary = withEvidence(evidenceBlock(stages, ['plan', 'critique']), `PLAN\n${textOf(stages, 'plan')}\n\nCRITIQUE\n${textOf(stages, 'critique')}`);
+        await announce('approval.requested', { jobId: job.id, kind: 'plan', summary: clip(summary, 4000), scope: scopeOf(stages) ?? [] }, job.id);
+      } else {
+        const pr = outputOf(lastOf(stages, 'pr')!);
+        const review = textOf(stages, 'review');
+        await announce(
+          'approval.requested',
+          {
+            jobId: job.id,
+            kind: 'merge',
+            url: pr.url,
+            headSha: pr.headSha,
+            summary: clip(
+              `${renewed ? 'The last merge was refused. Approve again to retry.\n\n' : ''}${withEvidence(evidenceBlock(stages, ['build', 'test', 'docs', 'review']), `REVIEW\n${review}`)}`,
+              4000,
+            ),
+          },
+          job.id,
+        );
+      }
+      try {
+        await ctx.state.set(askedKey(approving), true);
+      } catch (err) {
+        // The question was asked. If this note is lost, a restart asks once more, and the second card is ignored.
+        ctx.log.warn(`pipeline-dev: asked for the ${which} approval of job ${job.id} but could not note it: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+
     async function advance(jobId: string): Promise<void> {
       const job = await ctx.jobs.get(jobId);
       if (!job) return;
@@ -225,9 +290,9 @@ export default definePlugin({
         case 'fail':
           return await fail(job.id, action.reason, action.outOfScope ? { outOfScope: action.outOfScope } : {});
         case 'worktree': {
-          await ctx.jobs.startStage(job.id, 'worktree');
+          const opened = await ctx.jobs.startStage(job.id, 'worktree');
           const branch = `${prefix}/${slug(job.title)}-${job.id.slice(0, 8)}`;
-          ctx.emit('worktree.requested', { repoPath: job.repo, branch }, job.id);
+          await announceStage(opened, 'worktree.requested', { repoPath: job.repo, branch }, job.id);
           return;
         }
         case 'stage': {
@@ -246,8 +311,9 @@ export default definePlugin({
             sha: String(outputOf(lastOf(stages, 'docs') ?? ({ output: null } as Stage)).sha ?? ''),
             feedback: action.feedback ? `\nThis is a retry. Fix these problems first:\n\n${clip(action.feedback)}\n` : '',
           });
-          await ctx.jobs.startStage(job.id, name);
-          ctx.emit(
+          const opened = await ctx.jobs.startStage(job.id, name);
+          await announceStage(
+            opened,
             'stage.requested',
             {
               stage: name,
@@ -261,36 +327,15 @@ export default definePlugin({
           return;
         }
         case 'approve': {
-          const stageName = `approve-${action.which}`;
-          await ctx.jobs.startStage(job.id, stageName);
+          const approving = await ctx.jobs.startStage(job.id, `approve-${action.which}`);
           await ctx.jobs.setStatus(job.id, 'awaiting_approval');
-          if (action.which === 'plan') {
-            const summary = withEvidence(evidenceBlock(stages, ['plan', 'critique']), `PLAN\n${textOf(stages, 'plan')}\n\nCRITIQUE\n${textOf(stages, 'critique')}`);
-            ctx.emit('approval.requested', { jobId: job.id, kind: 'plan', summary: clip(summary, 4000), scope: scopeOf(stages) ?? [] }, job.id);
-          } else {
-            const pr = outputOf(lastOf(stages, 'pr')!);
-            const review = textOf(stages, 'review');
-            ctx.emit(
-              'approval.requested',
-              {
-                jobId: job.id,
-                kind: 'merge',
-                url: pr.url,
-                headSha: pr.headSha,
-                summary: clip(
-                  `${action.renewed ? 'The last merge was refused. Approve again to retry.\n\n' : ''}${withEvidence(evidenceBlock(stages, ['build', 'test', 'docs', 'review']), `REVIEW\n${review}`)}`,
-                  4000,
-                ),
-              },
-              job.id,
-            );
-          }
+          await requestApproval(job, action.which, stages, approving, action.renewed === true);
           return;
         }
         case 'pr': {
           const wt = outputOf(lastOf(stages, 'worktree')!);
           const reviewed = outputOf(lastOf(stages, 'docs')!);
-          await ctx.jobs.startStage(job.id, 'pr');
+          const opened = await ctx.jobs.startStage(job.id, 'pr');
           const warned = [...new Set(stages.flatMap((st) => outputOf(st).scopeWarning ?? []))];
           const body = [
             job.body ? `## Task\n\n${job.body}` : `## Task\n\n${job.title}`,
@@ -304,14 +349,14 @@ export default definePlugin({
             `Opened by Bulig, job ${job.id}.`,
           ].join('\n\n');
           // expectSha is the commit the reviewer saw. The github plugin opens the PR only if HEAD is exactly that.
-          ctx.emit('pr.requested', { cwd: String(wt.cwd), branch: String(wt.branch), title: job.title, body, expectSha: String(reviewed.sha) }, job.id);
+          await announceStage(opened, 'pr.requested', { cwd: String(wt.cwd), branch: String(wt.branch), title: job.title, body, expectSha: String(reviewed.sha) }, job.id);
           return;
         }
         case 'merge': {
           const wt = outputOf(lastOf(stages, 'worktree')!);
           const pr = outputOf(lastOf(stages, 'pr')!);
-          await ctx.jobs.startStage(job.id, 'merge');
-          ctx.emit('merge.requested', { cwd: String(wt.cwd), branch: String(wt.branch), number: pr.number, headSha: pr.headSha }, job.id);
+          const opened = await ctx.jobs.startStage(job.id, 'merge');
+          await announceStage(opened, 'merge.requested', { cwd: String(wt.cwd), branch: String(wt.branch), number: pr.number, headSha: pr.headSha }, job.id);
           return;
         }
       }
@@ -334,6 +379,19 @@ export default definePlugin({
             });
             continue;
           }
+          if (job.status === 'awaiting_approval') {
+            // The state was saved and the question may not have been: a lost write leaves a job waiting for an answer
+            // nobody was asked for. Ask again unless the question is known to have been asked.
+            await attempt(job.id, async () => {
+              const stages = await stagesOf(job.id);
+              const waiting = stages.find((s) => s.name.startsWith('approve-') && s.status === 'running');
+              if (!waiting || (await ctx.state.get(askedKey(waiting))) === true) return;
+              const which = waiting.name === 'approve-merge' ? 'merge' : 'plan';
+              const renewed = which === 'merge' && stages.filter((s) => s.name === 'approve-merge').length > 1;
+              await requestApproval(job, which, stages, waiting, renewed);
+            });
+            continue;
+          }
           if (job.status !== 'queued' && job.status !== 'running') continue;
           await attempt(job.id, async () => {
             // A stage still marked running belongs to a process that is gone. Mark it, and it runs again.
@@ -347,8 +405,8 @@ export default definePlugin({
             // Throw away what the dead stage left on disk. Finished edit stages were committed, so this only costs the cut-off one.
             const wt = lastOf(await stagesOf(job.id), 'worktree');
             if (mayHaveHalfDoneEdits && wt?.status === 'passed' && outputOf(wt).cwd) {
-              await ctx.jobs.startStage(job.id, 'reset');
-              ctx.emit('worktree.reset.requested', { cwd: String(outputOf(wt).cwd) }, job.id);
+              const opened = await ctx.jobs.startStage(job.id, 'reset');
+              await announceStage(opened, 'worktree.reset.requested', { cwd: String(outputOf(wt).cwd) }, job.id);
               return;
             }
             await advance(job.id);
@@ -512,7 +570,7 @@ export default definePlugin({
           const wt = outputOf(lastOf(await stagesOf(e.jobId), 'worktree')!);
           committing.set(e.jobId, { stage: p.stage, status, out });
           const job = await ctx.jobs.get(e.jobId);
-          ctx.emit(
+          await announce(
             'commit.requested',
             {
               cwd: String(wt.cwd),

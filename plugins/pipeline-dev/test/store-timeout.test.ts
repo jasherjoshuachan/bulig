@@ -72,3 +72,78 @@ describe('a store call that never comes back', () => {
     expect(errors.filter((e) => /record is unusable/.test(e))).toHaveLength(1);
   });
 });
+
+describe('an event that follows a saved state change is lost (D4)', () => {
+  const eventAfter = (type: string, ms: number) => {
+    let once = true;
+    return (m: string, _n: number, args: unknown[]) => (m === 'appendEvent' && (args[0] as { type: string }).type === type && once ? ((once = false), ms) : 0);
+  };
+
+  it('a lost stage.requested fails the job with the reason, and closes the stage it opened', async () => {
+    const worker: Sent[] = [];
+    const store = slowStore(new SqliteStore(newDb()), { after: eventAfter('stage.requested', 300) });
+    const k = boot(newDb(), [fakeWorker({ test: PASS, review: PASS }, worker), fakeGithub([]), fakeHuman().plugin], {}, { store, storeTimeoutMs: 100, storeBrokenMs: 5000 });
+    await k.start();
+    const job = await k.jobs.create({ repo: '/repo', title: 'T', body: 'x' });
+    await until(async () => (await k.jobs.get(job.id))!.status === 'failed', 'the job to fail');
+    const failure = (await k.history(job.id)).find((e) => e.type === 'pipeline.failed')!;
+    expect((failure.payload as { reason: string }).reason).toMatch(/^could not announce stage.requested: .*did not finish within 100 ms/);
+    expect(worker).toEqual([]);
+    expect((await k.jobs.stages(job.id)).find((s) => s.name === 'plan')).toMatchObject({ status: 'failed' });
+  });
+
+  it('a lost approval.requested fails the job with the reason; nobody is left waiting on a question that was never asked', async () => {
+    const human = fakeHuman();
+    const store = slowStore(new SqliteStore(newDb()), { after: eventAfter('approval.requested', 300) });
+    const k = boot(newDb(), [fakeWorker({ test: PASS, review: PASS }, []), fakeGithub([]), human.plugin], {}, { store, storeTimeoutMs: 100, storeBrokenMs: 5000 });
+    await k.start();
+    const job = await k.jobs.create({ repo: '/repo', title: 'T', body: 'x' });
+    await until(async () => (await k.jobs.get(job.id))!.status === 'failed', 'the job to fail');
+    const failure = (await k.history(job.id)).find((e) => e.type === 'pipeline.failed')!;
+    expect((failure.payload as { reason: string }).reason).toMatch(/^could not announce approval.requested/);
+    expect(human.requests).toHaveLength(0);
+  });
+
+  it('when the job cannot even be failed (the record is broken), a restart asks again, once; the old and the new question cannot both act', async () => {
+    const path = newDb();
+    const inner = new SqliteStore(path);
+    // approval.requested never gets an answer, so the queue gives up before the pipeline can fail the job.
+    let armed = true;
+    const store = slowStore(inner, { hang: (m, args) => m === 'appendEvent' && (args[0] as { type: string }).type === 'approval.requested' && armed });
+    const first = fakeHuman();
+    const k1 = boot(newDb(), [fakeWorker({ test: PASS, review: PASS }, []), fakeGithub([]), first.plugin], {}, { store, storeTimeoutMs: 100, storeBrokenMs: 300 });
+    await k1.start();
+    const job = await k1.jobs.create({ repo: '/repo', title: 'T', body: 'x' });
+    await until(() => store.applied.includes('setJobStatus') && k1.bus['queue'].brokenError !== undefined, 'the queue to give up');
+    await k1.stop();
+    armed = false;
+    expect(first.requests).toHaveLength(0);
+    const waiting = await new SqliteStore(path);
+    expect((await waiting.getJob(job.id))!.status).toBe('awaiting_approval');
+    await waiting.close();
+
+    // Restart: the person is asked now.
+    const worker: Sent[] = [];
+    const second = fakeHuman();
+    const k2 = boot(newDb(), [fakeWorker({ test: PASS, review: PASS }, worker), fakeGithub([]), second.plugin], {}, { store: new SqliteStore(path) });
+    await k2.start();
+    await until(() => second.requests.length === 1, 'the question after the restart');
+    expect((second.requests[0]!.payload as { kind: string }).kind).toBe('plan');
+    await k2.stop();
+
+    // Restart again: it was asked, so it is not asked a third time.
+    const third = fakeHuman();
+    const k3 = boot(newDb(), [fakeWorker({ test: PASS, review: PASS }, worker), fakeGithub([]), third.plugin], {}, { store: new SqliteStore(path) });
+    await k3.start();
+    await new Promise((r) => setTimeout(r, 300));
+    expect(third.requests).toHaveLength(0);
+
+    // Whichever card is pressed, the approval acts once. The other press finds nothing waiting.
+    third.grant(job.id, 'plan');
+    third.grant(job.id, 'plan');
+    await until(async () => (await k3.jobs.stages(job.id)).some((s) => s.name === 'build'), 'the build to start');
+    await k3.bus.idle();
+    expect((await k3.jobs.stages(job.id)).filter((s) => s.name === 'approve-plan')).toHaveLength(1);
+    expect(worker.filter((w) => w.stage === 'build')).toHaveLength(1);
+  });
+});

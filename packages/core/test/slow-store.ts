@@ -4,9 +4,9 @@ const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 export interface SlowOptions {
   /** Milliseconds a call waits before it reaches the real store. A function sees the method and the call number (from 1). */
-  before?: number | ((method: string, n: number) => number);
+  before?: number | ((method: string, n: number, args: unknown[]) => number);
   /** Milliseconds the answer waits after the real store has done the work, as a slow network would. */
-  after?: number | ((method: string, n: number) => number);
+  after?: number | ((method: string, n: number, args: unknown[]) => number);
   /** Return true to make this call never settle. */
   hang?: (method: string, args: unknown[], n: number) => boolean;
 }
@@ -23,7 +23,7 @@ const METHODS = [
   'getState', 'setState', 'appendEvent', 'eventsAfter', 'eventsForJob',
 ] as const;
 
-const at = (v: number | ((m: string, n: number) => number) | undefined, m: string, n: number) => (typeof v === 'function' ? v(m, n) : (v ?? 0));
+const at = (v: number | ((m: string, n: number, a: unknown[]) => number) | undefined, m: string, n: number, a: unknown[]) => (typeof v === 'function' ? v(m, n, a) : (v ?? 0));
 
 /** Wrap any adapter so every call takes time, or never ends. Used to find the places that only worked because the store was instant. */
 export function slowStore(inner: Store, options: SlowOptions = {}): SlowStore {
@@ -35,13 +35,13 @@ export function slowStore(inner: Store, options: SlowOptions = {}): SlowStore {
     for (const name of METHODS) {
       out[name] = async (...args: unknown[]) => {
         const call = ++n;
-        const wait = at(options.before, name, call);
+        const wait = at(options.before, name, call, args);
         if (wait > 0) await sleep(wait);
         if (options.hang?.(name, args, call)) return new Promise(() => {});
         wrapped.applied.push(name);
         const result = await (target[name] as (...a: unknown[]) => Promise<unknown>)(...args);
         if (name === 'appendEvent') wrapped.logged.add((result as { id: string }).id);
-        const later = at(options.after, name, call);
+        const later = at(options.after, name, call, args);
         if (later > 0) await sleep(later);
         return result;
       };
@@ -52,5 +52,6 @@ export function slowStore(inner: Store, options: SlowOptions = {}): SlowStore {
   const methods = wrapped as Record<string, unknown>;
   methods.transaction = <T>(fn: (tx: StoreTx) => Promise<T>) => inner.transaction((tx) => fn(delayed(tx)));
   methods.close = () => inner.close();
+  if (inner.abort) methods.abort = () => inner.abort!();
   return wrapped;
 }

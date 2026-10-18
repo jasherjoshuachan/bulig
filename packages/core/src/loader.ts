@@ -144,6 +144,13 @@ export function buildContext(manifest: Manifest, opts: Omit<LoadOptions, 'plugin
       }
       opts.bus.emitFrom(name, caps, { type, payload, jobId });
     },
+    // Same checks, thrown at once (this is not an async function). Then the caller waits for the commit.
+    emitCommitted(type, payload, jobId) {
+      if (!manifest.emits.includes(type)) {
+        throw new UndeclaredEventError(`Plugin "${name}" did not declare emitting "${type}"`);
+      }
+      return opts.bus.emitFrom(name, caps, { type, payload, jobId }, { report: false }).then(() => undefined);
+    },
     can: (cap) => caps.has(cap),
     require(cap) {
       if (!caps.has(cap)) {

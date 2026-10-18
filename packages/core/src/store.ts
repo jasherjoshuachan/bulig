@@ -23,6 +23,13 @@ export interface Store {
   /** Release the engine. No call may follow. */
   close(): Promise<void>;
 
+  /**
+   * Stop whatever is in flight so that nothing can commit afterwards. The kernel calls it once, when it gives up on the
+   * store because a call never came back. Optional: an adapter whose commit cannot be in flight when this is called (a
+   * synchronous one) may leave it out or make it a no-op, and says why.
+   */
+  abort?(): void | Promise<void>;
+
   /** Run `fn` as one transaction. Resolves with its result after the commit; rejects, with nothing kept, if `fn` rejects or the commit fails. */
   transaction<T>(fn: (tx: StoreTx) => Promise<T>): Promise<T>;
 
@@ -51,6 +58,17 @@ export interface Store {
   /** Events with seq greater than `afterSeq`, oldest first. */
   eventsAfter(afterSeq?: number): Promise<BuligEvent[]>;
   eventsForJob(jobId: string): Promise<BuligEvent[]>;
+}
+
+/**
+ * An adapter throws this from `transaction` when it can no longer say what the record holds: the rollback, or the
+ * commit and then the rollback, failed, so a transaction may be left open. The kernel stops using the store at once.
+ */
+export class StoreFatalError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = 'StoreFatalError';
+  }
 }
 
 /** The calls available inside a transaction: the store without `close` and without starting another transaction. */

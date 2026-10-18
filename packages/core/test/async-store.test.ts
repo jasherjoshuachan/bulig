@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { CapabilityDeniedError, definePlugin, type PluginContext } from '@bulig/plugin-sdk';
-import { SqliteStore, StoreBrokenError, StoreClosedError, StoreQueue, StoreTimeoutError } from '../src/index.ts';
+import { createKernel, SqliteStore, StoreBrokenError, StoreClosedError, StoreQueue, StoreTimeoutError } from '../src/index.ts';
 import { kernelWith, manifest, probe, tempDb } from './helpers.ts';
 import { slowStore } from './slow-store.ts';
 
@@ -318,5 +318,171 @@ describe('closing', () => {
     await expect(queue.run('late', (tx) => tx.schemaVersion())).rejects.toBeInstanceOf(StoreClosedError);
     expect(await first).toBe(3);
     await closing;
+  });
+});
+
+// A SQLite store whose commit takes time, or whose rollback fails: what an async adapter's commit looks like.
+class FaultyStore extends SqliteStore {
+  commitDelay = 0;
+  hangClose = false;
+  failRollback = false;
+  private raw() {
+    return (this as unknown as { db: { exec(sql: string): void; inTransaction: boolean } }).db;
+  }
+  breakRollback() {
+    const db = this.raw();
+    const exec = db.exec.bind(db);
+    db.exec = (sql: string) => {
+      if (sql === 'ROLLBACK' && this.failRollback) throw new Error('rollback failed (simulated)');
+      return exec(sql);
+    };
+  }
+  override async transaction<T>(fn: Parameters<SqliteStore['transaction']>[0]): Promise<T> {
+    if (!this.commitDelay) return super.transaction(fn) as Promise<T>;
+    const db = this.raw();
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      const result = (await fn(this)) as T;
+      await sleep(this.commitDelay);
+      db.exec('COMMIT');
+      return result;
+    } catch (err) {
+      if (db.inTransaction) db.exec('ROLLBACK');
+      throw err;
+    }
+  }
+  override async close(): Promise<void> {
+    if (this.hangClose) return new Promise(() => {});
+    return super.close();
+  }
+}
+
+describe('when the store itself misbehaves', () => {
+  it('a commit that lands after the queue gave up is stopped: nothing is kept and nothing is delivered', async () => {
+    const path = tempDb();
+    const store = new FaultyStore(path);
+    const delivered: string[] = [];
+    const watch = definePlugin({
+      manifest: manifest({ name: 'w', subscribes: ['job.*'] }),
+      register(ctx) {
+        ctx.on('job.*', (e) => void delivered.push(e.type));
+      },
+    });
+    const errors: string[] = [];
+    const k = createKernel({ store, plugins: [watch], enabled: ['w'], storeTimeoutMs: 100, storeBrokenMs: 300, logger: { debug() {}, info() {}, warn() {}, error: (m) => void errors.push(m) } });
+    await k.start();
+    store.commitDelay = 600; // the COMMIT would land at 600 ms, after the queue broke at 300 ms
+    const created = await k.jobs.create({ repo: '/r', title: 't' }).then(() => 'ok', (e: unknown) => e);
+    expect(created).toBeInstanceOf(StoreBrokenError);
+    await sleep(500);
+    const peek = new SqliteStore(path);
+    expect(await peek.listJobs()).toEqual([]);
+    expect((await peek.eventsAfter()).filter((e) => e.type === 'job.created')).toEqual([]);
+    await peek.close();
+    expect(delivered).toEqual([]);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toMatch(/store call "commit" \(inside task "jobs"\)/);
+    expect(errors[0]).not.toMatch(/was undone|were undone|rolled back/);
+    store.commitDelay = 0;
+    await k.stop();
+  });
+
+  it('a rollback that fails breaks the queue at once, with one loud error, instead of every later call failing on an open transaction', async () => {
+    const store = new FaultyStore(tempDb());
+    store.breakRollback();
+    const errors: string[] = [];
+    const k = createKernel({ store, plugins: [], enabled: [], logger: { debug() {}, info() {}, warn() {}, error: (m) => void errors.push(m) } });
+    await k.start();
+    store.failRollback = true;
+    const first = await k.jobs.atomic(async () => {
+      throw new Error('the task fails');
+    }).then(() => 'ok', (e: unknown) => e);
+    expect(first).toBeInstanceOf(StoreBrokenError);
+    expect((first as Error).message).toMatch(/ROLLBACK failed after "the task fails"/);
+    store.failRollback = false;
+    for (let i = 0; i < 3; i++) {
+      const later = await k.jobs.list().then(() => 'ok', (e: unknown) => e);
+      expect(later).toBeInstanceOf(StoreBrokenError);
+      expect((later as Error).message).not.toMatch(/within a transaction/);
+    }
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toMatch(/record is unusable/);
+    await k.stop();
+  });
+
+  it('stop() gives up on a store that never finishes closing, says so, and returns', async () => {
+    const store = new FaultyStore(tempDb());
+    const errors: string[] = [];
+    const k = createKernel({ store, plugins: [], enabled: [], storeCloseMs: 100, logger: { debug() {}, info() {}, warn() {}, error: (m) => void errors.push(m) } });
+    await k.start();
+    store.hangClose = true;
+    const t0 = Date.now();
+    const stopped = await Promise.race([k.stop().then(() => 'stopped' as const), sleep(3000).then(() => 'hung' as const)]);
+    expect(stopped).toBe('stopped');
+    expect(Date.now() - t0).toBeLessThan(2000);
+    expect(errors.join('\n')).toMatch(/did not close within 100 ms/);
+  });
+
+  it('names both the task and the store call that never came back', async () => {
+    const { plugin, box } = probe();
+    let stuck = false;
+    const store = slowStore(new SqliteStore(tempDb()), { hang: (m) => stuck && m === 'getJob' });
+    const errors: string[] = [];
+    const k = kernelWith({ plugins: [plugin], store, storeTimeoutMs: 30, storeBrokenMs: 90, logger: { debug() {}, info() {}, warn() {}, error: (m) => void errors.push(m) } });
+    await k.start();
+    stuck = true;
+    await box.ctx!.jobs.get('x').catch(() => {});
+    await sleep(200);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toMatch(/store call "getJob" \(inside task "jobs"\)/);
+  });
+});
+
+describe('emitCommitted', () => {
+  it('throws at once for an undeclared event or a denied capability, as emit does', async () => {
+    const { plugin, box } = probe({ emits: ['demo.ok', 'approval.granted'] });
+    const k = kernelWith({ plugins: [plugin] });
+    await k.start();
+    expect(() => box.ctx!.emitCommitted('demo.nope', null)).toThrow(/did not declare/);
+    expect(() => box.ctx!.emitCommitted('approval.granted', null)).toThrow(CapabilityDeniedError);
+  });
+
+  it('resolves once the event is committed and handed to its subscribers, and the event is in the log', async () => {
+    const seen: string[] = [];
+    const box: { ctx?: PluginContext } = {};
+    const plugin = definePlugin({
+      manifest: manifest({ name: 'a', subscribes: ['x.*'], emits: ['x.one'] }),
+      register(ctx) {
+        box.ctx = ctx;
+        ctx.on('x.*', (e) => void seen.push(e.type));
+      },
+    });
+    const k = kernelWith({ plugins: [plugin], store: slowStore(new SqliteStore(tempDb()), { before: 3, after: 3 }) });
+    await k.start();
+    await box.ctx!.emitCommitted('x.one', { n: 1 });
+    expect(seen).toEqual(['x.one']); // already delivered when the promise resolves
+    expect(types(await k.bus.replay(), 'x.')).toEqual(['x.one']);
+  });
+
+  it('rejects with the timeout when the event was not written, logs nothing itself, and delivers nothing', async () => {
+    const errors: string[] = [];
+    const seen: string[] = [];
+    const box: { ctx?: PluginContext } = {};
+    const plugin = definePlugin({
+      manifest: manifest({ name: 'a', subscribes: ['x.*'], emits: ['x.lost'] }),
+      register(ctx) {
+        box.ctx = ctx;
+        ctx.on('x.*', (e) => void seen.push(e.type));
+      },
+    });
+    let slowNext = false;
+    const store = slowStore(new SqliteStore(tempDb()), { after: (m) => (m === 'appendEvent' && slowNext ? ((slowNext = false), 150) : 0) });
+    const k = kernelWith({ plugins: [plugin], store, storeTimeoutMs: 50, logger: { debug() {}, info() {}, warn() {}, error: (m) => void errors.push(m) } });
+    await k.start();
+    slowNext = true;
+    await expect(box.ctx!.emitCommitted('x.lost', null)).rejects.toBeInstanceOf(StoreTimeoutError);
+    await k.bus.idle();
+    expect(seen).toEqual([]);
+    expect(errors).toEqual([]); // the caller heard; the kernel does not log it a second time
   });
 });

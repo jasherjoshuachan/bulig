@@ -149,16 +149,8 @@ export function createFakeKernel(manifest: Manifest, config: Record<string, unkn
   const jobs = fakeJobs(manifest, caps, rec);
   let seq = 0;
 
-  const ctx: PluginContext = {
-    on(pattern, handler) {
-      rec.subscribed.add(pattern);
-      if (!patternCovered(manifest.subscribes, pattern)) {
-        rec.findings.push({ rule: 'subscribes', message: `subscribed to "${pattern}" but did not declare it in subscribes` });
-        throw new UndeclaredSubscriptionError(`Plugin "${manifest.name}" did not declare a subscription to "${pattern}"`);
-      }
-      subs.push({ pattern, handler });
-    },
-    emit(type, payload, jobId) {
+  // Both emit calls make the same checks, and throw at once, so a plugin sees no difference in what is refused.
+  const record = (type: string, payload: unknown, jobId: string | undefined) => {
       if (!manifest.emits.includes(type)) {
         rec.findings.push({ rule: 'emits', message: `emitted "${type}" but did not declare it in emits` });
         throw new UndeclaredEventError(`Plugin "${manifest.name}" did not declare emitting "${type}"`);
@@ -172,6 +164,23 @@ export function createFakeKernel(manifest: Manifest, config: Record<string, unkn
       if (!jsonOk(payload)) rec.findings.push({ rule: 'emits', message: `the payload of "${type}" is not JSON: events are stored as JSON` });
       rec.emitted.add(type);
       emitted.push({ type, payload, jobId });
+  };
+
+  const ctx: PluginContext = {
+    on(pattern, handler) {
+      rec.subscribed.add(pattern);
+      if (!patternCovered(manifest.subscribes, pattern)) {
+        rec.findings.push({ rule: 'subscribes', message: `subscribed to "${pattern}" but did not declare it in subscribes` });
+        throw new UndeclaredSubscriptionError(`Plugin "${manifest.name}" did not declare a subscription to "${pattern}"`);
+      }
+      subs.push({ pattern, handler });
+    },
+    emit(type, payload, jobId) {
+      record(type, payload, jobId);
+    },
+    emitCommitted(type, payload, jobId) {
+      record(type, payload, jobId);
+      return Promise.resolve();
     },
     can(cap) {
       rec.usedCaps.add(cap);

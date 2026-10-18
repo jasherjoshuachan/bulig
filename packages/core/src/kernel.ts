@@ -207,7 +207,7 @@ export function createKernel(options: KernelOptions) {
     async start(): Promise<void> {
       // Validate everything before any plugin runs.
       loaded = selectPlugins(options.plugins, options.enabled);
-      const base = {
+      const shared = {
         grants: options.grants ?? {},
         pluginConfig: options.pluginConfig ?? {},
         bus,
@@ -228,7 +228,7 @@ export function createKernel(options: KernelOptions) {
         }
       }
       for (const { plugin, manifest } of loaded) {
-        await plugin.register(buildContext(manifest, base));
+        await plugin.register(buildContext(manifest, { ...shared, generation }));
       }
       // Wait for it to be written and handed to the handlers, so start() returns with the plugins running, as it always did.
       await bus.emit({

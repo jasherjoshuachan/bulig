@@ -86,7 +86,7 @@ const MIGRATIONS: string[] = [
     PRIMARY KEY (job_id, stage, attempt)
   );
   CREATE UNIQUE INDEX claims_live ON claims (job_id, stage) WHERE released_at IS NULL;`,
-  // 6: an event id is a key. An id written twice is refused. The kernel does not pass fixed ids yet (bus.record makes a fresh one), so this index is a guard for later; handler idempotency today comes from the stageId guards.
+  // 6: an event id is a key. An id written twice is refused. Events a handler causes get ids derived from their cause (bus.ts), so a handler run twice meets this index; the stageId guards cover effects outside the record.
   `CREATE UNIQUE INDEX events_id ON events (id);`,
 ];
 
@@ -98,6 +98,8 @@ interface JobRow { id: string; repo: string; title: string; body: string; status
 interface StageRow {
   id: string; job_id: string; name: string; status: StageStatus; attempt: number;
   started_at: Date; ended_at: Date | null; output: unknown;
+  /** From the stage's claim; null (or absent, on a row that came from a write) for a stage that began before claims existed. */
+  claim_generation?: number | null;
 }
 interface EventRow { seq: string; id: string; type: string; job_id: string | null; source: string; payload: unknown; at: Date }
 
@@ -109,6 +111,7 @@ const toJob = (r: JobRow): Job => ({
 const toStage = (r: StageRow): Stage => ({
   id: r.id, jobId: r.job_id, name: r.name, status: r.status, attempt: r.attempt,
   startedAt: r.started_at.toISOString(), endedAt: r.ended_at === null ? null : r.ended_at.toISOString(), output: r.output ?? null,
+  ...(r.claim_generation != null && { claimGeneration: r.claim_generation }),
 });
 const toEvent = (r: EventRow): BuligEvent => ({
   id: r.id, seq: Number(r.seq), type: r.type, ...(r.job_id !== null && { jobId: r.job_id }),
@@ -117,6 +120,9 @@ const toEvent = (r: EventRow): BuligEvent => ({
 
 const JOB_COLS = 'id, repo, title, body, status, created_at, updated_at';
 const STAGE_COLS = 'id, job_id, name, status, attempt, started_at, ended_at, output';
+/** A stage with the generation its claim was taken under (ADR 0010). */
+const STAGE_SELECT = `SELECT s.id, s.job_id, s.name, s.status, s.attempt, s.started_at, s.ended_at, s.output, c.generation AS claim_generation
+  FROM stages s LEFT JOIN claims c ON c.job_id = s.job_id AND c.stage = s.name AND c.attempt = s.attempt`;
 const EVENT_COLS = 'seq, id, type, job_id, source, payload, at';
 
 /**
@@ -551,18 +557,18 @@ export class PostgresStore implements Store {
       if ((err as { code?: string }).code === '23505') throw new StageClaimedError(jobId, name, stage.attempt, generation);
       throw err;
     }
-    return stage;
+    return { ...stage, claimGeneration: generation };
   }
 
   async getStage(id: string): Promise<Stage | undefined> {
     id = text('stage id', id);
-    const res = await this.query<StageRow>(`SELECT ${STAGE_COLS} FROM stages WHERE id = $1`, [id]);
+    const res = await this.query<StageRow>(`${STAGE_SELECT} WHERE s.id = $1`, [id]);
     return res.rows[0] && toStage(res.rows[0]);
   }
 
   async listStages(jobId: string): Promise<Stage[]> {
     jobId = text('job id', jobId);
-    const res = await this.query<StageRow>(`SELECT ${STAGE_COLS} FROM stages WHERE job_id = $1 ORDER BY started_at, ord`, [jobId]);
+    const res = await this.query<StageRow>(`${STAGE_SELECT} WHERE s.job_id = $1 ORDER BY s.started_at, s.ord`, [jobId]);
     return res.rows.map(toStage);
   }
 
@@ -582,7 +588,7 @@ export class PostgresStore implements Store {
       await this.query("UPDATE claims SET released_at = $4, release_reason = 'finished' WHERE job_id = $1 AND stage = $2 AND attempt = $3", [stage.jobId, stage.name, stage.attempt, now]);
     }
     const res = await this.query<StageRow>(`UPDATE stages SET status = $2, ended_at = $3, output = $4::jsonb WHERE id = $1 RETURNING ${STAGE_COLS}`, [id, status, now, json]);
-    return toStage(res.rows[0]!);
+    return { ...toStage(res.rows[0]!), ...(claim && { claimGeneration: claim.generation }) };
   }
 
   // ----- plugin state -----

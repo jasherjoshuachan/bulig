@@ -97,11 +97,11 @@ export default definePlugin({
     }
 
     /**
-     * When this copy of the plugin started. A stage that began after it belongs to this kernel and holds a live claim, so resume
-     * leaves it alone (ADR 0010); one that began before was left by a kernel that is gone.
+     * A running stage whose claim was taken under an older lease generation than this kernel's was left by a kernel that is gone
+     * or lost its lease (ADR 0010). One of this generation is live work and resume leaves it alone. A stage with no claim began
+     * before claims existed, so no live kernel owns it. Generations come from the record, so two machines' clocks do not matter.
      */
-    const registeredAt = Date.now();
-    const leftByOldKernel = (s: Stage) => s.status === 'running' && Date.parse(s.startedAt) <= registeredAt;
+    const leftByOldKernel = (s: Stage) => s.status === 'running' && (s.claimGeneration ?? 0) < ctx.generation;
 
     /** Edit stages whose Claude run is done and whose commit is still being made. Lost on a restart, which just reruns the stage. */
     const committing = new Map<string, { stage: string; status: 'passed' | 'failed'; out: StageOutput }>();

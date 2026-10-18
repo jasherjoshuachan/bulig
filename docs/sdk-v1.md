@@ -1,6 +1,6 @@
 # Plugin SDK v1 (release candidate)
 
-This is the contract between the kernel and a plugin. `@bulig/plugin-sdk` is version `1.0.0-rc.6`. A manifest that sets `"sdk": "1"` is promising to follow this page, and the kernel promises to keep honouring it.
+This is the contract between the kernel and a plugin. `@bulig/plugin-sdk` is version `1.0.0-rc.7`. A manifest that sets `"sdk": "1"` is promising to follow this page, and the kernel promises to keep honouring it.
 
 The page is split by how much Bulig is willing to promise:
 
@@ -48,6 +48,7 @@ Rules the kernel applies when it loads a manifest, and the conformance suite app
 | `emit(type, payload?, jobId?)` | stable | Throws `UndeclaredEventError` unless `type` is in `manifest.emits`. Throws `CapabilityDeniedError` if the type is gated (section 5) and the plugin lacks the capability. The payload must be JSON. The event is stored first, then delivered. An event emitted while a handler is handling event E gets an id derived from E, the handler, the order of the emit within that run, and the type (ADR 0010, addendum of 18 Oct 2026), so a handler that runs twice for one E writes each event once. If the id is already in the log the write is skipped and nothing is delivered a second time. A plugin does not pick ids and nothing in its code changes; it should not rely on an id being random. |
 | `emitCommitted(type, payload?, jobId?)` | experimental | Like `emit`, but returns a `Promise` that resolves once the event is committed to the log and handed to the subscribers (not once they have finished), and rejects if it was not written: `StoreTimeoutError`, `StoreBrokenError`, `StoreClosedError` (after the kernel stopped), or the store's own error. Same declaration and capability checks as `emit`, and they throw at once, not as a rejection. Use it where a lost event would leave work stuck, such as a state change followed by the event that asks someone to act on it, and `await` it. `emit` is unchanged: it returns `void` and a lost event is only logged. A write skipped because its derived id is already in the log resolves as a success: the event is there. Added in `1.0.0-rc.5` (ADR 0007). Experimental because only `pipeline-dev` uses it so far. |
 | `require(cap)` | stable | Throws `CapabilityDeniedError` unless `cap` is in `needs` and granted in config. Call it in `register()` so a missing grant stops the start. |
+| `generation` | experimental | A number: the executor-lease generation this kernel holds (ADR 0010). It goes up by one on every kernel start, so it is larger than the `claimGeneration` of every stage that an earlier kernel claimed. Read it to tell a stage of this kernel from one a dead kernel left; do not use the clock for that, because two machines' clocks can disagree. Read-only. Added in `1.0.0-rc.7`. |
 | `can(cap)` | stable | `true` when the plugin holds `cap`. No plugin uses it yet. |
 | `jobs.create/get/list` | stable | Read jobs, and create one. Creating one makes the kernel emit `job.created`. Async (`Promise`), because the record behind them can be a database server. Changed from sync during the release candidate (`1.0.0-rc.4`, ADR 0007), the same way `state` was. |
 | `jobs.setStatus` | stable | Ending a job (`done`, `failed`, `cancelled`) or moving it out of `awaiting_approval` needs `jobs.write`. A finished job is final. Async: a refused call rejects with `CapabilityDeniedError` and the same message it used to throw. Always `await` it. |
@@ -70,6 +71,7 @@ Event delivery: events are written to the log in emit order and delivered to sub
 | `SUPPORTED_SDK_MAJORS`, `DEPRECATED_SDK_MAJORS` | consts | stable | |
 | `SDK_RELEASE` | const | experimental | Moves with every release candidate. |
 | `Job`, `Stage`, `JobStatus`, `StageStatus`, `JOB_STATUSES`, `STAGE_STATUSES` | data | stable | Status values are part of the contract. Adding one is a minor change. Removing or renaming one is a major change. |
+| `Stage.claimGeneration` | field | experimental | `number`, optional. The lease generation under which the attempt's claim was taken. A running stage with a smaller number than `ctx.generation` belongs to a kernel that is gone or lost its lease. A finished stage keeps the number. Absent for a stage from before claims existed (`1.0.0-rc.6`), which no live kernel owns. Added in `1.0.0-rc.7` (ADR 0010, addendum of 18 Oct 2026). |
 | `Stage.output` | field | experimental | `unknown`. Its shape belongs to whichever plugin wrote the stage (today `pipeline-dev`). Other plugins must not read it. |
 | `BuligEvent` | type | stable | `{ id, seq?, type, jobId?, source, payload, at }`. |
 | `matchesPattern`, `patternCovered` | functions | stable | The wildcard rules in section 1. |
@@ -91,6 +93,7 @@ There is no other route than the context. A plugin can still import Node APIs, b
 |---|---|---|
 | `ctx.on` / `ctx.emit` | all seven | stable |
 | `ctx.emitCommitted` | pipeline-dev | experimental |
+| `ctx.generation`, `Stage.claimGeneration` | pipeline-dev (resume) | experimental |
 | `ctx.require` | channel-cli, channel-telegram, github, pipeline-dev, worker-claude-code | stable |
 | `ctx.can` | nobody | stable (unused) |
 | `ctx.jobs.get/list/stages` | channel-telegram, github, gate-promise, pipeline-dev, worker-claude-code | stable |
@@ -182,7 +185,7 @@ The names and the refused/failed meaning are stable because channels depend on t
 
 - The kernel loads a plugin whose `sdk` is in `SUPPORTED_SDK_MAJORS` (today `0` and `1`) and refuses any other with `SdkVersionMismatchError`.
 - A plugin written for major N keeps working on every release of major N, unchanged, without edits to its manifest.
-- The package version of `@bulig/plugin-sdk` is full semver (`1.0.0-rc.6`). The minor and patch numbers are for humans and release notes; plugins never declare them.
+- The package version of `@bulig/plugin-sdk` is full semver (`1.0.0-rc.7`). The minor and patch numbers are for humans and release notes; plugins never declare them.
 - A plugin that needs something added in a later minor checks for it at runtime, or says so in its own docs. There is no `sdkMin` field. Add one only if that turns out to hurt.
 
 A **breaking change** (needs major 2) is any of these, for something marked stable:

@@ -26,7 +26,7 @@ Effects outside the record are guarded where they happen, because the fence only
 
 - `worker-claude-code` starts Claude for a `stage.requested` only if the stage named in `stageId` is the running attempt. Otherwise it does nothing and says nothing.
 - `github` makes one commit per stage attempt. The commit carries a `Bulig-Stage: <stageId>` trailer, and a request whose attempt already has a commit gets that commit back.
-- `pipeline-dev` sends `stageId` with `stage.requested` and `commit.requested`, treats `StageClaimedError` as a duplicate and not as a failed job, and on resume leaves alone any running stage that began after this kernel started.
+- `pipeline-dev` sends `stageId` with `stage.requested` and `commit.requested`, treats `StageClaimedError` as a duplicate and not as a failed job, and on resume leaves alone any running stage that holds a claim of this kernel's generation.
 
 ## Jasher's words (18 Oct 2026)
 
@@ -53,7 +53,7 @@ A claim is the key to one room. Only one key per room can be out at a time, and 
 
 ## Known limits
 
-- **Resume compares wall-clock time.** `pipeline-dev`'s `leftByOldKernel` compares a stage's `startedAt` with `Date.now()` taken when the plugin registered. That is safe on one machine, which is today. Before a second machine runs a kernel (build-order step 4) it must compare claim generations instead, because two machines' clocks can disagree.
+- **Resume compares wall-clock time.** Fixed in the addendum of 18 Oct 2026: it now compares claim generations.
 - A non-lease break of the queue (a store call stuck past `storeBrokenMs`) stops writing and now stops the heartbeat, but `serve` does not exit for it. Only a lost lease does. A lost lease ends `serve` whichever path found it: the queue marks the break with the `LeaseLostError` as its `cause`, and the kernel passes that on to `onLeaseLost`, guarded so it fires once.
 
 ## Assumed (to confirm)
@@ -67,7 +67,7 @@ These were outside the three answers above. Each has the cautious default, and e
 5. **Every task asserts the lease, reads too.** One extra read per task.
 6. **A takeover closes the old stage without an event.** The stage row says failed and interrupted; the log says nothing, because the kernel that took over is not the one that knows why.
 7. **Writes with no fence count as generation 0.** The CLI's read-only paths and tests that use a Store directly keep working, and any fenced kernel takes over a claim they left.
-8. **Resume leaves alone any running stage that began after the plugin registered.** `pipeline-dev` cannot see claims, and this stands in for "a live claim of this generation".
+8. **Resume leaves alone any running stage whose claim is of this kernel's generation.** (Was: any stage that began after the plugin registered. Replaced in the addendum of 18 Oct 2026.)
 9. **A missing `stageId` means the old behaviour** in `worker-claude-code` and `github`, so another pipeline that does not send it still works. It also means a pipeline that forgets it gets no protection.
 10. **The Postgres takeover waits at most 10 s** for the old holder's open transactions (`lock_timeout`). After that, `acquireLease` fails and the kernel does not start.
 11. **No `claimStage`, `releaseClaim` or `expireClaims` on the Store.** `startStage` and `finishStage` do it in the same transaction, which is what "atomically" asked for. A claim whose job never resumes (a cancelled job whose stage was left running) stays live until something finishes that stage.
@@ -85,6 +85,16 @@ Until now `bus.record` never passed an id, so the unique index on `events.id` ne
 - **A duplicate id means the write is already done.** `appendEvent` still rejects with `DuplicateEventError` (which now carries the event the log holds). The bus turns that into a `ReplayedError`, and the whole task that met it is rolled back: nothing it wrote stays and nothing is delivered. This is the rule for every task, not only for the first event. The call that asked answers as a success: `emit` and `emitCommitted` with the stored event, `jobs.create` with the job the first run made, `jobs.setStatus` with the job as it is now. The handler carries on with the next line.
 - Nothing replays events today, so in production this changes no result yet: ids are different and nothing collides. It is the base for a standby that re-delivers an event, and the tests deliver one twice to prove it.
 - Plugin-visible: ids of handler-caused events are no longer random. No type changed, so the SDK version is unchanged for this item.
+
+### Decided: resume compares claim generations, not clocks
+
+`pipeline-dev` used to call a running stage "left by an old kernel" when its `startedAt` was not after the moment the plugin registered. With two machines that compares one clock with another. Now the record answers it.
+
+- `Stage.claimGeneration` is the generation under which the attempt's claim was taken, read from the claims table (a join on job, stage and attempt). It stays after the claim is released. A stage from before claims existed has none.
+- `ctx.generation` is the generation this kernel holds. The kernel takes the lease before any plugin registers, so it is known by then.
+- A running stage is left by an old kernel when `(claimGeneration ?? 0) < ctx.generation`. A stage with no claim counts as old, because every stage started since claims existed has one. A stage of this generation is live work and resume leaves it alone, whatever its `startedAt` says.
+- Every kernel start raises the generation by one, so a restarted kernel is always newer than the one it replaces, and a standby that takes over is newer than the kernel that stalled.
+- This is a plugin-visible addition, so the SDK is `1.0.0-rc.7`. The conformance suite's fake kernel runs at generation 1, claims the stages it starts under it, and seeds stages as generation 0.
 
 ## Assumed (to confirm), added 18 Oct 2026
 

@@ -502,6 +502,37 @@ export function describeStoreContract(name: string, make: () => Promise<StoreHan
         expect((await store.startStage(job.id, 'build')).attempt).toBe(2);
       });
 
+      it('says which lease generation a stage was claimed under, on every call that returns the stage', async () => {
+        const { store } = await fresh();
+        const job = await store.createJob({ repo: 'r', title: 't' });
+        const { generation } = await store.acquireLease('a', 60_000);
+        const queue = fenced(store, 'a', generation);
+        const started = await queue.run('start', (tx) => tx.startStage(job.id, 'build'));
+        expect(started.claimGeneration).toBe(generation);
+        expect((await store.getStage(started.id))?.claimGeneration).toBe(generation);
+        expect((await store.listStages(job.id))[0]?.claimGeneration).toBe(generation);
+        const done = await queue.run('finish', (tx) => tx.finishStage(started.id, 'passed'));
+        expect(done.claimGeneration).toBe(generation); // a finished stage keeps the generation it ran under
+        expect((await store.getStage(started.id))?.claimGeneration).toBe(generation);
+        // a write with no fence counts as generation 0
+        const bare = await store.startStage(job.id, 'test');
+        expect(bare.claimGeneration).toBe(0);
+      });
+
+      it('keeps the old generation on a stage another generation took over, and gives the next attempt the new one', async () => {
+        const { store } = await fresh();
+        const job = await store.createJob({ repo: 'r', title: 't' });
+        const one = (await store.acquireLease('a', TTL)).generation;
+        const old = await fenced(store, 'a', one).run('start', (tx) => tx.startStage(job.id, 'build'));
+        await new Promise((r) => setTimeout(r, SHORT_WAIT));
+        const two = (await store.acquireLease('b', 60_000)).generation;
+        expect(two).toBeGreaterThan(one);
+        const next = await fenced(store, 'b', two).run('start', (tx) => tx.startStage(job.id, 'build'));
+        const stages = await store.listStages(job.id);
+        expect(stages.find((s) => s.id === old.id)).toMatchObject({ status: 'failed', claimGeneration: one });
+        expect(stages.find((s) => s.id === next.id)).toMatchObject({ status: 'running', claimGeneration: two });
+      });
+
       it('claims per stage of a job: other stages of the job, and the same stage of other jobs, run side by side', async () => {
         const { store } = await fresh();
         const a = await store.createJob({ repo: 'r', title: 'a' });

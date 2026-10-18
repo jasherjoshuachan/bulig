@@ -3,6 +3,7 @@
  * It finds sentences that commit to work later ("I'll follow up") and asks whether the same message cites a job that
  * Bulig will actually run. It does not understand language: see the README for what it cannot catch.
  */
+import { clipText } from '@bulig/text';
 
 export interface PromiseClaim {
   /** The sentence, flattened and clipped. */
@@ -23,7 +24,7 @@ const INVISIBLE = /[\u0000-\u001f\u007f-\u009f؜​-‏‪-‮⁠⁦-⁩﻿]+/g;
 /** One line, no hidden characters, cut at `n` characters. Everything shown to a person goes through this. */
 export const clean = (s: unknown, n = 160): string => {
   const t = String(s ?? '').replace(INVISIBLE, ' ').replace(/\s+/g, ' ').trim();
-  return t.length > n ? `${t.slice(0, n - 1)}…` : t;
+  return t.length > n ? `${clipText(t, n - 1)}…` : t;
 };
 
 // ---------- the promise patterns (the documented list) ----------
@@ -69,8 +70,7 @@ export const MAX_SCAN = 50_000;
 
 /** Sentences outside code, quotes and block quotes. Fenced code, inline code, "double quoted" text and `>` lines are material, not statements. */
 export function sentences(text: string): string[] {
-  const stripped = text
-    .slice(0, MAX_SCAN)
+  const stripped = clipText(text, MAX_SCAN)
     .replace(/(```|~~~)[\s\S]*?(?:\1|$)/g, '\n')
     .replace(/`[^`\n]{0,300}`/g, ' ')
     .replace(/"[^"\n]{0,300}"|“[^”\n]{0,300}”/g, ' ')
@@ -85,7 +85,7 @@ export function sentences(text: string): string[] {
 
 /** The text with fenced and inline code removed. Job ids only count when they are written in the open. */
 export function plainText(text: string): string {
-  return text.slice(0, MAX_SCAN).replace(/(```|~~~)[\s\S]*?(?:\1|$)/g, '\n').replace(/`[^`\n]{0,300}`/g, ' ');
+  return clipText(text, MAX_SCAN).replace(/(```|~~~)[\s\S]*?(?:\1|$)/g, '\n').replace(/`[^`\n]{0,300}`/g, ' ');
 }
 
 /** Every promise in a piece of stage text. */

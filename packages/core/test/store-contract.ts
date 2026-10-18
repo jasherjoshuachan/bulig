@@ -19,7 +19,7 @@ export interface StoreContractOptions {
 }
 
 /**
- * The behaviour every Store adapter must show (ADR 0007). SqliteStore runs it today; the Postgres adapter runs it next.
+ * The behaviour every Store adapter must show (ADR 0007). SqliteStore runs it in store.test.ts and PostgresStore in postgres-store.test.ts.
  * It must not lean on one engine: no file paths, no row ids, no sync calls, no exact event numbers.
  */
 export function describeStoreContract(name: string, make: () => Promise<StoreHandle>, options: StoreContractOptions): void {
@@ -167,6 +167,21 @@ export function describeStoreContract(name: string, make: () => Promise<StoreHan
       expect(await store.eventsAfter(1_000_000_000)).toEqual([]);
     });
 
+    it('refuses an event number that is not a non-negative safe integer, before any SQL, and the transaction stays usable', async () => {
+      const { store } = await fresh();
+      await store.appendEvent({ type: 'a.one', source: 'x', payload: 1 });
+      for (const bad of [1.5, Number.NaN, -1, 2 ** 63, Number.POSITIVE_INFINITY, 2 ** 53]) {
+        await expect(store.eventsAfter(bad)).rejects.toThrow(/afterSeq must be a non-negative safe integer/);
+      }
+      expect(await store.eventsAfter(0)).toHaveLength(1);
+      await store.transaction(async (tx) => {
+        await tx.createJob({ repo: 'r', title: 'kept' });
+        await expect(tx.eventsAfter(1.5)).rejects.toThrow(/afterSeq/);
+        await tx.createJob({ repo: 'r', title: 'also kept' });
+      });
+      expect((await store.listJobs()).map((j) => j.title)).toEqual(['kept', 'also kept']);
+    });
+
     it('reads the events of one job in log order', async () => {
       const { store } = await fresh();
       const j1 = await store.createJob({ repo: 'r', title: '1' });
@@ -228,6 +243,75 @@ export function describeStoreContract(name: string, make: () => Promise<StoreHan
       // Made without waiting between them, so they are applied back to back.
       const made = await Promise.all(Array.from({ length: 40 }, (_, i) => store.createJob({ repo: 'r', title: `quick-${i}` })));
       expect((await store.listJobs()).slice(40).map((j) => j.id)).toEqual(made.map((j) => j.id));
+    });
+
+    it('accepts a lone surrogate (half an emoji) in any JSON value and reads it back as U+FFFD, and keeps whole emoji', async () => {
+      const { store } = await fresh();
+      const half = 'cut here \ud83e';
+      const robot = '\u{1F916}';
+      await store.setState('p', 'k', { a: [half, { n: `x\udd16y` }], robot });
+      expect(await store.getState('p', 'k')).toEqual({ a: ['cut here \ufffd', { n: 'x\ufffdy' }], robot });
+      await store.setState('p', 'bare', half);
+      expect(await store.getState('p', 'bare')).toBe('cut here \ufffd');
+      const ev = await store.appendEvent({ type: 'a.b', source: 'x', payload: { evidence: [{ target: half }], 'key\ud83e': 1 } });
+      expect(ev.payload).toEqual({ evidence: [{ target: 'cut here \ufffd' }], 'key\ufffd': 1 });
+      expect((await store.eventsAfter())[0]!.payload).toEqual(ev.payload);
+      const job = await store.createJob({ repo: 'r', title: 't' });
+      const stage = await store.startStage(job.id, 'build');
+      expect((await store.finishStage(stage.id, 'passed', { result: half })).output).toEqual({ result: 'cut here \ufffd' });
+      // Text that only looks like an escape is just text.
+      await store.setState('p', 'text', 'literal \\ud83e and \\u0000');
+      expect(await store.getState('p', 'text')).toBe('literal \\ud83e and \\u0000');
+    });
+
+    it('keeps a NUL character in a JSON string as U+FFFD, the same on every engine', async () => {
+      const { store } = await fresh();
+      await store.setState('p', 'k', ['a\u0000b', { 'k\u0000': 'v' }]);
+      expect(await store.getState('p', 'k')).toEqual(['a\ufffdb', { 'k\ufffd': 'v' }]);
+    });
+
+    it('refuses a NUL character in a plain text column or an identifier before it reaches the engine, and stores nothing', async () => {
+      const { store } = await fresh();
+      const job = await store.createJob({ repo: 'r', title: 't' });
+      const stage = await store.startStage(job.id, 'build');
+      const nul = (s: string) => `${s}\u0000${s}`;
+      const refused = [
+        store.createJob({ repo: nul('r'), title: 't' }),
+        store.createJob({ repo: 'r', title: nul('t') }),
+        store.createJob({ repo: 'r', title: 't', body: nul('b') }),
+        store.setJobStatus(nul('id'), 'done'),
+        store.startStage(job.id, nul('name')),
+        store.finishStage(stage.id, nul('passed') as 'passed'),
+        store.setState(nul('p'), 'k', 1),
+        store.setState('p', nul('k'), 1),
+        store.getState('p', nul('k')),
+        store.appendEvent({ type: nul('a.b'), source: 'x', payload: null }),
+        store.appendEvent({ type: 'a.b', source: nul('x'), payload: null }),
+        store.getJob(nul('id')),
+        store.eventsForJob(nul('id')),
+      ];
+      for (const p of refused) await expect(p).rejects.toThrow(/NUL/);
+      expect((await store.listJobs()).map((j) => j.title)).toEqual(['t']);
+      expect(await store.eventsAfter()).toEqual([]);
+      expect(await store.getState('p', 'k')).toBeUndefined();
+    });
+
+    it('a NUL refusal inside a transaction leaves the transaction usable, so the rest of it still commits', async () => {
+      const { store } = await fresh();
+      await store.transaction(async (tx) => {
+        await tx.createJob({ repo: 'r', title: 'before' });
+        await expect(tx.createJob({ repo: 'r', title: 'bad\u0000' })).rejects.toThrow(/NUL/);
+        await expect(tx.setState('p', 'k\u0000', 1)).rejects.toThrow(/NUL/);
+        await tx.createJob({ repo: 'r', title: 'after' });
+      });
+      expect((await store.listJobs()).map((j) => j.title)).toEqual(['before', 'after']);
+    });
+
+    it('stores a lone surrogate in a title as U+FFFD', async () => {
+      const { store } = await fresh();
+      const job = await store.createJob({ repo: 'r', title: 'half \ud83e' });
+      expect(job.title).toBe('half \ufffd');
+      expect((await store.getJob(job.id))?.title).toBe('half \ufffd');
     });
 
     describe('transaction', () => {

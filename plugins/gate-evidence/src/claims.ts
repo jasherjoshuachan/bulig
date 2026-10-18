@@ -3,6 +3,7 @@
  * It finds sentences that assert a result and asks whether the tool-use records of the same turn back them up.
  * It does not understand language: see the README for what it cannot catch.
  */
+import { clipText } from '@bulig/text';
 
 /** One thing Claude did in a turn. Built by the worker from the tool-use stream, never from the model's text. */
 export interface EvidenceRecord {
@@ -36,7 +37,7 @@ const INVISIBLE = /[\u0000-\u001f\u007f-\u009f؜​-‏‪-‮⁠⁦-⁩﻿]+/g;
 /** One line, no hidden characters, cut at `n` characters. Everything shown to a person goes through this. */
 export const clean = (s: unknown, n = 160): string => {
   const t = String(s ?? '').replace(INVISIBLE, ' ').replace(/\s+/g, ' ').trim();
-  return t.length > n ? `${t.slice(0, n - 1)}…` : t;
+  return t.length > n ? `${clipText(t, n - 1)}…` : t;
 };
 
 // ---------- the claim patterns (the documented list) ----------

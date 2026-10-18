@@ -1,4 +1,5 @@
 import { definePlugin, type BuligEvent, type Job, type Plugin, type PluginContext } from '@bulig/plugin-sdk';
+import { clipText } from '@bulig/text';
 
 export type ApprovalKind = 'plan' | 'merge';
 
@@ -20,7 +21,7 @@ export interface CliChannel {
 }
 
 const short = (id?: string) => (id ?? '--------').slice(0, 8);
-const one = (s: unknown, n = 160) => String(s ?? '').replace(/\s+/g, ' ').trim().slice(0, n);
+const one = (s: unknown, n = 160) => clipText(String(s ?? '').replace(/\s+/g, ' ').trim(), n);
 const usd = (n: unknown) => (typeof n === 'number' ? ` $${n.toFixed(4)}` : '');
 
 /** One concise line (or a few) for an event. Undefined means: say nothing. */
@@ -77,7 +78,7 @@ export function format(e: BuligEvent): string[] | undefined {
         for (const f of p.scope) head.push(`${tag}     - ${String(f).replace(/\s+/g, ' ')}`);
       }
       const summary = String(p.summary ?? '').trim().split('\n').slice(0, 14);
-      for (const s of summary) head.push(`${tag}   | ${s.slice(0, 160)}`);
+      for (const s of summary) head.push(`${tag}   | ${clipText(s, 160)}`);
       // The commands name this approval stage, so a line copied from an earlier question cannot answer a later one.
       if (typeof p.stageId !== 'string' || p.stageId === '') {
         head.push(`${tag}   this request names no approval stage, so no command is printed. See the open stage with: bulig history ${id}`);

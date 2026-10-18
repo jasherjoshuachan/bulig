@@ -1,4 +1,5 @@
 {
+  "store": { "kind": "sqlite" },
   "dbPath": "~/.bulig/bulig.sqlite",
   "enabled": ["channel-cli", "channel-telegram", "worker-claude-code", "gate-evidence", "gate-promise", "github", "pipeline-dev"],
   "grants": {

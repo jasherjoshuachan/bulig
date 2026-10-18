@@ -19,6 +19,7 @@
  * other than dots and wildcards, or (2) it has several parts and its first part is not a plain folder or file
  * name (no * or ?). So docs/** and src/**\/*.ts pass; **, *?, **\/?*, **\/*.md, *\/docs/** and .*\/** do not.
  */
+import { clipText } from '@bulig/text';
 
 /** The most entries a SCOPE block may have. */
 export const MAX_SCOPE_ENTRIES = 100;
@@ -37,7 +38,7 @@ const CONTROL = /[\u0000-\u001f\u007f]/;
 
 /** Clean one SCOPE line into a pattern, or say why it can't be one. */
 export function normalizeScopeEntry(raw: string, opts: { allowBroad?: boolean } = {}): ScopeEntry {
-  const shown = JSON.stringify(raw.length > 80 ? `${raw.slice(0, 80)}...` : raw);
+  const shown = JSON.stringify(raw.length > 80 ? `${clipText(raw, 80)}...` : raw);
   const bad = (why: string): ScopeEntry => ({ ok: false, error: `${shown}: ${why}` });
   let p = raw.trim();
   if (!p) return bad('empty');

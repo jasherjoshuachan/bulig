@@ -1302,3 +1302,21 @@ describe('/retry does not start a second job for the same one', () => {
     });
   });
 });
+
+describe('chunkLines', () => {
+  const lone = (s: string) => /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/.test(s);
+  it('breaks between lines, and inside a long line without splitting an emoji, wherever the limit falls', async () => {
+    const { chunkLines } = await import('../src/index.ts');
+    expect(chunkLines(['aaa', 'bbb', 'cc'], 7)).toEqual(['aaa\nbbb', 'cc']);
+    expect(chunkLines([''], 5)).toEqual([]);
+    const robot = '\u{1F916}';
+    for (const max of [3, 4, 5, 6, 7, 10]) {
+      const lines = [`ab${robot}cd${robot}${robot}ef${robot}`, 'x'];
+      const pieces = chunkLines(lines, max);
+      expect(pieces.every((p) => !lone(p))).toBe(true);
+      expect(pieces.join('\n').replace(/\n/g, '')).toBe(lines.join(''));
+    }
+    // A limit smaller than one emoji still makes progress.
+    expect(chunkLines([robot + robot], 1).join('')).toBe(robot + robot);
+  });
+});

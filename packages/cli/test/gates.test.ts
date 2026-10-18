@@ -48,7 +48,7 @@ describe('gate wiring', () => {
   });
 });
 
-const cfg = (enabled: string[], pluginConfig: Record<string, Record<string, unknown>> = {}): BuligConfig => ({ dbPath: '/x', enabled, grants: {}, pluginConfig, eventCapabilities: {} });
+const cfg = (enabled: string[], pluginConfig: Record<string, Record<string, unknown>> = {}): BuligConfig => ({ store: { kind: 'sqlite' }, dbPath: '/x', enabled, grants: {}, pluginConfig, eventCapabilities: {} });
 
 describe('the plugin config the kernel gets', () => {
   it('gate-promise alone reads stage.completed even when the user config says stage.checked, which nothing would emit', () => {

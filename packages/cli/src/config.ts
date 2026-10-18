@@ -9,7 +9,23 @@ export const BUILTIN_PLUGINS = ['channel-cli', 'worker-claude-code', ...GATE_PLU
 /** Plugins the CLI ships but leaves off until the config turns them on, because they need setup. */
 export const OPT_IN_PLUGINS = ['channel-telegram'] as const;
 
+/**
+ * Where the kernel keeps its record. SQLite at `dbPath` is the default. For Postgres the config holds only the NAME of the
+ * environment variable that carries the connection string, so a password never lands in a file that gets committed or copied.
+ */
+const StoreSchema = z.discriminatedUnion('kind', [
+  z.strictObject({ kind: z.literal('sqlite') }),
+  z.strictObject({
+    kind: z.literal('postgres'),
+    urlEnv: z
+      .string()
+      .regex(/^[A-Za-z_][A-Za-z0-9_]*$/, 'urlEnv is the name of an environment variable, such as BULIG_DATABASE_URL, not the connection string'),
+  }),
+]);
+export type StoreConfig = z.infer<typeof StoreSchema>;
+
 const ConfigSchema = z.object({
+  store: StoreSchema.optional(),
   dbPath: z.string().optional(),
   enabled: z.array(z.string()).optional(),
   grants: z.record(z.string(), z.array(z.string())).optional(),
@@ -18,6 +34,8 @@ const ConfigSchema = z.object({
 });
 
 export interface BuligConfig {
+  /** Which store the kernel runs on. `sqlite` (the default) uses the file at `dbPath`; `postgres` reads its connection string from the variable `urlEnv` names. */
+  store: StoreConfig;
   dbPath: string;
   enabled: string[];
   grants: Record<string, string[]>;
@@ -77,6 +95,7 @@ export function loadConfig(cwd: string, home: string): { config: BuligConfig; pa
   return {
     path,
     config: {
+      store: c.store ?? { kind: 'sqlite' },
       dbPath: expand(c.dbPath ?? defaultDbPath(home), home, dirname(path)),
       enabled,
       grants: c.grants ?? {},

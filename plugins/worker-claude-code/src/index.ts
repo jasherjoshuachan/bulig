@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { definePlugin, type BuligEvent } from '@bulig/plugin-sdk';
+import { clipText } from '@bulig/text';
 
 export type StageMode = 'readonly' | 'edit';
 
@@ -210,18 +211,20 @@ const KINDS: Record<string, EvidenceRecord['kind']> = {
 };
 
 const flat = (v: unknown): string =>
-  (typeof v === 'string' ? v : '')
+  clipText(
+    (typeof v === 'string' ? v : '')
     .replace(/[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u202a-\u202e\u2060\u2066-\u2069\ufeff]+/g, ' ')
     .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, MAX_TARGET);
+    .trim(),
+    MAX_TARGET,
+  );
 
 function recordOf(tool: string, input: unknown): EvidenceRecord {
   const i = (typeof input === 'object' && input !== null ? input : {}) as Record<string, unknown>;
   const kind = Object.hasOwn(KINDS, tool) ? KINDS[tool]! : 'other';
   const target =
     kind === 'run' ? flat(i.command) : kind === 'search' ? flat(i.pattern) : kind === 'other' ? '' : flat(i.file_path) || flat(i.notebook_path);
-  return { tool: flat(tool).slice(0, 60), kind, target, ok: false };
+  return { tool: clipText(flat(tool), 60), kind, target, ok: false };
 }
 
 /**
@@ -351,7 +354,7 @@ export class OutputParser {
   private readonly skim = new LineSkim();
 
   write(chunk: Buffer): void {
-    if (this.head.length < HEAD_CHARS) this.head += chunk.toString('utf8', 0, HEAD_CHARS * 4).slice(0, HEAD_CHARS - this.head.length);
+    if (this.head.length < HEAD_CHARS) this.head += clipText(chunk.toString('utf8', 0, HEAD_CHARS * 4), HEAD_CHARS - this.head.length);
     let pos = 0;
     while (pos < chunk.length) {
       const nl = chunk.indexOf(10, pos);
@@ -499,7 +502,7 @@ function run(
       if (timedOut) return done({ ok: false, result: '', error: `timed out after ${Math.round(timeoutMs / 1000)}s` });
       const parsed = parser.finish();
       if (code !== 0) {
-        const why = stderr.trim().slice(0, 300) || parsed.error || 'no output';
+        const why = clipText(stderr.trim(), 300) || parsed.error || 'no output';
         return done({ ok: false, result: parsed.result, error: `claude exited with code ${code}: ${why}` });
       }
       done(parsed);

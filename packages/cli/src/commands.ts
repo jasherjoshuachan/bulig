@@ -285,8 +285,8 @@ async function cmdDeny(args: string[], io: Io): Promise<number> {
  */
 function checkStage(jobId: string, waiting: { id: string; name: string }, stageArg: string | undefined): void {
   const what = `the ${waiting.name.slice(8)} approval, stage ${waiting.id}`;
-  if (!stageArg) throw new UserError(`name the approval stage you are answering. Job ${jobId} is waiting for ${what}. Read the question with: bulig history ${jobId}`);
-  if (stageArg !== waiting.id) throw new UserError(`stage ${stageArg} is not the open question, so it has expired. Job ${jobId} is waiting for ${what}. Read the question with: bulig history ${jobId}`);
+  if (!stageArg) throw new UserError(`name the approval stage you are answering. Job ${jobId} is waiting for ${what}. See the open stage with: bulig history ${jobId}`);
+  if (stageArg !== waiting.id) throw new UserError(`stage ${stageArg} is not the open question, so it has expired. Job ${jobId} is waiting for ${what}. See the open stage with: bulig history ${jobId}`);
 }
 
 /** Pick up a job whose process died mid-stage. */

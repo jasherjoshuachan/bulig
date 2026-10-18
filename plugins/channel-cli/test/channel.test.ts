@@ -58,12 +58,19 @@ describe('format', () => {
     expect(failed.join('\n')).toContain('outside the approved scope: test-results/.last-run.json');
   });
 
-  it('an approval request shows the summary and the exact commands', () => {
-    const lines = format(ev('approval.requested', { jobId: 'abcdef1234567890', kind: 'plan', summary: 'PLAN\nstep one' }))!;
+  it('an approval request shows the summary and the exact commands, naming its stage', () => {
+    const lines = format(ev('approval.requested', { jobId: 'abcdef1234567890', kind: 'plan', stageId: 'stage-7', summary: 'PLAN\nstep one' }))!;
     expect(lines[0]).toBe('[abcdef12] approval needed: plan');
     expect(lines.join('\n')).toContain('| step one');
-    expect(lines.join('\n')).toContain('bulig approve abcdef1234567890 plan');
-    expect(lines.join('\n')).toContain('bulig deny abcdef1234567890');
+    expect(lines.join('\n')).toContain('bulig approve abcdef1234567890 plan stage-7');
+    expect(lines.join('\n')).toContain('bulig deny abcdef1234567890 stage-7');
+  });
+
+  it('an approval request that names no stage prints no commands and says where to look', () => {
+    const text = format(ev('approval.requested', { jobId: 'abcdef1234567890', kind: 'merge', summary: 'REVIEW' }))!.join('\n');
+    expect(text).not.toContain('bulig approve');
+    expect(text).not.toContain('bulig deny');
+    expect(text).toContain('this request names no approval stage, so no command is printed. See the open stage with: bulig history abcdef1234567890');
   });
 
   it('says nothing for events it does not know', () => {

@@ -194,7 +194,7 @@ describe('a whole job through the CLI', () => {
     for (const argv of [['approve', id, 'plan'], ['deny', id]]) {
       const r = await w.run(...argv);
       expect(r.code).toBe(2);
-      expect(r.err).toContain(`name the approval stage you are answering. Job ${id} is waiting for the plan approval, stage ${stage}`);
+      expect(r.err).toContain(`name the approval stage you are answering. Job ${id} is waiting for the plan approval, stage ${stage}. See the open stage with: bulig history ${id}`);
     }
     // Another stage's id (a line copied from an earlier question), or a prefix of this one, has expired.
     for (const other of ['00000000-0000-4000-9000-000000000001', stage.slice(0, 12)]) {

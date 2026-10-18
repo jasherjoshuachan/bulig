@@ -79,9 +79,12 @@ export function format(e: BuligEvent): string[] | undefined {
       const summary = String(p.summary ?? '').trim().split('\n').slice(0, 14);
       for (const s of summary) head.push(`${tag}   | ${s.slice(0, 160)}`);
       // The commands name this approval stage, so a line copied from an earlier question cannot answer a later one.
-      const stage = String(p.stageId ?? '');
-      head.push(`${tag}   approve: bulig approve ${id} ${kind} ${stage}`);
-      head.push(`${tag}   deny:    bulig deny ${id} ${stage}`);
+      if (typeof p.stageId !== 'string' || p.stageId === '') {
+        head.push(`${tag}   this request names no approval stage, so no command is printed. See the open stage with: bulig history ${id}`);
+        return head;
+      }
+      head.push(`${tag}   approve: bulig approve ${id} ${kind} ${p.stageId}`);
+      head.push(`${tag}   deny:    bulig deny ${id} ${p.stageId}`);
       return head;
     }
     default:

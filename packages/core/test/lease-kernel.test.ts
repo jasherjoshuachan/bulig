@@ -134,6 +134,55 @@ for (const adapter of ADAPTERS) {
       expect((await (await adapter.peek()).acquireLease('kernel-b', 5_000)).generation).toBe(2);
     });
 
+    it('keeps the lease alive while stop() drains the queue, so a clean stop with slow queued work reports no lost lease', async () => {
+      const store = await adapter.make();
+      const lost: string[] = [];
+      const { k, errors } = kernelOn(store, { leaseHolder: 'kernel-a', leaseTtlMs: 500, leaseHeartbeatMs: 100, stopWaitMs: 100, storeTimeoutMs: 5_000, onLeaseLost: (r) => void lost.push(r) });
+      await k.start();
+      // Work that outlasts both the wait in stop() and the lease, and a task behind it that checks the lease only when it starts.
+      void k.jobs.atomic(async () => {
+        await sleep(1_200);
+      });
+      const behind = k.jobs.list();
+      await k.stop();
+      await expect(behind).resolves.toEqual([]);
+      expect(lost).toEqual([]); // serve would have exited 1 on this
+      expect(errors).toEqual([]);
+      expect((await (await adapter.peek()).acquireLease('kernel-b', 5_000)).generation).toBe(2); // and the lease was handed back
+    });
+
+    it('does not ask the owner to exit non-zero for a lease lost while stopping', async () => {
+      const store = await adapter.make();
+      const lost: string[] = [];
+      let refuse = false;
+      const flaky = withLease(store, { renewLease: async (h, g, t) => (refuse ? false : store.renewLease(h, g, t)) });
+      const { k, errors } = kernelOn(flaky, { leaseHolder: 'kernel-a', leaseTtlMs: 1_000, leaseHeartbeatMs: 60, stopWaitMs: 100, onLeaseLost: (r) => void lost.push(r) });
+      await k.start();
+      k.jobs
+        .atomic(async () => {
+          await sleep(400);
+        })
+        .catch(() => {}); // the lease goes while it runs, so the queue gives up on it
+      refuse = true;
+      await k.stop();
+      expect(lost).toEqual([]); // the process is already exiting cleanly
+      expect(errors.join('\n')).toMatch(/executor lease was lost/); // but the log still says it
+    });
+
+    it('still tells the owner when the lease is lost before stop() began', async () => {
+      const store = await adapter.make();
+      const lost: string[] = [];
+      let refuse = false;
+      const flaky = withLease(store, { renewLease: async (h, g, t) => (refuse ? false : store.renewLease(h, g, t)) });
+      const { k } = kernelOn(flaky, { leaseHolder: 'kernel-a', leaseTtlMs: 1_000, leaseHeartbeatMs: 60, onLeaseLost: (r) => void lost.push(r) });
+      await k.start();
+      refuse = true;
+      await sleep(250);
+      expect(lost).toHaveLength(1);
+      await k.stop();
+      expect(lost).toHaveLength(1);
+    });
+
     it('does not start while another kernel holds the lease, and says why', async () => {
       const store = await adapter.make();
       const first = kernelOn(store, { leaseHolder: 'kernel-a', leaseTtlMs: 5_000, leaseHeartbeatMs: 1_000 });

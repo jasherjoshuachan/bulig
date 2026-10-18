@@ -19,6 +19,11 @@ export interface KernelOptions {
    * refuses every later store call, and logs one error. Default 120000, never less than storeTimeoutMs.
    */
   storeBrokenMs?: number;
+  /**
+   * How long stop() waits for handlers and queued writes to finish before it stops waiting on them. Default 10000. The lease is
+   * kept alive for the whole of stop(), so work that is still queued after this does not lose it.
+   */
+  stopWaitMs?: number;
   /** How long stop() waits for the store's own close() before it stops waiting and says so. Default 10000. */
   storeCloseMs?: number;
   /**
@@ -158,10 +163,13 @@ export function createKernel(options: KernelOptions) {
     }
   }
 
+  /** Set once stop() has begun, or a start has failed. From then on the process is on its way out, so a lost lease is logged but does not ask the owner to exit non-zero. */
+  let ending = false;
+
   /** Tell the owner the lease is gone, once, whichever path (the heartbeat or a task's own check) noticed first. */
   let leaseLostTold = false;
   function tellLeaseLost(reason: string): void {
-    if (leaseLostTold) return;
+    if (leaseLostTold || ending) return;
     leaseLostTold = true;
     options.onLeaseLost?.(reason);
   }
@@ -238,6 +246,7 @@ export function createKernel(options: KernelOptions) {
           payload: { plugins: loaded.map((l) => l.manifest.name) },
         });
       } catch (err) {
+        ending = true;
         // A kernel that did not start must not go on holding the lease: the heartbeat would renew it until the process exits,
         // and the next kernel would wait for it for nothing.
         if (heartbeat) clearInterval(heartbeat);
@@ -248,6 +257,7 @@ export function createKernel(options: KernelOptions) {
     },
 
     async stop(): Promise<void> {
+      ending = true;
       for (const { plugin, manifest } of [...loaded].reverse()) {
         try {
           await plugin.stop?.();
@@ -256,11 +266,12 @@ export function createKernel(options: KernelOptions) {
         }
       }
       // Let handlers that are still working (a git command, a killed Claude run) finish before the log closes.
-      await bus.idle();
+      await bus.idle(options.stopWaitMs ?? 10_000);
+      // The heartbeat runs until the queue is empty: a task still queued after the wait above must find the lease alive.
+      await queue.idle();
       if (heartbeat) clearInterval(heartbeat);
       heartbeat = undefined;
       // Hand the lease back once the queued work is done, so the next kernel need not wait for it to run out.
-      await queue.idle();
       if (generation !== undefined) await record.releaseLease(holder, generation).catch(() => {});
       await queue.close();
     },

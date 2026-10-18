@@ -1,6 +1,7 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import Database from 'better-sqlite3';
 import { describe, expect, it } from 'vitest';
 import { SqliteStore } from '../src/index.ts';
 import { tempDb } from './helpers.ts';
@@ -26,7 +27,7 @@ describeStoreContract(
     };
     return handle;
   },
-  { schemaVersion: 3 },
+  { schemaVersion: 6 },
 );
 
 // What belongs to SQLite alone.
@@ -47,5 +48,30 @@ describe('SqliteStore', () => {
     const b = new SqliteStore(path);
     expect((await b.getJob(job.id))?.title).toBe('t');
     await b.close();
+  });
+
+  it('the database itself allows one live claim per job stage, whatever the code above it does (the partial unique index)', async () => {
+    const path = tempDb();
+    const s = new SqliteStore(path);
+    const job = await s.createJob({ repo: 'r', title: 't' });
+    await s.startStage(job.id, 'build');
+    const raw = new Database(path);
+    const claim = raw.prepare("INSERT INTO claims (job_id, stage, generation, attempt, claimed_at) VALUES (?, 'build', 0, 2, 'now')");
+    expect(() => claim.run(job.id)).toThrow(/UNIQUE/);
+    // a released claim does not count, and other stages and jobs are free
+    raw.prepare("UPDATE claims SET released_at = 'now' WHERE job_id = ?").run(job.id);
+    expect(() => claim.run(job.id)).not.toThrow();
+    raw.close();
+    await s.close();
+  });
+
+  it('the database itself refuses a second event with the same id', async () => {
+    const path = tempDb();
+    const s = new SqliteStore(path);
+    await s.appendEvent({ id: 'evt-1', type: 'a.b', source: 'x', payload: null });
+    const raw = new Database(path);
+    expect(() => raw.prepare("INSERT INTO events (id, type, source, at) VALUES ('evt-1', 'a.b', 'x', 'now')").run()).toThrow(/UNIQUE/);
+    raw.close();
+    await s.close();
   });
 });

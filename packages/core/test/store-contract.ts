@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import type { Store } from '../src/index.ts';
+import { DuplicateEventError, LeaseHeldError, LeaseLostError, StageClaimedError, StageNotClaimedError, StoreBrokenError, StoreQueue, type Store } from '../src/index.ts';
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 /**
  * One open store, plus a way to close it and open the same data again. How the data is kept (a file, a schema in a
@@ -87,6 +89,8 @@ export function describeStoreContract(name: string, make: () => Promise<StoreHan
       const job = await store.createJob({ repo: 'r', title: 't' });
       const first = await store.startStage(job.id, 'build');
       expect(first).toMatchObject({ jobId: job.id, name: 'build', status: 'running', attempt: 1, endedAt: null, output: null });
+      // A stage is claimed while it runs (ADR 0010): the next attempt starts once the last one has finished.
+      await store.finishStage(first.id, 'failed');
       expect((await store.startStage(job.id, 'build')).attempt).toBe(2);
       expect((await store.startStage(job.id, 'test')).attempt).toBe(1);
       const other = await store.createJob({ repo: 'r', title: 'other' });
@@ -98,6 +102,7 @@ export function describeStoreContract(name: string, make: () => Promise<StoreHan
       const { store } = await fresh();
       const job = await store.createJob({ repo: 'r', title: 't' });
       const a = await store.startStage(job.id, 'plan');
+      await store.finishStage(a.id, 'passed');
       const b = await store.startStage(job.id, 'build');
       const c = await store.startStage(job.id, 'plan');
       expect((await store.listStages(job.id)).map((s) => s.id)).toEqual([a.id, b.id, c.id]);
@@ -364,6 +369,277 @@ export function describeStoreContract(name: string, make: () => Promise<StoreHan
         await store.transaction((tx) => tx.createJob({ repo: 'r', title: 'a' }));
         await store.transaction((tx) => tx.createJob({ repo: 'r', title: 'b' }));
         expect((await store.listJobs()).map((j) => j.title)).toEqual(['a', 'b']);
+      });
+    });
+
+    describe('executor lease (ADR 0010)', () => {
+      const TTL = 250; // long enough that a slow moment on a busy machine does not end it early, short enough to wait out
+      const SHORT_WAIT = TTL + 150;
+
+      it('gives the first holder generation 1, lets the same holder in again with a higher number, and keeps a second holder out while it runs', async () => {
+        const { store } = await fresh();
+        expect(await store.acquireLease('a', 60_000)).toEqual({ generation: 1 });
+        expect(await store.acquireLease('a', 60_000)).toEqual({ generation: 2 });
+        const err = await store.acquireLease('b', 60_000).catch((e: unknown) => e);
+        expect(err).toBeInstanceOf(LeaseHeldError);
+        expect((err as LeaseHeldError).holder).toBe('a');
+        // the refused attempt changed nothing
+        expect(await store.renewLease('a', 2, 60_000)).toBe(true);
+      });
+
+      it('lets another holder take it after it runs out, with the next generation, and the old holder is then refused everywhere', async () => {
+        const { store } = await fresh();
+        const a = await store.acquireLease('a', TTL);
+        await sleep(SHORT_WAIT);
+        const b = await store.acquireLease('b', 60_000);
+        expect(b.generation).toBe(a.generation + 1);
+        expect(await store.renewLease('a', a.generation, 60_000)).toBe(false);
+        await expect(store.transaction((tx) => tx.assertLease('a', a.generation))).rejects.toBeInstanceOf(LeaseLostError);
+        await expect(store.transaction((tx) => tx.assertLease('b', b.generation))).resolves.toBeUndefined();
+      });
+
+      it('refuses a write from the old holder after a takeover, and keeps nothing of it', async () => {
+        const { store } = await fresh();
+        const a = await store.acquireLease('a', TTL);
+        await sleep(SHORT_WAIT);
+        await store.acquireLease('b', 60_000);
+        const late = store.transaction(async (tx) => {
+          await tx.assertLease('a', a.generation);
+          await tx.createJob({ repo: 'r', title: 'late write from the old holder' });
+        });
+        await expect(late).rejects.toBeInstanceOf(LeaseLostError);
+        expect(await store.listJobs()).toEqual([]);
+      });
+
+      it('refuses a stale generation even when the holder name is right', async () => {
+        const { store } = await fresh();
+        const first = await store.acquireLease('a', 60_000);
+        const second = await store.acquireLease('a', 60_000);
+        await expect(store.transaction((tx) => tx.assertLease('a', first.generation))).rejects.toBeInstanceOf(LeaseLostError);
+        await expect(store.transaction((tx) => tx.assertLease('a', second.generation))).resolves.toBeUndefined();
+      });
+
+      it('refuses the holder itself once its lease has run out, even before anyone else takes it', async () => {
+        const { store } = await fresh();
+        const a = await store.acquireLease('a', TTL);
+        await sleep(SHORT_WAIT);
+        await expect(store.transaction((tx) => tx.assertLease('a', a.generation))).rejects.toBeInstanceOf(LeaseLostError);
+        expect(await store.renewLease('a', a.generation, 60_000)).toBe(false);
+      });
+
+      it('refuses an assertion when no lease was ever taken', async () => {
+        const { store } = await fresh();
+        await expect(store.transaction((tx) => tx.assertLease('a', 1))).rejects.toBeInstanceOf(LeaseLostError);
+      });
+
+      it('renews only for the current holder and generation, and a renewal moves the end out', async () => {
+        const { store } = await fresh();
+        const a = await store.acquireLease('a', TTL);
+        expect(await store.renewLease('a', a.generation + 1, 60_000)).toBe(false);
+        expect(await store.renewLease('b', a.generation, 60_000)).toBe(false);
+        expect(await store.renewLease('a', a.generation, 60_000)).toBe(true);
+        await sleep(SHORT_WAIT); // would have run out without the renewal
+        await expect(store.acquireLease('b', 60_000)).rejects.toBeInstanceOf(LeaseHeldError);
+      });
+
+      it('lets the next holder in at once after a release, and the number still goes up', async () => {
+        const { store } = await fresh();
+        const a = await store.acquireLease('a', 60_000);
+        await store.releaseLease('a', a.generation);
+        expect((await store.acquireLease('b', 60_000)).generation).toBe(a.generation + 1);
+        // a release by someone who no longer holds it does nothing
+        await store.releaseLease('a', a.generation);
+        await expect(store.acquireLease('c', 60_000)).rejects.toBeInstanceOf(LeaseHeldError);
+      });
+
+      it('rejects a lease length that is not a positive whole number of milliseconds', async () => {
+        const { store } = await fresh();
+        await expect(store.acquireLease('a', 0)).rejects.toThrow(/positive whole number/);
+        await expect(store.acquireLease('a', 1.5)).rejects.toThrow(/positive whole number/);
+        await expect(store.renewLease('a', 1, -1)).rejects.toThrow(/positive whole number/);
+      });
+
+      it('can be renewed while a transaction is open and waiting, and the renewal is not undone when that transaction rolls back', async () => {
+        const { store } = await fresh();
+        const a = await store.acquireLease('a', 400);
+        let renewed: boolean | undefined;
+        await store
+          .transaction(async (tx) => {
+            await tx.assertLease('a', a.generation);
+            await tx.createJob({ repo: 'r', title: 'doomed' });
+            // the transaction now waits; the heartbeat has its own way in
+            await sleep(150);
+            renewed = await store.renewLease('a', a.generation, 60_000);
+            throw new Error('rolled back');
+          })
+          .catch(() => {});
+        expect(renewed).toBe(true);
+        expect(await store.listJobs()).toEqual([]);
+        await sleep(450); // past the original 400 ms
+        await expect(store.acquireLease('b', 60_000)).rejects.toBeInstanceOf(LeaseHeldError);
+      });
+    });
+
+    describe('claims (ADR 0010)', () => {
+      const TTL = 250; // long enough that a slow moment on a busy machine does not end it early, short enough to wait out
+      const SHORT_WAIT = TTL + 150;
+      /** Run `fn` as a task of a queue fenced with this lease, the way the kernel does. */
+      const fenced = (store: Store, holder: string, generation: number) => {
+        const queue = new StoreQueue(store);
+        queue.setFence({ holder, generation });
+        return queue;
+      };
+
+      it('refuses to start a stage that is already running, and allows it again once it has finished', async () => {
+        const { store } = await fresh();
+        const job = await store.createJob({ repo: 'r', title: 't' });
+        const first = await store.startStage(job.id, 'build');
+        const err = await store.startStage(job.id, 'build').catch((e: unknown) => e);
+        expect(err).toBeInstanceOf(StageClaimedError);
+        expect(err).toMatchObject({ jobId: job.id, stage: 'build', attempt: 1 });
+        expect(await store.listStages(job.id)).toHaveLength(1); // the refused start wrote no stage row
+        await store.finishStage(first.id, 'passed');
+        expect((await store.startStage(job.id, 'build')).attempt).toBe(2);
+      });
+
+      it('claims per stage of a job: other stages of the job, and the same stage of other jobs, run side by side', async () => {
+        const { store } = await fresh();
+        const a = await store.createJob({ repo: 'r', title: 'a' });
+        const b = await store.createJob({ repo: 'r', title: 'b' });
+        const held = [await store.startStage(a.id, 'build'), await store.startStage(a.id, 'test'), await store.startStage(b.id, 'build')];
+        expect(held.every((s) => s.status === 'running' && s.attempt === 1)).toBe(true);
+      });
+
+      it('lets exactly one of two racing starts of one stage win', async () => {
+        const { store } = await fresh();
+        const { generation } = await store.acquireLease('a', 60_000);
+        const job = await store.createJob({ repo: 'r', title: 't' });
+        const queue = fenced(store, 'a', generation);
+        const results = await Promise.allSettled([
+          queue.run('one', (tx) => tx.startStage(job.id, 'build')),
+          queue.run('two', (tx) => tx.startStage(job.id, 'build')),
+        ]);
+        expect(results.map((r) => r.status).sort()).toEqual(['fulfilled', 'rejected']);
+        const lost = results.find((r) => r.status === 'rejected') as PromiseRejectedResult;
+        expect(lost.reason).toBeInstanceOf(StageClaimedError);
+        expect(await store.listStages(job.id)).toHaveLength(1);
+      });
+
+      it('lets only one of two starts of a stage made at the same moment outside a transaction through', async () => {
+        const { store } = await fresh();
+        const job = await store.createJob({ repo: 'r', title: 't' });
+        const results = await Promise.allSettled([store.startStage(job.id, 'plan'), store.startStage(job.id, 'plan')]);
+        expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
+      });
+
+      it('takes a stage over from a holder that lost the lease: new attempt, old claim released as lease-lost, old stage closed as interrupted', async () => {
+        const { store } = await fresh();
+        const a = await store.acquireLease('a', TTL);
+        const job = await store.createJob({ repo: 'r', title: 't' });
+        const old = await fenced(store, 'a', a.generation).run('start', (tx) => tx.startStage(job.id, 'build'));
+        await sleep(SHORT_WAIT);
+        const b = await store.acquireLease('b', 60_000);
+        const taken = await fenced(store, 'b', b.generation).run('take over', (tx) => tx.startStage(job.id, 'build'));
+        expect(taken.attempt).toBe(2);
+        expect(taken.status).toBe('running');
+        const closed = await store.getStage(old.id);
+        expect(closed).toMatchObject({ status: 'failed', output: { interrupted: true, reason: 'lease-lost' } });
+        expect(closed?.endedAt).not.toBeNull();
+        // and the new holder's claim is a real one
+        await expect(fenced(store, 'b', b.generation).run('again', (tx) => tx.startStage(job.id, 'build'))).rejects.toBeInstanceOf(StageClaimedError);
+      });
+
+      it('refuses the old attempt a finish once its claim was taken over: the attempt number is the fence', async () => {
+        const { store } = await fresh();
+        const a = await store.acquireLease('a', TTL);
+        const job = await store.createJob({ repo: 'r', title: 't' });
+        const old = await fenced(store, 'a', a.generation).run('start', (tx) => tx.startStage(job.id, 'build'));
+        await sleep(SHORT_WAIT);
+        const b = await store.acquireLease('b', 60_000);
+        const next = await fenced(store, 'b', b.generation).run('take over', (tx) => tx.startStage(job.id, 'build'));
+        // A late finish for attempt 1 that got past the lease check (it is not fenced here) still bounces off the claim.
+        const err = await store.finishStage(old.id, 'passed', { late: true }).catch((e: unknown) => e);
+        expect(err).toBeInstanceOf(StageNotClaimedError);
+        expect((await store.getStage(old.id))?.output).toMatchObject({ reason: 'lease-lost' }); // the late output was not kept
+        // and the live attempt can still finish
+        expect((await store.finishStage(next.id, 'passed')).status).toBe('passed');
+      });
+
+      it('lets a newer generation finish a stage the dead kernel left running, which is how a restart closes it', async () => {
+        const { store } = await fresh();
+        const a = await store.acquireLease('a', TTL);
+        const job = await store.createJob({ repo: 'r', title: 't' });
+        const left = await fenced(store, 'a', a.generation).run('start', (tx) => tx.startStage(job.id, 'build'));
+        await sleep(SHORT_WAIT);
+        const b = await store.acquireLease('b', 60_000);
+        const closed = await fenced(store, 'b', b.generation).run('close', (tx) => tx.finishStage(left.id, 'failed', { interrupted: true }));
+        expect(closed.status).toBe('failed');
+        expect((await store.startStage(job.id, 'build')).attempt).toBe(2);
+      });
+
+      it('refuses to finish a stage twice', async () => {
+        const { store } = await fresh();
+        const job = await store.createJob({ repo: 'r', title: 't' });
+        const stage = await store.startStage(job.id, 'build');
+        await store.finishStage(stage.id, 'passed', { n: 1 });
+        await expect(store.finishStage(stage.id, 'failed', { n: 2 })).rejects.toBeInstanceOf(StageNotClaimedError);
+        expect((await store.getStage(stage.id))?.output).toEqual({ n: 1 });
+      });
+
+      it('keeps a refused start, or a refused finish, from spoiling the rest of its transaction', async () => {
+        const { store } = await fresh();
+        const job = await store.createJob({ repo: 'r', title: 't' });
+        const stage = await store.startStage(job.id, 'build');
+        await store.finishStage(stage.id, 'passed');
+        const open = await store.startStage(job.id, 'build');
+        await store.transaction(async (tx) => {
+          await expect(tx.startStage(job.id, 'build')).rejects.toBeInstanceOf(StageClaimedError);
+          await expect(tx.finishStage(stage.id, 'failed')).rejects.toBeInstanceOf(StageNotClaimedError);
+          await tx.createJob({ repo: 'r', title: 'still works' });
+        });
+        expect((await store.listJobs()).map((j) => j.title)).toContain('still works');
+        expect((await store.getStage(open.id))?.status).toBe('running');
+      });
+
+      it('breaks the queue and writes nothing when a task is run under a lease that was taken away', async () => {
+        const { store } = await fresh();
+        const a = await store.acquireLease('a', TTL);
+        const queue = fenced(store, 'a', a.generation);
+        await queue.run('before', (tx) => tx.createJob({ repo: 'r', title: 'ok while it holds the lease' }));
+        await sleep(SHORT_WAIT);
+        await store.acquireLease('b', 60_000);
+        const late = queue.run('late', (tx) => tx.createJob({ repo: 'r', title: 'late' }));
+        await expect(late).rejects.toBeInstanceOf(StoreBrokenError);
+        await expect(late).rejects.toThrow(/executor lease was lost/);
+        await expect(queue.run('read', (tx) => tx.listJobs())).rejects.toBeInstanceOf(StoreBrokenError);
+        expect(queue.brokenError).toBeInstanceOf(StoreBrokenError);
+      });
+    });
+
+    describe('event ids (ADR 0010)', () => {
+      it('writes an event under the id it is given, and rejects a second event with the same id, keeping the first', async () => {
+        const { store } = await fresh();
+        const first = await store.appendEvent({ id: 'evt-1', type: 'a.b', source: 'x', payload: { n: 1 } });
+        expect(first.id).toBe('evt-1');
+        const err = await store.appendEvent({ id: 'evt-1', type: 'a.b', source: 'x', payload: { n: 2 } }).catch((e: unknown) => e);
+        expect(err).toBeInstanceOf(DuplicateEventError);
+        expect((await store.eventsAfter()).map((e) => e.payload)).toEqual([{ n: 1 }]);
+      });
+
+      it('leaves the transaction usable after a duplicate, so the rest of it still commits', async () => {
+        const { store } = await fresh();
+        await store.appendEvent({ id: 'evt-1', type: 'a.b', source: 'x', payload: null });
+        await store.transaction(async (tx) => {
+          await expect(tx.appendEvent({ id: 'evt-1', type: 'a.c', source: 'x', payload: null })).rejects.toBeInstanceOf(DuplicateEventError);
+          await tx.appendEvent({ type: 'a.d', source: 'x', payload: null });
+        });
+        expect((await store.eventsAfter()).map((e) => e.type)).toEqual(['a.b', 'a.d']);
+      });
+
+      it('still makes its own id when none is given, and two such events never collide', async () => {
+        const { store } = await fresh();
+        const [a, b] = [await store.appendEvent({ type: 'a.b', source: 'x', payload: null }), await store.appendEvent({ type: 'a.b', source: 'x', payload: null })];
+        expect(a.id).not.toBe(b.id);
       });
     });
 

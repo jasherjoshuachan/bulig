@@ -33,6 +33,9 @@ export interface GithubConfig {
 
 class StepError extends Error {}
 
+/** The line a commit carries so a repeated request for the same stage attempt can find it. */
+const STAGE_TRAILER = 'Bulig-Stage';
+
 const str = (p: unknown, key: string): string => {
   const v = (p as Record<string, unknown> | null)?.[key];
   if (typeof v !== 'string' || v === '') throw new StepError(`payload is missing "${key}"`);
@@ -379,6 +382,20 @@ export default definePlugin({
       try {
         const cwd = str(event.payload, 'cwd');
         const message = str(event.payload, 'message');
+        // One commit per stage attempt (ADR 0010). The commit carries the attempt's id as a trailer, and a request whose attempt
+        // already has a commit gets that commit back instead of a second one. The check reads git, so it holds across a restart.
+        const stageId = (event.payload as { stageId?: unknown }).stageId;
+        if (stageId !== undefined && (typeof stageId !== 'string' || !/^[A-Za-z0-9_-]{1,64}$/.test(stageId))) throw new StepError('commit.requested has a stageId that is not a plain id');
+        const trailer = stageId === undefined ? undefined : `${STAGE_TRAILER}: ${stageId}`;
+        if (trailer) {
+          const done = await runGit(cwd, ['log', '--fixed-strings', `--grep=${trailer}`, '--format=%H', '-n', '1']);
+          const earlier = done.code === 0 ? done.stdout.trim() : '';
+          if (earlier) {
+            ctx.log.warn(`github: stage attempt ${stageId} already has commit ${earlier.slice(0, 7)}, so no second commit was made`);
+            ctx.emit('commit.done', { sha: earlier, base: await baseOf(cwd) }, event.jobId);
+            return;
+          }
+        }
         const rules = readScopeRules(event.payload, cwd);
         const status = await runGit(cwd, ['status', '--porcelain=v1', '-z', '--untracked-files=all']);
         if (status.code !== 0) throw new StepError(`git status failed (exit ${status.code}): ${clipText((status.stderr || status.stdout).trim(), 500)}`);
@@ -418,7 +435,7 @@ export default definePlugin({
             await runGit(cwd, ['reset', '-q']);
             throw new StepError(`the index held files that were never checked (${listed(extra)}), so nothing was committed`);
           }
-          must('git commit', await runGit(cwd, [...IDENTITY, 'commit', '-m', message]));
+          must('git commit', await runGit(cwd, [...IDENTITY, 'commit', '-m', trailer ? `${message}\n\n${trailer}` : message]));
         }
         const sha = must('git rev-parse', await runGit(cwd, ['rev-parse', 'HEAD']));
         ctx.emit('commit.done', { sha, base: await baseOf(cwd), ...(outside.length && { outOfScope: outside }) }, event.jobId);

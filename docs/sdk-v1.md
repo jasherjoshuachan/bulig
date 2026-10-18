@@ -1,6 +1,6 @@
 # Plugin SDK v1 (release candidate)
 
-This is the contract between the kernel and a plugin. `@bulig/plugin-sdk` is version `1.0.0-rc.5`. A manifest that sets `"sdk": "1"` is promising to follow this page, and the kernel promises to keep honouring it.
+This is the contract between the kernel and a plugin. `@bulig/plugin-sdk` is version `1.0.0-rc.6`. A manifest that sets `"sdk": "1"` is promising to follow this page, and the kernel promises to keep honouring it.
 
 The page is split by how much Bulig is willing to promise:
 
@@ -52,7 +52,7 @@ Rules the kernel applies when it loads a manifest, and the conformance suite app
 | `jobs.create/get/list` | stable | Read jobs, and create one. Creating one makes the kernel emit `job.created`. Async (`Promise`), because the record behind them can be a database server. Changed from sync during the release candidate (`1.0.0-rc.4`, ADR 0007), the same way `state` was. |
 | `jobs.setStatus` | stable | Ending a job (`done`, `failed`, `cancelled`) or moving it out of `awaiting_approval` needs `jobs.write`. A finished job is final. Async: a refused call rejects with `CapabilityDeniedError` and the same message it used to throw. Always `await` it. |
 | `jobs.stages(jobId)` | stable | Every stage of a job, oldest first. Async. |
-| `jobs.startStage/finishStage` | experimental | Open or close a stage. Stages whose name starts with `approve-` need `jobs.write`. That prefix is a string convention the permission check relies on. It should become a field. Async: a refused call rejects. Always `await` both, because a write resolves only when it is durable. |
+| `jobs.startStage/finishStage` | experimental | Open or close a stage. Stages whose name starts with `approve-` need `jobs.write`. That prefix is a string convention the permission check relies on. It should become a field. Async: a refused call rejects. Always `await` both, because a write resolves only when it is durable. From `1.0.0-rc.6` (ADR 0010) a stage is claimed while it runs. `startStage` rejects with an error named `StageClaimedError` when the same stage of the same job has a live claim of the same or a newer generation than the caller's; check `err.name`, and treat it as "somebody is already doing this", not as a failure of the job. A live claim of an older generation belongs to a kernel that lost its lease: it is taken over (its stage is closed as failed and interrupted) and the caller gets the next attempt. A stage that began before claims existed has no claim row, so a claim does not fence it: `startStage` opens the next attempt beside it, and `finishStage` closes it as it always did. `finishStage` releases the claim and rejects with `StageNotClaimedError` for an attempt whose claim is already released (it finished, or another kernel took it over), so a stage cannot be finished twice. Both are subclasses of `Error` that live in `@bulig/core`, not in this package. |
 | `state.get/set` | stable | The plugin's own key-value store. Both calls are async (`Promise`), because the record behind them can be a database server. `set` resolves only when the value is durable, so a plugin that awaits it can save a position and then act. JSON values only: a value that is not JSON rejects. Survives a restart. Other plugins' keys are invisible. Always `await` `set`: a rejection nobody handles ends a Node 22 process, and the conformance suite cannot see a forgotten `await`. Made async before the freeze, while one plugin used it. |
 | `log.debug/info/warn/error` | stable | |
 | `config` | experimental | The plugin's own object from `pluginConfig`, untyped. The manifest has no config schema yet, so every plugin validates its own config in `register()`. The conformance suite checks that an invalid config is refused clearly. A `configSchema` manifest field is the likely fix. |
@@ -139,7 +139,7 @@ The three capabilities the kernel enforces are frozen. The other names are conve
 
 | Event | Emitted by | Payload | Status |
 |---|---|---|---|
-| `stage.requested` | pipeline | `{ stage, prompt, model, mode: "readonly"\|"edit", cwd }` | stable |
+| `stage.requested` | pipeline | `{ stage, prompt, model, mode: "readonly"\|"edit", cwd, stageId? }` | stable (`stageId` is experimental) |
 | `stage.completed` | worker | `{ stage, ok: true, result: string, costUsd?, sessionId?, evidence?: EvidenceRecord[] }` | `stage`, `ok`, `result` stable. `costUsd`, `sessionId` experimental. `evidence` experimental: the record shape is gate-evidence's input and has one producer. |
 | `stage.checked` | gate-evidence | the `stage.completed` fields, plus `{ checked, mode?, evidenceSummary?, evidenceLines?, unverified? }` | name and the forwarded fields stable. The gate fields are experimental. |
 | `stage.screened` | gate-promise | the `stage.checked` or `stage.completed` fields minus raw `evidence`, plus `{ promiseChecked, promiseMode?, promises? }` | name and forwarded fields stable. The gate fields are experimental. |
@@ -182,7 +182,7 @@ The names and the refused/failed meaning are stable because channels depend on t
 
 - The kernel loads a plugin whose `sdk` is in `SUPPORTED_SDK_MAJORS` (today `0` and `1`) and refuses any other with `SdkVersionMismatchError`.
 - A plugin written for major N keeps working on every release of major N, unchanged, without edits to its manifest.
-- The package version of `@bulig/plugin-sdk` is full semver (`1.0.0-rc.5`). The minor and patch numbers are for humans and release notes; plugins never declare them.
+- The package version of `@bulig/plugin-sdk` is full semver (`1.0.0-rc.6`). The minor and patch numbers are for humans and release notes; plugins never declare them.
 - A plugin that needs something added in a later minor checks for it at runtime, or says so in its own docs. There is no `sdkMin` field. Add one only if that turns out to hurt.
 
 A **breaking change** (needs major 2) is any of these, for something marked stable:

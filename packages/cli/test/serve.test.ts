@@ -23,7 +23,7 @@ afterEach(async () => {
 });
 
 /** Stands in for worker-claude-code. `hangOn` never answers that stage, like a process that dies mid-stage. */
-function fakeWorker(hangOn?: string): Plugin {
+function fakeWorker(hangOn?: string, onStop?: () => void): Plugin {
   const replies: Record<string, string> = {
     plan: 'The plan\n\nSCOPE:\n- src/multiply.js\n- test/multiply.test.js',
     critique: 'The critique',
@@ -40,6 +40,9 @@ function fakeWorker(hangOn?: string): Plugin {
         if (stage === hangOn) return;
         ctx.emit('stage.completed', { stage, result: replies[stage] ?? 'ok', costUsd: 0.01, sessionId: `s-${stage}` }, e.jobId);
       });
+    },
+    stop() {
+      onStop?.();
     },
   });
 }
@@ -87,7 +90,7 @@ async function world(over: { enabled?: string[]; token?: boolean } = {}) {
 }
 
 /** Start `bulig serve` and hand back a way to stop it with a signal-like call. */
-function serve(w: Awaited<ReturnType<typeof world>>, plugins: Plugin[]) {
+function serve(w: Awaited<ReturnType<typeof world>>, plugins: Plugin[], extra: Partial<Io> = {}) {
   const out: string[] = [];
   const err: string[] = [];
   let stop: () => void = () => {};
@@ -101,6 +104,7 @@ function serve(w: Awaited<ReturnType<typeof world>>, plugins: Plugin[]) {
       return () => {};
     },
     servePlugins: plugins,
+    ...extra,
   };
   const done = runCli(['serve'], io);
   return { out, err, done, stop: () => stop() };
@@ -180,6 +184,69 @@ describe('bulig serve', () => {
     const store = new SqliteStore(w.dbPath);
     expect(await store.listJobs()).toHaveLength(1);
     await store.close();
+  });
+
+  it('stops the workers and exits non-zero when the executor lease is lost, so a supervisor restarts it', async () => {
+    const w = await world();
+    let stopped = 0;
+    // From the first renewal on, the store says the lease is no longer this kernel's.
+    let refuse = false;
+    const openStore = (dbPath: string) => {
+      const real = new SqliteStore(dbPath);
+      const wrapped = Object.create(real) as SqliteStore;
+      Object.assign(wrapped, {
+        transaction: real.transaction.bind(real),
+        close: real.close.bind(real),
+        abort: real.abort?.bind(real),
+        schemaVersion: real.schemaVersion.bind(real),
+        acquireLease: real.acquireLease.bind(real),
+        releaseLease: real.releaseLease.bind(real),
+        renewLease: (h: string, g: number, t: number) => (refuse ? Promise.resolve(false) : real.renewLease(h, g, t)),
+      });
+      return wrapped;
+    };
+    const s = serve(w, [createTelegramChannel(), fakeWorker(undefined, () => void stopped++), fakeGithub(), pipeline], { openStore, lease: { ttlMs: 1_000, heartbeatMs: 100 } });
+    await until(() => s.out.some((l) => l.includes('serving')), 'serve to start');
+    expect(stopped).toBe(0);
+    refuse = true;
+    // No Ctrl-C here: serve must end by itself.
+    expect(await s.done).toBe(1);
+    expect(stopped).toBe(1);
+    expect(s.err.filter((l) => /lost the executor lease/.test(l))).toHaveLength(1);
+    expect(s.out.some((l) => /stopping\. Unfinished jobs/.test(l))).toBe(false);
+    expect(existsSync(`${w.dbPath}.lock`)).toBe(false);
+  });
+
+  it('also exits non-zero when a task finds the lease gone before the heartbeat does', async () => {
+    const w = await world();
+    let stopped = 0;
+    // Every renewal says "renewed" but renews nothing, so the lease runs out and a rival takes it. Only a task can notice.
+    const openStore = (dbPath: string) => {
+      const real = new SqliteStore(dbPath);
+      const wrapped = Object.create(real) as SqliteStore;
+      Object.assign(wrapped, {
+        transaction: real.transaction.bind(real),
+        close: real.close.bind(real),
+        abort: real.abort?.bind(real),
+        schemaVersion: real.schemaVersion.bind(real),
+        acquireLease: real.acquireLease.bind(real),
+        releaseLease: real.releaseLease.bind(real),
+        renewLease: () => Promise.resolve(true),
+      });
+      return wrapped;
+    };
+    const s = serve(w, [createTelegramChannel(), fakeWorker(undefined, () => void stopped++), fakeGithub(), pipeline], { openStore, lease: { ttlMs: 600, heartbeatMs: 100 } });
+    await until(() => s.out.some((l) => l.includes('serving')), 'serve to start');
+    await new Promise((r) => setTimeout(r, 700));
+    const rival = new SqliteStore(w.dbPath);
+    try {
+      await rival.acquireLease('rival', 60_000);
+      expect(await s.done).toBe(1);
+    } finally {
+      await rival.close();
+    }
+    expect(stopped).toBe(1);
+    expect(s.err.filter((l) => /lost the executor lease/.test(l))).toHaveLength(1);
   });
 
   it('exits with a clear message when the token is not in the environment', async () => {

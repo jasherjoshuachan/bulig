@@ -395,6 +395,48 @@ describe('commit.requested', () => {
     expect(git(cwd, 'rev-list', '--count', 'main..HEAD')).toBe('1');
   });
 
+  it('makes one commit per stage attempt: a second request for the same attempt gets the first commit back, even with new changes on disk', async () => {
+    const h = await setup();
+    h.fire('worktree.requested', { repoPath: h.repo, branch: 'bulig/c-3' });
+    const { cwd } = (await h.waitFor('worktree.ready')).payload as { cwd: string };
+    writeFileSync(join(cwd, 'c.txt'), 'c\n');
+    h.fire('commit.requested', { cwd, message: 'build', scope: SCOPE_TXT, stageId: 'attempt-1' });
+    const first = (await h.waitFor('commit.done')).payload as { sha: string };
+    expect(git(cwd, 'log', '-1', '--format=%B')).toContain('Bulig-Stage: attempt-1');
+    h.seen.length = 0;
+    // The request comes again (a restart, a repeated event) and the tree has changed in between.
+    writeFileSync(join(cwd, 'later.txt'), 'later\n');
+    h.fire('commit.requested', { cwd, message: 'build', scope: SCOPE_TXT, stageId: 'attempt-1' });
+    const second = (await h.waitFor('commit.done')).payload as { sha: string };
+    expect(second.sha).toBe(first.sha);
+    expect(git(cwd, 'rev-list', '--count', 'main..HEAD')).toBe('1');
+    expect(git(cwd, 'status', '--porcelain')).toContain('later.txt'); // left alone, not swept into a second commit
+  });
+
+  it('returns the attempt\'s own commit, not the newest one, when a later attempt has committed since', async () => {
+    const h = await setup();
+    h.fire('worktree.requested', { repoPath: h.repo, branch: 'bulig/c-4' });
+    const { cwd } = (await h.waitFor('worktree.ready')).payload as { cwd: string };
+    writeFileSync(join(cwd, 'one.txt'), '1\n');
+    h.fire('commit.requested', { cwd, message: 'build', scope: SCOPE_TXT, stageId: 'attempt-1' });
+    const one = (await h.waitFor('commit.done')).payload as { sha: string };
+    h.seen.length = 0;
+    writeFileSync(join(cwd, 'two.txt'), '2\n');
+    h.fire('commit.requested', { cwd, message: 'test', scope: SCOPE_TXT, stageId: 'attempt-2' });
+    const two = (await h.waitFor('commit.done')).payload as { sha: string };
+    expect(two.sha).not.toBe(one.sha);
+    h.seen.length = 0;
+    h.fire('commit.requested', { cwd, message: 'build', scope: SCOPE_TXT, stageId: 'attempt-1' });
+    expect(((await h.waitFor('commit.done')).payload as { sha: string }).sha).toBe(one.sha);
+    expect(git(cwd, 'rev-list', '--count', 'main..HEAD')).toBe('2');
+  });
+
+  it('refuses a stage id that is not a plain id', async () => {
+    const h = await setup();
+    h.fire('commit.requested', { cwd: h.repo, message: 'x', scope: SCOPE_TXT, stageId: 'a\n\nSigned-off-by: someone' });
+    expect(((await h.waitFor('commit.failed')).payload as { error: string }).error).toMatch(/stageId/);
+  });
+
   it('emits commit.failed when the directory is not a repo', async () => {
     const h = await setup();
     h.fire('commit.requested', { cwd: h.root, message: 'x', scope: SCOPE_TXT });

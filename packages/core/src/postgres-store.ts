@@ -4,7 +4,17 @@ import { parse as parseConnectionString } from 'pg-connection-string';
 import type { BuligEvent, Job, JobStatus, Stage, StageStatus } from '@bulig/plugin-sdk';
 import { storableJson } from '@bulig/text';
 import { eventSeq, text } from './store-text.ts';
-import { StoreFatalError, type Store, type StoreTx } from './store.ts';
+import {
+  DuplicateEventError,
+  LEASE_LOST_OUTPUT,
+  LeaseHeldError,
+  LeaseLostError,
+  StageClaimedError,
+  StageNotClaimedError,
+  StoreFatalError,
+  type Store,
+  type StoreTx,
+} from './store.ts';
 
 // Each entry upgrades the schema by one version. Never edit an old entry once it has shipped; add a new one.
 // They mirror the SQLite migrations one for one, so both adapters report the same schema version.
@@ -53,11 +63,37 @@ const MIGRATIONS: string[] = [
     value JSONB NOT NULL,
     PRIMARY KEY (plugin, key)
   );`,
+  // 4: the executor lease (ADR 0010). One row. The unique index on (id, generation) makes generation a "key" column to
+  // Postgres: a transaction that reads the row with FOR KEY SHARE (assertLease) then blocks a takeover, which changes the
+  // generation, but not a renewal, which changes only expires_at. That is how a takeover waits for the old holder's open
+  // transactions while the old holder's heartbeat is never made to wait.
+  `CREATE TABLE executor_lease (
+    id BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (id),
+    holder TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL
+  );
+  CREATE UNIQUE INDEX executor_lease_key ON executor_lease (id, generation);`,
+  // 5: one claim per stage of a job (ADR 0010). A claim that is not released is live, and only one may be live.
+  `CREATE TABLE claims (
+    job_id TEXT NOT NULL REFERENCES jobs(id),
+    stage TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    attempt INTEGER NOT NULL,
+    claimed_at TIMESTAMPTZ NOT NULL,
+    released_at TIMESTAMPTZ,
+    release_reason TEXT,
+    PRIMARY KEY (job_id, stage, attempt)
+  );
+  CREATE UNIQUE INDEX claims_live ON claims (job_id, stage) WHERE released_at IS NULL;`,
+  // 6: an event id is a key. An id written twice is refused. The kernel does not pass fixed ids yet (bus.record makes a fresh one), so this index is a guard for later; handler idempotency today comes from the stageId guards.
+  `CREATE UNIQUE INDEX events_id ON events (id);`,
 ];
 
 /** Held for the length of a migration run, so two processes opening a fresh database cannot both create the tables. */
 const MIGRATION_LOCK = 0x42554c47; // "BULG"
 
+interface ClaimRow { job_id: string; stage: string; generation: number; attempt: number; claimed_at: Date; released_at: Date | null; release_reason: string | null }
 interface JobRow { id: string; repo: string; title: string; body: string; status: JobStatus; created_at: Date; updated_at: Date }
 interface StageRow {
   id: string; job_id: string; name: string; status: StageStatus; attempt: number;
@@ -147,6 +183,8 @@ export interface PostgresStoreOptions {
  * One dedicated connection (a pg.Client, not a pool) serves every call. The kernel queue runs one task at a time, and a
  * transaction has to stay on a single connection. The pg client queues queries in the order they were made, which is
  * what the port promises for calls made one after another.
+ * The executor lease (ADR 0010) is the one exception: it has a second connection of its own (see `leaseClient`), so a heartbeat is
+ * never queued behind a slow transaction.
  *
  * The connection opens on the first call (or in `PostgresStore.open`, which waits for it). A writer also brings the schema up
  * to date then; a reader never creates or upgrades it and refuses a missing or older schema (SchemaNotReadyError). The
@@ -171,6 +209,17 @@ export class PostgresStore implements Store {
   private tail: Promise<unknown> = Promise.resolve();
 
   private readonly writer: boolean;
+
+  /**
+   * A second connection, used only for the executor lease (ADR 0010): acquire, renew and release. It takes no advisory lock and runs
+   * no migration. The main connection is busy for as long as a transaction is open, and a heartbeat that waited behind a slow
+   * task would let a healthy kernel lose its lease. It opens on first use, after the main connection has the schema ready.
+   */
+  private leaseClient: pg.Client | undefined;
+  private leaseStarting: Promise<pg.Client> | undefined;
+  /** Set while a transaction is open: the generation its writes are fenced with. Undefined means unfenced, generation 0. */
+  private fence: { holder: string; generation: number } | undefined;
+  private inTx = false;
 
   constructor(private readonly connectionString: string, options: PostgresStoreOptions = {}) {
     if (!connectionString) throw new Error('PostgresStore needs a connection string');
@@ -267,8 +316,10 @@ export class PostgresStore implements Store {
   abort(): void {
     if (this.ended) return;
     this.ended = 'aborted';
-    const stream = (this.client as unknown as { connection?: { stream?: { destroy(): void } } } | undefined)?.connection?.stream;
-    stream?.destroy();
+    for (const c of [this.client, this.leaseClient]) {
+      const stream = (c as unknown as { connection?: { stream?: { destroy(): void } } } | undefined)?.connection?.stream;
+      stream?.destroy();
+    }
   }
 
   async close(): Promise<void> {
@@ -278,6 +329,8 @@ export class PostgresStore implements Store {
     // Give the writer lock back before hanging up, so a kernel that starts straight afterwards is not refused while the
     // server is still tidying up the old session.
     if (this.writer) await client?.query('SELECT pg_advisory_unlock($1::bigint)', [WRITER_LOCK]).catch(() => {});
+    const lease = this.leaseClient ?? (await this.leaseStarting?.catch(() => undefined));
+    await lease?.end().catch(() => {});
     await client?.end();
   }
 
@@ -291,13 +344,19 @@ export class PostgresStore implements Store {
   async transaction<T>(fn: (tx: StoreTx) => Promise<T>): Promise<T> {
     const client = await this.connected();
     await this.send(client, 'BEGIN');
+    this.inTx = true;
+    this.fence = undefined;
     let result: T;
     try {
       result = await fn(this);
     } catch (err) {
+      this.inTx = false;
+      this.fence = undefined;
       await this.rollback(client, err);
       throw err;
     }
+    this.inTx = false;
+    this.fence = undefined;
     if (this.ended) throw new Error(`PostgresStore was ${this.ended} before the commit, so nothing was committed`);
     let committed: pg.QueryResult;
     try {
@@ -322,6 +381,102 @@ export class PostgresStore implements Store {
       const why = original instanceof Error ? original.message : String(original);
       throw new StoreFatalError(`ROLLBACK failed after "${why}" (${during}), so a transaction may be left open`, { cause: rollbackErr });
     }
+  }
+
+  // ----- executor lease (ADR 0010) -----
+
+  /** The lease connection, opened the first time it is needed. Only after the main connection has made sure the schema is there. */
+  private leased(): Promise<pg.Client> {
+    if (this.ended) return Promise.reject(new Error(`PostgresStore was ${this.ended}, so no call can follow`));
+    this.leaseStarting ??= (async () => {
+      await this.connected();
+      const client = new pg.Client({ connectionString: this.connectionString, application_name: 'bulig-lease', connectionTimeoutMillis: 10_000, keepAlive: true });
+      client.on('error', () => {});
+      try {
+        await client.connect();
+      } catch (err) {
+        client.end().catch(() => {});
+        throw err;
+      }
+      if (this.ended) {
+        client.end().catch(() => {});
+        throw new Error(`PostgresStore was ${this.ended} while it was connecting`);
+      }
+      this.leaseClient = client;
+      return client;
+    })().catch((err: unknown) => {
+      this.leaseStarting = undefined;
+      throw err;
+    });
+    return this.leaseStarting;
+  }
+
+  async acquireLease(holder: string, ttlMs: number): Promise<{ generation: number }> {
+    holder = text('lease holder', holder);
+    ttl(ttlMs);
+    const client = await this.leased();
+    // Look first, without a lock: a live lease of someone else is refused without touching the row. The upsert below would
+    // lock it even when its condition fails, and so wait behind a transaction that is only reading the lease.
+    const seen = await client.query<{ holder: string; expires_at: Date; live: boolean }>('SELECT holder, expires_at, expires_at > clock_timestamp() AS live FROM executor_lease WHERE id');
+    const now = seen.rows[0];
+    if (now && now.live && now.holder !== holder) throw new LeaseHeldError(now.holder, now.expires_at);
+    // A takeover changes the generation, so it waits for every transaction the old holder has open (they hold FOR KEY SHARE).
+    // The wait is bounded, so a kernel that cannot get in says so instead of hanging.
+    await client.query('BEGIN');
+    try {
+      await client.query("SET LOCAL lock_timeout = '10s'");
+      const res = await client.query<{ generation: number }>(
+        `INSERT INTO executor_lease (id, holder, generation, expires_at) VALUES (TRUE, $1, 1, clock_timestamp() + $2::double precision * interval '1 millisecond')
+         ON CONFLICT (id) DO UPDATE SET holder = EXCLUDED.holder, generation = executor_lease.generation + 1, expires_at = EXCLUDED.expires_at
+         WHERE executor_lease.holder = EXCLUDED.holder OR executor_lease.expires_at <= clock_timestamp()
+         RETURNING generation`,
+        [holder, ttlMs],
+      );
+      if (res.rows.length === 0) {
+        const held = (await client.query<{ holder: string; expires_at: Date }>('SELECT holder, expires_at FROM executor_lease WHERE id')).rows[0]!;
+        await client.query('ROLLBACK');
+        throw new LeaseHeldError(held.holder, held.expires_at);
+      }
+      await client.query('COMMIT');
+      return { generation: res.rows[0]!.generation };
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw err;
+    }
+  }
+
+  async renewLease(holder: string, generation: number, ttlMs: number): Promise<boolean> {
+    holder = text('lease holder', holder);
+    ttl(ttlMs);
+    const client = await this.leased();
+    // Only expires_at changes, so this never waits for a transaction that has asserted the lease.
+    const res = await client.query(
+      `UPDATE executor_lease SET expires_at = clock_timestamp() + $3::double precision * interval '1 millisecond'
+       WHERE id AND holder = $1 AND generation = $2 AND expires_at > clock_timestamp()`,
+      [holder, generation, ttlMs],
+    );
+    return res.rowCount === 1;
+  }
+
+  async releaseLease(holder: string, generation: number): Promise<void> {
+    holder = text('lease holder', holder);
+    const client = await this.leased();
+    await client.query('UPDATE executor_lease SET expires_at = to_timestamp(0) WHERE id AND holder = $1 AND generation = $2', [holder, generation]);
+  }
+
+  async assertLease(holder: string, generation: number): Promise<void> {
+    holder = text('lease holder', holder);
+    // FOR KEY SHARE: a takeover (new generation) now waits until this transaction ends, and a renewal does not. See migration 4.
+    const res = await this.query<{ holder: string; generation: number; live: boolean }>(
+      'SELECT holder, generation, expires_at > clock_timestamp() AS live FROM executor_lease WHERE id FOR KEY SHARE',
+    );
+    const row = res.rows[0];
+    if (!row) throw new LeaseLostError(holder, generation, 'no lease has been taken on this record');
+    if (row.holder !== holder || row.generation !== generation) {
+      throw new LeaseLostError(holder, generation, `the lease is now "${row.holder}" at generation ${row.generation}`);
+    }
+    if (!row.live) throw new LeaseLostError(holder, generation, 'the lease ran out');
+    if (this.inTx) this.fence = { holder, generation };
   }
 
   // ----- jobs -----
@@ -361,17 +516,42 @@ export class PostgresStore implements Store {
 
   async startStage(jobId: string, name: string): Promise<Stage> {
     jobId = text('job id', jobId); name = text('stage name', name);
-    // One statement, so the job check, the attempt count and the insert cannot be split by another call, and a missing job
-    // is an empty result rather than a foreign key error that would abandon the transaction.
+    const generation = this.fence?.generation ?? 0;
+    const job = await this.query('SELECT 1 FROM jobs WHERE id = $1', [jobId]);
+    if (job.rows.length === 0) throw new Error(`No such job: ${jobId}`);
+    const now = new Date().toISOString();
+    // SKIP LOCKED: a claim row another transaction is changing right now is not waited for. It is not ours to take over; the
+    // insert below then meets the partial unique index and is refused if that claim turns out to be live.
+    const live = (
+      await this.query<ClaimRow>('SELECT * FROM claims WHERE job_id = $1 AND stage = $2 AND released_at IS NULL FOR UPDATE SKIP LOCKED', [jobId, name])
+    ).rows[0];
+    if (live) {
+      // A claim of this generation or a newer one is somebody's work in progress. An older one belongs to a kernel that lost its lease.
+      if (live.generation >= generation) throw new StageClaimedError(jobId, name, live.attempt, live.generation);
+      await this.query("UPDATE claims SET released_at = $4, release_reason = 'lease-lost' WHERE job_id = $1 AND stage = $2 AND attempt = $3", [jobId, name, live.attempt, now]);
+      await this.query("UPDATE stages SET status = 'failed', ended_at = $4, output = $5::jsonb WHERE job_id = $1 AND name = $2 AND attempt = $3 AND status = 'running'", [
+        jobId,
+        name,
+        live.attempt,
+        now,
+        JSON.stringify(LEASE_LOST_OUTPUT),
+      ]);
+    }
     const res = await this.query<StageRow>(
       `INSERT INTO stages (id, job_id, name, status, attempt, started_at)
        SELECT $1::text, $2::text, $3::text, 'running', (SELECT COUNT(*) + 1 FROM stages WHERE job_id = $2::text AND name = $3::text), $4::timestamptz
-       WHERE EXISTS (SELECT 1 FROM jobs WHERE id = $2::text)
        RETURNING ${STAGE_COLS}`,
-      [randomUUID(), jobId, name, new Date().toISOString()],
+      [randomUUID(), jobId, name, now],
     );
-    if (res.rows.length === 0) throw new Error(`No such job: ${jobId}`);
-    return toStage(res.rows[0]!);
+    const stage = toStage(res.rows[0]!);
+    try {
+      await this.query('INSERT INTO claims (job_id, stage, generation, attempt, claimed_at) VALUES ($1, $2, $3, $4, $5)', [jobId, name, generation, stage.attempt, now]);
+    } catch (err) {
+      // Lost a race with another writer: its claim is live. The server has abandoned this transaction, which the caller's rollback finishes.
+      if ((err as { code?: string }).code === '23505') throw new StageClaimedError(jobId, name, stage.attempt, generation);
+      throw err;
+    }
+    return stage;
   }
 
   async getStage(id: string): Promise<Stage | undefined> {
@@ -390,11 +570,18 @@ export class PostgresStore implements Store {
     id = text('stage id', id); status = text('status', status);
     const json = output === undefined ? null : storableJson(output);
     if (json === undefined) throw new Error(`Output of stage ${id} is not JSON`);
-    const res = await this.query<StageRow>(
-      `UPDATE stages SET status = $2, ended_at = $3, output = $4::jsonb WHERE id = $1 RETURNING ${STAGE_COLS}`,
-      [id, status, new Date().toISOString(), json],
-    );
-    if (res.rows.length === 0) throw new Error(`No such stage: ${id}`);
+    const found = await this.query<StageRow>(`SELECT ${STAGE_COLS} FROM stages WHERE id = $1`, [id]);
+    if (found.rows.length === 0) throw new Error(`No such stage: ${id}`);
+    const stage = toStage(found.rows[0]!);
+    const now = new Date().toISOString();
+    // FOR UPDATE: waits if another transaction is taking this claim over, then sees the result.
+    const claim = (await this.query<ClaimRow>('SELECT * FROM claims WHERE job_id = $1 AND stage = $2 AND attempt = $3 FOR UPDATE', [stage.jobId, stage.name, stage.attempt])).rows[0];
+    if (claim) {
+      // The attempt number is the fence: an attempt whose claim was taken over or already released cannot write its end.
+      if (claim.released_at !== null) throw new StageNotClaimedError(id, `attempt ${stage.attempt} no longer holds the claim (released: ${claim.release_reason})`);
+      await this.query("UPDATE claims SET released_at = $4, release_reason = 'finished' WHERE job_id = $1 AND stage = $2 AND attempt = $3", [stage.jobId, stage.name, stage.attempt, now]);
+    }
+    const res = await this.query<StageRow>(`UPDATE stages SET status = $2, ended_at = $3, output = $4::jsonb WHERE id = $1 RETURNING ${STAGE_COLS}`, [id, status, now, json]);
     return toStage(res.rows[0]!);
   }
 
@@ -418,14 +605,17 @@ export class PostgresStore implements Store {
 
   // ----- events -----
 
-  async appendEvent(e: { type: string; jobId?: string; source: string; payload: unknown }): Promise<BuligEvent> {
-    e = { ...e, type: text('event type', e.type), source: text('event source', e.source), ...(e.jobId !== undefined && { jobId: text('job id', e.jobId) }) };
+  async appendEvent(e: { id?: string; type: string; jobId?: string; source: string; payload: unknown }): Promise<BuligEvent> {
+    e = { ...e, type: text('event type', e.type), source: text('event source', e.source), ...(e.jobId !== undefined && { jobId: text('job id', e.jobId) }), ...(e.id !== undefined && { id: text('event id', e.id) }) };
     const json = e.payload === undefined ? null : storableJson(e.payload);
     if (json === undefined) throw new Error(`Payload of event "${e.type}" is not JSON`);
+    const id = e.id ?? randomUUID();
+    // ON CONFLICT DO NOTHING, not an error: a unique violation would abandon the whole transaction.
     const res = await this.query<EventRow>(
-      `INSERT INTO events (id, type, job_id, source, payload, at) VALUES ($1, $2, $3, $4, $5::jsonb, $6) RETURNING ${EVENT_COLS}`,
-      [randomUUID(), e.type, e.jobId ?? null, e.source, json, new Date().toISOString()],
+      `INSERT INTO events (id, type, job_id, source, payload, at) VALUES ($1, $2, $3, $4, $5::jsonb, $6) ON CONFLICT (id) DO NOTHING RETURNING ${EVENT_COLS}`,
+      [id, e.type, e.jobId ?? null, e.source, json, new Date().toISOString()],
     );
+    if (res.rows.length === 0) throw new DuplicateEventError(id);
     return toEvent(res.rows[0]!);
   }
 
@@ -440,6 +630,11 @@ export class PostgresStore implements Store {
     const res = await this.query<EventRow>(`SELECT ${EVENT_COLS} FROM events WHERE job_id = $1 ORDER BY seq`, [jobId]);
     return res.rows.map(toEvent);
   }
+}
+
+/** A lease that lasts a positive whole number of milliseconds. */
+function ttl(ms: number): void {
+  if (!Number.isSafeInteger(ms) || ms <= 0) throw new Error('A lease lasts a positive whole number of milliseconds');
 }
 
 /**

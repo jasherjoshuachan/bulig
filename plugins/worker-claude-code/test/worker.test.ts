@@ -883,6 +883,61 @@ describe('a job that ends while its stage is still starting (slow store)', () =>
   });
 });
 
+describe('a stage request names its attempt (ADR 0010)', () => {
+  afterEach(() => void delete process.env.FAKE_CLAUDE_LOG); // the child reads it when it starts, so it stays set for the test
+  const runsIn = (log: string) => (existsSync(log) ? readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).length : 0);
+  async function rig() {
+    const log = join(tmp(), 'runs.log');
+    process.env.FAKE_CLAUDE_LOG = log;
+    const h = await setup({ passEnv: ['FAKE_CLAUDE_LOG'] }, undefined, createWorker());
+    const job = await h.k.jobs.create({ repo: '/r', title: 'x' });
+    return { ...h, job, log };
+  }
+
+  it('runs Claude once for the attempt that is running', async () => {
+    const h = await rig();
+    const stage = await h.k.jobs.startStage(h.job.id, 'build');
+    h.fire(req({ stage: 'build', mode: 'edit', stageId: stage.id }), h.job.id);
+    await waitFor(() => h.seen.length === 1);
+    expect(h.seen[0]!.type).toBe('stage.completed');
+    expect(runsIn(h.log)).toBe(1);
+  });
+
+  it('does not run Claude for an attempt that has already finished', async () => {
+    const h = await rig();
+    const stage = await h.k.jobs.startStage(h.job.id, 'build');
+    await h.k.jobs.finishStage(stage.id, 'passed');
+    h.fire(req({ stage: 'build', mode: 'edit', stageId: stage.id }), h.job.id);
+    await h.k.bus.idle();
+    await new Promise((r) => setTimeout(r, 150));
+    expect(runsIn(h.log)).toBe(0);
+    expect(h.seen).toEqual([]); // and it says nothing, so it cannot fail the attempt that replaced it
+  });
+
+  it('does not run Claude for an attempt that a newer one has replaced', async () => {
+    const h = await rig();
+    const first = await h.k.jobs.startStage(h.job.id, 'build');
+    await h.k.jobs.finishStage(first.id, 'failed');
+    const second = await h.k.jobs.startStage(h.job.id, 'build');
+    h.fire(req({ stage: 'build', mode: 'edit', stageId: first.id }), h.job.id);
+    await h.k.bus.idle();
+    await new Promise((r) => setTimeout(r, 150));
+    expect(runsIn(h.log)).toBe(0);
+    expect(h.seen).toEqual([]);
+    h.fire(req({ stage: 'build', mode: 'edit', stageId: second.id }), h.job.id);
+    await waitFor(() => h.seen.length === 1);
+    expect(runsIn(h.log)).toBe(1);
+  });
+
+  it('does not run Claude for a stage id that does not exist', async () => {
+    const h = await rig();
+    h.fire(req({ stage: 'build', mode: 'edit', stageId: 'no-such-stage' }), h.job.id);
+    await h.k.bus.idle();
+    await new Promise((r) => setTimeout(r, 150));
+    expect(runsIn(h.log)).toBe(0);
+  });
+});
+
 function realpathOf(p: string): string {
   // macOS tmp dirs resolve through /private
   return existsSync(`/private${p}`) ? `/private${p}` : p;

@@ -33,6 +33,8 @@ export type Script = Record<string, Reply | Reply[]>;
 
 export interface Sent {
   stage: string;
+  /** The stage attempt the request is for (ADR 0010). */
+  stageId?: string;
   prompt: string;
   model: string;
   mode: string;

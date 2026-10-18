@@ -166,8 +166,8 @@ for (const adapter of ADAPTERS) {
       it('times out with a clear error, and the next call goes through once the late one is over', async () => {
         const { plugin, box } = probe();
         let late = 0;
-        const store = slowStore(await adapter.make(), { before: (m) => (m === 'getJob' && late++ === 0 ? 200 : 0) });
-        const k = kernelWith({ plugins: [plugin], store, storeTimeoutMs: 60 });
+        const store = slowStore(await adapter.make(), { before: (m) => (m === 'getJob' && late++ === 0 ? 1000 : 0) });
+        const k = kernelWith({ plugins: [plugin], store, storeTimeoutMs: 300 });
         await k.start();
         const job = await k.jobs.create({ repo: '/r', title: 't' });
         late = 0;
@@ -178,10 +178,10 @@ for (const adapter of ADAPTERS) {
         const [a, b] = await Promise.allSettled([stuck, behind]);
         expect(a.status).toBe('rejected');
         expect((a as PromiseRejectedResult).reason).toBeInstanceOf(StoreTimeoutError);
-        expect((a as PromiseRejectedResult).reason.message).toMatch(/did not finish within 60 ms/);
+        expect((a as PromiseRejectedResult).reason.message).toMatch(/did not finish within 300 ms/);
         expect(b.status).toBe('fulfilled');
         // The caller heard at the deadline. The next task started only when the late call was over.
-        expect(Date.now() - t0).toBeGreaterThanOrEqual(190);
+        expect(Date.now() - t0).toBeGreaterThanOrEqual(990);
         expect((await box.ctx!.jobs.get(job.id))?.id).toBe(job.id);
       });
 
@@ -370,7 +370,7 @@ for (const adapter of ADAPTERS) {
         });
         const closing = queue.close();
         await expect(queue.run('late', (tx) => tx.schemaVersion())).rejects.toBeInstanceOf(StoreClosedError);
-        expect(await first).toBe(3);
+        expect(await first).toBe(6);
         await closing;
       });
     });

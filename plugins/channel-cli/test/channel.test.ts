@@ -98,9 +98,10 @@ describe('channel-cli plugin', () => {
     const { k, channel } = boot(['channel.send:terminal', 'approval.grant'], createCliChannel({ write: (l) => lines.push(l) }), [src]);
     await k.start();
     const job = await channel.submit({ repo: '/r', title: 'Add multiply', body: 'details' });
-    expect(k.jobs.get(job.id)!.body).toBe('details');
-    k.jobs.setStatus(job.id, 'running');
+    expect((await k.jobs.get(job.id))!.body).toBe('details');
+    (await k.jobs.setStatus(job.id, 'running'));
     (src as unknown as { emit: (t: string, p: unknown, j: string) => void }).emit('stage.requested', { stage: 'plan', model: 'opus', mode: 'readonly' }, job.id);
+    await k.bus.idle();
     expect(lines).toEqual([`[${job.id.slice(0, 8)}] job running`, `[${job.id.slice(0, 8)}] plan: started (opus, readonly)`]);
   });
 
@@ -118,16 +119,16 @@ describe('channel-cli plugin', () => {
       });
     const first = make(createCliChannel({ write: () => {} }));
     await first.start();
-    const a = first.jobs.create({ repo: '/r', title: 'a' });
-    const b = first.jobs.create({ repo: '/r', title: 'b' });
+    const a = (await first.jobs.create({ repo: '/r', title: 'a' }));
+    const b = (await first.jobs.create({ repo: '/r', title: 'b' }));
     await first.stop();
 
     const lines: string[] = [];
     const second = make(createCliChannel({ write: (l) => lines.push(l), onlyJob: b.id }));
     kernels.push(second);
     await second.start();
-    second.jobs.setStatus(a.id, 'running');
-    second.jobs.setStatus(b.id, 'running');
+    (await second.jobs.setStatus(a.id, 'running'));
+    (await second.jobs.setStatus(b.id, 'running'));
     expect(lines).toEqual([`[${b.id.slice(0, 8)}] job running`]);
   });
 
@@ -137,7 +138,7 @@ describe('channel-cli plugin', () => {
     const job = await channel.submit({ repo: '/r', title: 't' });
     channel.grant(job.id, 'plan');
     channel.deny(job.id);
-    const mine = k.history(job.id).filter((e) => e.source === 'channel-cli');
+    const mine = (await k.history(job.id)).filter((e) => e.source === 'channel-cli');
     expect(mine.map((e) => e.type)).toEqual(['approval.granted', 'approval.denied']);
     expect(mine[0]!.payload).toEqual({ jobId: job.id, kind: 'plan' });
   });

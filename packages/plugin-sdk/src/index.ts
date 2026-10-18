@@ -7,7 +7,7 @@ import { z } from 'zod';
 export const SDK_VERSION = '1';
 
 /** The full release of the contract. v1 candidate until the freeze is tagged. */
-export const SDK_RELEASE = '1.0.0-rc.4';
+export const SDK_RELEASE = '1.0.0-rc.5';
 
 /**
  * Majors the kernel loads. "0" is the pre-freeze contract: it loads unchanged, with a deprecation warning, and is
@@ -189,6 +189,12 @@ export interface PluginContext {
   on(pattern: string, handler: EventHandler): void;
   /** Publish. Throws UndeclaredEventError if the type is not in manifest.emits. */
   emit(type: string, payload?: unknown, jobId?: string): void;
+  /**
+   * Publish, and wait until the event is committed to the log and handed to the subscribers. Rejects if it was not
+   * written (the store timed out, failed, or was given up on). Throws at once, as `emit` does, for an undeclared event
+   * or a denied capability. Use it when a lost event would leave work stuck, and always await it.
+   */
+  emitCommitted(type: string, payload?: unknown, jobId?: string): Promise<void>;
   can(capability: string): boolean;
   /** Throws CapabilityDeniedError unless declared in needs AND granted in config. */
   require(capability: string): void;

@@ -140,7 +140,7 @@ export default definePlugin({
       if (typeof branch !== 'string' || !branch) return;
       cleanupAsked.add(jobId);
       for (const s of stages) if (s.status === 'running') await ctx.jobs.finishStage(s.id, 'failed', { cancelled: true });
-      ctx.emit('worktree.cleanup.requested', { repoPath: job.repo, branch }, jobId);
+      await announce('worktree.cleanup.requested', { repoPath: job.repo, branch }, jobId);
     }
 
     /** Close a stage, then see whether that was the last thing holding up a cleanup. */
@@ -149,11 +149,42 @@ export default definePlugin({
       await cleanupIfIdle(s.jobId);
     }
 
+    /**
+     * Write an event and wait until it is committed. A state change is saved first and the event that tells someone to
+     * act on it second; if the second write is lost, nobody is told, and the job would wait for ever. So a lost event
+     * is an error here, and the handler's guard turns it into a failed job with this reason. If failing the job cannot be
+     * written either, the job stays as it is until the next start, where resume handles a running job. A job that is
+     * waiting for an approval nobody was asked for is not picked up again: re-asking is left out until an approval is
+     * bound to the exact stage it was asked for (an old card must not approve a later question).
+     */
+    async function announce(type: string, payload: unknown, jobId: string): Promise<void> {
+      try {
+        await ctx.emitCommitted(type, payload, jobId);
+      } catch (err) {
+        throw new Error(`could not announce ${type}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+
+    /** `announce` for the event that follows startStage: if it is lost, close the stage that was just opened, so a job that fails because of it can be cleaned up. */
+    async function announceStage(stage: Stage, type: string, payload: unknown, jobId: string): Promise<void> {
+      try {
+        await announce(type, payload, jobId);
+      } catch (err) {
+        await finish(stage, 'failed', { error: err instanceof Error ? err.message : String(err) }).catch(() => {});
+        throw err;
+      }
+    }
+
     async function fail(jobId: string, reason: string, extra: Record<string, unknown> = {}): Promise<void> {
       const job = await ctx.jobs.get(jobId);
       if (!job || job.status === 'failed' || job.status === 'done' || job.status === 'cancelled') return;
       await ctx.jobs.setStatus(jobId, 'failed');
-      ctx.emit('pipeline.failed', { reason, ...extra }, jobId);
+      try {
+        await ctx.emitCommitted('pipeline.failed', { reason, ...extra }, jobId);
+      } catch (err) {
+        // The job is failed and that is on record. Only the announcement was lost, and there is no one left to tell.
+        ctx.log.error(`pipeline-dev: job ${jobId} failed ("${reason}") but pipeline.failed could not be written: ${err instanceof Error ? err.message : String(err)}`);
+      }
     }
 
     /** The scope the person approved with the plan. Undefined if the plan on record has none. */
@@ -225,9 +256,9 @@ export default definePlugin({
         case 'fail':
           return await fail(job.id, action.reason, action.outOfScope ? { outOfScope: action.outOfScope } : {});
         case 'worktree': {
-          await ctx.jobs.startStage(job.id, 'worktree');
+          const opened = await ctx.jobs.startStage(job.id, 'worktree');
           const branch = `${prefix}/${slug(job.title)}-${job.id.slice(0, 8)}`;
-          ctx.emit('worktree.requested', { repoPath: job.repo, branch }, job.id);
+          await announceStage(opened, 'worktree.requested', { repoPath: job.repo, branch }, job.id);
           return;
         }
         case 'stage': {
@@ -246,8 +277,9 @@ export default definePlugin({
             sha: String(outputOf(lastOf(stages, 'docs') ?? ({ output: null } as Stage)).sha ?? ''),
             feedback: action.feedback ? `\nThis is a retry. Fix these problems first:\n\n${clip(action.feedback)}\n` : '',
           });
-          await ctx.jobs.startStage(job.id, name);
-          ctx.emit(
+          const opened = await ctx.jobs.startStage(job.id, name);
+          await announceStage(
+            opened,
             'stage.requested',
             {
               stage: name,
@@ -266,11 +298,11 @@ export default definePlugin({
           await ctx.jobs.setStatus(job.id, 'awaiting_approval');
           if (action.which === 'plan') {
             const summary = withEvidence(evidenceBlock(stages, ['plan', 'critique']), `PLAN\n${textOf(stages, 'plan')}\n\nCRITIQUE\n${textOf(stages, 'critique')}`);
-            ctx.emit('approval.requested', { jobId: job.id, kind: 'plan', summary: clip(summary, 4000), scope: scopeOf(stages) ?? [] }, job.id);
+            await announce('approval.requested', { jobId: job.id, kind: 'plan', summary: clip(summary, 4000), scope: scopeOf(stages) ?? [] }, job.id);
           } else {
             const pr = outputOf(lastOf(stages, 'pr')!);
             const review = textOf(stages, 'review');
-            ctx.emit(
+            await announce(
               'approval.requested',
               {
                 jobId: job.id,
@@ -290,7 +322,7 @@ export default definePlugin({
         case 'pr': {
           const wt = outputOf(lastOf(stages, 'worktree')!);
           const reviewed = outputOf(lastOf(stages, 'docs')!);
-          await ctx.jobs.startStage(job.id, 'pr');
+          const opened = await ctx.jobs.startStage(job.id, 'pr');
           const warned = [...new Set(stages.flatMap((st) => outputOf(st).scopeWarning ?? []))];
           const body = [
             job.body ? `## Task\n\n${job.body}` : `## Task\n\n${job.title}`,
@@ -304,14 +336,14 @@ export default definePlugin({
             `Opened by Bulig, job ${job.id}.`,
           ].join('\n\n');
           // expectSha is the commit the reviewer saw. The github plugin opens the PR only if HEAD is exactly that.
-          ctx.emit('pr.requested', { cwd: String(wt.cwd), branch: String(wt.branch), title: job.title, body, expectSha: String(reviewed.sha) }, job.id);
+          await announceStage(opened, 'pr.requested', { cwd: String(wt.cwd), branch: String(wt.branch), title: job.title, body, expectSha: String(reviewed.sha) }, job.id);
           return;
         }
         case 'merge': {
           const wt = outputOf(lastOf(stages, 'worktree')!);
           const pr = outputOf(lastOf(stages, 'pr')!);
-          await ctx.jobs.startStage(job.id, 'merge');
-          ctx.emit('merge.requested', { cwd: String(wt.cwd), branch: String(wt.branch), number: pr.number, headSha: pr.headSha }, job.id);
+          const opened = await ctx.jobs.startStage(job.id, 'merge');
+          await announceStage(opened, 'merge.requested', { cwd: String(wt.cwd), branch: String(wt.branch), number: pr.number, headSha: pr.headSha }, job.id);
           return;
         }
       }
@@ -347,8 +379,8 @@ export default definePlugin({
             // Throw away what the dead stage left on disk. Finished edit stages were committed, so this only costs the cut-off one.
             const wt = lastOf(await stagesOf(job.id), 'worktree');
             if (mayHaveHalfDoneEdits && wt?.status === 'passed' && outputOf(wt).cwd) {
-              await ctx.jobs.startStage(job.id, 'reset');
-              ctx.emit('worktree.reset.requested', { cwd: String(outputOf(wt).cwd) }, job.id);
+              const opened = await ctx.jobs.startStage(job.id, 'reset');
+              await announceStage(opened, 'worktree.reset.requested', { cwd: String(outputOf(wt).cwd) }, job.id);
               return;
             }
             await advance(job.id);
@@ -512,18 +544,25 @@ export default definePlugin({
           const wt = outputOf(lastOf(await stagesOf(e.jobId), 'worktree')!);
           committing.set(e.jobId, { stage: p.stage, status, out });
           const job = await ctx.jobs.get(e.jobId);
-          ctx.emit(
-            'commit.requested',
-            {
-              cwd: String(wt.cwd),
-              message: `${job?.title ?? 'work'} (${p.stage})`,
-              scope: scopeOf(await stagesOf(e.jobId)) ?? [],
-              scopeAllow,
-              scopeMode,
-              allowBroadScope: allowBroad,
-            },
-            e.jobId,
-          );
+          try {
+            await announce(
+              'commit.requested',
+              {
+                cwd: String(wt.cwd),
+                message: `${job?.title ?? 'work'} (${p.stage})`,
+                scope: scopeOf(await stagesOf(e.jobId)) ?? [],
+                scopeAllow,
+                scopeMode,
+                allowBroadScope: allowBroad,
+              },
+              e.jobId,
+            );
+          } catch (err) {
+            // Nothing will answer, so nothing will close this stage. Close it here, or the cleanup that waits for it never runs.
+            committing.delete(e.jobId);
+            await finish(s, 'failed', { error: err instanceof Error ? err.message : String(err) }).catch(() => {});
+            throw err;
+          }
           return;
         }
         await finish(s, status, out);

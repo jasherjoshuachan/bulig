@@ -4,6 +4,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeAll, describe, expect, it } from 'vitest';
+import { SqliteStore } from '@bulig/core';
+import { slowStore } from '../../core/test/slow-store.ts';
 import { acquireLock, loadConfig, runCli, type Io } from '../src/index.ts';
 
 const FAKE_CLAUDE = fileURLToPath(new URL('./fixtures/fake-claude-dev.mjs', import.meta.url));
@@ -168,6 +170,30 @@ describe('a whole job through the CLI', () => {
     expect(existsSync(join(w.repo, '.worktrees', id))).toBe(false);
     expect(git(w.repo, 'worktree', 'list').split('\n')).toHaveLength(1);
     expect(git(w.repo, 'branch', '--list', 'bulig/*')).toBe('');
+  });
+
+  it('with a slow store, approve and deny report where the job ended up after the pipeline acted on them', async () => {
+    const w = world();
+    const run = await w.run('run', '--repo', w.repo, '--title', 'Add multiply function', '--issue', 'Add src/multiply.js exporting multiply(a,b)');
+    const id = jobIdFrom(run.out);
+    const second = jobIdFrom((await w.run('run', '--repo', w.repo, '--title', 'Try it')).out);
+
+    // Every store call now takes a few ms each way, as a database server would make it. The job still says
+    // awaiting_approval for a while after the approval is given, because the pipeline has not acted on it yet.
+    w.io.openStore = (dbPath) => slowStore(new SqliteStore(dbPath), { before: 3, after: 3 });
+    const plan = await w.run('approve', id, 'plan');
+    expect(plan.err).toBe('');
+    for (const s of ['build: started', 'test: started', 'review: started', 'PR opened:', 'approval needed: merge']) expect(plan.out).toContain(s);
+    expect(plan.out).toContain('is awaiting approval');
+
+    const merge = await w.run('approve', id, 'merge');
+    expect(merge.out).toContain('PR merged');
+    expect(merge.out).toContain('is done');
+
+    const deny = await w.run('deny', second);
+    expect(deny.out).toContain('is cancelled');
+    delete w.io.openStore;
+    expect((await w.run('status', second)).out).toContain('status   cancelled');
   });
 
   it('approving the wrong kind, or a finished job, is refused before anything starts', async () => {

@@ -41,8 +41,8 @@ async function rig(config: Record<string, unknown> = {}) {
   });
   kernels.push(k);
   await k.start();
-  const own = k.jobs.create({ repo: '/r', title: 'this job' });
-  const other = k.jobs.create({ repo: '/r', title: 'follow-up work' });
+  const own = (await k.jobs.create({ repo: '/r', title: 'this job' }));
+  const other = (await k.jobs.create({ repo: '/r', title: 'follow-up work' }));
   const after = (type: string) => seen.filter((e) => e.type === type).map((e) => e.payload as Record<string, any>);
   return { k, own, other, say: async (stage: string, result: string, jobId = own.id, extra?: Record<string, unknown>) => {
       say(stage, result, jobId, extra);
@@ -87,9 +87,9 @@ describe('a promise with no live job id', () => {
 
   it('the job of the stage itself, a finished job and a cancelled job do not count', async () => {
     const r = await rig();
-    const done = r.k.jobs.create({ repo: '/r', title: 'old' });
-    r.k.jobs.setStatus(done.id, 'running');
-    r.k.jobs.setStatus(done.id, 'done');
+    const done = (await r.k.jobs.create({ repo: '/r', title: 'old' }));
+    (await r.k.jobs.setStatus(done.id, 'running'));
+    (await r.k.jobs.setStatus(done.id, 'done'));
     await r.say('build', `I'll follow up, see ${r.own.id}.`);
     await r.say('build', `I'll follow up, see ${done.id}.`);
     const out = r.after('stage.screened');

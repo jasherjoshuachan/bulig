@@ -98,12 +98,12 @@ describe('scope guard end to end: a job told "README only"', () => {
     });
     await r.k.start();
     await settle(r.k);
-    const job = r.k.jobs.create({ repo: r.repo, title: 'Update the README', body: 'README only' });
+    const job = (await r.k.jobs.create({ repo: r.repo, title: 'Update the README', body: 'README only' }));
     await settle(r.k);
     await waitUntil(() => r.human.requests.some((e) => (e.payload as { kind: string }).kind === 'plan'));
     r.human.grant(job.id, 'plan');
     await settle(r.k);
-    await waitUntil(() => r.k.jobs.get(job.id)!.status === 'awaiting_approval' && r.human.requests.some((e) => (e.payload as { kind: string }).kind === 'merge'));
+    await waitUntil(async () => (await r.k.jobs.get(job.id))!.status === 'awaiting_approval' && r.human.requests.some((e) => (e.payload as { kind: string }).kind === 'merge'));
 
     expect(r.seenStages).toEqual(['plan', 'critique', 'build', 'test', 'build', 'test', 'docs', 'review']);
     const branch = git(r.repo, 'branch', '--list', 'bulig/*').replace(/^[*+ ]+/, '');
@@ -124,16 +124,16 @@ describe('scope guard end to end: a job told "README only"', () => {
     });
     await r.k.start();
     await settle(r.k);
-    const job = r.k.jobs.create({ repo: r.repo, title: 'Update the README', body: 'README only' });
+    const job = (await r.k.jobs.create({ repo: r.repo, title: 'Update the README', body: 'README only' }));
     await settle(r.k);
     await waitUntil(() => r.human.requests.some((e) => (e.payload as { kind: string }).kind === 'plan'));
     r.human.grant(job.id, 'plan');
     await settle(r.k);
-    await waitUntil(() => r.k.jobs.get(job.id)!.status === 'failed');
-    const failed = r.k.history(job.id).find((e) => e.type === 'pipeline.failed')!.payload as { reason: string; outOfScope: string[] };
+    await waitUntil(async () => (await r.k.jobs.get(job.id))!.status === 'failed');
+    const failed = (await r.k.history(job.id)).find((e) => e.type === 'pipeline.failed')!.payload as { reason: string; outOfScope: string[] };
     expect(failed.outOfScope).toEqual([JUNK]);
     expect(failed.reason).toContain(JUNK);
-    expect(r.k.history(job.id).map((e) => e.type)).not.toContain('pr.requested');
+    expect((await r.k.history(job.id)).map((e) => e.type)).not.toContain('pr.requested');
     // The refused commit never touched the branch with the junk in it.
     const branch = git(r.repo, 'branch', '--list', 'bulig/*').replace(/^[*+ ]+/, '');
     expect(git(r.repo, 'ls-tree', '-r', '--name-only', branch)).not.toContain('test-results');
@@ -141,9 +141,9 @@ describe('scope guard end to end: a job told "README only"', () => {
   });
 });
 
-async function waitUntil(cond: () => boolean, ms = 20000) {
+async function waitUntil(cond: () => boolean | Promise<boolean>, ms = 20000) {
   const end = Date.now() + ms;
-  while (!cond()) {
+  while (!(await cond())) {
     if (Date.now() > end) throw new Error('timed out');
     await new Promise((res) => setTimeout(res, 20));
   }

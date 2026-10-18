@@ -554,6 +554,13 @@ export function createWorker() {
   const byJob = new Map<string, Set<ChildProcess>>();
   /** Children that were ended because their job was cancelled or failed. */
   const ended = new WeakSet<ChildProcess>();
+  /**
+   * Stages that have been asked for and have no Claude process yet, per job. A cancel that arrives in this gap finds no
+   * child to stop, and the status the stage handler read just before may be older than the cancel, so the cancel is noted here.
+   */
+  const starting = new Map<string, number>();
+  /** Jobs that were cancelled or failed while one of their stages was starting. Cleared when the last starting stage is through. */
+  const endedWhileStarting = new Set<string>();
   let stopping = false;
   let graceMs = STOP_GRACE_MS;
 
@@ -582,6 +589,7 @@ export function createWorker() {
       ctx.on('job.status', (event: BuligEvent) => {
         const to = (event.payload as { to?: string } | null)?.to;
         if (!event.jobId || (to !== 'cancelled' && to !== 'failed')) return;
+        if (starting.has(event.jobId)) endedWhileStarting.add(event.jobId);
         for (const child of byJob.get(event.jobId) ?? []) {
           ended.add(child);
           terminate(child, graceMs);
@@ -596,39 +604,68 @@ export function createWorker() {
         }
         if (stopping) return; // shutting down: start nothing. The stage stays running and is picked up on resume.
         const jobId = event.jobId;
-        const state = jobId ? (await ctx.jobs.get(jobId))?.status : undefined;
-        if (stopping) return; // stop() may have come in while the job was being read
-        if (state === 'cancelled' || state === 'failed') {
-          ctx.emit('stage.failed', { stage: req.stage, error: `the job is ${state}, so the stage did not start` }, jobId);
-          return;
-        }
-        let spawned: ChildProcess | undefined;
-        const out = await run(bin, buildArgs(req, cfg.extraArgs, cfg.allowDomains), req.cwd, timeoutMs, buildEnv(process.env, cfg.passEnv), children, (child) => {
-          spawned = child;
-          if (!jobId) return () => {};
-          const set = byJob.get(jobId) ?? new Set<ChildProcess>();
-          set.add(child);
-          byJob.set(jobId, set);
-          return () => {
-            set.delete(child);
-            if (set.size === 0 && byJob.get(jobId) === set) byJob.delete(jobId);
-          };
-        });
-        // A run that was ended by stop() says nothing. The stage stays running, and the next start marks it interrupted.
-        if (stopping) return;
-        if (spawned && ended.has(spawned)) {
-          // Killed because its job ended. Say so, so the stage is closed and cleanup can go ahead.
-          ctx.emit('stage.failed', { stage: req.stage, error: 'the job ended, so this run was stopped' }, jobId);
-          return;
-        }
-        if (out.ok) {
-          ctx.emit(
-            'stage.completed',
-            { stage: req.stage, ok: true, result: out.result, costUsd: out.costUsd, sessionId: out.sessionId, evidence: out.evidence ?? [] },
-            event.jobId,
-          );
-        } else {
-          ctx.emit('stage.failed', { stage: req.stage, error: out.error ?? 'unknown failure' }, event.jobId);
+        // Note that this stage is starting before reading the job: the read takes time, and a cancel that comes in
+        // during it must be able to tell this handler (the job.status handler above sets the flag).
+        if (jobId) starting.set(jobId, (starting.get(jobId) ?? 0) + 1);
+        let left = false;
+        const leave = () => {
+          if (!jobId || left) return;
+          left = true;
+          const n = (starting.get(jobId) ?? 1) - 1;
+          if (n > 0) starting.set(jobId, n);
+          else {
+            starting.delete(jobId);
+            endedWhileStarting.delete(jobId);
+          }
+        };
+        try {
+          let state: string | undefined;
+          try {
+            state = jobId ? (await ctx.jobs.get(jobId))?.status : undefined;
+          } catch (err) {
+            // Shutting down: the stage stays running and is picked up on resume, as for any stage that was cut off.
+            if (stopping) return;
+            // The store did not answer. Say so and fail the stage, so the pipeline can fail the job instead of waiting on a stage that will never report.
+            ctx.emit('stage.failed', { stage: req.stage, error: `could not read the job, so the stage did not start: ${err instanceof Error ? err.message : String(err)}` }, jobId);
+            return;
+          }
+          if (stopping) return; // stop() may have come in while the job was being read
+          if (state === 'cancelled' || state === 'failed' || (jobId && endedWhileStarting.has(jobId))) {
+            ctx.emit('stage.failed', { stage: req.stage, error: `the job is ${state === 'cancelled' || state === 'failed' ? state : 'ending'}, so the stage did not start` }, jobId);
+            return;
+          }
+          let spawned: ChildProcess | undefined;
+          const out = await run(bin, buildArgs(req, cfg.extraArgs, cfg.allowDomains), req.cwd, timeoutMs, buildEnv(process.env, cfg.passEnv), children, (child) => {
+            spawned = child;
+            if (!jobId) return () => {};
+            const set = byJob.get(jobId) ?? new Set<ChildProcess>();
+            set.add(child);
+            byJob.set(jobId, set);
+            // From here the child is in byJob, where a cancel finds it. Nothing runs between the check above and this line.
+            leave();
+            return () => {
+              set.delete(child);
+              if (set.size === 0 && byJob.get(jobId) === set) byJob.delete(jobId);
+            };
+          });
+          // A run that was ended by stop() says nothing. The stage stays running, and the next start marks it interrupted.
+          if (stopping) return;
+          if (spawned && ended.has(spawned)) {
+            // Killed because its job ended. Say so, so the stage is closed and cleanup can go ahead.
+            ctx.emit('stage.failed', { stage: req.stage, error: 'the job ended, so this run was stopped' }, jobId);
+            return;
+          }
+          if (out.ok) {
+            ctx.emit(
+              'stage.completed',
+              { stage: req.stage, ok: true, result: out.result, costUsd: out.costUsd, sessionId: out.sessionId, evidence: out.evidence ?? [] },
+              event.jobId,
+            );
+          } else {
+            ctx.emit('stage.failed', { stage: req.stage, error: out.error ?? 'unknown failure' }, event.jobId);
+          }
+        } finally {
+          leave();
         }
       });
     },

@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createTelegramChannel } from '@bulig/channel-telegram';
-import { Store } from '@bulig/core';
+import { SqliteStore } from '@bulig/core';
 import pipeline from '@bulig/pipeline-dev';
 import { definePlugin, type Plugin } from '@bulig/plugin-sdk';
 import { loadConfig, runCli, type Io } from '../src/index.ts';
@@ -135,13 +135,13 @@ describe('bulig serve', () => {
     expect(at('PR opened')).toBeLessThan(at('approval needed: merge'));
     expect(at('PR merged')).toBeLessThan(at('job done'));
 
-    const events = new Store(w.dbPath);
-    const job = events.listJobs()[0]!;
+    const events = new SqliteStore(w.dbPath);
+    const job = (await events.listJobs())[0]!;
     expect(job).toMatchObject({ title: 'Add multiply function', body: 'Add src/multiply.js exporting multiply(a,b).', status: 'done' });
-    const types = events.eventsForJob(job.id).map((e) => e.type);
+    const types = (await events.eventsForJob(job.id)).map((e) => e.type);
     expect(types).toContain('pr.merged');
     expect(types.filter((t) => t === 'approval.granted')).toHaveLength(2);
-    events.close();
+    await events.close();
 
     s.stop();
     expect(await s.done).toBe(0);
@@ -177,9 +177,9 @@ describe('bulig serve', () => {
     await until(() => approvalMessage(w.fake, 'plan') !== undefined, 'plan approval after resume');
     second.stop();
     expect(await second.done).toBe(0);
-    const store = new Store(w.dbPath);
-    expect(store.listJobs()).toHaveLength(1);
-    store.close();
+    const store = new SqliteStore(w.dbPath);
+    expect(await store.listJobs()).toHaveLength(1);
+    await store.close();
   });
 
   it('exits with a clear message when the token is not in the environment', async () => {
@@ -237,10 +237,10 @@ describe('bulig serve with its default plugin list', () => {
     stop();
     expect(await done).toBe(0);
     expect(err).toEqual([]);
-    const store = new Store(w.dbPath);
-    const plan = store.listStages(store.listJobs()[0]!.id).find((st) => st.name === 'plan')!;
+    const store = new SqliteStore(w.dbPath);
+    const plan = (await store.listStages((await store.listJobs())[0]!.id)).find((st) => st.name === 'plan')!;
     expect(plan.status).toBe('passed');
-    store.close();
+    await store.close();
   }, 30000);
 
   it('refuses to start when an enabled plugin is not registered, naming it', async () => {

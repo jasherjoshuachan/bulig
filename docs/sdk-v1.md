@@ -90,6 +90,7 @@ There is no other route than the context. A plugin can still import Node APIs, b
 | Path | Used by | Status |
 |---|---|---|
 | `ctx.on` / `ctx.emit` | all seven | stable |
+| `ctx.emitCommitted` | pipeline-dev | experimental |
 | `ctx.require` | channel-cli, channel-telegram, github, pipeline-dev, worker-claude-code | stable |
 | `ctx.can` | nobody | stable (unused) |
 | `ctx.jobs.get/list/stages` | channel-telegram, github, gate-promise, pipeline-dev, worker-claude-code | stable |

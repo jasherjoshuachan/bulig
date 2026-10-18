@@ -64,7 +64,12 @@ export function createKernel(options: KernelOptions) {
     brokenMs: options.storeBrokenMs ?? 120_000,
     closeMs: options.storeCloseMs ?? 10_000,
     onCloseCutShort: (ms) => logger.error(`The store did not close within ${ms} ms, so stop() stopped waiting for it. Its connection may still be open.`),
-    onBroken: (err) => logger.error(`${err.message} Nothing more will be written or delivered until it is restarted.`),
+    onBroken: (err) => {
+      logger.error(`${err.message} Nothing more will be written or delivered until it is restarted.`);
+      // A kernel that has given up on the record must not go on renewing the lease: it would keep a standby out for nothing.
+      if (heartbeat) clearInterval(heartbeat);
+      heartbeat = undefined;
+    },
   });
   const bus = new Bus(queue, { ...DEFAULT_EVENT_CAPABILITIES, ...options.eventCapabilities }, (err, input) => {
     // Once the queue is broken one error already said so. Every event after it would only repeat it.

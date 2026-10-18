@@ -5,7 +5,7 @@ import { pgSupport, usePgServer, type PgDatabase } from '../../../packages/core/
 import { boot, fakeHuman, newDb, SCOPE_BLOCK, settle, type Sent } from './harness.ts';
 
 // Chaos test for claims and the executor lease (ADR 0010, spec section 11): kill a kernel in the middle of a build, start another
-// on the same record, and the job must finish with exactly one PR on GitHub and no lost or doubled event. It runs on every
+// on the same record, and the job must finish with exactly one PR on GitHub, no lost event, and no stage asked for or reported twice. It runs on every
 // adapter there is. Each rule has its own scenario:
 //   crash:  the first kernel dies (its store is gone, nothing is handed back). The next one waits for the lease to run out.
 //   zombie: the first kernel is alive but its heartbeat stopped working, so its lease ran out and another kernel took it. When its
@@ -153,14 +153,22 @@ for (const adapter of ADAPTERS) {
       const log = await k.bus.replay();
       // no event lost: everything written before the failure is still there, in place
       expect(log.slice(0, before.length).map((e) => ({ id: e.id, seq: e.seq! }))).toEqual(before);
-      // no event doubled: ids and seq numbers are each used once, and seq only goes up
-      expect(new Set(log.map((e) => e.id)).size).toBe(log.length);
+      // seq only goes up and is never reused
       const seqs = log.map((e) => e.seq!);
       expect(seqs).toEqual([...seqs].sort((a, b) => a - b));
       expect(new Set(seqs).size).toBe(seqs.length);
-      // each attempt was asked for once
-      const asked = log.filter((e) => e.type === 'stage.requested').map((e) => (e.payload as { stageId: string }).stageId);
+      // exactly one stage.requested per stage attempt
+      const asked = log.filter((e) => e.type === 'stage.requested').map((e) => (e.payload as { stageId?: string }).stageId);
+      expect(asked.every((id) => typeof id === 'string')).toBe(true);
       expect(new Set(asked).size).toBe(asked.length);
+      // exactly one stage.completed per build attempt that finished: the cut-off or stalled build never counts, and neither does a late report
+      const stages = await k.jobs.stages(jobId);
+      const finishedBuilds = stages.filter((s) => s.name === 'build' && s.status === 'passed');
+      const builds = log.filter((e) => e.type === 'stage.completed' && (e.payload as { stage: string }).stage === 'build');
+      expect(finishedBuilds).toHaveLength(1);
+      expect(builds.map((e) => (e.payload as { sessionId: string }).sessionId)).toEqual(finishedBuilds.map((s) => `s-${s.id}`));
+      const reports = log.filter((e) => e.type === 'stage.completed').map((e) => (e.payload as { sessionId: string }).sessionId);
+      expect(new Set(reports).size).toBe(reports.length);
       const types = await story(k, jobId);
       expect(types.filter((t) => t === 'pr.requested')).toHaveLength(1);
       expect(types.filter((t) => t === 'pr.opened')).toHaveLength(1);

@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { createKernel, LeaseHeldError, PostgresStore, SqliteStore, StoreBrokenError, type Store } from '../src/index.ts';
 import { tempDb } from './helpers.ts';
+import { slowStore } from './slow-store.ts';
 import { pgSupport, usePgServer, type PgDatabase } from './pg-throwaway.ts';
 
 // The kernel's side of the executor lease (ADR 0010): it takes the lease before any plugin runs, renews it from a path of its
@@ -187,6 +188,30 @@ for (const adapter of ADAPTERS) {
       await expect(k.jobs.create({ repo: 'r', title: 'and again' })).rejects.toBeInstanceOf(StoreBrokenError);
       expect(await rival.listJobs()).toEqual([]);
       expect(errors.join('\n')).toMatch(/executor lease was lost/);
+    });
+
+    it('stops renewing the lease once the queue is broken for another reason (a store call that never returns)', async () => {
+      const real = await adapter.make();
+      let stuck = false;
+      let renewals = 0;
+      const store = slowStore(real, { hang: (m) => stuck && m === 'getJob' });
+      store.renewLease = (h, g, t) => {
+        renewals++;
+        return real.renewLease(h, g, t);
+      };
+      const lost: string[] = [];
+      const { k, errors } = kernelOn(store, { leaseHolder: 'kernel-a', leaseTtlMs: 2_000, leaseHeartbeatMs: 50, storeTimeoutMs: 40, storeBrokenMs: 80, onLeaseLost: (r) => void lost.push(r) });
+      await k.start();
+      await sleep(180);
+      expect(renewals).toBeGreaterThan(1); // it is beating
+      stuck = true;
+      await expect(k.jobs.get('nope')).rejects.toThrow();
+      await sleep(250);
+      expect(errors.join('\n')).toMatch(/Nothing more will be written/);
+      const after = renewals;
+      await sleep(400);
+      expect(renewals).toBe(after); // the beat stopped with the queue
+      expect(lost).toEqual([]); // and this was not a lost lease
     });
 
     it('refuses a heartbeat that is not well inside the lease', () => {

@@ -86,7 +86,7 @@ const MIGRATIONS: string[] = [
     PRIMARY KEY (job_id, stage, attempt)
   );
   CREATE UNIQUE INDEX claims_live ON claims (job_id, stage) WHERE released_at IS NULL;`,
-  // 6: an event id is a key. Handlers that run twice for one event can no longer both write it.
+  // 6: an event id is a key. An id written twice is refused. The kernel does not pass fixed ids yet (bus.record makes a fresh one), so this index is a guard for later; handler idempotency today comes from the stageId guards.
   `CREATE UNIQUE INDEX events_id ON events (id);`,
 ];
 

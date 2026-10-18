@@ -76,14 +76,14 @@ const MIGRATIONS: string[] = [
     PRIMARY KEY (job_id, stage, attempt)
   );
   CREATE UNIQUE INDEX claims_live ON claims(job_id, stage) WHERE released_at IS NULL;`,
-  // 6: an event id is a key. Handlers that run twice for one event can no longer both write it.
+  // 6: an event id is a key. An id written twice is refused. The kernel does not pass fixed ids yet (bus.record makes a fresh one), so this index is a guard for later; handler idempotency today comes from the stageId guards.
   `CREATE UNIQUE INDEX events_id ON events(id);`,
 ];
 
 /**
- * The lease's clock. SQLite has no now() that moves inside a transaction, but its own 'now' is the host clock read at the
- * moment of the statement, which is the same source for every process using this file on this machine. Every lease
- * statement reads it in SQL, never from JavaScript, so acquire, renew and assert all use one source. Milliseconds since 1970.
+ * The lease's clock. SQLite's 'now' is fixed for the length of one statement, and the next statement reads the host clock again.
+ * That is the same source for every process using this file on this machine. Every lease statement reads it in SQL, never from
+ * JavaScript, so acquire, renew and assert all use one source. Milliseconds since 1970.
  */
 const NOW = "CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)";
 

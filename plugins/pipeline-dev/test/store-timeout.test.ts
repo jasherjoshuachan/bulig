@@ -119,9 +119,8 @@ describe('an event that follows a saved state change is lost (D4)', () => {
     await until(async () => (await k.history(job.id)).some((e) => e.type === 'worktree.cleanup.requested'), 'the cleanup request');
   });
 
-  it('when the job cannot even be failed (the record is broken), it stays as it is and a restart does not ask the question again', async () => {
-    // Known gap, left open on purpose: a re-ask would let an old card approve a later question, because a grant is not
-    // bound to the stage it was asked for. That is fixed separately.
+  it('when the job cannot even be failed (the record is broken), it stays as it is, and a restart asks the question again under a new stage', async () => {
+    // Before ADR 0009 this job waited for ever. The full set of re-ask cases is in reask.test.ts.
     const path = newDb();
     const inner = new SqliteStore(path);
     const store = slowStore(inner, { hang: (m, args) => m === 'appendEvent' && (args[0] as { type: string }).type === 'approval.requested' });
@@ -132,12 +131,16 @@ describe('an event that follows a saved state change is lost (D4)', () => {
     await until(() => k1.bus['queue'].brokenError !== undefined, 'the queue to give up');
     await k1.stop();
     expect(first.requests).toHaveLength(0);
+    const reopened = new SqliteStore(path);
+    const lost = (await reopened.listStages(job.id)).find((s) => s.name === 'approve-plan')!;
+    expect(lost.status).toBe('running');
 
     const second = fakeHuman();
-    const k2 = boot(newDb(), [fakeWorker({ test: PASS, review: PASS }, []), fakeGithub([]), second.plugin], {}, { store: new SqliteStore(path) });
+    const k2 = boot(newDb(), [fakeWorker({ test: PASS, review: PASS }, []), fakeGithub([]), second.plugin], {}, { store: reopened });
     await k2.start();
-    await new Promise((r) => setTimeout(r, 400));
-    expect(second.requests).toHaveLength(0);
+    await until(() => second.requests.length === 1, 'the question to be asked again');
+    const asked = (second.requests[0]!.payload as { stageId: string }).stageId;
+    expect(asked).not.toBe(lost.id);
     expect((await k2.jobs.get(job.id))!.status).toBe('awaiting_approval');
   });
 });

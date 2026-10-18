@@ -152,7 +152,10 @@ export default definePlugin({
     /**
      * Write an event and wait until it is committed. A state change is saved first and the event that tells someone to
      * act on it second; if the second write is lost, nobody is told, and the job would wait for ever. So a lost event
-     * is an error here, and the handler's guard turns it into a failed job with this reason.
+     * is an error here, and the handler's guard turns it into a failed job with this reason. If failing the job cannot be
+     * written either, the job stays as it is until the next start, where resume handles a running job. A job that is
+     * waiting for an approval nobody was asked for is not picked up again: re-asking is left out until an approval is
+     * bound to the exact stage it was asked for (an old card must not approve a later question).
      */
     async function announce(type: string, payload: unknown, jobId: string): Promise<void> {
       try {
@@ -232,43 +235,6 @@ export default definePlugin({
       ];
     }
 
-    /** The state key that says the person was asked for this approval stage. */
-    const askedKey = (stage: Stage) => `approval-asked:${stage.id}`;
-
-    /**
-     * Ask the person to approve. The question is written to the log before anything is recorded as asked, and it is
-     * recorded as asked only once the write is committed, so a restart can tell a question that was lost from one that was not.
-     */
-    async function requestApproval(job: Job, which: 'plan' | 'merge', stages: Stage[], approving: Stage, renewed: boolean): Promise<void> {
-      if (which === 'plan') {
-        const summary = withEvidence(evidenceBlock(stages, ['plan', 'critique']), `PLAN\n${textOf(stages, 'plan')}\n\nCRITIQUE\n${textOf(stages, 'critique')}`);
-        await announce('approval.requested', { jobId: job.id, kind: 'plan', summary: clip(summary, 4000), scope: scopeOf(stages) ?? [] }, job.id);
-      } else {
-        const pr = outputOf(lastOf(stages, 'pr')!);
-        const review = textOf(stages, 'review');
-        await announce(
-          'approval.requested',
-          {
-            jobId: job.id,
-            kind: 'merge',
-            url: pr.url,
-            headSha: pr.headSha,
-            summary: clip(
-              `${renewed ? 'The last merge was refused. Approve again to retry.\n\n' : ''}${withEvidence(evidenceBlock(stages, ['build', 'test', 'docs', 'review']), `REVIEW\n${review}`)}`,
-              4000,
-            ),
-          },
-          job.id,
-        );
-      }
-      try {
-        await ctx.state.set(askedKey(approving), true);
-      } catch (err) {
-        // The question was asked. If this note is lost, a restart asks once more, and the second card is ignored.
-        ctx.log.warn(`pipeline-dev: asked for the ${which} approval of job ${job.id} but could not note it: ${err instanceof Error ? err.message : String(err)}`);
-      }
-    }
-
     async function advance(jobId: string): Promise<void> {
       const job = await ctx.jobs.get(jobId);
       if (!job) return;
@@ -327,9 +293,30 @@ export default definePlugin({
           return;
         }
         case 'approve': {
-          const approving = await ctx.jobs.startStage(job.id, `approve-${action.which}`);
+          const stageName = `approve-${action.which}`;
+          await ctx.jobs.startStage(job.id, stageName);
           await ctx.jobs.setStatus(job.id, 'awaiting_approval');
-          await requestApproval(job, action.which, stages, approving, action.renewed === true);
+          if (action.which === 'plan') {
+            const summary = withEvidence(evidenceBlock(stages, ['plan', 'critique']), `PLAN\n${textOf(stages, 'plan')}\n\nCRITIQUE\n${textOf(stages, 'critique')}`);
+            await announce('approval.requested', { jobId: job.id, kind: 'plan', summary: clip(summary, 4000), scope: scopeOf(stages) ?? [] }, job.id);
+          } else {
+            const pr = outputOf(lastOf(stages, 'pr')!);
+            const review = textOf(stages, 'review');
+            await announce(
+              'approval.requested',
+              {
+                jobId: job.id,
+                kind: 'merge',
+                url: pr.url,
+                headSha: pr.headSha,
+                summary: clip(
+                  `${action.renewed ? 'The last merge was refused. Approve again to retry.\n\n' : ''}${withEvidence(evidenceBlock(stages, ['build', 'test', 'docs', 'review']), `REVIEW\n${review}`)}`,
+                  4000,
+                ),
+              },
+              job.id,
+            );
+          }
           return;
         }
         case 'pr': {
@@ -376,19 +363,6 @@ export default definePlugin({
               for (const s of await ctx.jobs.stages(job.id)) {
                 if (s.status === 'running') await finish(s, 'failed', { interrupted: true, reason: 'interrupted', error: 'process stopped mid-stage' });
               }
-            });
-            continue;
-          }
-          if (job.status === 'awaiting_approval') {
-            // The state was saved and the question may not have been: a lost write leaves a job waiting for an answer
-            // nobody was asked for. Ask again unless the question is known to have been asked.
-            await attempt(job.id, async () => {
-              const stages = await stagesOf(job.id);
-              const waiting = stages.find((s) => s.name.startsWith('approve-') && s.status === 'running');
-              if (!waiting || (await ctx.state.get(askedKey(waiting))) === true) return;
-              const which = waiting.name === 'approve-merge' ? 'merge' : 'plan';
-              const renewed = which === 'merge' && stages.filter((s) => s.name === 'approve-merge').length > 1;
-              await requestApproval(job, which, stages, waiting, renewed);
             });
             continue;
           }
@@ -570,18 +544,25 @@ export default definePlugin({
           const wt = outputOf(lastOf(await stagesOf(e.jobId), 'worktree')!);
           committing.set(e.jobId, { stage: p.stage, status, out });
           const job = await ctx.jobs.get(e.jobId);
-          await announce(
-            'commit.requested',
-            {
-              cwd: String(wt.cwd),
-              message: `${job?.title ?? 'work'} (${p.stage})`,
-              scope: scopeOf(await stagesOf(e.jobId)) ?? [],
-              scopeAllow,
-              scopeMode,
-              allowBroadScope: allowBroad,
-            },
-            e.jobId,
-          );
+          try {
+            await announce(
+              'commit.requested',
+              {
+                cwd: String(wt.cwd),
+                message: `${job?.title ?? 'work'} (${p.stage})`,
+                scope: scopeOf(await stagesOf(e.jobId)) ?? [],
+                scopeAllow,
+                scopeMode,
+                allowBroadScope: allowBroad,
+              },
+              e.jobId,
+            );
+          } catch (err) {
+            // Nothing will answer, so nothing will close this stage. Close it here, or the cleanup that waits for it never runs.
+            committing.delete(e.jobId);
+            await finish(s, 'failed', { error: err instanceof Error ? err.message : String(err) }).catch(() => {});
+            throw err;
+          }
           return;
         }
         await finish(s, status, out);

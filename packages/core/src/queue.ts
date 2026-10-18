@@ -8,7 +8,7 @@ export interface QueueTx extends StoreTx {
   afterCommit(fn: () => void): void;
 }
 
-/** A task did not finish in time. It was rolled back, and nothing it did was kept. */
+/** A task did not finish in time. It is rolled back once the call it was inside comes back; if that never happens the queue breaks. */
 export class StoreTimeoutError extends Error {
   constructor(label: string, ms: number) {
     super(`Store call "${label}" did not finish within ${ms} ms, so it was given up on and is being rolled back. The store may be down or stuck.`);

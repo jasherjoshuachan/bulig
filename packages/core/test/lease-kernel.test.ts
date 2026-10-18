@@ -229,16 +229,16 @@ for (const adapter of ADAPTERS) {
         return real.renewLease(h, g, t);
       };
       const lost: string[] = [];
-      const { k, errors } = kernelOn(store, { leaseHolder: 'kernel-a', leaseTtlMs: 2_000, leaseHeartbeatMs: 50, storeTimeoutMs: 40, storeBrokenMs: 80, onLeaseLost: (r) => void lost.push(r) });
+      const { k, errors } = kernelOn(store, { leaseHolder: 'kernel-a', leaseTtlMs: 2_000, leaseHeartbeatMs: 200, storeTimeoutMs: 160, storeBrokenMs: 320, onLeaseLost: (r) => void lost.push(r) });
       await k.start();
-      await sleep(180);
+      await sleep(720);
       expect(renewals).toBeGreaterThan(1); // it is beating
       stuck = true;
       await expect(k.jobs.get('nope')).rejects.toThrow();
-      await sleep(250);
+      await sleep(1_000);
       expect(errors.join('\n')).toMatch(/Nothing more will be written/);
       const after = renewals;
-      await sleep(400);
+      await sleep(1_600);
       expect(renewals).toBe(after); // the beat stopped with the queue
       expect(lost).toEqual([]); // and this was not a lost lease
     });

@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { createKernel, LeaseHeldError, PostgresStore, SqliteStore, StoreBrokenError, type Store } from '../src/index.ts';
-import { tempDb } from './helpers.ts';
+import type { Plugin } from '@bulig/plugin-sdk';
+import { manifest, tempDb } from './helpers.ts';
 import { slowStore } from './slow-store.ts';
 import { pgSupport, usePgServer, type PgDatabase } from './pg-throwaway.ts';
 
@@ -106,6 +107,31 @@ for (const adapter of ADAPTERS) {
       expect((err as LeaseHeldError).holder).toBe('kernel-a');
       await k.stop();
       expect((await other.acquireLease('someone-else', 5_000)).generation).toBe(2);
+    });
+
+    it('lets go of the lease, and stops renewing it, when a plugin fails to start', async () => {
+      const store = await adapter.make();
+      let renewals = 0;
+      const counted = withLease(store, {
+        renewLease: async (h, g, t) => {
+          renewals++;
+          return store.renewLease(h, g, t);
+        },
+      });
+      const bad: Plugin = {
+        manifest: manifest({ name: 'bad', sdk: '1' }),
+        register() {
+          throw new Error('no thanks');
+        },
+      };
+      const { k } = kernelOn(counted, { plugins: [bad], enabled: ['bad'], leaseHolder: 'kernel-a', leaseTtlMs: 5_000, leaseHeartbeatMs: 100 });
+      await expect(k.start()).rejects.toThrow('no thanks');
+      await sleep(30);
+      const seen = renewals;
+      await sleep(450); // four beats of a heartbeat that was left running
+      expect(renewals).toBe(seen);
+      // and the next kernel need not wait for the lease to run out
+      expect((await (await adapter.peek()).acquireLease('kernel-b', 5_000)).generation).toBe(2);
     });
 
     it('does not start while another kernel holds the lease, and says why', async () => {

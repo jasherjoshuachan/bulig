@@ -222,20 +222,29 @@ export function createKernel(options: KernelOptions) {
       generation = await takeLease();
       queue.setFence({ holder, generation });
       startHeartbeat(generation);
-      for (const { manifest } of loaded) {
-        if (DEPRECATED_SDK_MAJORS.includes(manifest.sdk)) {
-          logger.warn(`Plugin "${manifest.name}" targets sdk ${manifest.sdk}, which is deprecated. Set "sdk" to "1" after it passes the conformance suite.`);
+      try {
+        for (const { manifest } of loaded) {
+          if (DEPRECATED_SDK_MAJORS.includes(manifest.sdk)) {
+            logger.warn(`Plugin "${manifest.name}" targets sdk ${manifest.sdk}, which is deprecated. Set "sdk" to "1" after it passes the conformance suite.`);
+          }
         }
+        for (const { plugin, manifest } of loaded) {
+          await plugin.register(buildContext(manifest, { ...shared, generation }));
+        }
+        // Wait for it to be written and handed to the handlers, so start() returns with the plugins running, as it always did.
+        await bus.emit({
+          type: 'kernel.started',
+          source: 'kernel',
+          payload: { plugins: loaded.map((l) => l.manifest.name) },
+        });
+      } catch (err) {
+        // A kernel that did not start must not go on holding the lease: the heartbeat would renew it until the process exits,
+        // and the next kernel would wait for it for nothing.
+        if (heartbeat) clearInterval(heartbeat);
+        heartbeat = undefined;
+        await record.releaseLease(holder, generation).catch(() => {});
+        throw err;
       }
-      for (const { plugin, manifest } of loaded) {
-        await plugin.register(buildContext(manifest, { ...shared, generation }));
-      }
-      // Wait for it to be written and handed to the handlers, so start() returns with the plugins running, as it always did.
-      await bus.emit({
-        type: 'kernel.started',
-        source: 'kernel',
-        payload: { plugins: loaded.map((l) => l.manifest.name) },
-      });
     },
 
     async stop(): Promise<void> {

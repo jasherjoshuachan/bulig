@@ -131,16 +131,23 @@ export default definePlugin({
      * or recreate, a worktree that was just removed. Every stage that closes calls this again.
      */
     async function cleanupIfIdle(jobId: string): Promise<void> {
-      if (cfg.keepFailedWorktrees || cleanupAsked.has(jobId)) return;
+      if (cleanupAsked.has(jobId)) return;
       const job = await ctx.jobs.get(jobId);
       if (!job || (job.status !== 'failed' && job.status !== 'cancelled')) return;
       const stages = await ctx.jobs.stages(jobId);
       // A stage waiting for a person has no process behind it, so it does not hold the cleanup up.
       if (stages.some((s) => s.status === 'running' && !s.name.startsWith('approve-'))) return;
-      const wt = lastOf(stages.filter((s) => !outputOf(s).interrupted), 'worktree');
-      const branch = wt?.status === 'passed' ? outputOf(wt).branch : undefined;
+      // A worktree stage whose close timed out is failed but still carries its branch (a stage that failed to make one has none).
+      const branch = outputOf(lastOf(stages.filter((s) => !outputOf(s).interrupted), 'worktree') ?? ({ output: null } as Stage)).branch;
       if (typeof branch !== 'string' || !branch) return;
       cleanupAsked.add(jobId);
+      if (cfg.keepFailedWorktrees) {
+        // Kept on purpose. Say so, so a later restart with the setting off does not remove what was kept.
+        await ctx.state.set(`kept:${jobId}`, true);
+        return;
+      }
+      // Written before the request, so a request that is lost can be told from a job that never had one.
+      await ctx.state.set(`cleanup-asked:${jobId}`, true);
       for (const s of stages) if (s.status === 'running') await ctx.jobs.finishStage(s.id, 'failed', { cancelled: true });
       await announce('worktree.cleanup.requested', { repoPath: job.repo, branch }, jobId);
     }
@@ -150,8 +157,10 @@ export default definePlugin({
      * is about to fail the job: a stage left running holds up the cleanup. If this write is lost as well, the stage stays
      * running until the next start, where resume closes it (the backstop).
      */
-    async function abandon(s: Stage, err: unknown): Promise<void> {
-      await ctx.jobs.finishStage(s.id, 'failed', { error: err instanceof Error ? err.message : String(err) }).catch(() => {});
+    async function abandon(s: Stage, err: unknown, output?: unknown): Promise<void> {
+      // Keep what the stage was going to record (a worktree's cwd and branch, a resume's interrupted marker); the error goes on top.
+      const kept = output && typeof output === 'object' && !Array.isArray(output) ? (output as Record<string, unknown>) : {};
+      await ctx.jobs.finishStage(s.id, 'failed', { ...kept, error: err instanceof Error ? err.message : String(err) }).catch(() => {});
     }
 
     /** Close a stage, then see whether that was the last thing holding up a cleanup. A close that fails is tried once more as a failure, then the error goes on to fail the job. */
@@ -159,7 +168,7 @@ export default definePlugin({
       try {
         await ctx.jobs.finishStage(s.id, status, output);
       } catch (err) {
-        await abandon(s, err);
+        await abandon(s, err, output);
         throw err;
       }
       await cleanupIfIdle(s.jobId);
@@ -381,7 +390,8 @@ export default definePlugin({
                 if (s.status === 'running') await finish(s, 'failed', { interrupted: true, reason: 'interrupted', error: 'process stopped mid-stage' });
               }
               // A cleanup request that was lost leaves the worktree behind. Ask again until a cleanup is on record (it is safe to repeat).
-              if (!(await ctx.state.get(`cleaned:${job.id}`))) await cleanupIfIdle(job.id);
+              // Only a job whose cleanup was asked for: a worktree kept on purpose, or one from before these records, is left alone.
+              if (!(await ctx.state.get(`cleaned:${job.id}`)) && !(await ctx.state.get(`kept:${job.id}`)) && (await ctx.state.get(`cleanup-asked:${job.id}`))) await cleanupIfIdle(job.id);
             });
             continue;
           }

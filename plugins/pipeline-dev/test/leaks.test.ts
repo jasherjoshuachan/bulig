@@ -55,6 +55,22 @@ describe('R1: a timed-out store call must not leave a stage running', () => {
     expect(JSON.stringify(plan.output)).toMatch(/did not finish within 100 ms/);
     expect((await k.jobs.stages(job.id)).filter((s) => s.status === 'running')).toEqual([]);
   });
+
+  it('a worktree stage whose close times out keeps its cwd and branch next to the error, so its cleanup can find the branch', async () => {
+    // finishStage calls in order: worktree first. Its close (as passed) is the one that times out.
+    let finishes = 0;
+    const store = slowStore(new SqliteStore(newDb()), { after: (m) => (m === 'finishStage' && ++finishes === 1 ? 300 : 0) });
+    const github: { type: string; payload: unknown }[] = [];
+    const k = boot(newDb(), [fakeWorker({ test: PASS, review: PASS }, []), fakeGithub(github), fakeHuman().plugin], {}, { store, storeTimeoutMs: 100, storeBrokenMs: 5000 });
+    await k.start();
+    const job = await k.jobs.create({ repo: '/repo', title: 'T', body: 'x' });
+    await until(async () => (await k.jobs.get(job.id))!.status === 'failed', 'the job to fail');
+    const wt = (await k.jobs.stages(job.id)).find((s) => s.name === 'worktree')!;
+    expect(wt.status).toBe('failed');
+    expect(wt.output).toMatchObject({ cwd: `/fake/wt/${job.id}`, branch: expect.any(String), error: expect.stringMatching(/did not finish within 100 ms/) });
+    await until(() => github.some((g) => g.type === 'worktree.cleanup.requested'), 'the cleanup request');
+    expect(github.find((g) => g.type === 'worktree.cleanup.requested')!.payload).toMatchObject({ branch: (wt.output as { branch: string }).branch });
+  });
 });
 
 describe('R2: a lost worktree.cleanup.requested is asked for again on the next start', () => {
@@ -90,5 +106,30 @@ describe('R2: a lost worktree.cleanup.requested is asked for again on the next s
     await k3.start();
     await new Promise((r) => setTimeout(r, 300));
     expect(third.filter((g) => g.type === 'worktree.cleanup.requested')).toEqual([]);
+  });
+});
+
+describe('a worktree kept on purpose is not cleaned up by a later restart', () => {
+  it('keepFailedWorktrees on, then off, then a restart: no cleanup is requested', async () => {
+    const path = newDb();
+    const first: { type: string; payload: unknown }[] = [];
+    const human = fakeHuman();
+    const k1 = boot(newDb(), [fakeWorker({ test: PASS, review: PASS }, []), fakeGithub(first), human.plugin], { keepFailedWorktrees: true }, { store: new SqliteStore(path) });
+    await k1.start();
+    const job = await k1.jobs.create({ repo: '/repo', title: 'T', body: 'x' });
+    await until(() => human.requests.length === 1, 'the plan question');
+    human.deny(job.id);
+    await until(async () => (await k1.jobs.get(job.id))!.status === 'cancelled', 'the job to be cancelled');
+    await k1.bus.idle();
+    await k1.stop();
+    expect(first.filter((g) => g.type === 'worktree.cleanup.requested')).toEqual([]);
+
+    const second: { type: string; payload: unknown }[] = [];
+    const k2 = boot(newDb(), [fakeWorker({}, []), fakeGithub(second), fakeHuman().plugin], { keepFailedWorktrees: false }, { store: new SqliteStore(path) });
+    await k2.start();
+    await k2.bus.idle();
+    await new Promise((r) => setTimeout(r, 300));
+    expect(second.filter((g) => g.type === 'worktree.cleanup.requested')).toEqual([]);
+    expect((await k2.history(job.id)).some((e) => e.type === 'worktree.cleanup.requested')).toBe(false);
   });
 });

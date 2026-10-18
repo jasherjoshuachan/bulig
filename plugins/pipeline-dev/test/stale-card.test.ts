@@ -105,6 +105,7 @@ describe('a card left over from an earlier question', () => {
     // Deny on the old card has expired too: the job is not cancelled.
     r.tap(staleB, staleB.deny);
     await until(() => r.fake.of('answerCallbackQuery').length === answersBefore + 2, 'the stale deny is answered', 15000);
+    expect(r.fake.of('answerCallbackQuery').at(-1)!.params.text).toBe('That approval is no longer open.');
     await settle(r.k);
     expect(r.k.history(job.id).filter((e) => e.source === 'channel-telegram' && e.type.startsWith('approval.'))).toHaveLength(2);
 

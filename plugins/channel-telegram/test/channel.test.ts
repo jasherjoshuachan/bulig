@@ -1079,6 +1079,15 @@ describe('/retry does not start a second job for the same one', () => {
       return spy;
     };
     afterEach(() => vi.restoreAllMocks());
+    /**
+     * Wait for the millisecond clock to move on. Job times and the retry-pending mark are ISO strings to the millisecond,
+     * and a job made in the same millisecond as the mark counts as made after it. A same-title job made just before a
+     * /retry must be strictly older than the mark, or the plugin may adopt it as the retry.
+     */
+    const nextMs = async () => {
+      const start = new Date().toISOString();
+      while (new Date().toISOString() === start) await new Promise((r) => setTimeout(r, 1));
+    };
 
     it('the next /retry finds the job that was already created and refuses', async () => {
       const { fake, b, old } = await failedJob();
@@ -1248,10 +1257,11 @@ describe('/retry does not start a second job for the same one', () => {
       const { fake, b, old } = await failedJob();
       const other = await b.d.ctx.jobs.create({ repo: old.repo, title: old.title });
       await b.d.ctx.jobs.setStatus(other.id, 'failed');
+      await nextMs();
       breakLinkOnce('retries:');
       fake.say(CHAT, `/retry ${old.id}`);
       await until(() => replies(fake).length === 1, 'failure reply');
-      const orphan = (await b.d.ctx.jobs.list())[2]!;
+      const orphan = (await b.d.ctx.jobs.list()).find((j) => j.id !== old.id && j.id !== other.id)!;
       fake.say(CHAT, `/retry ${other.id}`);
       await until(() => replies(fake).length === 2, 'retry of the other job');
       expect(replies(fake)[1]).toContain(`started from ${other.id.slice(0, 8)}`);
@@ -1265,10 +1275,11 @@ describe('/retry does not start a second job for the same one', () => {
       const { fake, b, old } = await failedJob();
       const lookalike = await b.d.ctx.jobs.create({ repo: old.repo, title: old.title });
       await b.d.ctx.jobs.setStatus(lookalike.id, 'running');
+      await nextMs();
       breakLinkOnce();
       fake.say(CHAT, `/retry ${old.id}`);
       await until(() => replies(fake).length === 1, 'failure reply');
-      const orphan = (await b.d.ctx.jobs.list())[2]!;
+      const orphan = (await b.d.ctx.jobs.list()).find((j) => j.id !== old.id && j.id !== lookalike.id)!;
       fake.say(CHAT, `/retry ${old.id}`);
       await until(() => replies(fake).length === 2, 'refusal');
       expect(replies(fake)[1]).toContain(`Job ${orphan.id.slice(0, 8)} already retried this one`);

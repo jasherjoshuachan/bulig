@@ -57,6 +57,24 @@ describe('happy path', () => {
     ]);
   });
 
+  it('every commit request carries the stageId of the stage attempt that is running, so the github plugin can make one commit per attempt', async () => {
+    const r = rig();
+    await r.k.start();
+    await settle(r.k);
+    const job = await jobOf(r.k);
+    await settle(r.k);
+    r.human.grant(job.id, 'plan');
+    await settle(r.k);
+    const commits = r.github.filter((g) => g.type === 'commit.requested').map((g) => g.payload as { stageId?: unknown });
+    expect(commits).toHaveLength(3);
+    for (const c of commits) expect(typeof c.stageId).toBe('string');
+    // the id is the one the worker was asked to run, and the one the stage row has
+    const edits = (await r.k.jobs.stages(job.id)).filter((s) => ['build', 'test', 'docs'].includes(s.name));
+    expect(commits.map((c) => c.stageId)).toEqual(edits.map((s) => s.id));
+    expect(commits.map((c) => c.stageId)).toEqual(r.worker.filter((w) => ['build', 'test', 'docs'].includes(w.stage)).map((w) => w.stageId));
+    expect(new Set(commits.map((c) => c.stageId)).size).toBe(3);
+  });
+
   it('uses the strong model for plan, critique and review and the standard one for the rest', async () => {
     const r = rig({}, {}, { models: { strong: 'big', standard: 'mid' } });
     await r.k.start();

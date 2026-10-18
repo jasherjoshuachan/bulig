@@ -21,6 +21,8 @@ class FakeGithubServer {
   readonly prs = new Map<string, number>();
   createCalls = 0;
   commits = 0;
+  /** The attempt each commit was asked for, in order (ADR 0010): the one-commit-per-attempt guard on the real github plugin depends on it. */
+  readonly commitStageIds: (string | undefined)[] = [];
   create(branch: string): number {
     this.createCalls++;
     if (!this.prs.has(branch)) this.prs.set(branch, this.prs.size + 1);
@@ -45,6 +47,7 @@ function githubPlugin(server: FakeGithubServer): Plugin {
       ctx.on('worktree.cleanup.requested', (e) => ctx.emit('worktree.cleaned', e.payload, e.jobId));
       ctx.on('commit.requested', (e) => {
         server.commits++;
+        server.commitStageIds.push((e.payload as { stageId?: string }).stageId);
         ctx.emit('commit.done', { sha: `c0ffee${server.commits}`, base: 'ba5e000' }, e.jobId);
       });
       ctx.on('pr.requested', (e) => {
@@ -175,6 +178,11 @@ for (const adapter of ADAPTERS) {
       // exactly one PR on GitHub, and GitHub was asked once
       expect(github.prs.size).toBe(1);
       expect(github.createCalls).toBe(1);
+      // Exactly one commit per edit attempt that finished, each asked for with that attempt's stageId. The cut-off or stalled build made none.
+      const edits = stages.filter((s) => ['build', 'test', 'docs'].includes(s.name) && s.status === 'passed');
+      expect(edits.map((s) => s.name)).toEqual(['build', 'test', 'docs']);
+      expect(github.commits).toBe(edits.length);
+      expect(github.commitStageIds).toEqual(edits.map((s) => s.id));
       expect((await k.jobs.get(jobId))!.status).toBe('done');
     };
 

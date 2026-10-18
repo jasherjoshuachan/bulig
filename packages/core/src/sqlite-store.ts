@@ -2,7 +2,7 @@ import Database from 'better-sqlite3';
 import { randomUUID } from 'node:crypto';
 import type { BuligEvent, Job, JobStatus, Stage, StageStatus } from '@bulig/plugin-sdk';
 import { storableJson } from '@bulig/text';
-import { text } from './store-text.ts';
+import { eventSeq, text } from './store-text.ts';
 import { StoreFatalError, type Store, type StoreTx } from './store.ts';
 
 // Each entry upgrades the schema by one version. Never edit an old entry; add a new one.
@@ -260,6 +260,7 @@ export class SqliteStore implements Store {
 
   /** Events with seq greater than `afterSeq`, oldest first. */
   async eventsAfter(afterSeq = 0): Promise<BuligEvent[]> {
+    eventSeq(afterSeq);
     const rows = this.db.prepare('SELECT * FROM events WHERE seq > ? ORDER BY seq').all(afterSeq);
     return (rows as EventRow[]).map(toEvent);
   }

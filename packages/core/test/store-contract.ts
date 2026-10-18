@@ -167,6 +167,21 @@ export function describeStoreContract(name: string, make: () => Promise<StoreHan
       expect(await store.eventsAfter(1_000_000_000)).toEqual([]);
     });
 
+    it('refuses an event number that is not a non-negative safe integer, before any SQL, and the transaction stays usable', async () => {
+      const { store } = await fresh();
+      await store.appendEvent({ type: 'a.one', source: 'x', payload: 1 });
+      for (const bad of [1.5, Number.NaN, -1, 2 ** 63, Number.POSITIVE_INFINITY, 2 ** 53]) {
+        await expect(store.eventsAfter(bad)).rejects.toThrow(/afterSeq must be a non-negative safe integer/);
+      }
+      expect(await store.eventsAfter(0)).toHaveLength(1);
+      await store.transaction(async (tx) => {
+        await tx.createJob({ repo: 'r', title: 'kept' });
+        await expect(tx.eventsAfter(1.5)).rejects.toThrow(/afterSeq/);
+        await tx.createJob({ repo: 'r', title: 'also kept' });
+      });
+      expect((await store.listJobs()).map((j) => j.title)).toEqual(['kept', 'also kept']);
+    });
+
     it('reads the events of one job in log order', async () => {
       const { store } = await fresh();
       const j1 = await store.createJob({ repo: 'r', title: '1' });

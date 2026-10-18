@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { PostgresStore, SqliteStore } from '@bulig/core';
-import { describePg, usePgServer, type PgDatabase } from '../../core/test/pg-throwaway.ts';
+import { describePg, queryRows, usePgServer, type PgDatabase } from '../../core/test/pg-throwaway.ts';
 import { slowStore } from '../../core/test/slow-store.ts';
 import { acquireLock, loadConfig, runCli, type Io } from '../src/index.ts';
 
@@ -445,6 +445,16 @@ describePg('the CLI on Postgres', () => {
 
     // The record lives in Postgres alone: no SQLite file was made.
     expect(existsSync(w.config.dbPath)).toBe(false);
+  });
+
+  it('status and history on a database the kernel has not set up yet say so and create nothing, like a missing SQLite file', async () => {
+    const { w, db } = await pgWorld();
+    for (const argv of [['status'], ['history', 'abc'], ['approve', 'abc', 'plan']]) {
+      const r = await w.run(...argv);
+      expect(r.code).toBe(2);
+      expect(r.err).toContain('no Bulig schema yet. Run a job first');
+    }
+    expect(await queryRows(db.url, "SELECT count(*)::int AS n FROM pg_tables WHERE schemaname = 'public'")).toEqual([{ n: 0 }]);
   });
 
   it('deny finds the job in Postgres too', async () => {

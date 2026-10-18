@@ -70,8 +70,7 @@ export const MAX_SCAN = 50_000;
 
 /** Sentences outside code, quotes and block quotes. Fenced code, inline code, "double quoted" text and `>` lines are material, not statements. */
 export function sentences(text: string): string[] {
-  const stripped = text
-    .slice(0, MAX_SCAN)
+  const stripped = clipText(text, MAX_SCAN)
     .replace(/(```|~~~)[\s\S]*?(?:\1|$)/g, '\n')
     .replace(/`[^`\n]{0,300}`/g, ' ')
     .replace(/"[^"\n]{0,300}"|“[^”\n]{0,300}”/g, ' ')
@@ -86,7 +85,7 @@ export function sentences(text: string): string[] {
 
 /** The text with fenced and inline code removed. Job ids only count when they are written in the open. */
 export function plainText(text: string): string {
-  return text.slice(0, MAX_SCAN).replace(/(```|~~~)[\s\S]*?(?:\1|$)/g, '\n').replace(/`[^`\n]{0,300}`/g, ' ');
+  return clipText(text, MAX_SCAN).replace(/(```|~~~)[\s\S]*?(?:\1|$)/g, '\n').replace(/`[^`\n]{0,300}`/g, ' ');
 }
 
 /** Every promise in a piece of stage text. */

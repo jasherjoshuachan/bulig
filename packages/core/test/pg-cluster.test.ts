@@ -1,5 +1,6 @@
 import { spawn, type ChildProcess } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import pg from 'pg';
@@ -90,9 +91,14 @@ describe.skipIf(!canRun)('a throwaway cluster is taken down', () => {
   });
 
   it('the sweep leaves a cluster whose owner is alive alone, and a folder with no owner.pid alone', async () => {
+    const orphan = mkdtempSync(join(tmpdir(), 'bulig-pg-'));
+    mkdirSync(join(orphan, 'data'));
+    writeFileSync(join(orphan, 'data', 'keep.txt'), 'x');
     const mine = await startPgServer();
     try {
-      sweepStaleClusters();
+      const swept = sweepStaleClusters();
+      expect(swept).not.toContain(orphan);
+      expect(existsSync(join(orphan, 'data', 'keep.txt'))).toBe(true); // no owner.pid: not ours to judge, so not touched
       expect(existsSync(mine.dir!)).toBe(true);
       const db = await mine.newDatabase();
       const c = new pg.Client({ connectionString: db.url });
@@ -102,7 +108,37 @@ describe.skipIf(!canRun)('a throwaway cluster is taken down', () => {
       await db.drop();
     } finally {
       await mine.stop();
+      rmSync(orphan, { recursive: true, force: true });
     }
     expect(existsSync(mine.dir!)).toBe(false);
+  });
+
+  it('the sweep never signals a process that merely has the pid in postmaster.pid: an unrelated live process is left alone, nothing waits, the folder stays', async () => {
+    // What a leftover folder looks like after a SIGKILLed run plus a reboot or crash: the owner is dead, and the pid in
+    // postmaster.pid now belongs to some other program. That program here records any signal it gets, and ignores SIGQUIT.
+    const work = mkdtempSync(join(tmpdir(), 'bulig-sweep-test-'));
+    const log = join(work, 'signals.log');
+    const bystander = spawn(process.execPath, ['-e', `const fs=require('fs');for(const s of ['SIGQUIT','SIGTERM','SIGINT','SIGHUP'])process.on(s,()=>fs.appendFileSync(${JSON.stringify(log)},s+'\\n'));console.log('up');setInterval(()=>{},1000)`], { stdio: ['ignore', 'pipe', 'inherit'] });
+    await new Promise<void>((r) => bystander.stdout!.once('data', () => r()));
+    const dead = spawn(process.execPath, ['-e', '']);
+    await new Promise((r) => dead.on('exit', r));
+    const folder = mkdtempSync(join(tmpdir(), 'bulig-pg-'));
+    try {
+      mkdirSync(join(folder, 'data'));
+      writeFileSync(join(folder, 'owner.pid'), String(dead.pid));
+      writeFileSync(join(folder, 'data', 'postmaster.pid'), `${bystander.pid}\n${join(folder, 'data')}\n`);
+      const t0 = Date.now();
+      const swept = sweepStaleClusters();
+      expect(Date.now() - t0).toBeLessThan(5000);
+      expect(swept).not.toContain(folder);
+      await new Promise((r) => setTimeout(r, 300));
+      expect(alive(bystander.pid!)).toBe(true);
+      expect(existsSync(log) ? readFileSync(log, 'utf8') : '').toBe(''); // not one signal
+      expect(existsSync(folder)).toBe(true);
+    } finally {
+      bystander.kill('SIGKILL');
+      rmSync(folder, { recursive: true, force: true });
+      rmSync(work, { recursive: true, force: true });
+    }
   });
 });

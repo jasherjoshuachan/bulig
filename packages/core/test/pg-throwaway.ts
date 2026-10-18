@@ -1,8 +1,8 @@
 import { afterAll, beforeAll, describe } from 'vitest';
-import { startPgServer, type PgDatabase, type PgServer } from './pg-cluster.ts';
+import { queryRows, startPgServer, type PgDatabase, type PgServer } from './pg-cluster.ts';
 import { pgSupport } from './pg-support.ts';
 
-export { pgSupport, startPgServer, type PgDatabase, type PgServer };
+export { pgSupport, queryRows, startPgServer, type PgDatabase, type PgServer };
 
 /** `describe` for a suite that needs Postgres: skipped, not failed, where there is none. See pg-cluster.ts for how the server is made and taken down. */
 export const describePg: typeof describe = pgSupport.available ? describe : (describe.skip as typeof describe);

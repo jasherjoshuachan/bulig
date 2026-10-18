@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import pg from 'pg';
-import { OtherWriterError, PostgresStore, type PostgresStoreOptions, StoreBrokenError, StoreFatalError, StoreTimeoutError } from '../src/index.ts';
+import { assertPostgresUrl, OtherWriterError, PostgresStore, SchemaNotReadyError, type PostgresStoreOptions, StoreBrokenError, StoreFatalError, StoreTimeoutError } from '../src/index.ts';
 import { kernelWith, probe } from './helpers.ts';
 import { describePg, usePgServer, type PgDatabase } from './pg-throwaway.ts';
 import { describeStoreContract, type StoreHandle } from './store-contract.ts';
@@ -104,11 +104,48 @@ describePg('PostgresStore', () => {
       await expect(PostgresStore.open(db.url, { mode: 'reader' })).rejects.toThrow(/schema version 99/);
     });
 
-    it('two processes opening a fresh database at the same moment both end up with one schema', async () => {
+    it('two kernels opening a fresh database at the same moment: one gets it, the other is refused, and there is one schema', async () => {
       const db = await freshDb();
-      const [a, b, c] = await Promise.all([open(db.url), open(db.url, { mode: 'reader' }), open(db.url, { mode: 'reader' })]);
-      expect(await Promise.all([a.schemaVersion(), b.schemaVersion(), c.schemaVersion()])).toEqual([3, 3, 3]);
-      expect(await peek(db.url, 'SELECT count(*)::int AS n FROM bulig_schema')).toEqual([{ n: 1 }]);
+      const results = await Promise.allSettled([PostgresStore.open(db.url), PostgresStore.open(db.url)]);
+      for (const r of results) if (r.status === 'fulfilled') stores.push(r.value);
+      expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
+      const lost = results.find((r) => r.status === 'rejected') as PromiseRejectedResult;
+      expect(lost.reason).toBeInstanceOf(OtherWriterError);
+      expect(await peek(db.url, 'SELECT version FROM bulig_schema')).toEqual([{ version: 3 }]);
+    });
+
+    describe('a reader never migrates', () => {
+      it('on a database with no schema it is refused, with a message that points at the kernel, and creates nothing', async () => {
+        const db = await freshDb();
+        const err = await PostgresStore.open(db.url, { mode: 'reader' }).catch((e: unknown) => e);
+        expect(err).toBeInstanceOf(SchemaNotReadyError);
+        expect((err as SchemaNotReadyError).reason).toBe('empty');
+        expect((err as Error).message).toMatch(/no Bulig schema yet. Run a job first/);
+        expect(await peek(db.url, "SELECT count(*)::int AS n FROM pg_tables WHERE schemaname = 'public'")).toEqual([{ n: 0 }]);
+      });
+
+      it('on an older schema it is refused and the schema is left as it was; the writer upgrades it', async () => {
+        const db = await freshDb();
+        await (await open(db.url)).close();
+        await peek(db.url, 'UPDATE bulig_schema SET version = 2');
+        await peek(db.url, 'DROP TABLE plugin_state'); // what version 2 looked like
+        const err = await PostgresStore.open(db.url, { mode: 'reader' }).catch((e: unknown) => e);
+        expect(err).toBeInstanceOf(SchemaNotReadyError);
+        expect((err as SchemaNotReadyError).reason).toBe('old');
+        expect((err as Error).message).toMatch(/schema version 2 and this Bulig needs 3\. Start the kernel/);
+        expect(await peek(db.url, 'SELECT version FROM bulig_schema')).toEqual([{ version: 2 }]);
+        expect(await peek(db.url, "SELECT to_regclass('plugin_state') IS NULL AS missing")).toEqual([{ missing: true }]);
+        const writer = await open(db.url);
+        expect(await writer.schemaVersion()).toBe(3);
+        await (await open(db.url, { mode: 'reader' })).schemaVersion();
+      });
+
+      it('on a newer schema it is refused', async () => {
+        const db = await freshDb();
+        await (await open(db.url)).close();
+        await peek(db.url, 'UPDATE bulig_schema SET version = 99');
+        await expect(PostgresStore.open(db.url, { mode: 'reader' })).rejects.toThrow(/schema version 99/);
+      });
     });
 
     it('a transaction that carries on after a database error is not reported as committed', async () => {
@@ -218,7 +255,7 @@ describePg('PostgresStore', () => {
 
       it('a writer that fails to start (for example a newer database) does not keep the lock', async () => {
         const db = await freshDb();
-        await (await open(db.url, { mode: 'reader' })).close();
+        await (await open(db.url)).close();
         await peek(db.url, 'UPDATE bulig_schema SET version = 99');
         await expect(PostgresStore.open(db.url)).rejects.toThrow(/schema version 99/);
         await peek(db.url, 'UPDATE bulig_schema SET version = 3');
@@ -239,7 +276,24 @@ describePg('PostgresStore', () => {
           expect(message).not.toContain('S3cretPW');
         }
         expect(() => new PostgresStore('postgres://u@h/db')).not.toThrow();
+        expect(() => new PostgresStore('postgres://u:pw@h:5433/db?sslmode=disable')).not.toThrow();
+        expect(() => new PostgresStore('postgresql://u@[::1]:5432/db')).not.toThrow();
+        expect(() => new PostgresStore('postgresql:///db?host=/var/run/postgresql')).not.toThrow();
         expect(() => new PostgresStore('PostgreSQL://u@h/db')).not.toThrow();
+      });
+
+      it('refuses a string with no host, because the driver would dial localhost on the default port; it only parses, it opens nothing', () => {
+        for (const bad of ['postgres://', 'postgres:///bulig', 'postgresql://u:S3cretPW@/db', 'postgres://?sslmode=disable', 'postgres://u:S3cretPW@:5432/db', 'postgresql:///db?host=']) {
+          let message = '';
+          try {
+            new PostgresStore(bad);
+          } catch (e) {
+            message = (e as Error).message;
+          }
+          expect(message).toMatch(/must start with postgres:\/\/ or postgresql:\/\/ and name a host/);
+          expect(message).not.toContain('S3cretPW');
+          expect(() => assertPostgresUrl(bad)).toThrow(/name a host/);
+        }
       });
 
       it('a string with a scheme that the driver cannot read fails without quoting it', async () => {

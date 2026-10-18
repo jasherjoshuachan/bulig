@@ -71,18 +71,21 @@ const bullets = (list: unknown, max: number): string[] => {
   return lines;
 };
 /** Split text into pieces of at most `max` characters, breaking between lines (and inside a line only if one line is longer than `max`). */
-const chunkLines = (lines: string[], max: number): string[] => {
+export const chunkLines = (lines: string[], max: number): string[] => {
   const out: string[] = [];
   let cur = '';
   for (const raw of lines) {
-    for (let i = 0; i === 0 || i < raw.length; i += max) {
-      const line = raw.slice(i, i + max);
+    let rest = raw;
+    do {
+      // Cut with clipText so a piece never ends in half an emoji. If the limit is smaller than one emoji, take the emoji whole.
+      const line = clipText(rest, max) || rest.slice(0, 2);
+      rest = rest.slice(line.length);
       if (cur && cur.length + 1 + line.length > max) {
         out.push(cur);
         cur = '';
       }
       cur = cur ? `${cur}\n${line}` : line;
-    }
+    } while (rest);
   }
   if (cur) out.push(cur);
   return out;

@@ -3,7 +3,7 @@ import { dirname, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import { createCliChannel, type CliChannel } from '@bulig/channel-cli';
 import telegram from '@bulig/channel-telegram';
-import { assertPostgresUrl, createKernel, PostgresStore, SqliteStore, type Kernel, type Store } from '@bulig/core';
+import { assertPostgresUrl, createKernel, PostgresStore, SchemaNotReadyError, SqliteStore, type Kernel, type Store } from '@bulig/core';
 import gate from '@bulig/gate-evidence';
 import gatePromise from '@bulig/gate-promise';
 import github from '@bulig/github';
@@ -383,6 +383,10 @@ async function withConfiguredStore<T>(config: Pick<BuligConfig, 'store' | 'dbPat
   }
   try {
     return await fn(store);
+  } catch (err) {
+    // A reader does not create or upgrade the schema; say what to do, the way a missing SQLite file does.
+    if (err instanceof SchemaNotReadyError) throw new UserError(err.message);
+    throw err;
   } finally {
     await store.close();
   }

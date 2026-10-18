@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import pg from 'pg';
 import type { BuligEvent, Job, JobStatus, Stage, StageStatus } from '@bulig/plugin-sdk';
 import { storableJson } from '@bulig/text';
-import { text } from './store-text.ts';
+import { eventSeq, text } from './store-text.ts';
 import { StoreFatalError, type Store, type StoreTx } from './store.ts';
 
 // Each entry upgrades the schema by one version. Never edit an old entry once it has shipped; add a new one.
@@ -99,18 +99,36 @@ export class OtherWriterError extends Error {
 }
 
 /**
- * Check the shape of a connection string without ever repeating it. A string with no scheme is read by the driver as a
- * pieces-of-it mess, and its errors can quote part of it, including a password.
+ * Check a connection string without ever repeating it. It must start with postgres:// or postgresql://, and it must name a
+ * host (or give a `host=` parameter, which can be a socket folder). A string with no scheme is read by the driver as a
+ * mess of pieces whose errors can quote part of it, including a password. A string with no host makes the driver dial
+ * localhost on the default port, which is whatever Postgres happens to run there, so it is refused rather than guessed.
  */
 export function assertPostgresUrl(url: string): void {
-  if (!/^postgres(?:ql)?:\/\//i.test(url)) throw new Error('The Postgres connection string must start with postgres:// or postgresql://');
+  const m = /^postgres(?:ql)?:\/\/([^/?#]*)([^#]*)/i.exec(url);
+  if (!m) throw new Error(CONNECTION_STRING_HELP);
+  const authority = m[1]!;
+  const host = authority.slice(authority.lastIndexOf('@') + 1).replace(/:\d*$/, '');
+  const hostParam = /[?&]host=([^&]+)/.exec(m[2]!)?.[1];
+  if (!host && !hostParam) throw new Error(CONNECTION_STRING_HELP);
+}
+const CONNECTION_STRING_HELP = 'The Postgres connection string must start with postgres:// or postgresql:// and name a host (for example postgresql://user@host/database)';
+
+/** A reader found no usable schema, and a reader never creates or upgrades one: the kernel (the writer) does. */
+export class SchemaNotReadyError extends Error {
+  constructor(public readonly reason: 'empty' | 'old', message: string) {
+    super(message);
+    this.name = 'SchemaNotReadyError';
+  }
 }
 
 export interface PostgresStoreOptions {
   /**
    * `writer` (the default) is the kernel's store: it takes the writer lock when it connects and keeps it until it closes, and
    * opening fails with OtherWriterError if another writer holds it. `reader` never takes or waits for the lock; it is for
-   * short, read-only looks from outside the kernel, such as `bulig status`. A reader is not forced to be read-only.
+   * short, read-only looks from outside the kernel, such as `bulig status`. A reader never migrates: a database with no
+   * schema, or an older one than this code, is refused with SchemaNotReadyError, because upgrading under a running older
+   * kernel is the writer's decision. A reader is not forced to be read-only.
    */
   mode?: 'writer' | 'reader';
 }
@@ -192,8 +210,10 @@ export class PostgresStore implements Store {
       if (this.writer) {
         const got = await client.query<{ ok: boolean }>('SELECT pg_try_advisory_lock($1::bigint) AS ok', [WRITER_LOCK]);
         if (!got.rows[0]?.ok) throw new OtherWriterError();
+        await migrate(client);
+      } else {
+        await checkSchema(client);
       }
-      await migrate(client);
     } catch (err) {
       client.end().catch(() => {});
       throw err;
@@ -401,6 +421,7 @@ export class PostgresStore implements Store {
   }
 
   async eventsAfter(afterSeq = 0): Promise<BuligEvent[]> {
+    eventSeq(afterSeq);
     const res = await this.query<EventRow>(`SELECT ${EVENT_COLS} FROM events WHERE seq > $1 ORDER BY seq`, [afterSeq]);
     return res.rows.map(toEvent);
   }
@@ -434,5 +455,18 @@ async function migrate(client: pg.Client): Promise<void> {
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
     throw err;
+  }
+}
+
+/** What a reader does instead of migrating: look, and refuse unless the schema is there and is the one this code knows. */
+async function checkSchema(client: pg.Client): Promise<void> {
+  const has = (await client.query<{ has: boolean }>("SELECT to_regclass('bulig_schema') IS NOT NULL AS has")).rows[0]?.has;
+  if (!has) throw new SchemaNotReadyError('empty', 'The database has no Bulig schema yet. Run a job first (the kernel creates it).');
+  const current = (await client.query<{ version: number }>('SELECT version FROM bulig_schema')).rows[0]?.version ?? 0;
+  if (current > MIGRATIONS.length) {
+    throw new Error(`This database is at schema version ${current}, but this Bulig only knows ${MIGRATIONS.length}. Upgrade Bulig before opening it.`);
+  }
+  if (current < MIGRATIONS.length) {
+    throw new SchemaNotReadyError('old', `This database is at schema version ${current} and this Bulig needs ${MIGRATIONS.length}. Start the kernel (serve, or run) so it upgrades the database first. A read-only command does not.`);
   }
 }

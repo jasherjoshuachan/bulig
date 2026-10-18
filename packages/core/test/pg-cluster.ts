@@ -1,6 +1,6 @@
 import { spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { appendFileSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -24,9 +24,9 @@ import { bins, pgSupport } from './pg-support.ts';
  * - The process exits any other way that runs JavaScript (process.exit, an uncaught error), or gets SIGINT, SIGTERM or
  *   SIGHUP: the same cleanup runs, then a signal is passed on so the process still ends the way it would have.
  * - SIGKILL (and a power cut) cannot be caught. The cluster and its folder stay behind. Each folder holds `owner.pid`, the
- *   pid of the process that made it, so the next run that makes a cluster calls `sweepStaleClusters()` first: any
- *   `bulig-pg-*` folder with an `owner.pid` whose process is gone gets its postmaster stopped and the folder deleted.
- *   Folders without `owner.pid`, and folders whose owner is alive, are never touched.
+ *   pid of the process that made it, so the next run that makes a cluster calls `sweepStaleClusters()` first. It signals a
+ *   process only when it can prove the process is the postmaster of that very folder, and otherwise signals nothing (rules
+ *   on `sweepStaleClusters`). Folders without `owner.pid`, and folders whose owner is alive, are never touched.
  */
 
 export interface PgDatabase {
@@ -52,6 +52,9 @@ const withClient = async <T>(url: string, fn: (c: pg.Client) => Promise<T>): Pro
     await c.end().catch(() => {});
   }
 };
+
+/** Run one query on a database and hand back the rows. For looking at what a test left behind. */
+export const queryRows = <T = Record<string, unknown>>(url: string, sql: string): Promise<T[]> => withClient(url, async (c) => (await c.query(sql)).rows as T[]);
 
 function serverOn(adminUrl: string, onStop: () => Promise<void>, dir?: string): PgServer {
   return {
@@ -97,10 +100,44 @@ const alive = (pid: number): boolean => {
 const PREFIX = 'bulig-pg-';
 const FOLDERS = () => [...new Set([tmpdir(), '/tmp'])];
 
-/** Stop and delete clusters that an earlier run left behind (it was killed with SIGKILL). Only folders this helper made, only when their owner is gone. */
+/** The command line of a process, or undefined when it cannot be read. */
+const commandOf = (pid: number): string | undefined => {
+  const r = spawnSync('ps', ['-o', 'command=', '-p', String(pid)], { encoding: 'utf8' });
+  const out = r.status === 0 ? r.stdout.trim() : '';
+  return out || undefined;
+};
+
+/**
+ * True only when `pid` is a live postgres process started with exactly `-D <data>`. A pid in a leftover postmaster.pid proves
+ * nothing by itself: after a crash or a reboot it can belong to any process, including another cluster's postmaster.
+ */
+function isPostmasterOf(pid: number, data: string): boolean {
+  const command = commandOf(pid);
+  if (!command) return false;
+  const exe = command.split(/\s+/)[0] ?? '';
+  if (exe.split('/').pop() !== 'postgres') return false;
+  const dirs = new Set([data]);
+  try {
+    dirs.add(realpathSync(data));
+  } catch {
+    // gone
+  }
+  return [...dirs].some((d) => command.endsWith(` -D ${d}`) || command.includes(` -D ${d} `));
+}
+
+const warned = new Set<string>();
+
+/**
+ * Delete clusters that an earlier run left behind (it was killed with SIGKILL). Only folders this helper made (`bulig-pg-*`
+ * with an `owner.pid`), and only when that owner process is gone. Then, per folder:
+ * - postmaster.pid names a live process that is provably this folder's postmaster (a postgres whose command line has
+ *   `-D <folder>/data`): ask it to quit (SIGQUIT, what `pg_ctl stop -m immediate` sends), wait up to 10 s, delete the folder;
+ * - it names no live process (or there is no postmaster.pid): delete the folder;
+ * - it names a live process that is NOT that postmaster (the pid was reused): signal nothing, never wait, leave the folder, say so once.
+ * pg_ctl is not used: it signals whatever pid the file holds.
+ */
 export function sweepStaleClusters(): string[] {
   const swept: string[] = [];
-  const pgCtl = bins('pg_ctl');
   for (const base of FOLDERS()) {
     let names: string[] = [];
     try {
@@ -114,7 +151,25 @@ export function sweepStaleClusters(): string[] {
         const owner = Number.parseInt(readFileSync(join(dir, 'owner.pid'), 'utf8'), 10);
         if (!Number.isInteger(owner) || owner <= 0 || alive(owner)) continue;
         const data = join(dir, 'data');
-        if (pgCtl && existsSync(join(data, 'postmaster.pid'))) spawnSync(pgCtl, ['-D', data, '-m', 'immediate', '-w', 'stop'], { stdio: 'ignore' });
+        let pid = 0;
+        try {
+          pid = Number.parseInt(readFileSync(join(data, 'postmaster.pid'), 'utf8').split('\n')[0] ?? '', 10);
+        } catch {
+          // no postmaster.pid
+        }
+        if (Number.isInteger(pid) && pid > 1 && alive(pid)) {
+          if (!isPostmasterOf(pid, data)) {
+            if (!warned.has(dir)) {
+              warned.add(dir);
+              console.warn(`[bulig] left ${dir}: its postmaster.pid names process ${pid}, which is not that cluster's postmaster. Delete the folder by hand.`);
+            }
+            continue;
+          }
+          process.kill(pid, 'SIGQUIT');
+          const end = Date.now() + 10_000;
+          while (alive(pid) && Date.now() < end) spawnSync('sleep', ['0.1']);
+          if (alive(pid)) continue;
+        }
         rmSync(dir, { recursive: true, force: true });
         swept.push(dir);
       } catch {

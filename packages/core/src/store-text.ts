@@ -19,3 +19,9 @@ export function text<T extends string>(what: string, value: T): T {
   if (value.includes('\u0000')) throw new Error(`${what} contains a NUL character, which the store does not accept`);
   return wellFormed(value) as T;
 }
+
+/** The `afterSeq` of eventsAfter: an event number. Anything else is refused the same way on every engine, before any SQL. */
+export function eventSeq(afterSeq: number): number {
+  if (!Number.isSafeInteger(afterSeq) || afterSeq < 0) throw new Error('afterSeq must be a non-negative safe integer');
+  return afterSeq;
+}

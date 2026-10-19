@@ -71,7 +71,7 @@ want bulig-loopback.service IPAddressDeny any
 for u in bulig.service bulig-worker.service bulig-backup.service bulig-restore-drill.service bulig-loopback.service; do
   if [ "$(value "$u" IPAddressDeny | wc -l | tr -d ' ')" = "1" ]; then ok "$u has an IPAddressDeny line"; else bad "$u has no (or two) IPAddressDeny lines"; fi
   case " $(value "$u" IPAddressAllow) " in
-    *" 127.0.0.1/32 "* | *" 127.0.0.0/8 "* | *" localhost "* | *" any "* | *" 0.0.0.0/0 "* | *" 172.17.0.1/32 "* | *" ::1/128 "* | *" 127.0.0.53/32 "* | *" 100.64.0.0/10 "*) bad "$u allows localhost, the DNS stub, a whole range, the docker bridge or everything: $(value "$u" IPAddressAllow)" ;;
+    *" 127.0.0.1/32 "* | *" 127.0.0.0/8 "* | *" localhost "* | *" any "* | *" 0.0.0.0/0 "* | *" 172.16.0.1/32 "* | *" ::1/128 "* | *" 127.0.0.53/32 "* | *" 100.64.0.0/10 "*) bad "$u allows localhost, the DNS stub, a whole range, the docker bridge or everything: $(value "$u" IPAddressAllow)" ;;
     *) ok "$u does not allow 127.0.0.1, localhost, the DNS stub, Tailscale as a range, the docker bridge or everything" ;;
   esac
 done
@@ -103,6 +103,22 @@ if grep -q 'DynamicUser' "$deploy/RUNBOOK.md" && grep -q 'io.systemd.DynamicUser
 
 if grep -q '^## Must be proven on the server first' "$deploy/RUNBOOK.md" && sed -n '/^## Must be proven on the server first/,/^## Things to know/p' "$deploy/RUNBOOK.md" | grep -q 'systemctl show' && sed -n '/^## Must be proven on the server first/,/^## Things to know/p' "$deploy/RUNBOOK.md" | grep -q 'resolv.conf'; then ok "the RUNBOOK lists what must be proven on the server first"; else bad "RUNBOOK: no 'Must be proven on the server first' list"; fi
 
+PROVEN="$(sed -n '/^## Must be proven on the server first/,/^## Things to know/p' "$deploy/RUNBOOK.md")"
+if grep -q 'fence-extra-probes.txt' <<<"$PROVEN" && grep -q 'gh-token' <<<"$PROVEN"; then ok "the server-first list names the extra probes file and the gh-token credential"; else bad "server-first list lacks the extra probes or the gh-token item"; fi
+CUT="$(sed -n '/^## Cutover/,/^## Rollback/p' "$deploy/RUNBOOK.md")"
+if grep -q 'every item in "Must be proven on the server first"' <<<"$CUT" && grep -q 'postcheck.sh' <<<"$CUT"; then ok "Cutover waits for every server-first item, health.sh and postcheck.sh"; else bad "Cutover does not say it waits for the server-first list, health.sh and postcheck.sh"; fi
+STEP8="$(sed -n '/^8\. \*\*Copy over the old record/,/^9\. \*\*Synthetic/p' "$deploy/RUNBOOK.md")"
+# shellcheck disable=SC2016
+if grep -q 'bulig-cli.sh --as kernel --exec' <<<"$STEP8" && grep -q 'Never `scp`' <<<"$STEP8"; then ok "step 8 pipes the SQLite file in through bulig-cli.sh --exec and says never to scp it into a user's folder"; else bad "step 8 does not use bulig-cli.sh --exec"; fi
+UNINST="$(grep -- '- \*\*Remove Bulig completely' "$deploy/RUNBOOK.md")"
+if [ "${UNINST%%postcheck.sh*}" != "$UNINST" ] && [ "${UNINST%%postcheck.sh*}" != "${UNINST%%/var/lib/bulig-checks*}" ] && [ "${#UNINST}" -gt 0 ]; then
+  before_pc="${UNINST%%\`postcheck.sh\`*}"
+  case "$before_pc" in *"/var/lib/bulig-checks"*) bad "uninstall removes /var/lib/bulig-checks before postcheck.sh runs" ;; *) ok "uninstall runs postcheck.sh before the folder it reads is removed" ;; esac
+else bad "uninstall text: postcheck order not found"; fi
+if grep -q 'ProtectKernelTunables' <(grep -n 'unpacks the tar as root' "$deploy/RUNBOOK.md") && grep -q 'ProtectClock' <(grep -n 'unpacks the tar as root' "$deploy/RUNBOOK.md"); then ok "the RUNBOOK's claim about the unpack sandbox lists the kernel protections it really has"; else bad "RUNBOOK unpack claim"; fi
+if grep -q 'Depends on PR #50' "$deploy/RUNBOOK.md"; then ok "the RUNBOOK names its dependency on PR #50 (config credential, gh-token, gateway)"; else bad "no PR #50 dependency note"; fi
+if grep -q 'loopback address, so it may treat it as local and trusted' "$deploy/RUNBOOK.md" && ! grep -q 'public anyway' <(grep -v 'not "public anyway"' "$deploy/RUNBOOK.md"); then ok "the RUNBOOK says requests from the gateway address reach wildcard listeners with a loopback source (not 'public anyway')"; else bad "RUNBOOK wildcard-listener wording"; fi
+
 echo "the gateway address"
 gw="127.74.3.1"
 case "$(value bulig-worker.service ExecStart)" in *"--kernel http://$gw:7431 "*) ok "the worker connects to http://$gw:7431" ;; *) bad "worker URL: $(value bulig-worker.service ExecStart)" ;; esac
@@ -126,7 +142,7 @@ want bulig-worker.service TasksMax 512
 
 echo "the worker's command line against the CLI in PR #50"
 cmdline="$(value bulig-worker.service ExecStart)"
-flags="$(printf '%s\n' "$cmdline" | grep -oE ' --[a-z-]+' | tr -d ' ' | sort | tr '\n' ' ')"
+flags="$(grep -oE ' --[a-z-]+' <<<"$cmdline" | tr -d ' ' | sort | tr '\n' ' ')"
 if [ "$flags" = "--claude-token-file --id --kernel --slots --token-file --work-dir " ]; then ok "ExecStart uses --kernel --id --token-file --claude-token-file --work-dir --slots, all flags of bulig worker"; else bad "worker flags: $flags"; fi
 case "$cmdline" in *"--token-file %d/worker-token"*"--claude-token-file %d/claude-token"*) ok "both token files are read from the unit's credentials directory (%d)" ;; *) bad "token file flags: $cmdline" ;; esac
 # shellcheck disable=SC2016

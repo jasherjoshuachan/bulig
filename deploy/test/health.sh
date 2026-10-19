@@ -56,18 +56,18 @@ rm -rf "$kit/test"
 cat >"$kit/fence-check.sh" <<'STUB'
 #!/usr/bin/env bash
 echo "fence-check $*" >>"$STUB_LOG/fence"
-if [ -n "${STUB_FENCE_FAIL:-}" ]; then echo "FAIL worker xorg-abstract-socket UNEXPECTED SUCCESS"; exit 1; fi
+if [ -n "${STUB_FENCE_FAIL:-}" ]; then echo "FAIL worker abstract-1 UNEXPECTED SUCCESS"; exit 1; fi
 exit 0
 STUB
 chmod +x "$kit/fence-check.sh"
 
-printf '2: eth0    inet 91.98.153.155/32 metric 100 scope global dynamic eth0\n2: eth0    inet6 2a01:4f8:c17:a0b6::1/64 scope global\n' >"$log/ip-data"
+printf '2: eth0    inet 203.0.113.10/32 metric 100 scope global dynamic eth0\n2: eth0    inet6 2001:db8::10/64 scope global\n' >"$log/ip-data"
 rm -rf "$root"
 mkdir -p "$root/etc/bulig" "$root/etc/systemd/system/bulig-worker.service.d" "$root/var/lib/bulig-checks"
 chmod 700 "$root/etc/bulig" "$root/var/lib/bulig-checks"
 printf 'postgres://bulig:pw@%%2Fvar%%2Frun%%2Fpostgresql:5436/bulig' >"$root/etc/bulig/pg-url"
 cp "$deploy/systemd/bulig-worker.service" "$root/etc/systemd/system/"
-printf '[Service]\nIPAddressDeny=2a01:4f8:c17:a0b6::1/128 91.98.153.155/32\n' >"$root/etc/systemd/system/bulig-worker.service.d/10-host-addresses.conf"
+printf '[Service]\nIPAddressDeny=2001:db8::10/128 203.0.113.10/32\n' >"$root/etc/systemd/system/bulig-worker.service.d/10-host-addresses.conf"
 cat >"$root/var/lib/bulig-checks/precheck.snapshot" <<'DATA'
 ## listening tcp sockets (Bulig's ports 5436 and 7431 left out; pids stripped)
 0.0.0.0:22 users:(("sshd"))
@@ -76,7 +76,7 @@ cat >"$root/var/lib/bulig-checks/precheck.snapshot" <<'DATA'
 [::]:22 users:(("sshd"))
 ## docker containers (name, image, state)
 DATA
-printf 'LISTEN 0 128 0.0.0.0:22 0.0.0.0:*\nLISTEN 0 511 0.0.0.0:80 0.0.0.0:*\nLISTEN 0 128 [::]:22 [::]:*\nLISTEN 0 4096 127.0.0.1:9222 0.0.0.0:*\n' >"$log/ss.txt"
+printf 'LISTEN 0 128 0.0.0.0:22 0.0.0.0:*\nLISTEN 0 511 0.0.0.0:80 0.0.0.0:*\nLISTEN 0 128 [::]:22 [::]:*\nLISTEN 0 4096 127.0.0.1:41022 0.0.0.0:*\n' >"$log/ss.txt"
 h="$kit/health.sh"
 # every run starts the lease stand-in again from its first answer
 hrun() { echo 0 >"$log/psql-n"; bash "$h" --wait 1 >"$work/out" 2>&1; }
@@ -93,7 +93,7 @@ echo "the fence fails health"
 : >"$log/fence"
 echo 0 >"$log/psql-n"
 expect_fail_msg "a failing fence check fails health" "the fence does not hold" env STUB_FENCE_FAIL=1 bash "$h" --wait 1
-if grep -q "FAIL worker xorg-abstract-socket" "$work/out" && grep -q "health: FAILED" "$work/out"; then ok "with the probe's FAIL line shown and health: FAILED"; else bad "output: $(cat "$work/out")"; fi
+if grep -q "FAIL worker abstract-1" "$work/out" && grep -q "health: FAILED" "$work/out"; then ok "with the probe's FAIL line shown and health: FAILED"; else bad "output: $(cat "$work/out")"; fi
 : >"$log/fence"
 echo 0 >"$log/psql-n"
 expect_ok "--no-fence skips the fence check" bash "$h" --wait 1 --no-fence
@@ -105,12 +105,12 @@ expect_fail_msg "an inactive gateway-address unit fails health" "bulig-loopback.
 if [ ! -s "$log/fence" ]; then ok "and the fence is not probed while health is already failing"; else bad "fence ran after a failure"; fi
 
 echo "warnings"
-printf '2: eth0    inet 91.98.153.155/32 scope global\n2: eth0    inet6 2a01:4f8:c17:a0b6::1/64 scope global\n2: eth0    inet 203.0.113.9/32 scope global\n' >"$log/ip-data"
+printf '2: eth0    inet 203.0.113.10/32 scope global\n2: eth0    inet6 2001:db8::10/64 scope global\n2: eth0    inet 203.0.113.9/32 scope global\n' >"$log/ip-data"
 hrun
 rc=$?
 if [ "$rc" -eq 0 ]; then ok "health still passes with a new address on the machine"; else bad "health failed: $(cat "$work/out")"; fi
 if grep -q "^warn  the host address 203.0.113.9/32 is not in the worker's IPAddressDeny" "$work/out"; then ok "a host address missing from the worker's drop-in is a warning that names the fix"; else bad "address warning: $(grep warn "$work/out")"; fi
-if ! grep -q "warn  the host address 91.98.153.155" "$work/out"; then ok "and one that is there is not"; else bad "false warning"; fi
+if ! grep -q "warn  the host address 203.0.113.10" "$work/out"; then ok "and one that is there is not"; else bad "false warning"; fi
 rm -f "$root/etc/systemd/system/bulig-worker.service.d/10-host-addresses.conf"
 hrun
 if [ "$(grep -c '^warn  the host address' "$work/out")" -ge 1 ]; then ok "with no drop-in at all every address is a warning"; else bad "no-drop-in: $(grep warn "$work/out")"; fi
@@ -118,12 +118,12 @@ printf '[Service]\nIPAddressDeny=203.0.113.9/32\n' >"$root/etc/systemd/system/bu
 printf '2: eth0    inet 203.0.113.9/32 scope global\n' >"$log/ip-data"
 hrun
 if ! grep -q "^warn  the host address" "$work/out"; then ok "a drop-in that matches the current addresses gives no warning"; else bad "false address warning: $(grep warn "$work/out")"; fi
-printf 'LISTEN 0 128 0.0.0.0:22 0.0.0.0:*\nLISTEN 0 511 0.0.0.0:80 0.0.0.0:*\nLISTEN 0 128 [::]:22 [::]:*\nLISTEN 0 128 *:8081 *:*\nLISTEN 0 128 [::]:8082 [::]:*\nLISTEN 0 128 0.0.0.0:9000 0.0.0.0:*\nLISTEN 0 128 127.0.0.1:9222 0.0.0.0:*\n' >"$log/ss.txt"
+printf 'LISTEN 0 128 0.0.0.0:22 0.0.0.0:*\nLISTEN 0 511 0.0.0.0:80 0.0.0.0:*\nLISTEN 0 128 [::]:22 [::]:*\nLISTEN 0 128 *:8081 *:*\nLISTEN 0 128 [::]:8082 [::]:*\nLISTEN 0 128 0.0.0.0:9000 0.0.0.0:*\nLISTEN 0 128 127.0.0.1:41022 0.0.0.0:*\n' >"$log/ss.txt"
 hrun
 rc=$?
 if grep -q "^warn  a service listens on every address now (\*:8081)" "$work/out" && grep -q "^warn  a service listens on every address now (0.0.0.0:9000)" "$work/out" && grep -qF "now ([::]:8082)" "$work/out"; then ok "new listeners on every address (0.0.0.0, * and [::]) are warnings"; else bad "listener warnings: $(grep warn "$work/out")"; fi
 if ! grep -q "now (0.0.0.0:22)\|now (0.0.0.0:80)\|now (\[::\]:22)" "$work/out"; then ok "listeners that were there at the precheck are not"; else bad "false listener warning"; fi
-if ! grep -q "9222" "$work/out"; then ok "a listener on 127.0.0.1 is not a wildcard listener"; else bad "9222 reported"; fi
+if ! grep -q "41022" "$work/out"; then ok "a listener on 127.0.0.1 is not a wildcard listener"; else bad "41022 reported"; fi
 if [ "$rc" -eq 0 ]; then ok "warnings do not fail health"; else bad "health failed on warnings (rc=$rc)"; fi
 rm -f "$root/var/lib/bulig-checks/precheck.snapshot"
 hrun

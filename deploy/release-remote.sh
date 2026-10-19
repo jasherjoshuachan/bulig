@@ -73,10 +73,18 @@ prev=""
 prev_tk=""
 if [ -L "$cur" ]; then prev="$(readlink "$cur")"; fi
 if [ -L "$tk_cur" ]; then prev_tk="$(readlink "$tk_cur")"; fi
-if [ "$prev" = "$rel" ]; then
+# A release counts as live only once it passed its health check: $OPT/.healthy-sha holds the sha of the last one that did. A first release that
+# failed leaves nothing behind (links, units and services are put back), and a rerun of the same sha is not refused.
+healthy_file="$OPT/.healthy-sha"
+healthy=""
+if [ -f "$healthy_file" ]; then healthy="$(cat "$healthy_file")"; fi
+if [ "$prev" = "$rel" ] && [ "$healthy" = "$short" ]; then
   echo "release: $short is already the live release. Nothing changed." >&2
   exit 3
 fi
+# What to go back to if this one fails: the current release, if it is the one that last passed its health check.
+prev_healthy=""
+if [ -n "$prev" ] && [ "$(basename "$prev")" = "$healthy" ]; then prev_healthy="$prev"; fi
 
 work="$(mktemp -d "$CHK/rel.XXXXXX")"
 pristine="$work/pristine"
@@ -102,13 +110,18 @@ tar -x --no-same-owner -f -
 pnpm install --frozen-lockfile --prod=false --config.package-import-method=copy --store-dir /var/tmp/pnpm-store </dev/null >&2
 find . -name node_modules -type d -prune -print0 | tar -c --null -T - -f -'
   build_fence_props
+  local rc=0 got
+  # head -c: at most one byte more than the cap is ever written to disk, whatever the build sends.
   tar -c -C "$src" . | systemd-run --quiet --pipe --wait --collect --unit="bulig-build-$short-$$" "${FENCE_BUILD[@]}" \
     -p PrivateTmp=yes -p ProtectSystem=strict -p ProtectHome=yes -p PrivateDevices=yes -p NoNewPrivileges=yes \
     -p ProtectKernelTunables=yes -p ProtectKernelModules=yes -p ProtectControlGroups=yes -p RestrictSUIDSGID=yes -p LockPersonality=yes \
     -p UMask=0022 \
     -p KillMode=control-group -p SendSIGKILL=yes -p MemoryMax=2G -p CPUQuota=200% -p TasksMax=512 -p RuntimeMaxSec=1800 \
     --setenv=HOME=/var/tmp/home --setenv=PATH=/usr/local/bin:/usr/bin:/bin --setenv=CI=true \
-    -- /bin/sh -c "$script" >"$out"
+    -- /bin/sh -c "$script" | head -c "$((MAX_MODULES_BYTES + 1))" >"$out" || rc=$?
+  got="$(wc -c <"$out" | tr -d ' ')"
+  [ "$got" -le "$MAX_MODULES_BYTES" ] || die "the build output is more than the $MAX_MODULES_BYTES allowed"
+  [ "$rc" -eq 0 ] || die "the build failed (exit $rc)"
 }
 
 # extract_modules <tar> <empty dest>: root unpacks the tar, but in a sandbox where the destination is the one writable place and there is
@@ -118,6 +131,7 @@ extract_modules() {
   systemd-run --quiet --pipe --wait --collect --unit="bulig-extract-$short-$$" \
     -p ProtectSystem=strict -p "ReadWritePaths=$dest" -p ProtectHome=yes -p PrivateTmp=yes -p PrivateDevices=yes -p PrivateNetwork=yes \
     -p NoNewPrivileges=yes -p CapabilityBoundingSet= -p RestrictAddressFamilies=AF_UNIX -p MemoryMax=1G -p TasksMax=16 -p UMask=0022 \
+    -p ProtectKernelTunables=yes -p ProtectControlGroups=yes -p ProtectKernelModules=yes -p ProtectKernelLogs=yes -p ProtectClock=yes \
     -p KillMode=control-group \
     -- /usr/bin/tar -x --no-same-owner --no-same-permissions -f - -C "$dest" <"$tarfile"
 }
@@ -138,7 +152,6 @@ else
   build_modules "$pristine" "$work/modules.tar"
   size="$(wc -c <"$work/modules.tar" | tr -d ' ')"
   [ "$size" -gt 0 ] || die "the build produced no node_modules"
-  [ "$size" -le "$MAX_MODULES_BYTES" ] || die "the build output is $size bytes, more than the $MAX_MODULES_BYTES allowed"
   extract_modules "$work/modules.tar" "$mods"
   check_modules "$mods"
   # The final tree: a fresh copy of what was delivered, plus the node_modules folders, moved in. Nothing else from the build.
@@ -206,6 +219,7 @@ prune() { # prune <dir> <live path> <previous path>: keep the newest $keep relea
 }
 
 if apply_release; then
+  printf '%s\n' "$short" >"$healthy_file.new" && mv -T "$healthy_file.new" "$healthy_file"
   echo "release: healthy on $short"
   prune "$OPT/releases" "$rel" "$prev"
   prune "$TK" "$tk_rel" "$prev_tk"
@@ -214,8 +228,8 @@ fi
 
 echo "release: install, restart or health check FAILED on $short" >&2
 journalctl -u bulig.service -u bulig-worker.service -n 40 --no-pager >&2 || true
-if [ -n "$prev" ] && [ -d "$prev" ]; then
-  echo "release: rolling back to $prev (Node tree, root tools and unit files)" >&2
+if [ -n "$prev_healthy" ] && [ -d "$prev_healthy" ]; then
+  echo "release: rolling back to $prev_healthy (Node tree, root tools and unit files)" >&2
   swap_link "$prev" "$cur"
   if [ -n "$prev_tk" ] && [ -d "$prev_tk" ]; then swap_link "$prev_tk" "$tk_cur"; fi
   restore_units
@@ -227,7 +241,14 @@ if [ -n "$prev" ] && [ -d "$prev" ]; then
     echo "release: rollback is ALSO unhealthy. Look at journalctl -u bulig.service -u bulig-worker.service." >&2
   fi
 else
-  echo "release: no previous release to go back to. Stopping both services so they do not crash-loop." >&2
+  # A failed FIRST release leaves nothing behind: services stopped and disabled (a reboot starts nothing), both current links and the unit files
+  # removed, and no success marker, so the same sha can be released again.
+  echo "release: no healthy release to go back to. Stopping and disabling both services and removing what this release installed." >&2
   systemctl stop bulig-worker.service bulig.service || true
+  systemctl disable bulig-worker.service bulig.service bulig-loopback.service >/dev/null 2>&1 || true
+  systemctl stop bulig-loopback.service || true
+  rm -f "$cur" "$tk_cur" "$healthy_file"
+  restore_units
+  systemctl daemon-reload || true
 fi
 exit 1

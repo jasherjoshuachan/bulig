@@ -52,6 +52,7 @@ case "$unit" in
     scratch="$(mktemp -d)"
     tar -x -C "$scratch" -f - || exit 1
     [ -f "$scratch/pnpm-lock.yaml" ] || { echo "no lockfile on stdin" >&2; exit 1; }
+    if [ -n "${STUB_BUILD_FAIL:-}" ]; then echo "pnpm: install failed" >&2; rm -rf "$scratch"; exit 1; fi
     echo "evil" >>"$scratch/packages/cli/bin/bulig.mjs" # a hostile build edits its own copy; root's trees are not in reach
     if [ -n "${STUB_MODULES_TAR:-}" ]; then cat "$STUB_MODULES_TAR"; else tar -c -C "$STUB_MODULES_DIR" .; fi
     rc=$?
@@ -75,10 +76,10 @@ cat >"$stubs/ip" <<'STUB'
 case "$*" in
   *"scope global"*)
     cat <<'DATA'
-2: eth0    inet 91.98.153.155/32 metric 100 scope global dynamic eth0
-2: eth0    inet6 2a01:4f8:c17:a0b6::1/64 scope global
-6: tailscale0    inet 100.85.168.22/32 scope global tailscale0
-7: docker0    inet 172.17.0.1/16 brd 172.17.255.255 scope global docker0
+2: eth0    inet 203.0.113.10/32 metric 100 scope global dynamic eth0
+2: eth0    inet6 2001:db8::10/64 scope global
+6: tailscale0    inet 100.64.0.10/32 scope global tailscale0
+7: docker0    inet 172.16.0.1/16 brd 172.16.255.255 scope global docker0
 DATA
     ;;
 esac
@@ -99,6 +100,11 @@ args=(); t=0
 for a in "$@"; do if [ "$a" = "-T" ]; then t=1; else args+=("$a"); fi; done
 if [ "$t" -eq 1 ] && [ -L "${args[1]}" ]; then rm -f "${args[1]}"; fi
 exec /bin/mv "${args[@]}"
+STUB
+cat >"$stubs/head" <<'STUB'
+#!/usr/bin/env bash
+echo "head $*" >>"$STUB_LOG/head"
+exec /usr/bin/head "$@"
 STUB
 chmod +x "$stubs"/*
 export PATH="$stubs:/usr/bin:/bin:/usr/sbin:/sbin"
@@ -132,7 +138,12 @@ deliver() {
   cp "$deploy/release-remote.sh" "$inc/deploy/"
   cp "$deploy"/lib/*.sh "$inc/deploy/lib/"
   cp "$deploy/bulig.config.vps.json" "$inc/deploy/"
-  printf '#!/usr/bin/env bash\nexit %s\n' "$hx" >"$inc/deploy/health.sh"
+  if [ "$hx" = "flag" ]; then
+    # healthy only once the flag file exists (a cause outside the release, such as a missing credential, that is fixed between two runs)
+    printf '#!/usr/bin/env bash\n[ -e "%s" ]\n' "$work/health-ok" >"$inc/deploy/health.sh"
+  else
+    printf '#!/usr/bin/env bash\nexit %s\n' "$hx" >"$inc/deploy/health.sh"
+  fi
   chmod 755 "$inc/deploy/health.sh" "$inc/deploy/release-remote.sh"
   for u in $UNITS; do
     [ "$u" = "$missing" ] || printf '[Unit]\n# version %s\n' "$short" >"$inc/deploy/systemd/$u"
@@ -222,21 +233,23 @@ for p in DynamicUser=yes PrivateTmp=yes KillMode=control-group ProtectSystem=str
   case "$build_call" in *"$p"*) ok "the build unit has $p" ;; *) bad "the build unit lacks $p: $build_call" ;; esac
 done
 DENY="localhost link-local multicast 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7"
-case "$build_call" in *"-p IPAddressDeny=$DENY 2a01:4f8:c17:a0b6::1/128 91.98.153.155/32 -p "*) ok "the build cannot reach localhost, link-local, multicast, private ranges, Tailscale, the docker bridges or this machine's own public addresses (read from ip at run time)" ;; *) bad "the build's IPAddressDeny: $build_call" ;; esac
+case "$build_call" in *"-p IPAddressDeny=$DENY 2001:db8::10/128 203.0.113.10/32 -p "*) ok "the build cannot reach localhost, link-local, multicast, private ranges, Tailscale, the docker bridges or this machine's own public addresses (read from ip at run time)" ;; *) bad "the build's IPAddressDeny: $build_call" ;; esac
 case "$build_call" in *"IPAddressAllow"*) bad "the build allows an address: $build_call" ;; *) ok "and the build allows no address at all (not even the DNS stub)" ;; esac
 case "$build_call" in *"-p RestrictAddressFamilies=AF_INET AF_INET6 -p "*) ok "the build gets IP sockets only: no AF_UNIX, so a tenant's abstract socket is out of reach" ;; *) bad "the build's address families: $build_call" ;; esac
 case "$build_call" in *"-p InaccessiblePaths=-/run/tailscale -/run/snapd.socket -/run/docker.sock -/var/run/docker.sock "*) ok "the build cannot see the tailscale, snapd or docker sockets" ;; *) bad "the build's InaccessiblePaths: $build_call" ;; esac
 case "$build_call" in *"-p BindReadOnlyPaths=/run/systemd/resolve/resolv.conf:/etc/resolv.conf "*) ok "the build resolves names through resolved's upstream list, not the 127.0.0.53 stub" ;; *) bad "the build's resolver: $build_call" ;; esac
 wd="$r/etc/systemd/system/bulig-worker.service.d/10-host-addresses.conf"
-if [ -f "$wd" ] && grep -qx "IPAddressDeny=2a01:4f8:c17:a0b6::1/128 91.98.153.155/32" "$wd"; then ok "each release refreshes the worker's drop-in with the machine's current public addresses"; else bad "worker drop-in: $(cat "$wd" 2>&1)"; fi
+if [ -f "$wd" ] && grep -qx "IPAddressDeny=2001:db8::10/128 203.0.113.10/32" "$wd"; then ok "each release refreshes the worker's drop-in with the machine's current public addresses"; else bad "worker drop-in: $(cat "$wd" 2>&1)"; fi
 case "$build_call" in *"--uid="* | *" -p User="*) bad "the build is tied to a named user: $build_call" ;; *) ok "the build runs as a throwaway user, not as bulig or bulig-worker" ;; esac
 case "$build_call" in *"$r"* | *"/var/lib/bulig-checks"* | *"/usr/local/lib/bulig"*) bad "a path of root's trees reached the build's arguments: $build_call" ;; *) ok "no path of root's trees is in the build's arguments (the source goes in on stdin)" ;; esac
 if grep -q "^systemctl enable bulig-loopback.service bulig.service bulig-worker.service" "$STUB_LOG/calls" && grep -q "^systemctl start bulig-loopback.service" "$STUB_LOG/calls"; then ok "the gateway address unit is enabled and started before the services restart"; else bad "systemctl calls: $(grep systemctl "$STUB_LOG/calls" | head -5)"; fi
-for p in "ReadWritePaths=$r/var/lib/bulig-checks/rel." ProtectSystem=strict PrivateNetwork=yes CapabilityBoundingSet= NoNewPrivileges=yes; do
+for p in "ReadWritePaths=$r/var/lib/bulig-checks/rel." ProtectSystem=strict PrivateNetwork=yes CapabilityBoundingSet= NoNewPrivileges=yes ProtectKernelTunables=yes ProtectControlGroups=yes ProtectKernelModules=yes ProtectKernelLogs=yes ProtectClock=yes; do
   case "$extract_call" in *"$p"*) ok "the unpack unit has $p" ;; *) bad "the unpack unit lacks $p: $extract_call" ;; esac
 done
-rw_values="$(printf '%s\n' "$extract_call" | grep -o 'ReadWritePaths=[^ ]*')"
+rw_values="$(grep -o 'ReadWritePaths=[^ ]*' <<<"$extract_call")"
 if [ "$(printf '%s\n' "$rw_values" | wc -l | tr -d ' ')" = "1" ] && case "$rw_values" in *"/mods") true ;; *) false ;; esac; then ok "the unpack unit can write one folder only (the empty mods folder)"; else bad "unpack writable paths: $rw_values"; fi
+
+if grep -qx "head -c $((2 * 1024 * 1024 * 1024 + 1))" "$STUB_LOG/head"; then ok "the build's output is cut at the cap plus one byte on the stream, before it is written (head -c 2 GiB + 1)"; else bad "head calls: $(cat "$STUB_LOG/head" 2>&1)"; fi
 
 # --- 2. an unhealthy release rolls back ---
 echo "release B (health check fails)"
@@ -262,6 +275,14 @@ rc=$?
 if [ "$rc" -eq 3 ] && grep -q "already the live release" "$work/out"; then ok "a sha that is already live is refused with exit 3"; else bad "rc=$rc: $(cat "$work/out")"; fi
 if [ -z "$(leftovers)" ]; then ok "and its incoming folder is removed"; else bad "left: $(leftovers)"; fi
 if user_folders_untouched; then ok "and the user folders are untouched"; else bad "a user folder changed"; fi
+
+# --- 4b. a build that fails says so ---
+echo "a failed build"
+export STUB_BUILD_FAIL=1
+incBF="$(deliver "cafecafecafe" 0)"
+expect_fail_msg "a build that exits non-zero is reported as failed" "the build failed" run_remote "cafecafecafe" "$incBF"
+unset STUB_BUILD_FAIL
+if [ "$(readlink "$r/opt/bulig/current")" = "$r/opt/bulig/releases/$A" ] && [ ! -e "$r/usr/local/lib/bulig/cafecafecafe" ]; then ok "and nothing was installed"; else bad "state after a failed build"; fi
 
 # --- 5. a config that is already there is never overwritten ---
 echo "release E (existing config)"
@@ -327,6 +348,46 @@ releases_before="$(releases_list)"
 refused "a tar that writes through its own link is refused" "" "99999999999a"
 unset STUB_MODULES_TAR
 export STUB_MODULES_DIR="$MODS"
+
+# --- 6b. a failed FIRST release leaves nothing behind ---
+echo "a failed first release"
+wipe_root() {
+  rm -rf "$r/opt/bulig/releases"/* "$r/opt/bulig/current" "$r/opt/bulig/.healthy-sha" "$r/usr/local/lib/bulig"/* "$r/etc/bulig/config.json"
+  rm -rf "$r/etc/systemd/system"/bulig*
+}
+wipe_root
+F="f1f1f1f1f1f1"
+rm -f "$work/health-ok"
+echo "$F" >"$r/opt/bulig/.healthy-sha"   # a stale marker for this very sha: a failed first release must not leave it
+incF="$(deliver "$F" flag)"
+: >"$STUB_LOG/calls"
+expect_fail_msg "a first release that fails its health check fails" "no healthy release to go back to" run_remote "$F" "$incF"
+if [ ! -e "$r/opt/bulig/current" ] && [ ! -L "$r/opt/bulig/current" ] && [ ! -e "$r/usr/local/lib/bulig/current" ] && [ ! -L "$r/usr/local/lib/bulig/current" ]; then ok "both current links are removed"; else bad "links left in $r/opt/bulig or $r/usr/local/lib/bulig"; fi
+if [ -z "$(find "$r/etc/systemd/system" -name 'bulig*' ! -name '*.d' | head -1)" ]; then ok "the unit files this release installed are removed"; else bad "unit files left: $(find "$r/etc/systemd/system" -name 'bulig*' ! -name '*.d')"; fi
+if grep -q "^systemctl disable bulig-worker.service bulig.service bulig-loopback.service" "$STUB_LOG/calls" && grep -q "^systemctl stop bulig-worker.service bulig.service" "$STUB_LOG/calls"; then ok "both services (and the gateway address) are stopped and disabled, so a reboot starts nothing"; else bad "systemctl calls: $(grep systemctl "$STUB_LOG/calls")"; fi
+if [ ! -e "$r/opt/bulig/.healthy-sha" ]; then ok "no success marker is written"; else bad "a success marker exists"; fi
+if user_folders_untouched; then ok "and the user folders are untouched"; else bad "a user folder changed"; fi
+touch "$work/health-ok"
+incF2="$(deliver "$F" flag)"
+expect_ok "the same sha can be released again" run_remote "$F" "$incF2"
+if [ "$(link_of "$r/opt/bulig/current")" = "$F" ] && [ "$(cat "$r/opt/bulig/.healthy-sha")" = "$F" ]; then ok "and it goes live, with the success marker written"; else bad "after the rerun: $(readlink "$r/opt/bulig/current") / $(cat "$r/opt/bulig/.healthy-sha" 2>&1)"; fi
+incF3="$(deliver "$F" flag)"
+run_remote "$F" "$incF3" >"$work/out" 2>&1
+rc=$?
+if [ "$rc" -eq 3 ] && grep -q "already the live release" "$work/out"; then ok "and only now is the same sha refused as already live"; else bad "third run rc=$rc: $(cat "$work/out")"; fi
+# a release that was linked but never passed its health check is not a place to roll back to
+echo "other-sha" >"$r/opt/bulig/.healthy-sha"
+G="9a9a9a9a9a9a"
+incG="$(deliver "$G" 1)"
+: >"$STUB_LOG/calls"
+expect_fail_msg "a failing release does not roll back to a current release that never passed health" "no healthy release to go back to" run_remote "$G" "$incG"
+if [ ! -e "$r/opt/bulig/current" ] && [ ! -L "$r/opt/bulig/current" ]; then ok "and it is not left linked to the failed one either"; else bad "link left: $(readlink "$r/opt/bulig/current")"; fi
+echo "$F" >"$r/opt/bulig/.healthy-sha"
+ln -sfn "$r/opt/bulig/releases/$F" "$r/opt/bulig/current"
+# a release that was linked but never passed its health check is not 'live' and is not a place to roll back to
+echo "stale" >"$r/opt/bulig/.healthy-sha"
+incF4="$(deliver "$F" flag)"
+expect_ok "a current link whose release never passed health is released again, not refused" run_remote "$F" "$incF4"
 
 # --- 7. bad arguments ---
 echo "arguments"

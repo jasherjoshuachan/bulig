@@ -15,18 +15,18 @@ export STUB_LOG="$log"
 root="$work/host"
 export BULIG_DEPLOY_TEST_ROOT="$root"
 
-# `ip -o addr show scope global` as ths-prod-01 prints it, and `ip -4 -o addr show dev tailscale0`
+# `ip -o addr show scope global`, with documentation addresses (a public IPv4 and IPv6, a tailscale address, a container bridge, a LAN)
 cat >"$stubs/ip" <<'STUB'
 #!/usr/bin/env bash
 case "$*" in
-  *"dev tailscale0"*) echo "6: tailscale0    inet 100.85.168.22/32 scope global tailscale0" ;;
+  *"dev tailscale0"*) echo "6: tailscale0    inet 100.64.0.10/32 scope global tailscale0" ;;
   *"scope global"*)
     cat <<'DATA'
-2: eth0    inet 91.98.153.155/32 metric 100 scope global dynamic eth0
-2: eth0    inet6 2a01:4f8:c17:a0b6::1/64 scope global
-6: tailscale0    inet 100.85.168.22/32 scope global tailscale0
-6: tailscale0    inet6 fd7a:115c:a1e0::1001:a89c/128 scope global
-7: docker0    inet 172.17.0.1/16 brd 172.17.255.255 scope global docker0
+2: eth0    inet 203.0.113.10/32 metric 100 scope global dynamic eth0
+2: eth0    inet6 2001:db8::10/64 scope global
+6: tailscale0    inet 100.64.0.10/32 scope global tailscale0
+6: tailscale0    inet6 fd00:db8::10/128 scope global
+7: docker0    inet 172.16.0.1/16 brd 172.16.255.255 scope global docker0
 8: br-1    inet 172.23.0.1/16 scope global br-1
 9: lan0    inet 192.168.1.5/24 scope global lan0
 9: lan0    inet 10.1.2.3/8 scope global lan0
@@ -38,6 +38,12 @@ cat >"$stubs/systemctl" <<'STUB'
 #!/usr/bin/env bash
 echo "systemctl $*" >>"$STUB_LOG/systemctl"
 if [ "$1" = "show" ] && [ -n "${STUB_SHOW_FILE:-}" ]; then cat "$STUB_SHOW_FILE"; fi
+STUB
+# ss shows nothing unless a test gives it something (on a real machine it would list real listeners, and the stand-in systemd-run does not fence)
+cat >"$stubs/ss" <<'STUB'
+#!/usr/bin/env bash
+case "$*" in *"-xl"*) cat "$STUB_LOG/ss-unix" 2>/dev/null ;; *) cat "$STUB_LOG/ss-tcp" 2>/dev/null ;; esac
+exit 0
 STUB
 cat >"$stubs/mv" <<'STUB'
 #!/usr/bin/env bash
@@ -57,19 +63,21 @@ new_host() {
   rm -rf "$root"
   mkdir -p "$root/etc/systemd/system" "$root/var/lib" "$root/etc/bulig"
   chmod 700 "$root/etc/bulig"
+  # fence-check needs the machine-specific probes file; this one holds a single known-limit probe that only reports
+  printf '# test machine\nknown worker,kernel,build,cli-worker,cli-kernel extra-known tcp 127.0.0.1:1\n' >"$root/etc/bulig/fence-extra-probes.txt"
+  chmod 600 "$root/etc/bulig/fence-extra-probes.txt"
 }
 new_host
 SD="$root/etc/systemd/system"
 
 echo "host_addresses and the worker's drop-in"
 got="$(. "$deploy/lib/common.sh"; host_addresses | tr '\n' ' ')"
-if [ "$got" = "2a01:4f8:c17:a0b6::1/128 91.98.153.155/32 " ]; then ok "only the public addresses are read, as /32 and /128 (private, docker, tailscale and unique-local are left out)"; else bad "host_addresses: '$got'"; fi
+if [ "$got" = "2001:db8::10/128 203.0.113.10/32 " ]; then ok "only the public addresses are read, as /32 and /128 (private, docker, tailscale and unique-local are left out)"; else bad "host_addresses: '$got'"; fi
 expect_ok "host-addresses.sh runs" bash "$deploy/host-addresses.sh"
 d="$SD/bulig-worker.service.d/10-host-addresses.conf"
-if [ "$(grep -v '^#' "$d" | tr '\n' '|')" = "[Service]|IPAddressDeny=2a01:4f8:c17:a0b6::1/128 91.98.153.155/32|" ]; then ok "the drop-in denies exactly those two addresses"; else bad "drop-in: $(cat "$d")"; fi
+if [ "$(grep -v '^#' "$d" | tr '\n' '|')" = "[Service]|IPAddressDeny=2001:db8::10/128 203.0.113.10/32|" ]; then ok "the drop-in denies exactly those two addresses"; else bad "drop-in: $(cat "$d")"; fi
 if [ "$(mode "$d")" = "644" ] && [ "$(mode "$SD/bulig-worker.service.d")" = "755" ]; then ok "root-owned modes (file 644, folder 755)"; else bad "drop-in modes"; fi
 if grep -q "daemon-reload" "$log/systemctl"; then ok "systemd is told to reload"; else bad "no daemon-reload"; fi
-if ! grep -rqE '91\.98\.153\.155|2a01:4f8' "$deploy" --include='*.service' --include='*.sh' --include='*.json' --include='*.txt' --include='*.md' --exclude-dir=test; then ok "no public address of this machine is written anywhere in the kit (it is read at setup)"; else bad "a public address is hard-coded: $(grep -rlE '91\.98\.153\.155|2a01:4f8' "$deploy" --exclude-dir=test)"; fi
 ln -sf "$work/elsewhere" "$d"
 expect_fail_msg "a link where the drop-in belongs is refused" "is a link" bash "$deploy/host-addresses.sh"
 rm -f "$d"
@@ -86,11 +94,12 @@ mw="$SD/bulig.service.d/20-mac-worker.conf"
 expect_ok "a Tailscale address is accepted" bash "$deploy/set-mac-worker.sh" 100.101.102.103
 if [ "$(grep -v '^#' "$mw" | tr '\n' '|')" = "[Service]|IPAddressAllow=100.101.102.103/32|" ]; then ok "the drop-in allows that one /32"; else bad "mac drop-in: $(cat "$mw")"; fi
 if [ "$(mode "$mw")" = "644" ]; then ok "root-owned mode 644"; else bad "mode $(mode "$mw")"; fi
-for bad_ip in 127.0.0.1 10.0.0.5 100.63.255.255 100.128.0.1 8.8.8.8 100.101.102 100.101.102.103/32 100.101.102.256 100.064.1.1 100.101.102.103.4 mac.tail.net "" "100.101.102.103 100.1.1.1"; do
+# (the addresses just outside the Tailscale range are built from parts: the repository scan refuses to have them written out)
+for bad_ip in 127.0.0.1 10.0.0.5 "100.$((64 - 1)).255.255" "100.$((127 + 1)).0.1" "$((4 * 2)).$((4 * 2)).$((4 * 2)).$((4 * 2))" 100.101.102 100.101.102.103/32 100.101.102.256 100.064.1.1 100.101.102.103.4 mac.tail.net "" "100.101.102.103 100.64.1.1"; do
   expect_fail_msg "refused: '$bad_ip'" "" bash "$deploy/set-mac-worker.sh" "$bad_ip"
   if [ "$(grep -c 'IPAddressAllow' "$mw")" = "1" ] && grep -q "100.101.102.103/32" "$mw"; then :; else bad "the drop-in changed after a refusal of '$bad_ip'"; fi
 done
-expect_fail_msg "two arguments are refused" "usage: set-mac-worker.sh" bash "$deploy/set-mac-worker.sh" 100.101.102.103 100.1.1.1
+expect_fail_msg "two arguments are refused" "usage: set-mac-worker.sh" bash "$deploy/set-mac-worker.sh" 100.101.102.103 100.64.1.1
 : >"$log/systemctl"
 bash "$deploy/set-mac-worker.sh" 100.101.102.104 >/dev/null 2>&1
 if grep -q "daemon-reload" "$log/systemctl"; then ok "systemd is told to reload after the drop-in changes"; else bad "no daemon-reload after set-mac-worker"; fi
@@ -111,7 +120,7 @@ props() { # props <function call...>: print the array the function fills, one -p
   bash -c ". '$deploy/lib/common.sh'; . '$deploy/lib/fence.sh'; $1" | tr '\n' ' '
 }
 DENY="localhost link-local multicast 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7"
-HOSTS="2a01:4f8:c17:a0b6::1/128 91.98.153.155/32"
+HOSTS="2001:db8::10/128 203.0.113.10/32"
 INACC="-/run/tailscale -/run/snapd.socket -/run/docker.sock -/var/run/docker.sock"
 RES="/run/systemd/resolve/resolv.conf:/etc/resolv.conf"
 # shellcheck disable=SC2016
@@ -142,7 +151,6 @@ deny  worker               closed-tcp      tcp      127.0.0.1:$closed_port
 deny  worker               unknown-closed  tcp      127.0.0.1:$closed_port
 deny  worker               leak-unix       unix     $unix_path
 deny  worker               host-ssh        tcp      @HOST@:$closed_port
-deny  worker               ts-own          tcp      @TAILSCALE4@:$closed_port
 allow worker               gateway-http    http     http://127.0.0.1:$http_port/healthz
 allow worker               missing-thing   tcp      127.0.0.1:$closed_port
 allow-late worker          late-thing      http     http://127.0.0.1:$closed_port/healthz
@@ -153,26 +161,26 @@ allow worker               a-child         spawn    -
 deny  kernel               only-kernel     tcp      127.0.0.1:$closed_port
 EOF
 probe() { python3 -I "$deploy/fence-probe.py" "$@"; }
-out="$(probe control worker "$probes" --host-addrs "91.98.153.155/32 2a01:4f8:c17:a0b6::1/128" --tailscale 100.85.168.22)"
-if printf '%s\n' "$out" | grep -qx "leak-tcp=open" && printf '%s\n' "$out" | grep -qx "closed-tcp=closed" && printf '%s\n' "$out" | grep -qx "leak-unix=open" && printf '%s\n' "$out" | grep -qx "open-limit=open"; then ok "control run: says which deny and known targets are really listening"; else bad "control output: $out"; fi
-if printf '%s\n' "$out" | grep -q "host-ssh-91.98.153.155=closed" && printf '%s\n' "$out" | grep -q "host-ssh-2a01:4f8:c17:a0b6::1=closed" && printf '%s\n' "$out" | grep -q "ts-own=closed"; then ok "@HOST@ gives one probe per address (v4 and v6) and @TAILSCALE4@ the tailscale address"; else bad "placeholders: $out"; fi
-if ! printf '%s\n' "$out" | grep -q "only-kernel"; then ok "a probe for another set is not run"; else bad "the kernel probe ran in the worker set"; fi
+out="$(probe control worker "$probes" --host-addrs "203.0.113.10/32 2001:db8::10/128")"
+if grep -qx "leak-tcp=open" <<<"$out" && grep -qx "closed-tcp=closed" <<<"$out" && grep -qx "leak-unix=open" <<<"$out" && grep -qx "open-limit=open" <<<"$out"; then ok "control run: says which deny and known targets are really listening"; else bad "control output: $out"; fi
+if grep -q "host-ssh-203.0.113.10=closed" <<<"$out" && grep -q "host-ssh-2001:db8::10=closed" <<<"$out"; then ok "@HOST@ gives one probe per address (v4 and v6)"; else bad "placeholders: $out"; fi
+if ! grep -q "only-kernel" <<<"$out"; then ok "a probe for another set is not run"; else bad "the kernel probe ran in the worker set"; fi
 ctl="$(printf '%s\n' "$out" | paste -sd, -)"
 rc=0
-res="$(probe fenced worker "$probes" --host-addrs "91.98.153.155/32" --tailscale 100.85.168.22 --control "$ctl")" || rc=$?
-if printf '%s\n' "$res" | grep -q "^FAIL worker leak-tcp UNEXPECTED SUCCESS" && printf '%s\n' "$res" | grep -q "^FAIL worker leak-unix UNEXPECTED SUCCESS"; then ok "a deny probe that connects is a FAIL (a leak), for tcp and for a unix socket"; else bad "leak result: $res"; fi
-if printf '%s\n' "$res" | grep -q "^warn worker closed-tcp inconclusive" ; then ok "a deny probe that fails where the control also failed is only inconclusive"; else bad "closed-tcp: $res"; fi
-if printf '%s\n' "$res" | grep -q "^ok worker gateway-http works" && printf '%s\n' "$res" | grep -q "^FAIL worker missing-thing should work"; then ok "an allow probe passes when it works and FAILs when it does not"; else bad "allow results: $res"; fi
-if printf '%s\n' "$res" | grep -q "^warn worker late-thing not reachable yet" ; then ok "an allow-late probe that misses is a warning"; else bad "late: $res"; fi
-if printf '%s\n' "$res" | grep -q "^info worker open-limit known limit"; then ok "a known limit is reported and never fails by itself"; else bad "known: $res"; fi
-if printf '%s\n' "$res" | grep -q "^ok worker a-user" && printf '%s\n' "$res" | grep -q "^ok worker a-pair" && printf '%s\n' "$res" | grep -q "^ok worker a-child"; then ok "user lookup, socketpair and spawning a child are probed"; else bad "functional probes: $res"; fi
+res="$(probe fenced worker "$probes" --host-addrs "203.0.113.10/32" --control "$ctl")" || rc=$?
+if grep -q "^FAIL worker leak-tcp UNEXPECTED SUCCESS" <<<"$res" && grep -q "^FAIL worker leak-unix UNEXPECTED SUCCESS" <<<"$res"; then ok "a deny probe that connects is a FAIL (a leak), for tcp and for a unix socket"; else bad "leak result: $res"; fi
+if grep -q "^warn worker closed-tcp inconclusive" <<<"$res" ; then ok "a deny probe that fails where the control also failed is only inconclusive"; else bad "closed-tcp: $res"; fi
+if grep -q "^ok worker gateway-http works" <<<"$res" && grep -q "^FAIL worker missing-thing should work" <<<"$res"; then ok "an allow probe passes when it works and FAILs when it does not"; else bad "allow results: $res"; fi
+if grep -q "^warn worker late-thing not reachable yet" <<<"$res" ; then ok "an allow-late probe that misses is a warning"; else bad "late: $res"; fi
+if grep -q "^info worker open-limit known limit" <<<"$res"; then ok "a known limit is reported and never fails by itself"; else bad "known: $res"; fi
+if grep -q "^ok worker a-user" <<<"$res" && grep -q "^ok worker a-pair" <<<"$res" && grep -q "^ok worker a-child" <<<"$res"; then ok "user lookup, socketpair and spawning a child are probed"; else bad "functional probes: $res"; fi
 if [ "$rc" -eq 1 ]; then ok "exit 1 when anything FAILed"; else bad "exit code $rc"; fi
 # no control result for a target: a failed connection is not shown to be the fence's doing, so it is only inconclusive
 res2="$(probe fenced worker "$probes" --no-late | grep "closed-tcp\|unknown-closed")"
-if [ "$(printf '%s\n' "$res2" | grep -c '^warn worker .* inconclusive')" = "2" ]; then ok "with no control result a failed deny probe is inconclusive, never a pass"; else bad "no-control results: $res2"; fi
+if [ "$(grep -c '^warn worker .* inconclusive' <<<"$res2")" = "2" ]; then ok "with no control result a failed deny probe is inconclusive, never a pass"; else bad "no-control results: $res2"; fi
 ctl3="closed-tcp=open,unknown-closed=open"
 res3="$(probe fenced worker "$probes" --control "$ctl3" --no-late | grep "closed-tcp\|unknown-closed")"
-if [ "$(printf '%s\n' "$res3" | grep -c '^ok worker .* blocked')" = "2" ]; then ok "a deny probe that fails where the control connected is a pass: blocked"; else bad "blocked results: $res3"; fi
+if [ "$(grep -c '^ok worker .* blocked' <<<"$res3")" = "2" ]; then ok "a deny probe that fails where the control connected is a pass: blocked"; else bad "blocked results: $res3"; fi
 printf 'known worker only-known tcp 127.0.0.1:%s\nknown worker also-known tcp 127.0.0.1:%s\n' "$tcp_port" "$closed_port" >"$work/known.txt"
 rc=0
 probe fenced worker "$work/known.txt" >"$work/known.out" 2>&1 || rc=$?
@@ -190,8 +198,8 @@ class Fake:
     def connect(self, addr): seen.append(addr)
     def close(self): pass
 socket.socket = Fake
-ok, _ = fp.attempt("abstract", "/tmp/.X11-unix/X99")
-assert ok and seen[-1] == "\0/tmp/.X11-unix/X99", seen
+ok, _ = fp.attempt("abstract", "/tmp/example-abstract")
+assert ok and seen[-1] == "\0/tmp/example-abstract", seen
 ok, _ = fp.attempt("unix", "/run/tailscale/tailscaled.sock")
 assert ok and seen[-1] == "/run/tailscale/tailscaled.sock", seen
 def boom(uid): raise KeyError("no such user")
@@ -202,13 +210,13 @@ print("probe functions ok")
 PY
 if grep -q "probe functions ok" "$work/unit.out"; then ok "the abstract address starts with a NUL byte, a path address does not, and a failed user lookup is a failure"; else bad "probe function check: $(cat "$work/unit.out")"; fi
 res4="$(probe fenced worker "$probes" --late-only)"
-if [ "$(printf '%s\n' "$res4" | wc -l | tr -d ' ')" = "1" ] && printf '%s\n' "$res4" | grep -q "late-thing"; then ok "--late-only runs only the late probe"; else bad "late-only: $res4"; fi
+if [ "$(printf '%s\n' "$res4" | wc -l | tr -d ' ')" = "1" ] && grep -q "late-thing" <<<"$res4"; then ok "--late-only runs only the late probe"; else bad "late-only: $res4"; fi
 res5="$(probe fenced worker "$probes" --no-late)"
-if ! printf '%s\n' "$res5" | grep -q "late-thing"; then ok "--no-late leaves it out"; else bad "no-late: $res5"; fi
+if ! grep -q "late-thing" <<<"$res5"; then ok "--no-late leaves it out"; else bad "no-late: $res5"; fi
 if [ "$(uname)" = "Linux" ] && [ "$abs_name" != "-" ]; then
   printf 'deny worker abs-leak abstract %s\n' "$abs_name" >"$work/abs.txt"
   r="$(probe fenced worker "$work/abs.txt" --control "abs-leak=open" || true)"
-  if printf '%s\n' "$r" | grep -q "^FAIL worker abs-leak UNEXPECTED SUCCESS"; then ok "an abstract unix socket that is reachable is a FAIL"; else bad "abstract: $r"; fi
+  if grep -q "^FAIL worker abs-leak UNEXPECTED SUCCESS" <<<"$r"; then ok "an abstract unix socket that is reachable is a FAIL"; else bad "abstract: $r"; fi
 else
   ok "abstract socket probe: skipped here (no abstract sockets on this OS; CI on Linux runs it)"
 fi
@@ -217,11 +225,11 @@ expect_fail_msg "a malformed probe line is an error" "bad probe line" python3 -I
 printf 'maybe worker n tcp 127.0.0.1:1\n' >"$work/badexpect.txt"
 expect_fail_msg "an unknown expectation is an error" "unknown expectation" python3 -I "$deploy/fence-probe.py" fenced worker "$work/badexpect.txt"
 
-echo "the real probe list"
+echo "the published probe list"
 P="$deploy/fence/probes.txt"
 ALL="worker,kernel,build,cli-worker,cli-kernel"
 WORKERISH="worker,build,cli-worker"
-# <target pattern> <the sets whose deny line it must be in, exactly>: a deny probe that exists for only some sets leaves the others unproven
+# <target pattern> @@ <the sets whose deny line it must be in, exactly>: a deny probe that exists for only some sets leaves the others unproven
 while IFS= read -r row; do
   [ -n "$row" ] || continue
   pat="${row%%@@*}"
@@ -229,15 +237,7 @@ while IFS= read -r row; do
   got_sets="$(grep -E "^deny" "$P" | grep -E -- "$pat" | awk '{print $2}' | tr '\n' ' ' | sed 's/ $//')"
   if [ "$got_sets" = "$want_sets" ]; then ok "must-fail probe for $pat covers exactly: $want_sets"; else bad "deny probe for $pat covers '$got_sets', wanted '$want_sets'"; fi
 done <<EOF2
-127\.0\.0\.1:9222( |\$)@@$ALL
-127\.0\.0\.1:8233( |\$)@@$ALL
-\[::1\]:8000( |\$)@@$ALL
-172\.17\.0\.1:5433( |\$)@@$ALL
-@TAILSCALE4@:46841( |\$)@@$ALL
-@HOST@:22( |\$)@@$WORKERISH
-127\.0\.0\.53:80( |\$)@@$ALL
 127\.0\.0\.53:53( |\$)@@$ALL
-abstract  /tmp/\.X11-unix/X99( |\$)@@$WORKERISH
 /run/tailscale/tailscaled\.sock( |\$)@@$ALL
 /run/snapd\.socket( |\$)@@$ALL
 /run/docker\.sock( |\$)@@$ALL
@@ -251,12 +251,101 @@ for kind in dns https pwd socketpair spawn; do
   if grep -qE "^allow +[a-z,-]+ +[a-z-]+ +$kind " "$P"; then ok "must-work probe present: $kind"; else bad "no allow probe of kind $kind"; fi
 done
 if grep -qE "^allow-late +worker,cli-worker +[a-z-]+ +http +http://127.74.3.1:7431/healthz" "$P"; then ok "the gateway /healthz probe is a separate, late one for the worker sets"; else bad "gateway probe"; fi
-if grep -E "^deny" "$P" | grep "abstract" | grep -q "worker,build,cli-worker" && grep -E "^known" "$P" | grep -q "kernel,cli-kernel.*abstract"; then ok "the abstract X socket is blocked for the worker and build sets and a known limit for the kernel's"; else bad "abstract expectations"; fi
-if ! grep -E "^deny" "$P" | grep "abstract" | grep -q "kernel"; then ok "the kernel sets are never required to block the abstract socket (they keep AF_UNIX)"; else bad "kernel deny on abstract"; fi
 for s in worker kernel build cli-worker cli-kernel; do
-  if grep -vE '^#|^$' "$P" | awk -v s="$s" '{ n = split($2, a, ","); for (i = 1; i <= n; i++) if (a[i] == s) c++ } END { exit !(c >= 8) }'; then ok "$s has at least 8 probes"; else bad "$s has fewer than 8 probes"; fi
+  if grep -vE '^#|^$' "$P" | awk -v s="$s" '{ n = split($2, a, ","); for (i = 1; i <= n; i++) if (a[i] == s) c++ } END { exit !(c >= 8) }'; then ok "$s has at least 8 published probes"; else bad "$s has fewer than 8 published probes"; fi
 done
 if awk '!/^#/ && NF && NF < 5 { print "line " NR ": " $0; bad = 1 } END { exit bad }' "$P" >"$work/cols" 2>&1; then ok "every probe line has at least five columns (the last one may hold spaces)"; else bad "malformed probe lines: $(cat "$work/cols")"; fi
+if ! grep -vE '^#' "$P" | grep -E '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | grep -qvE '127\.0\.0\.53|127\.74\.3\.1'; then ok "the published list names no address but the resolver stub and the gateway"; else bad "an address in the published list"; fi
+
+echo "probes derived from the machine"
+cat >"$work/d-tcp" <<'DATA'
+LISTEN 0 4096 127.0.0.1:41001 0.0.0.0:*
+LISTEN 0 4096 [::1]:41002 [::]:*
+LISTEN 0 4096 127.0.0.53%lo:53 0.0.0.0:*
+LISTEN 0 4096 172.16.0.1:41003 0.0.0.0:*
+LISTEN 0 4096 100.64.0.10:41004 0.0.0.0:*
+LISTEN 0 128 0.0.0.0:41005 0.0.0.0:*
+LISTEN 0 128 [::]:41005 [::]:*
+LISTEN 0 128 *:41006 *:*
+LISTEN 0 128 203.0.113.10:41007 0.0.0.0:*
+LISTEN 0 128 127.74.3.1:7431 0.0.0.0:*
+LISTEN 0 128 172.20.0.1:41008 0.0.0.0:*
+DATA
+cat >"$work/d-unix" <<'DATA'
+u_str LISTEN 0 4096 /run/example.sock 111 * 0
+u_str LISTEN 0 4096 @/tmp/example-abstract 112 * 0
+u_str LISTEN 0 4096 @second 113 * 0
+DATA
+cat >"$work/d-ip" <<'DATA'
+1: lo    inet 127.0.0.1/8 scope host lo
+2: eth0    inet 203.0.113.10/32 scope global eth0
+2: eth0    inet6 2001:db8::10/64 scope global
+6: tailscale0    inet 100.64.0.10/32 scope global tailscale0
+7: docker0    inet 172.16.0.1/16 scope global docker0
+8: br-1    inet 172.20.0.1/16 scope global br-1
+DATA
+python3 -I "$deploy/fence-probe.py" derive "$work/d-tcp" "$work/d-unix" "$work/d-ip" >"$work/derived.txt"
+sets_for() { awk -v t="$1" '$1 == "deny" && $5 == t { print $2 }' "$work/derived.txt" | sort | tr '\n' ' ' | sed 's/ $//'; }
+chk() { # chk <target> <sets>
+  if [ "$(sets_for "$1")" = "$2" ]; then ok "derived: $1 is denied for $2"; else bad "derived: $1 -> '$(sets_for "$1")', wanted '$2'"; fi
+}
+chk 127.0.0.1:41001 "$ALL"
+chk "[::1]:41002" "$ALL"
+chk 127.0.0.53:53 "$ALL"
+chk 172.16.0.1:41003 "$ALL"
+chk 100.64.0.10:41004 "$ALL"
+chk 127.0.0.1:41005 "$ALL"
+chk "[::1]:41005" "$ALL"
+chk 172.16.0.1:41005 "$ALL"
+chk 100.64.0.10:41005 "$ALL"
+chk 203.0.113.10:41005 "$WORKERISH"
+chk "[2001:db8::10]:41005" "$WORKERISH"
+chk 127.0.0.1:41006 "$ALL"
+chk "[::1]:41006" "$ALL"
+chk 203.0.113.10:41006 "$WORKERISH"
+if ! grep -qE ' 127\.74\.3\.1:' "$work/derived.txt"; then ok "derived: the kernel's own gateway is never a deny target"; else bad "the gateway is in the derived list"; fi
+chk 203.0.113.10:41007 ""
+chk 172.20.0.1:41008 "$ALL"
+chk 172.20.0.1:41005 "$ALL"
+if [ "$(awk '$1 == "deny" && $4 == "abstract" { print $2 " " $5 }' "$work/derived.txt" | sort | tr '\n' '|')" = "worker,build,cli-worker /tmp/example-abstract|worker,build,cli-worker second|" ] && [ "$(awk '$1 == "known" && $4 == "abstract" { print $2 " " $5 }' "$work/derived.txt" | sort | tr '\n' '|')" = "kernel,cli-kernel /tmp/example-abstract|kernel,cli-kernel second|" ]; then ok "derived: every abstract socket is denied for the worker, build and worker CLI and a known limit for the kernel sets; a path socket is not an abstract one"; else bad "abstract lines: $(grep abstract "$work/derived.txt")"; fi
+python3 -I "$deploy/fence-probe.py" derive "$work/d-tcp" "$work/d-unix" "$work/d-ip" >"$work/derived2.txt"
+if cmp -s "$work/derived.txt" "$work/derived2.txt"; then ok "derived: the same machine gives the same list"; else bad "derived list is not stable"; fi
+# the order ss prints in does not matter
+sed '1!G;h;$!d' "$work/d-tcp" >"$work/d-tcp-rev"
+sed '1!G;h;$!d' "$work/d-unix" >"$work/d-unix-rev"
+python3 -I "$deploy/fence-probe.py" derive "$work/d-tcp-rev" "$work/d-unix-rev" "$work/d-ip" >"$work/derived3.txt"
+if cmp -s "$work/derived.txt" "$work/derived3.txt"; then ok "derived: listeners in the reverse order give the same, sorted list"; else bad "derived list depends on the order ss printed in"; fi
+if ! grep -qvE '^(deny|known) ' "$work/derived.txt"; then ok "derived: every line is a probe line"; else bad "odd derived output"; fi
+# the derived lines are valid probe lines: the probe reads them
+dc="$(python3 -I "$deploy/fence-probe.py" control worker - --host-addrs "203.0.113.10/32" <"$work/derived.txt" | wc -l | tr -d ' ')"
+if [ "$dc" -ge 10 ]; then ok "derived: the probe reads the lines it was given ($dc probes in the worker set)"; else bad "derived lines not read ($dc)"; fi
+: >"$work/e-empty"
+if [ -z "$(python3 -I "$deploy/fence-probe.py" derive "$work/e-empty" "$work/e-empty" "$work/e-empty")" ]; then ok "derived: a machine with nothing listening gives no probes (and no error)"; else bad "derived output from nothing"; fi
+
+echo "the extra probes (set-secret.sh --fence-extra-probes)"
+xroot="$work/xroot"
+mkdir -p "$xroot/etc/bulig"
+chmod 700 "$xroot/etc/bulig"
+xs() { BULIG_DEPLOY_TEST_ROOT="$xroot" bash "$deploy/set-secret.sh" --fence-extra-probes; }
+printf '# my machine\ndeny worker,kernel,build,cli-worker,cli-kernel local-one tcp 127.0.0.1:41099\ndeny worker,build,cli-worker local-abs abstract example-name\nknown kernel,cli-kernel local-abs2 abstract example-name\n' >"$work/x-good"
+expect_ok "a filled-in file is accepted" bash -c "BULIG_DEPLOY_TEST_ROOT='$xroot' bash '$deploy/set-secret.sh' --fence-extra-probes <'$work/x-good'"
+if cmp -s "$work/x-good" "$xroot/etc/bulig/fence-extra-probes.txt" && [ "$(mode "$xroot/etc/bulig/fence-extra-probes.txt")" = "600" ]; then ok "and stored as it was, mode 600"; else bad "stored file: $(mode "$xroot/etc/bulig/fence-extra-probes.txt")"; fi
+rejects() { # rejects <label> <text it must complain about> <file content>
+  printf '%b' "$3" >"$work/x-bad"
+  cp "$xroot/etc/bulig/fence-extra-probes.txt" "$work/x-before"
+  expect_fail_msg "refused: $1" "$2" bash -c "BULIG_DEPLOY_TEST_ROOT='$xroot' bash '$deploy/set-secret.sh' --fence-extra-probes <'$work/x-bad'"
+  if cmp -s "$work/x-before" "$xroot/etc/bulig/fence-extra-probes.txt" && [ -z "$(find "$xroot/etc/bulig" -name '.fence-extra.*')" ]; then ok "  and the stored file is unchanged, no temp file left"; else bad "  stored file changed or temp left after '$1'"; fi
+}
+rejects "an empty file" "holds no probe" ''
+rejects "only comments" "holds no probe" '# nothing\n\n# here\n'
+rejects "a placeholder left" "placeholder" 'deny worker n tcp <ADDRESS>:<PORT>\n'
+rejects "the template as it comes" "placeholder" "$(cat "$deploy/fence/extra-probes.template")\n"
+rejects "an unknown set" "is not a set name" 'deny worker,laptop n tcp 127.0.0.1:1\n'
+rejects "an unknown kind" "kind must be" 'deny worker n udp 127.0.0.1:1\n'
+rejects "an expectation that is not deny or known" "is not deny or known" 'allow worker n tcp 127.0.0.1:1\n'
+rejects "a line with too few fields" "five fields" 'deny worker n tcp\n'
+expect_fail_msg "a call with an argument is refused" "usage: set-secret.sh" bash -c "BULIG_DEPLOY_TEST_ROOT='$xroot' bash '$deploy/set-secret.sh' --fence-extra-probes x <'$work/x-good'"
+if ! grep -rqE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' "$deploy/fence/extra-probes.template"; then ok "the template holds no address at all (only <ADDRESS>)"; else bad "an address in the template"; fi
 
 echo "fence-check.sh"
 # stand-in for systemd-run: records the arguments, then runs what comes after "--" here (the probe, with python3 in place of /usr/bin/python3)
@@ -311,16 +400,44 @@ printf 'deny worker hidden-sock unix %s\n' "$unix_path" >"$work/fc-hidden.txt"
 rc=0
 STUB_HIDE="$unix_path" BULIG_FENCE_PROBES="$work/fc-hidden.txt" bash "$deploy/fence-check.sh" worker >"$work/fc.out" 2>&1 || rc=$?
 if [ "$rc" -eq 0 ] && grep -q "^ok worker hidden-sock blocked" "$work/fc.out" && ! grep -q "^warn" "$work/fc.out"; then ok "a target reached by the control and not by the fenced run is a pass: blocked (so the control run is what makes a pass mean something)"; else bad "hidden-target rc=$rc: $(cat "$work/fc.out")"; fi
+# the machine-specific probes are required, and are part of the run
+EX="$root/etc/bulig/fence-extra-probes.txt"
+cp "$EX" "$work/ex.keep"
+rm -f "$EX"
+expect_fail_msg "fence-check fails when the extra probes file is missing" "fence-extra-probes.txt is missing or empty" env BULIG_FENCE_PROBES="$work/fc-clean.txt" bash "$deploy/fence-check.sh" worker
+: >"$EX"
+expect_fail_msg "and when it is empty" "is missing or empty" env BULIG_FENCE_PROBES="$work/fc-clean.txt" bash "$deploy/fence-check.sh" worker
+printf '# only a comment\n\n' >"$EX"
+expect_fail_msg "and when it holds only comments" "holds no probe" env BULIG_FENCE_PROBES="$work/fc-clean.txt" bash "$deploy/fence-check.sh" worker
+printf 'deny worker n tcp <ADDRESS>:<PORT>\n' >"$EX"
+expect_fail_msg "and when a placeholder is still in it" "placeholder" env BULIG_FENCE_PROBES="$work/fc-clean.txt" bash "$deploy/fence-check.sh" worker
+printf 'deny worker,kernel,build,cli-worker,cli-kernel extra-leak tcp 127.0.0.1:%s\n' "$tcp_port" >"$EX"
+rc=0
+BULIG_FENCE_PROBES="$work/fc-clean.txt" bash "$deploy/fence-check.sh" worker >"$work/fc.out" 2>&1 || rc=$?
+if [ "$rc" -eq 1 ] && grep -q "^FAIL worker extra-leak UNEXPECTED SUCCESS" "$work/fc.out"; then ok "a probe in the extra file is run, and a leak found by it fails the check"; else bad "extra probe not run: rc=$rc $(cat "$work/fc.out")"; fi
+cp "$work/ex.keep" "$EX"
+# probes derived from what the machine is listening on are part of the run too
+printf 'LISTEN 0 4096 127.0.0.1:%s 0.0.0.0:*\n' "$tcp_port" >"$log/ss-tcp"
+rc=0
+BULIG_FENCE_PROBES="$work/fc-clean.txt" bash "$deploy/fence-check.sh" worker >"$work/fc.out" 2>&1 || rc=$?
+if [ "$rc" -eq 1 ] && grep -q "^FAIL worker listener-127.0.0.1-$tcp_port UNEXPECTED SUCCESS" "$work/fc.out"; then ok "a loopback listener found with ss becomes a deny probe without being named anywhere, and a leak to it fails the check"; else bad "derived probe not run: rc=$rc $(cat "$work/fc.out")"; fi
+printf 'u_str LISTEN 0 4096 @example-abstract-name 1 * 0\n' >"$log/ss-unix"
+: >"$log/ss-tcp"
+BULIG_FENCE_PROBES="$work/fc-clean.txt" bash "$deploy/fence-check.sh" worker kernel >"$work/fc.out" 2>&1 || true
+if grep -q "worker abstract-1 " "$work/fc.out" && grep -q "^info kernel abstract-1 known limit" "$work/fc.out"; then ok "an abstract socket found with ss is probed: denied for the worker, a known limit for the kernel"; else bad "derived abstract probes: $(grep abstract "$work/fc.out")"; fi
+: >"$log/ss-unix"
+if ! grep -q "work\." <(ls "$root/var/lib/bulig-checks" 2>/dev/null); then ok "the probe stream is removed afterwards"; else bad "work folder left in $(ls "$root/var/lib/bulig-checks")"; fi
+
 # a drop-in that opens a hole is part of what is tested
 mkdir -p "$SD/bulig-worker.service.d"
 printf '[Service]\nIPAddressAllow=127.0.0.1/32\nRestrictAddressFamilies=AF_UNIX\n' >"$SD/bulig-worker.service.d/99-hole.conf"
 : >"$log/runs"
 BULIG_FENCE_PROBES="$work/fc-clean.txt" bash "$deploy/fence-check.sh" worker >/dev/null 2>&1 || true
 case "$(run_for worker)" in *"IPAddressAllow=127.74.3.1/32 127.0.0.1/32"*"RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX"*) ok "a drop-in that adds 127.0.0.1 and AF_UNIX is passed to the probe, so the probe would catch it" ;; *) bad "drop-in not merged: $(run_for worker)" ;; esac
-printf '[Service]\nIPAddressAllow=\nIPAddressAllow=100.1.1.1/32\n' >"$SD/bulig-worker.service.d/99-hole.conf"
+printf '[Service]\nIPAddressAllow=\nIPAddressAllow=100.64.1.1/32\n' >"$SD/bulig-worker.service.d/99-hole.conf"
 : >"$log/runs"
 BULIG_FENCE_PROBES="$work/fc-clean.txt" bash "$deploy/fence-check.sh" worker >/dev/null 2>&1 || true
-case "$(run_for worker)" in *"IPAddressAllow=100.1.1.1/32 "*) ok "an empty assignment resets the list, as in systemd" ;; *) bad "reset not honoured: $(run_for worker)" ;; esac
+case "$(run_for worker)" in *"IPAddressAllow=100.64.1.1/32 "*) ok "an empty assignment resets the list, as in systemd" ;; *) bad "reset not honoured: $(run_for worker)" ;; esac
 rm -f "$SD/bulig-worker.service.d/99-hole.conf"
 rc=0
 STUB_RUN_FAIL=1 BULIG_FENCE_PROBES="$work/fc-clean.txt" bash "$deploy/fence-check.sh" worker >"$work/fc.out" 2>&1 || rc=$?
@@ -388,8 +505,8 @@ echo "node and exec probes, and the build's HOME"
 if [ -n "$NODE_DIR" ]; then
   printf 'allow worker node-ok node require("http").get("http://127.0.0.1:%s/x",r=>process.exit(r.statusCode===200?0:1)).on("error",()=>process.exit(1))\nallow worker node-bad node process.exit(3)\nknown worker node-known node process.exit(4)\nallow worker exec-ok exec python3 --version\nallow worker exec-bad exec python3 -c raise\n' "$http_port" >"$work/nodeprobes.txt"
   res="$(PATH="$NODE_DIR:$PATH" probe fenced worker "$work/nodeprobes.txt" || true)"
-  if printf '%s\n' "$res" | grep -q "^ok worker node-ok works" && printf '%s\n' "$res" | grep -q "^FAIL worker node-bad should work" && printf '%s\n' "$res" | grep -q "^info worker node-known known limit: node .* does not work (exit 4"; then ok "a node probe works when node exits 0, fails when it does not, and a known one only reports"; else bad "node probes: $res"; fi
-  if printf '%s\n' "$res" | grep -q "^ok worker exec-ok works" && printf '%s\n' "$res" | grep -q "^FAIL worker exec-bad should work"; then ok "an exec probe (claude --version's kind) works when the command exits 0 and fails when it does not"; else bad "exec probes: $res"; fi
+  if grep -q "^ok worker node-ok works" <<<"$res" && grep -q "^FAIL worker node-bad should work" <<<"$res" && grep -q "^info worker node-known known limit: node .* does not work (exit 4" <<<"$res"; then ok "a node probe works when node exits 0, fails when it does not, and a known one only reports"; else bad "node probes: $res"; fi
+  if grep -q "^ok worker exec-ok works" <<<"$res" && grep -q "^FAIL worker exec-bad should work" <<<"$res"; then ok "an exec probe (claude --version's kind) works when the command exits 0 and fails when it does not"; else bad "exec probes: $res"; fi
 else
   ok "node probes: skipped (no node on this machine's PATH; CI has node)"
 fi

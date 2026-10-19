@@ -20,10 +20,10 @@ cat >"$stubs/ip" <<'STUB'
 case "$*" in
   *"scope global"*)
     cat <<'DATA'
-2: eth0    inet 91.98.153.155/32 metric 100 scope global dynamic eth0
-2: eth0    inet6 2a01:4f8:c17:a0b6::1/64 scope global
-6: tailscale0    inet 100.85.168.22/32 scope global tailscale0
-7: docker0    inet 172.17.0.1/16 brd 172.17.255.255 scope global docker0
+2: eth0    inet 203.0.113.10/32 metric 100 scope global dynamic eth0
+2: eth0    inet6 2001:db8::10/64 scope global
+6: tailscale0    inet 100.64.0.10/32 scope global tailscale0
+7: docker0    inet 172.16.0.1/16 brd 172.16.255.255 scope global docker0
 DATA
     ;;
 esac
@@ -137,7 +137,7 @@ if grep -q ' -h ' "$log/chown" && ! grep -qv ' -h ' "$log/chown"; then ok "every
 if [ ! -e "$log/followed" ]; then ok "no chown followed a link"; else bad "a chown followed a link"; fi
 files="$(cd "$root" && find . -type f | sort | tr '\n' ' ')"
 if [ "$files" = "./etc/systemd/system/bulig-worker.service.d/10-host-addresses.conf " ]; then ok "setup writes one file only, the worker's host-address drop-in (no placeholder secrets, no config)"; else bad "files created: $files"; fi
-if grep -qx "IPAddressDeny=2a01:4f8:c17:a0b6::1/128 91.98.153.155/32" "$root/etc/systemd/system/bulig-worker.service.d/10-host-addresses.conf"; then ok "and that drop-in denies the machine's own public addresses, read from ip"; else bad "drop-in: $(cat "$root/etc/systemd/system/bulig-worker.service.d/10-host-addresses.conf")"; fi
+if grep -qx "IPAddressDeny=2001:db8::10/128 203.0.113.10/32" "$root/etc/systemd/system/bulig-worker.service.d/10-host-addresses.conf"; then ok "and that drop-in denies the machine's own public addresses, read from ip"; else bad "drop-in: $(cat "$root/etc/systemd/system/bulig-worker.service.d/10-host-addresses.conf")"; fi
 
 # --- 3. a second run changes nothing ---
 after1="$(listing "$root")"

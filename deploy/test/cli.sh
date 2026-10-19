@@ -13,10 +13,10 @@ cat >"$stubs/ip" <<'STUB'
 case "$*" in
   *"scope global"*)
     cat <<'DATA'
-2: eth0    inet 91.98.153.155/32 metric 100 scope global dynamic eth0
-2: eth0    inet6 2a01:4f8:c17:a0b6::1/64 scope global
-6: tailscale0    inet 100.85.168.22/32 scope global tailscale0
-7: docker0    inet 172.17.0.1/16 brd 172.17.255.255 scope global docker0
+2: eth0    inet 203.0.113.10/32 metric 100 scope global dynamic eth0
+2: eth0    inet6 2001:db8::10/64 scope global
+6: tailscale0    inet 100.64.0.10/32 scope global tailscale0
+7: docker0    inet 172.16.0.1/16 brd 172.16.255.255 scope global docker0
 DATA
     ;;
 esac
@@ -69,7 +69,7 @@ check "with the Claude token" "LoadCredential=claude-token:$work/root/etc/bulig/
 check "and its own worker token" "LoadCredential=worker-token:$work/root/etc/bulig/worker-token"
 absent "none of the kernel's secrets or its config" "pg-url|gh-token|worker-tokens|config.json"
 absent "no ReadWritePaths" "ReadWritePaths"
-check "the worker's one-off commands cannot reach Tailscale or this machine's own public addresses" "IPAddressDeny=localhost link-local multicast 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7 2a01:4f8:c17:a0b6::1/128 91.98.153.155/32"
+check "the worker's one-off commands cannot reach Tailscale or this machine's own public addresses" "IPAddressDeny=localhost link-local multicast 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7 2001:db8::10/128 203.0.113.10/32"
 check "only the gateway address is let through" "IPAddressAllow=127.74.3.1/32"
 check "the worker's one-off commands have no unix sockets at all" "RestrictAddressFamilies=AF_INET AF_INET6"
 if [ "$(grep -c '^RestrictAddressFamilies=' "$work/argv")" = "1" ] && ! grep -q 'RestrictAddressFamilies=.*AF_UNIX' "$work/argv"; then ok "and nothing else in the command line gives AF_UNIX back"; else bad "address-family lines: $(grep Restrict "$work/argv")"; fi

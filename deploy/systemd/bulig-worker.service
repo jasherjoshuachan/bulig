@@ -65,14 +65,13 @@ RestrictRealtime=true
 LockPersonality=true
 SystemCallArchitectures=native
 # NETWORK AND SOCKETS. This unit runs Claude (a prompt can steer it) and the commands Claude runs, so it gets the narrowest reach.
-# On this host 127.0.0.1 carries other tenants' services with no login (a browser debugging port, a workflow server, model servers, about
-# fifty more), the docker bridges carry containers, and a tenant's X server listens on an abstract unix socket that no file permission or
-# PrivateTmp hides. So:
+# Other services on this host listen on loopback and on the container bridges with no login of their own, and another tenant's program can
+# listen on an abstract unix socket that no file permission or PrivateTmp hides. So:
 # - RestrictAddressFamilies has no AF_UNIX (and no AF_NETLINK): the unit cannot open a unix socket at all, abstract ones included. Pipes and
 #   socketpair() are not affected (systemd.exec: "sockets created with socketpair() are unaffected"), which is what node's child_process uses.
 # - IPAddressDeny/Allow filter every IP packet in both directions (an Allow match wins, then a Deny match, then the packet is let through,
 #   which is the public internet). They match ADDRESSES, NOT PORTS: 127.74.3.1 is allowed for the kernel gateway, so a service listening on
-#   every address (22, 80, 443 here: public anyway) is also reachable at 127.74.3.1. The host's own public addresses are denied as well; they
+#   every address is also reachable at 127.74.3.1, with a loopback source (it may treat that as trusted). The host's own public addresses are denied as well; they
 #   are read from the machine at setup time into a drop-in (bulig-worker.service.d/10-host-addresses.conf, root-owned), not written here.
 # - DNS: /etc/resolv.conf is the systemd-resolved stub on 127.0.0.53, which would have to be allowed, and an allowed address reaches every
 #   listener on it. So the unit gets resolved's upstream list in its place (public servers, which the deny list does not touch).

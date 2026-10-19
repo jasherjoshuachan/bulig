@@ -37,6 +37,8 @@ BULIG_RESOLV_BIND="/run/systemd/resolve/resolv.conf:/etc/resolv.conf"
 R="${BULIG_DEPLOY_TEST_ROOT:-}"
 BULIG_CRED_DIR="$R/etc/bulig"
 BULIG_BACKUP_ENV_FILE="$R/etc/bulig/backup.env"
+# The machine-specific fence probes: root-owned, 0600, written on the server, never in git (RUNBOOK, "The extra probes").
+BULIG_FENCE_EXTRA="$R/etc/bulig/fence-extra-probes.txt"
 BULIG_OPT_DIR="$R/opt/bulig"
 BULIG_TOOLS_DIR="$R/usr/local/lib/bulig"
 BULIG_UNIT_DIR="$R/etc/systemd/system"
@@ -304,6 +306,39 @@ install_root_file() {
     die "$dest became a link. Not touching it."
   fi
   mv -T "$new" "$dest"
+}
+
+# fence_extra_check <file>: dies unless the file holds at least one probe and every probe line is complete: expect (deny|known), sets (known
+# names), a name, a kind (tcp|unix|abstract) and a target, with no <placeholder> left.
+fence_extra_check() {
+  local f="$1" line trimmed n=0 expect sets name kind target s
+  while IFS= read -r line || [ -n "$line" ]; do
+    trimmed="${line#"${line%%[![:space:]]*}"}"
+    case "$trimmed" in '' | '#'*) continue ;; esac
+    read -r expect sets name kind target <<<"$line"
+    case "$expect" in deny | known) ;; *) die "fence-extra-probes: '$expect' is not deny or known: $line" ;; esac
+    for s in ${sets//,/ }; do
+      case "$s" in worker | kernel | build | cli-worker | cli-kernel) ;; *) die "fence-extra-probes: '$s' is not a set name: $line" ;; esac
+    done
+    case "$kind" in tcp | unix | abstract) ;; *) die "fence-extra-probes: kind must be tcp, unix or abstract: $line" ;; esac
+    [ -n "$name" ] && [ -n "$target" ] || die "fence-extra-probes: a probe needs five fields: $line"
+    case "$line" in *'<'* | *'>'*) die "fence-extra-probes: a <placeholder> is still in: $line" ;; esac
+    n=$((n + 1))
+  done <"$f"
+  [ "$n" -gt 0 ] || die "fence-extra-probes: the file holds no probe"
+}
+
+# fence_extra_write: stdin becomes /etc/bulig/fence-extra-probes.txt (root, 0600, atomic) once it passes fence_extra_check.
+fence_extra_write() {
+  local tmp
+  need_dir "$BULIG_CRED_DIR"
+  tmp="$(mktemp "$BULIG_CRED_DIR/.fence-extra.XXXXXX")"
+  chmod 600 "$tmp"
+  cat >"$tmp"
+  (fence_extra_check "$tmp") || { rm -f "$tmp"; exit 1; }
+  if is_root; then chown -h root:root "$tmp"; fi
+  mv "$tmp" "$BULIG_FENCE_EXTRA"
+  echo "wrote $BULIG_FENCE_EXTRA ($(grep -cvE '^[[:space:]]*(#|$)' "$BULIG_FENCE_EXTRA") probes, root, 0600)"
 }
 
 # backup_key_write <NAME>: set one R2 setting in /etc/bulig/backup.env from stdin, keeping every other line. Known names only.

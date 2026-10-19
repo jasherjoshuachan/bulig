@@ -4,7 +4,7 @@
 #   2. the kernel holds the executor lease and keeps renewing it (two reads 11 s apart, the heartbeat is every 10 s)
 #   3. the Postgres cluster "16 bulig" is online on port 5436
 #   4. the fence holds (fence-check.sh): from inside each Bulig unit's properties, other tenants' services, the docker bridge, tailscale, the
-#      machine's own addresses and unix sockets (an abstract X server, tailscaled, docker) cannot be reached, and what the units need can
+#      machine's own addresses and unix sockets (other tenants' abstract sockets, tailscaled, docker) cannot be reached, and what the units need can
 #   It also WARNS (does not fail) when the host's addresses no longer match the worker's drop-in, or a new service listens on every address.
 # usage: health.sh [--wait <seconds>] [--no-fence]   (--wait: how long to give the service to take the lease after a start, default 30)
 set -euo pipefail

@@ -8,6 +8,8 @@
 #     openssl rand -hex 32 | ssh ths-prod-01 '/usr/local/lib/bulig/current/set-secret.sh --worker-token vps'
 #   the worker's repositories (not secret; /etc/bulig/worker.env, read by bulig-worker.service; at least one is needed):
 #     echo 'BULIG_WORKER_REPOS=--repo /var/lib/bulig/repos/sandbox=/var/lib/bulig-worker/work/sandbox' | ssh ths-prod-01 '/usr/local/lib/bulig/current/set-secret.sh --worker-env'
+#   the machine-specific fence probes (/etc/bulig/fence-extra-probes.txt, root 0600; filled in from fence/extra-probes.template, see the RUNBOOK):
+#     ssh ths-prod-01 '/usr/local/lib/bulig/current/set-secret.sh --fence-extra-probes' < filled-in-file
 #   one R2 setting in /etc/bulig/backup.env (used only by the backup units):
 #     set-secret.sh --backup-key <R2_ENDPOINT|R2_BUCKET|AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|...> < value
 set -euo pipefail
@@ -16,9 +18,13 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$here/lib/common.sh"
 need_root
 
-usage="usage: set-secret.sh --credential <name> | --worker-token <id> | --backup-key <NAME> | --worker-env, with the value on stdin. No other arguments."
+usage="usage: set-secret.sh --credential <name> | --worker-token <id> | --backup-key <NAME> | --worker-env | --fence-extra-probes, with the value on stdin. No other arguments."
 if [ "$#" -eq 1 ] && [ "$1" = "--worker-env" ]; then
   worker_env_write
+  exit 0
+fi
+if [ "$#" -eq 1 ] && [ "$1" = "--fence-extra-probes" ]; then
+  fence_extra_write
   exit 0
 fi
 [ "$#" -eq 2 ] || die "$usage"

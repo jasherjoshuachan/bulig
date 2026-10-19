@@ -73,7 +73,7 @@ expect_ok "the cluster is set up" bash "$deploy/setup-cluster.sh"
 if grep -qx "listen_addresses = ''" "$conf"; then ok "the cluster has no TCP listener (listen_addresses = '')"; else bad "conf: $(cat "$conf" 2>&1)"; fi
 if grep -qx "port = 5436" "$conf" && grep -qx "hba_file = '/etc/postgresql/16/bulig/bulig_hba.conf'" "$conf" && grep -qx "password_encryption = 'scram-sha-256'" "$conf"; then ok "port 5436, its own hba_file and scram-sha-256"; else bad "conf: $(cat "$conf")"; fi
 rules="$(grep -vE '^#|^$' "$hba")"
-if [ "$(printf '%s\n' "$rules" | wc -l | tr -d ' ')" = "3" ] && ! printf '%s\n' "$rules" | grep -qv '^local '; then ok "the login rules are three unix-socket lines and nothing else (no host line, so no TCP login)"; else bad "hba: $rules"; fi
+if [ "$(printf '%s\n' "$rules" | wc -l | tr -d ' ')" = "3" ] && ! grep -qv '^local ' <<<"$rules"; then ok "the login rules are three unix-socket lines and nothing else (no host line, so no TCP login)"; else bad "hba: $rules"; fi
 case "$rules" in *"local   all       postgres                  peer"*"local   bulig     bulig                     scram-sha-256"*"local   all       bulig_drill               scram-sha-256"*) ok "postgres by peer, bulig and bulig_drill by password" ;; *) bad "hba rules: $rules" ;; esac
 url="$(cat "$root/etc/bulig/pg-url")"
 case "$url" in postgres://bulig:*@%2Fvar%2Frun%2Fpostgresql:5436/bulig) ok "pg-url names the socket folder as its host, with the port" ;; *) bad "pg-url: $url" ;; esac

@@ -287,7 +287,7 @@ suite_rc=$?
 # The other suites: the restore drill and backup (stubbed tools), and the server half of a release (stubbed systemd).
 # (BULIG_TEST_ONLY_THIS_FILE=1: mutations.py runs one suite at a time)
 if [ -n "${BULIG_TEST_ONLY_THIS_FILE:-}" ]; then exit "$suite_rc"; fi
-for suite in drill.sh release.sh setup.sh cluster.sh cli.sh fence.sh health.sh units.sh invariant.sh; do
+for suite in drill.sh release.sh setup.sh cluster.sh cli.sh fence.sh health.sh scan.sh units.sh invariant.sh; do
   echo
   echo "== $suite"
   bash "$here/$suite" || suite_rc=1

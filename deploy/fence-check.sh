@@ -3,6 +3,8 @@
 # network, socket and path properties, and require that it CANNOT reach other tenants' services (localhost, the docker bridge, tailscale, the
 # machine's own addresses, unix sockets including an abstract one) and CAN do what the unit needs (DNS, https, its own gateway, a child
 # process, a user lookup). Any unexpected success is a failure. The probe list is one file, fence/probes.txt.
+#   Probes: fence/probes.txt (published, generic) + ones derived from what this machine listens on + /etc/bulig/fence-extra-probes.txt (root, 0600,
+#   required: this script fails without it).
 #   usage (root):  fence-check.sh [worker|kernel|build|cli-worker|cli-kernel|all] [--no-late | --late-only] [--late-strict]
 #   worker, kernel  properties are read from what systemd has LOADED (systemctl show: drop-ins, set-property and all); BULIG_FENCE_SOURCE=files
 #                   reads the unit file and its drop-ins instead (the offline path the tests use). SupplementaryGroups= is refused.
@@ -35,18 +37,26 @@ done
 command -v python3 >/dev/null 2>&1 || die "python3 not found"
 command -v systemd-run >/dev/null 2>&1 || die "systemd-run not found"
 
-probes="${BULIG_FENCE_PROBES:-$here/fence/probes.txt}"
+static_probes="${BULIG_FENCE_PROBES:-$here/fence/probes.txt}"
 probe="$here/fence-probe.py"
-[ -r "$probes" ] && [ -r "$probe" ] || die "the probe files are missing next to this script"
+[ -r "$static_probes" ] && [ -r "$probe" ] || die "the probe files are missing next to this script"
+# The machine-specific probes are required: without them the tenants on this machine would silently not be probed.
+[ -s "$BULIG_FENCE_EXTRA" ] || die "$BULIG_FENCE_EXTRA is missing or empty. Fill in fence/extra-probes.template and install it with set-secret.sh --fence-extra-probes (RUNBOOK, 'The extra probes')."
+(fence_extra_check "$BULIG_FENCE_EXTRA") || die "$BULIG_FENCE_EXTRA is not usable (see above)"
 host_addrs="$(host_addresses | tr '\n' ' ')"
-tailscale="$(ip -4 -o addr show dev tailscale0 2>/dev/null | awk '{ sub("/.*", "", $4); print $4; exit }' || true)"
 common_args=(--host-addrs "$host_addrs")
-if [ -n "$tailscale" ]; then common_args+=(--tailscale "$tailscale"); fi
+
+# One probe stream for all sets: the published probes, the ones derived from what this machine is listening on right now, and the extra file.
+# It is handed to the probe on stdin, so the unit never needs to read a file of root's.
+work="$(private_tmpdir)"
+trap 'rm -rf "$work"' EXIT
+python3 -I "$probe" derive <({ ss -H -ltn 2>/dev/null || true; }) <({ ss -H -xl 2>/dev/null || true; }) <({ ip -o addr 2>/dev/null || true; }) >"$work/derived"
+cat "$static_probes" "$work/derived" "$BULIG_FENCE_EXTRA" >"$work/all-probes"
 
 fail=0
 for s in "${sets[@]}"; do
   # 1. Outside every fence: which deny targets are really listening? (A target that is not there proves nothing when it cannot be reached.)
-  control="$(python3 -I "$probe" control "$s" "$probes" "${common_args[@]}" | paste -sd, -)"
+  control="$(python3 -I "$probe" control "$s" - "${common_args[@]}" <"$work/all-probes" | paste -sd, -)"
   # 2. The set's properties.
   ids=()
   case "$s" in
@@ -72,12 +82,13 @@ for s in "${sets[@]}"; do
   # 3. Inside: the probe, with exactly those properties. (The unit's other properties do not change what it can reach.)
   rc=0
   out="$(systemd-run --quiet --pipe --wait --collect --unit="bulig-fence-$s-$$" ${ids[@]+"${ids[@]}"} "${props[@]}" \
-    -- /usr/bin/python3 -I "$probe" fenced "$s" "$probes" "${common_args[@]}" --control "$control" ${late_flag[@]+"${late_flag[@]}"} 2>&1)" || rc=$?
+    -- /usr/bin/python3 -I "$probe" fenced "$s" - "${common_args[@]}" --control "$control" ${late_flag[@]+"${late_flag[@]}"} <"$work/all-probes" 2>&1)" || rc=$?
   printf '%s\n' "$out"
-  if printf '%s\n' "$out" | grep -q '^FAIL '; then fail=1; fi
+  # (here-strings, not printf | grep -q: under pipefail grep -q can close the pipe early and make printf fail)
+  if grep -q '^FAIL ' <<<"$out"; then fail=1; fi
   # The probe exits 1 only after printing its FAIL lines. Any other non-zero exit means it did not run (a property systemd refused, a crash).
-  if [ "$rc" -ne 0 ] && ! printf '%s\n' "$out" | grep -q '^FAIL '; then echo "FAIL $s did-not-run systemd-run or the probe exited $rc without a result"; fail=1; fi
-  if [ "$strict" -eq 1 ] && printf '%s\n' "$out" | grep -q '^warn .* not reachable yet'; then
+  if [ "$rc" -ne 0 ] && ! grep -q '^FAIL ' <<<"$out"; then echo "FAIL $s did-not-run systemd-run or the probe exited $rc without a result"; fail=1; fi
+  if [ "$strict" -eq 1 ] && grep -q '^warn .* not reachable yet' <<<"$out"; then
     echo "FAIL $s gateway-not-reachable the kernel is up but the worker's set cannot reach its gateway"
     fail=1
   fi

@@ -77,12 +77,12 @@ RestrictSUIDSGID=true
 RestrictRealtime=true
 LockPersonality=true
 SystemCallArchitectures=native
-# NETWORK. On this host 127.0.0.1 carries other tenants' services with no login and the docker bridges carry containers, so the kernel
+# NETWORK. Other services on this host listen on loopback and on the container bridges with no login of their own, so the kernel
 # reaches only what it needs: its own gateway address (the VPS worker connects to it; with 127.74.3.1 on lo, both ends of the loopback
 # conversation carry it), one Tailscale peer when the Mac worker is set up (a /32 in a root-owned drop-in, bulig.service.d/20-mac-worker.conf,
 # written by set-mac-worker.sh; none until then), and the public internet (GitHub). IPAddressDeny/Allow match ADDRESSES, NOT PORTS, so a service
-# listening on every address (22, 80, 443 here: public anyway) is also reachable at 127.74.3.1. It reaches Postgres over the unix socket.
-# KNOWN LIMIT: this unit keeps AF_UNIX (the Postgres socket), so it can still reach other tenants' ABSTRACT unix sockets (an X server here).
+# listening on every address is also reachable at 127.74.3.1, with a loopback source (it may treat that as trusted). It reaches Postgres over the unix socket.
+# KNOWN LIMIT: this unit keeps AF_UNIX (the Postgres socket), so it can still reach other tenants' ABSTRACT unix sockets.
 # It runs no worker code (the worker is a different unit with no AF_UNIX); an AppArmor profile (deny unix addr=@**,) is the next step.
 # DNS comes from resolved's upstream list, not the 127.0.0.53 stub (see bulig-worker.service).
 IPAddressDeny=localhost link-local multicast 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7

@@ -6,6 +6,8 @@
 # The scripts run against a throwaway folder (BULIG_DEPLOY_TEST_ROOT) and fake system tools; nothing real is touched.
 # shellcheck disable=SC1091,SC2030,SC2031
 set -uo pipefail
+# No test may wait on a terminal: a refusal that falls through to reading stdin must fail, not hang.
+exec </dev/null
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 deploy="$(dirname "$here")"
 work="$(mktemp -d)"
@@ -25,6 +27,13 @@ expect_fail() {
   shift
   if "$@" >"$work/out" 2>&1; then bad "$label (it succeeded)"; else ok "$label"; fi
 }
+# expect_fail_msg <label> <text the output must contain> <command...>: the command must fail AND say why. A refusal that fails for another
+# reason (a missing folder, a typo in the test) does not count.
+expect_fail_msg() {
+  local label="$1" want="$2"
+  shift 2
+  if "$@" >"$work/out" 2>&1; then bad "$label (it succeeded)"; elif grep -qF -- "$want" "$work/out"; then ok "$label"; else bad "$label (failed, but not with '$want'): $(head -c 300 "$work/out")"; fi
+}
 mode() { if /usr/bin/stat -c %a "$1" >/dev/null 2>&1; then stat -c %a "$1"; else /usr/bin/stat -f %Lp "$1"; fi; }
 
 # ---------- 1. set-secret.sh ----------
@@ -39,28 +48,30 @@ ss="$deploy/set-secret.sh"
 expect_ok "credential pg-url is written" bash -c "printf 'postgres://bulig:x@127.0.0.1:5436/bulig\n' | '$ss' --credential pg-url"
 if [ "$(cat "$root/etc/bulig/pg-url")" = "postgres://bulig:x@127.0.0.1:5436/bulig" ]; then ok "the value is stored without the newline"; else bad "pg-url content"; fi
 if [ "$(mode "$root/etc/bulig/pg-url")" = "600" ]; then ok "the file is mode 600"; else bad "pg-url mode is $(mode "$root/etc/bulig/pg-url")"; fi
-expect_fail "unknown credential name is refused" bash -c "echo v | '$ss' --credential bogus"
-expect_fail "a path-like credential name is refused" bash -c "echo v | '$ss' --credential ../../tmp/evil"
-expect_fail "an absolute path as the name is refused" bash -c "echo v | '$ss' --credential /tmp/evil"
-expect_fail "an old-style NAME FILE call is refused" bash -c "echo v | '$ss' R2_BUCKET '$root/tmp/evil'"
-expect_fail "a third argument is refused" bash -c "echo v | '$ss' --credential pg-url '$root/tmp/evil'"
-expect_fail "no arguments is refused" bash -c "echo v | '$ss'"
+# /etc/bulig exists here and pg-url was just written with the same command, so each refusal below is about the name or the arguments only.
+expect_fail_msg "unknown credential name is refused" "unknown credential 'bogus'" bash -c "echo v | '$ss' --credential bogus"
+expect_fail_msg "a path-like credential name is refused" "unknown credential '../../tmp/evil'" bash -c "echo v | '$ss' --credential ../../tmp/evil"
+expect_fail_msg "an absolute path as the name is refused" "unknown credential '/tmp/evil'" bash -c "echo v | '$ss' --credential /tmp/evil"
+expect_fail_msg "an old-style NAME FILE call is refused" "usage: set-secret.sh" bash -c "echo v | '$ss' R2_BUCKET '$root/tmp/evil'"
+expect_fail_msg "a third argument is refused" "usage: set-secret.sh" bash -c "echo v | '$ss' --credential pg-url '$root/tmp/evil'"
+expect_fail_msg "no arguments is refused" "usage: set-secret.sh" bash -c "echo v | '$ss'"
+for n in pg-url gh-token worker-tokens claude-token worker-token drill-pw; do
+  expect_ok "the known credential $n is accepted" bash -c "echo v | '$ss' --credential $n"
+done
 expect_ok "backup key R2_BUCKET is written" bash -c "echo mybucket | '$ss' --backup-key R2_BUCKET"
 expect_ok "a second backup key keeps the first" bash -c "echo https://x.example | '$ss' --backup-key R2_ENDPOINT"
 if grep -qx 'R2_BUCKET=mybucket' "$root/etc/bulig/backup.env" && grep -qx 'R2_ENDPOINT=https://x.example' "$root/etc/bulig/backup.env"; then ok "both backup keys are in the file"; else bad "backup.env content"; fi
 expect_ok "setting a key again replaces it" bash -c "echo other | '$ss' --backup-key R2_BUCKET"
 if [ "$(grep -c '^R2_BUCKET=' "$root/etc/bulig/backup.env")" = "1" ] && grep -qx 'R2_BUCKET=other' "$root/etc/bulig/backup.env"; then ok "one R2_BUCKET line, new value"; else bad "R2_BUCKET replace"; fi
-expect_fail "an unknown backup key is refused" bash -c "echo v | '$ss' --backup-key PATH"
-expect_fail "a multi-line backup value is refused" bash -c "printf 'a\nb\n' | '$ss' --backup-key R2_BUCKET"
+expect_fail_msg "an unknown backup key is refused" "unknown backup setting 'PATH'" bash -c "echo v | '$ss' --backup-key PATH"
+expect_fail_msg "a multi-line backup value is refused" "more than one line" bash -c "printf 'a\nb\n' | '$ss' --backup-key R2_BUCKET"
 if [ -z "$(ls -A "$root/tmp")" ]; then ok "nothing was written to the fake /tmp"; else bad "the fake /tmp has files: $(ls -A "$root/tmp")"; fi
 if [ "$(mode "$root/etc")" = "755" ] && [ "$(mode "$root/etc/bulig")" = "700" ]; then ok "folder modes are unchanged"; else bad "a folder mode changed"; fi
 if [ -z "$(find "$root/etc/bulig" -name '.*' -type f)" ]; then ok "no temp files left behind"; else bad "temp files left in $root/etc/bulig"; fi
 
 rm -rf "$root/etc/bulig"
-expect_fail "a missing /etc/bulig is refused" bash -c "echo v | '$ss' --credential pg-url"
+expect_fail_msg "a missing /etc/bulig is refused" "is missing" bash -c "echo v | '$ss' --credential pg-url"
 if [ ! -e "$root/etc/bulig" ]; then ok "and it was not created"; else bad "/etc/bulig was created"; fi
-expect_fail "precheck.sh with an argument is refused" bash "$deploy/precheck.sh" "$root/tmp/elsewhere"
-expect_fail "postcheck.sh with an argument is refused" bash "$deploy/postcheck.sh" "$root/tmp/elsewhere"
 
 # ---------- 1b. passfile ----------
 echo "pg_passfile"
@@ -107,9 +118,11 @@ cat >"$stubs/stat" <<'STUB'
 #!/usr/bin/env bash
 cat "$STUB_DATA/stat.txt"
 STUB
+# A fast stand-in for sha256sum (it only has to change when the content changes): "<cksum> <size>  <name>", same shape as the real output.
 cat >"$stubs/sha256sum" <<'STUB'
 #!/usr/bin/env bash
-exec shasum -a 256 "$@"
+if [ "$#" -eq 0 ]; then echo "$(cksum | tr ' ' '-')  -"; exit 0; fi
+for f in "$@"; do echo "$(cksum <"$f" | tr ' ' '-')  $f"; done
 STUB
 chmod +x "$stubs"/*
 
@@ -179,7 +192,7 @@ echo 'LISTEN 0 200 127.0.0.1:5436 0.0.0.0:* users:(("postgres",pid=1234,fd=5))' 
 echo 'LISTEN 0 128 100.64.0.9:7431 0.0.0.0:* users:(("node",pid=1300,fd=19))' >>"$w/data/ss.txt"
 echo '16 bulig 5436 online postgres /var/lib/postgresql/16/bulig /var/log/postgresql/postgresql-16-bulig.log' >>"$w/data/clusters.txt"
 printf 'bulig:x:998:998::/var/lib/bulig:/usr/sbin/nologin\nbulig-worker:x:997:997::/var/lib/bulig-worker:/usr/sbin/nologin\n' >>"$w/data/passwd.txt"
-printf 'bulig:x:998:\nbulig-worker:x:997:\nbulig-work:x:996:bulig,bulig-worker\n' >>"$w/data/group.txt"
+printf 'bulig:x:998:\nbulig-worker:x:997:\n' >>"$w/data/group.txt"
 echo "x" >"$w/root/etc/systemd/system/bulig.service"
 echo "x" >"$w/root/etc/systemd/system/bulig-backup.timer"
 ln -s /etc/systemd/system/bulig.service "$w/root/etc/systemd/system/multi-user.target.wants/bulig.service"
@@ -220,10 +233,13 @@ export STUB_DATA="$w/data" BULIG_DEPLOY_TEST_ROOT="$w/root"
 expect_ok "precheck.sh runs" bash "$deploy/precheck.sh"
 checks="$w/root/var/lib/bulig-checks"
 if [ -f "$checks/precheck.snapshot" ] && [ "$(mode "$checks")" = "700" ]; then ok "it wrote one file in a 0700 folder of its own"; else bad "precheck output"; fi
+# The same fixture that makes the no-argument run succeed must make the run with an argument fail, and for the stated reason.
+expect_fail_msg "precheck.sh with an argument is refused" "takes no arguments" bash "$deploy/precheck.sh" "$w/root/tmp-elsewhere"
 expect_ok "postcheck.sh passes when nothing changed" bash "$deploy/postcheck.sh"
+expect_fail_msg "postcheck.sh with an argument is refused" "takes no arguments" bash "$deploy/postcheck.sh" "$w/root/tmp-elsewhere"
+if [ ! -e "$w/root/tmp-elsewhere" ]; then ok "neither script touched the path it was given"; else bad "a script created the path it was given"; fi
 echo 'LISTEN 0 1 0.0.0.0:8080 0.0.0.0:* users:(("python3",pid=7,fd=3))' >>"$w/data/ss.txt"
-expect_fail "postcheck.sh fails after a change" bash "$deploy/postcheck.sh"
-if grep -q '8080' "$work/out"; then ok "and its output shows the change"; else bad "postcheck output did not show the change"; fi
+expect_fail_msg "postcheck.sh fails after a change, and shows it" "8080" bash "$deploy/postcheck.sh"
 if [ "$(find "$checks" -type f | wc -l | tr -d ' ')" = "1" ]; then ok "postcheck left no temp files"; else bad "postcheck left extra files in $checks"; fi
 
 echo

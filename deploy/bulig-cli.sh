@@ -27,7 +27,7 @@ common=(
   -p ProtectControlGroups=yes -p ProtectClock=yes -p ProtectHostname=yes -p ProtectProc=invisible
   -p RestrictSUIDSGID=yes -p RestrictRealtime=yes -p LockPersonality=yes -p SystemCallArchitectures=native
   -p RestrictAddressFamilies="AF_UNIX AF_INET AF_INET6"
-  -p UMask=0002 -p SupplementaryGroups=bulig-work
+  -p UMask=0077
   -p TasksMax=256 -p CPUWeight=50 -p Nice=10
 )
 case "$role" in
@@ -36,7 +36,7 @@ case "$role" in
       -p LoadCredential=pg-url:/etc/bulig/pg-url -p LoadCredential=gh-token:/etc/bulig/gh-token -p LoadCredential=worker-tokens:/etc/bulig/worker-tokens
       --setenv=HOME="$BULIG_HOME" --setenv=PATH="/usr/local/bin:/usr/bin:/bin:$BULIG_HOME/.local/bin") ;;
   worker)
-    spec=(--uid=bulig-worker --gid=bulig-worker -p MemoryMax=2G -p CPUQuota=200% -p ReadWritePaths="$BULIG_WORK_DIR $BULIG_WORKER_HOME"
+    spec=(--uid=bulig-worker --gid=bulig-worker -p MemoryMax=2G -p CPUQuota=200% -p ReadWritePaths="$BULIG_WORKER_HOME"
       -p LoadCredential=claude-token:/etc/bulig/claude-token -p LoadCredential=worker-token:/etc/bulig/worker-token
       --setenv=HOME="$BULIG_WORKER_HOME" --setenv=PATH="/usr/local/bin:/usr/bin:/bin:$BULIG_WORKER_HOME/.local/bin") ;;
   *) die "--as must be kernel or worker" ;;

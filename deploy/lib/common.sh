@@ -15,7 +15,10 @@ BULIG_GATEWAY_PORT=7431
 R="${BULIG_DEPLOY_TEST_ROOT:-}"
 BULIG_HOME="/var/lib/bulig"
 BULIG_WORKER_HOME="/var/lib/bulig-worker"
-BULIG_WORK_DIR="/var/lib/bulig/work"
+# Where the kernel keeps repo clones and its own worktrees (user bulig only), and where the worker keeps its own clones (user bulig-worker
+# only). Nothing is shared: the worker sends the kernel a patch, and the kernel applies it in its own worktree (ADR 0011, PR #50).
+BULIG_REPOS_DIR="/var/lib/bulig/repos"
+BULIG_WORKER_WORK_DIR="/var/lib/bulig-worker/work"
 BULIG_CRED_DIR="$R/etc/bulig"
 BULIG_BACKUP_ENV_FILE="$R/etc/bulig/backup.env"
 BULIG_CHECKS_DIR="$R/var/lib/bulig-checks"

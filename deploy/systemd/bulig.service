@@ -16,9 +16,6 @@ Type=simple
 # The kernel's own user. The worker (which runs Claude Code) is a different user in bulig-worker.service.
 User=bulig
 Group=bulig
-# bulig-work: shared with bulig-worker, for /var/lib/bulig/work. Files written there are group-writable (UMask=0002) so the kernel can
-# commit what the worker edited.
-SupplementaryGroups=bulig-work
 WorkingDirectory=/opt/bulig/current
 # Secrets come in as credentials: root-only files (0600), one secret each, found in $CREDENTIALS_DIRECTORY. This unit holds the database URL,
 # the GitHub token and the table of worker tokens. It does NOT hold the Claude token: that goes only to bulig-worker.service, a different
@@ -36,7 +33,8 @@ RestartSec=5
 # Give running work time to stop; after that the whole control group is killed.
 TimeoutStopSec=60
 KillMode=control-group
-UMask=0002
+# Everything the kernel writes (repos, worktrees, state) is private to bulig.
+UMask=0077
 
 # Caps, so a runaway kernel cannot starve client production on the same host. (The worker has its own, in bulig-worker.service.)
 MemoryMax=4G
@@ -53,7 +51,7 @@ CapabilityBoundingSet=
 AmbientCapabilities=
 PrivateTmp=true
 PrivateDevices=true
-# Whole filesystem read-only except the line below (state, config, worktrees under work/, ~/.config/gh).
+# Whole filesystem read-only except the line below (state, config, repos and worktrees under repos/, ~/.config/gh).
 ProtectSystem=strict
 ReadWritePaths=/var/lib/bulig
 # /home and /root become read-only. The bulig home (/var/lib/bulig) is outside them and is in ReadWritePaths.

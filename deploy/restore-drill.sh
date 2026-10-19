@@ -2,8 +2,9 @@
 # Prove the newest backup restores. Take the newest entry of the local index, download that object from R2, check its sha256 against
 # the index, restore it into a scratch database with pg_restore as a role that owns nothing else (bulig_drill, not a superuser),
 # compare tables and row counts with the live database, log the time, drop the scratch database.
-# Safe even if the R2 key is shared or stolen: an object that is not in the local index is never restored, and nothing here runs
-# SQL from the dump through psql or as a superuser (pg_restore applies catalog entries only, and there are no shell escapes).
+# Safe even if the R2 key is shared or stolen: an object that is not in the local index is never restored. For an object that is in the
+# index, pg_restore replays the dump's SQL (table definitions, data, constraints) as bulig_drill, a role that is not a superuser and owns
+# nothing but its scratch database. Nothing here pipes the dump through psql, so a dump cannot use psql shell escapes.
 # Runs from bulig-restore-drill.service (root; credentials backup-env, pg-url and drill-pw come from LoadCredential=).
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -20,6 +21,15 @@ sum="$(tail -n1 "$BULIG_BACKUP_INDEX" | cut -d' ' -f1)"
 key="$(tail -n1 "$BULIG_BACKUP_INDEX" | cut -d' ' -f3)"
 case "$key" in "$R2_PREFIX/bulig-postgres-"*.dump) ;; *) die "the newest index entry is not a bulig dump key: '$key'" ;; esac
 [[ "$sum" =~ ^[0-9a-f]{64}$ ]] || die "the newest index entry has no sha256"
+
+# The newest backup must be recent. The key carries its UTC time (bulig-postgres-2026-10-19T03-15-00Z.dump). A drill of a stale backup
+# would pass while the nightly backup has quietly stopped, so it fails instead.
+stamp="${key##*/bulig-postgres-}"
+stamp="${stamp%.dump}"
+[[ "$stamp" =~ ^([0-9]{4}-[0-9]{2}-[0-9]{2})T([0-9]{2})-([0-9]{2})-([0-9]{2})Z$ ]] || die "cannot read the time from the key '$key'"
+made="$(date -u -d "${BASH_REMATCH[1]} ${BASH_REMATCH[2]}:${BASH_REMATCH[3]}:${BASH_REMATCH[4]}" +%s)" || die "cannot read the time from the key '$key'"
+age=$(($(date -u +%s) - made))
+[ "$age" -le 172800 ] || die "the newest backup is $((age / 3600)) hours old (limit 48). The nightly backup has stopped; look at bulig-backup.service."
 
 work="$(mktemp -d)"
 scratch="bulig_drill_$(date -u +%Y%m%d%H%M%S)"
@@ -56,7 +66,7 @@ grep -qxF "$actual  $key" "$BULIG_BACKUP_INDEX" || die "the object downloaded fo
 
 restore_started=$SECONDS
 psql_drill -d postgres -c "CREATE DATABASE \"$scratch\"" >/dev/null
-# --no-owner --role: every restored object belongs to bulig_drill. No superuser, no psql reading the dump.
+# --no-owner --role: every restored object belongs to bulig_drill. No superuser, and the dump is not piped through psql.
 "$(pg_bin pg_restore)" --no-owner --no-privileges --exit-on-error --role=bulig_drill "${pg_args[@]}" -U bulig_drill -d "$scratch" "$dump"
 restore_seconds=$((SECONDS - restore_started))
 

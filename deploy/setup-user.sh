@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# Create the two Bulig system users, their shared work group, and the folders Bulig uses. Idempotent: a second run changes nothing.
-# Run as root on ths-prod-01. It touches only the users bulig and bulig-worker, the group bulig-work, and the paths below.
+# Create the two Bulig system users and the folders Bulig uses. Idempotent: a second run changes nothing.
+# Run as root on ths-prod-01. It touches only the users bulig and bulig-worker and the paths below.
 #
 #   bulig         the kernel (bulig.service). Holds the database URL, the GitHub token, the worker tokens. Never sees the Claude token.
 #   bulig-worker  the worker (bulig-worker.service). Runs Claude Code. Holds the Claude token and its own worker token. Never sees
 #                 /etc/bulig or the kernel's credentials: they are different users with different units.
-#   bulig-work    a group both belong to, for /var/lib/bulig/work, where the worker edits worktrees and the kernel commits them.
+#
+# The two users share no folder and no group. The worker has its own clone of a repo and sends the kernel a patch; the kernel applies it in
+# its own worktree (ADR 0011, PR #50). Neither user can read the other's tree.
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/common.sh
@@ -28,33 +30,18 @@ make_user() {
 make_user bulig "$BULIG_HOME"
 make_user bulig-worker "$BULIG_WORKER_HOME"
 
-if getent group bulig-work >/dev/null; then
-  echo "group bulig-work: already there"
-else
-  groupadd --system bulig-work
-  echo "group bulig-work: created"
-fi
-for u in bulig bulig-worker; do
-  id -nG "$u" | tr ' ' '\n' | grep -qx bulig-work || usermod -aG bulig-work "$u"
-done
-
-# /var/lib/bulig: the kernel's space (state, ~/.bulig config, ~/.config/gh). 0711 lets bulig-worker walk through to work/ but not list or read it.
-install -d -m 0711 -o bulig -g bulig "$BULIG_HOME"
+# /var/lib/bulig: the kernel's space (state, ~/.bulig config, ~/.config/gh, repos). Private to bulig.
+install -d -m 0750 -o bulig -g bulig "$BULIG_HOME"
 install -d -m 0750 -o bulig -g bulig "$BULIG_HOME/state"
 # Where the kernel looks for its config: $HOME/.bulig/config.json. Root owns the folder and the file, bulig can read but not edit them.
 install -d -m 0750 -o root -g bulig "$BULIG_HOME/.bulig"
-# Worktrees and repo clones. setgid + group bulig-work + both units run with umask 0002, so what one user writes the other can use.
-install -d -m 0750 -o bulig -g bulig-work "$BULIG_WORK_DIR"
-chmod 2770 "$BULIG_WORK_DIR"
-# /var/lib/bulig-worker: the worker's own home (Claude's sign-in and settings live here). The kernel user cannot read it.
+# The kernel's repo clones and worktrees. Its git runs with hooks and fsmonitor off (PR #50 and PR-G).
+install -d -m 0750 -o bulig -g bulig "$BULIG_REPOS_DIR"
+# /var/lib/bulig-worker: the worker's home (Claude's sign-in and settings), and work/ for its own clones. Private to bulig-worker.
 install -d -m 0750 -o bulig-worker -g bulig-worker "$BULIG_WORKER_HOME"
-# Repos are owned by whichever user cloned them, so git must be told that this folder is shared (git refuses "dubious ownership" otherwise).
-for h in "$BULIG_HOME:bulig" "$BULIG_WORKER_HOME:bulig-worker"; do
-  home="${h%%:*}"; u="${h##*:}"
-  if ! runuser -u "$u" -- env HOME="$home" git config --global --get-all safe.directory 2>/dev/null | grep -qxF '*'; then
-    runuser -u "$u" -- env HOME="$home" git config --global --add safe.directory '*' 2>/dev/null || echo "  note: git is not installed for $u yet; add safe.directory later"
-  fi
-done
+install -d -m 0700 -o bulig-worker -g bulig-worker "$BULIG_WORKER_WORK_DIR"
+# git's "dubious ownership" check does not fire: each user only opens repos it created itself, so no safe.directory entry is added.
+# If one is ever needed, add that exact path for that user only, never '*'.
 
 # /opt/bulig: releases are unpacked here. Root owns /opt/bulig; release.sh hands a release to bulig only while it installs packages.
 install -d -m 0755 -o root -g root /opt/bulig /opt/bulig/releases

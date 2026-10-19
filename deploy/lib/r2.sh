@@ -32,11 +32,18 @@ r2_aws() {
   if command -v aws >/dev/null 2>&1; then
     aws --endpoint-url "$R2_ENDPOINT" "$@"
   else
-    command -v docker >/dev/null 2>&1 || die "neither aws nor docker is installed, so there is no way to reach R2"
-    docker run --rm -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_DEFAULT_REGION \
-      -e AWS_REQUEST_CHECKSUM_CALCULATION -e AWS_RESPONSE_CHECKSUM_VALIDATION \
-      "$AWSCLI_IMAGE" --endpoint-url "$R2_ENDPOINT" "$@"
+    r2_docker "$@"
   fi
+}
+
+# With docker there is no host mount at all: dockerd does not use this unit's private /tmp, so a -v folder would be a world-readable
+# path on the host. The file is streamed through the container's stdin and stdout instead, and written by this process into its own
+# private folder.
+r2_docker() {
+  command -v docker >/dev/null 2>&1 || die "neither aws nor docker is installed, so there is no way to reach R2"
+  docker run --rm -i -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_DEFAULT_REGION \
+    -e AWS_REQUEST_CHECKSUM_CALCULATION -e AWS_RESPONSE_CHECKSUM_VALIDATION \
+    "$AWSCLI_IMAGE" --endpoint-url "$R2_ENDPOINT" "$@"
 }
 
 # r2_put <local file> <key>
@@ -45,23 +52,17 @@ r2_put() {
   if command -v aws >/dev/null 2>&1; then
     r2_aws s3 cp "$file" "s3://$R2_BUCKET/$key" --only-show-errors
   else
-    docker run --rm -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_DEFAULT_REGION \
-      -e AWS_REQUEST_CHECKSUM_CALCULATION -e AWS_RESPONSE_CHECKSUM_VALIDATION \
-      -v "$(dirname "$file"):/spool:ro" "$AWSCLI_IMAGE" --endpoint-url "$R2_ENDPOINT" \
-      s3 cp "/spool/$(basename "$file")" "s3://$R2_BUCKET/$key" --only-show-errors
+    r2_docker s3 cp - "s3://$R2_BUCKET/$key" --only-show-errors <"$file"
   fi
 }
 
-# r2_get <key> <local file>
+# r2_get <key> <local file>   (the file is created with the caller's umask: callers set 077 and use a private folder)
 r2_get() {
   local key="$1" file="$2"
   if command -v aws >/dev/null 2>&1; then
     r2_aws s3 cp "s3://$R2_BUCKET/$key" "$file" --only-show-errors
   else
-    docker run --rm -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_DEFAULT_REGION \
-      -e AWS_REQUEST_CHECKSUM_CALCULATION -e AWS_RESPONSE_CHECKSUM_VALIDATION \
-      -v "$(dirname "$file"):/spool" "$AWSCLI_IMAGE" --endpoint-url "$R2_ENDPOINT" \
-      s3 cp "s3://$R2_BUCKET/$key" "/spool/$(basename "$file")" --only-show-errors
+    r2_docker s3 cp "s3://$R2_BUCKET/$key" - --only-show-errors >"$file"
   fi
 }
 

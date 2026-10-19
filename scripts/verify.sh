@@ -40,4 +40,7 @@ fi
 # Names that must never appear in this public repo. The list is private: see scripts/scan-forbidden.sh.
 bash scripts/scan-forbidden.sh
 
+# The deploy kit's own tests: path refusals, passfile format, and the before/after snapshot.
+bash deploy/test/run.sh
+
 echo "verify: ok"

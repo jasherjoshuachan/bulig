@@ -55,9 +55,9 @@ snapshot() {
     find "$R/etc/postgresql" -type f -not -path "*/$BULIG_PG_VERSION/$BULIG_PG_CLUSTER/*" -print0 | sort -z | xargs -0 -r sha256sum
   fi
 
-  echo "## users and groups (bulig, bulig-worker, bulig-work left out)"
+  echo "## users and groups (bulig and bulig-worker left out)"
   getent passwd | grep -Ev '^(bulig|bulig-worker):' | sort || true
-  getent group | grep -Ev '^(bulig|bulig-worker|bulig-work):' | sort || true
+  getent group | grep -Ev '^(bulig|bulig-worker):' | sort || true
 
   echo "## cron: root's crontab and /etc/cron.d (names containing bulig left out)"
   { crontab -l 2>/dev/null || echo "(no crontab)"; } | sha256sum

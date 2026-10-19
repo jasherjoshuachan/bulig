@@ -14,7 +14,6 @@ Type=simple
 # read the kernel's secrets: /etc/bulig is root-only, and the kernel's $CREDENTIALS_DIRECTORY belongs to the other user.
 User=bulig-worker
 Group=bulig-worker
-SupplementaryGroups=bulig-work
 WorkingDirectory=/opt/bulig/current
 # Only two credentials: the Claude token, and this worker's own token for the gateway. Not the database URL, not the GitHub token.
 LoadCredential=claude-token:/etc/bulig/claude-token
@@ -27,8 +26,8 @@ Restart=always
 RestartSec=5
 TimeoutStopSec=60
 KillMode=control-group
-# Group-writable files in /var/lib/bulig/work, so the kernel (user bulig) can commit what this worker edited.
-UMask=0002
+# Private to bulig-worker. The worker has its own clones under /var/lib/bulig-worker/work and sends the kernel a patch (ADR 0011, PR #50).
+UMask=0077
 
 # Caps. Together with the kernel (4G, 300%) this leaves the rest of the 8 CPUs and 15 GB to client production.
 MemoryMax=3G
@@ -43,9 +42,9 @@ CapabilityBoundingSet=
 AmbientCapabilities=
 PrivateTmp=true
 PrivateDevices=true
-# Read-only everywhere except the worktrees and this user's own home (Claude's sign-in and settings).
+# Read-only everywhere except this user's own home (Claude's sign-in and settings, and its clones under work/).
 ProtectSystem=strict
-ReadWritePaths=/var/lib/bulig/work /var/lib/bulig-worker
+ReadWritePaths=/var/lib/bulig-worker
 ProtectHome=read-only
 ProtectKernelTunables=true
 ProtectKernelModules=true

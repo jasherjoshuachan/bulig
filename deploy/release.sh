@@ -41,7 +41,8 @@ units="bulig.service bulig-worker.service bulig-backup.service bulig-backup.time
 
 case "$incoming" in /opt/bulig/releases/.incoming-*) ;; *) echo "release: odd incoming path" >&2; exit 1 ;; esac
 unit_backup=""
-cleanup() { rm -rf "$incoming"; [ -z "$unit_backup" ] || rm -rf "$unit_backup"; }
+pristine="$incoming.orig"
+cleanup() { rm -rf "$incoming" "$pristine"; [ -z "$unit_backup" ] || rm -rf "$unit_backup"; }
 trap cleanup EXIT
 
 # One release at a time on this host.
@@ -56,14 +57,25 @@ if [ "$prev" = "$rel" ]; then
   exit 3
 fi
 
-# 1. Install dependencies as bulig, then give the release to root so neither service can rewrite its own code.
+# 1. Install dependencies as bulig, check that bulig changed nothing but node_modules, then give the release to root so neither service can
+#    rewrite its own code. Dependency build scripts (better-sqlite3 needs its build, so --ignore-scripts is not an option) run as bulig and
+#    could edit any file in this folder. Some of these files later run as root (deploy/*.sh) or are copied to /etc/systemd/system, so the
+#    folder is compared with a root-owned copy of what was delivered, and the release fails on any difference outside node_modules.
 #    "copy" import: node_modules holds real copies, so the chown to root never reaches through a hard link into bulig's package store.
 if [ -d "$rel" ]; then
   echo "release: $short is already unpacked (not live); reusing it"
 else
+  chown -R root:root "$incoming"
+  cp -a "$incoming" "$pristine"
   chown -R bulig:bulig "$incoming"
   runuser -u bulig -- env HOME=/var/lib/bulig PATH="/usr/local/bin:/usr/bin:/bin:/var/lib/bulig/.local/bin" \
-    bash -c "cd '$incoming' && pnpm install --frozen-lockfile --prod=false --config.package-import-method=copy"
+    bash -c "cd '$incoming' && pnpm install --frozen-lockfile --prod=false --config.package-import-method=copy --store-dir /var/lib/bulig/.local/share/pnpm/store"
+  changed="$(rsync -rlpcni --delete --exclude=node_modules "$pristine/" "$incoming/")"
+  if [ -n "$changed" ]; then
+    echo "release: the install changed files outside node_modules. Refusing this release:" >&2
+    echo "$changed" >&2
+    exit 1
+  fi
   chown -R root:root "$incoming"
   chmod -R go-w "$incoming"
   mv -T "$incoming" "$rel"
@@ -90,12 +102,15 @@ if [ ! -e /var/lib/bulig/.bulig/config.json ]; then
   install -m 0640 -o root -g bulig "$rel"/deploy/bulig.config.vps.json /var/lib/bulig/.bulig/config.json
   echo "config: created /var/lib/bulig/.bulig/config.json from the VPS template (Telegram off, local worker off)"
 fi
-systemctl daemon-reload
-systemctl enable bulig.service bulig-worker.service >/dev/null 2>&1
-systemctl restart bulig.service bulig-worker.service
-
-# 4. Health. Failure rolls back to the previous release and the previous unit files (if there was a previous release).
-if "$cur/deploy/health.sh" --wait 40; then
+# 4. Reload, enable, restart, health. Any failure rolls back to the previous release and the previous unit files (if there was one).
+healthy=0
+if systemctl daemon-reload \
+  && systemctl enable bulig.service bulig-worker.service >/dev/null 2>&1 \
+  && systemctl restart bulig.service bulig-worker.service \
+  && "$cur/deploy/health.sh" --wait 40; then
+  healthy=1
+fi
+if [ "$healthy" -eq 1 ]; then
   echo "release: healthy on $short"
   # Keep the newest releases, never the live one or the previous one.
   ls -1dt /opt/bulig/releases/*/ | sed 's:/$::' | tail -n +"$((keep + 1))" | while read -r old; do
@@ -106,7 +121,7 @@ if "$cur/deploy/health.sh" --wait 40; then
   exit 0
 fi
 
-echo "release: health check FAILED on $short" >&2
+echo "release: reload, restart or health check FAILED on $short" >&2
 journalctl -u bulig.service -u bulig-worker.service -n 40 --no-pager >&2 || true
 if [ -n "$prev" ] && [ -d "$prev" ]; then
   echo "release: rolling back to $prev (code and unit files)" >&2

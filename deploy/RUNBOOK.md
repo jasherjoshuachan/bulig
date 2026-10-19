@@ -9,7 +9,8 @@ The two users, and why:
 - `bulig` runs the kernel (`bulig.service`). It holds the database URL, the GitHub token and the table of worker tokens.
 - `bulig-worker` runs the worker (`bulig-worker.service`), which runs Claude Code and the commands Claude runs. It holds the Claude token
   and its own worker token, and nothing else. It cannot read `/etc/bulig` or the kernel's credentials, because it is a different user.
-- `bulig-work` is a group both belong to, for `/var/lib/bulig/work`: the worker edits worktrees there and the kernel commits them.
+- The two users share no folder and no group. The worker has its own clone of a repo and sends the kernel a patch; the kernel applies it in its
+  own worktree (ADR 0011, PR #50). Neither user can read the other's tree. The kernel's git runs with hooks and fsmonitor off (PR #50 and PR-G).
 
 | What | Path |
 |---|---|
@@ -17,8 +18,8 @@ The two users, and why:
 | Secrets, one file each | `/etc/bulig/pg-url`, `gh-token`, `worker-tokens`, `claude-token`, `worker-token`, `drill-pw` (root, 0600). systemd hands each unit only its own through `LoadCredential=` (`credentials.example`) |
 | R2 settings | `/etc/bulig/backup.env` (root, 0600), loaded by the backup units only |
 | Kernel config | `/var/lib/bulig/.bulig/config.json` (root owns it, `bulig` can read it) |
-| Repos, clones and worktrees | `/var/lib/bulig/work` (group `bulig-work`, setgid, both units run with umask 0002) |
-| The worker's home (Claude sign-in) | `/var/lib/bulig-worker` |
+| The kernel's repos and worktrees | `/var/lib/bulig/repos` (`bulig:bulig`, 0750, kernel umask 0077) |
+| The worker's home (Claude sign-in) and its own clones | `/var/lib/bulig-worker`, clones in `/var/lib/bulig-worker/work` (`bulig-worker`, 0700, worker umask 0077) |
 | Dumps waiting for R2, and the index of checksums | `/var/backups/bulig` (root). The index (`/var/backups/bulig/index`) lists every dump this host made with its sha256 |
 | Before and after snapshots | `/var/lib/bulig-checks` (root) |
 
@@ -66,9 +67,10 @@ Stop at the first failure and read the message: every script says what it refuse
    ```bash
    bash deploy/release.sh <ref>
    ```
-   It archives the ref, copies it to a private folder on the server, then (under a lock) installs packages as bulig, hands the folder to
-   root, renames it to `/opt/bulig/releases/<sha>`, swaps `current`, installs the units, creates the config on the first run (Telegram
-   off, local worker off), restarts both services and runs `health.sh`. It refuses if that sha is already live. A failed health check puts
+   It archives the ref, copies it to a private folder on the server, then (under a lock) installs packages as bulig, compares the folder with a
+   root-owned copy of what was delivered and refuses the release if anything outside `node_modules` changed (dependency build scripts run as bulig,
+   and some files here later run as root), hands the folder to root, renames it to `/opt/bulig/releases/<sha>`, swaps `current`, installs the units, creates the config on the first run (Telegram
+   off, local worker off), restarts both services and runs `health.sh`. It refuses if that sha is already live. A failed reload, restart or health check puts
    the previous release and the previous unit files back.
 
 6. **Health.** Run it any time. It checks both services, and reads the lease twice, 11 seconds apart.
@@ -85,7 +87,7 @@ Stop at the first failure and read the message: every script says what it refuse
    (`bulig-cli.sh` runs as user `bulig` with the same credentials as the kernel unit; how PR-E names the target is its own detail.)
 
 8. **Synthetic jobs.** One on the VPS worker, one on the Mac worker over Tailscale. Exactly one PR each, on the sandbox repo. Repos are
-   cloned under `/var/lib/bulig/work`. Jobs run through the two services; one-off commands go through `bulig-cli.sh` (a transient unit
+   cloned by the kernel under `/var/lib/bulig/repos` and by the worker under `/var/lib/bulig-worker/work`. Jobs run through the two services; one-off commands go through `bulig-cli.sh` (a transient unit
    with caps, never a bare shell). Assumed (to confirm): the exact submit command comes with the worker protocol (PR-C), including the
    gateway on `127.0.0.1:7431` (and the Tailscale address for the Mac).
 
@@ -105,7 +107,7 @@ Stop at the first failure and read the message: every script says what it refuse
 
 10. **Restore drill.** Takes the newest entry of the local index, downloads it, checks the sha256, restores it into a scratch database in
     the bulig cluster as the `bulig_drill` role, compares tables and row counts with the live database, logs the time, drops the scratch
-    database. Look for `bulig-restore-drill: ok ... restore_seconds=N`.
+    database. It fails if the newest backup is more than 48 hours old, so a stopped nightly backup does not hide behind a passing drill. Look for `bulig-restore-drill: ok ... restore_seconds=N`.
     ```bash
     ssh ths-prod-01 'systemctl start bulig-restore-drill.service && journalctl -u bulig-restore-drill.service -n 5 --no-pager'
     ```
@@ -144,7 +146,7 @@ SQLite file is still the copy it was before the move, so going back loses anythi
 - **Stop Bulig, leave everything else alone.** `systemctl stop bulig-worker bulig`. The cluster keeps running. Jobs resume on the next start.
 - **Remove Bulig completely.** Only with Jasher's yes, and in this order: `systemctl disable --now bulig-worker bulig bulig-backup.timer bulig-restore-drill.timer`,
   remove `/etc/systemd/system/bulig*`, `systemctl daemon-reload`, `pg_dropcluster 16 bulig --stop`, then `userdel bulig`, `userdel bulig-worker`,
-  `groupdel bulig-work`, then `/opt/bulig`, `/etc/bulig`, `/var/lib/bulig`, `/var/lib/bulig-worker`, `/var/backups/bulig`. Run `postcheck.sh`; it should show nothing
+  then `/opt/bulig`, `/etc/bulig`, `/var/lib/bulig`, `/var/lib/bulig-worker`, `/var/backups/bulig`. Run `postcheck.sh`; it should show nothing
   changed from the precheck.
 - **Restore the database from R2.** The restore drill is the rehearsal. For a real restore: `systemctl stop bulig-worker bulig`, take the
   newest dump (a custom-format `.dump` under `bulig/postgres/`; check its sha256 against `/var/backups/bulig/index`), create an empty
@@ -160,5 +162,6 @@ SQLite file is still the copy it was before the move, so going back loses anythi
   leaves `worker-claude-code` out of `enabled`: the kernel has no in-process worker here, all work goes through `bulig-worker`.
 - Both services are `Restart=always`. A lost lease makes `serve` exit non-zero and systemd starts it again within 5 seconds.
 - `/opt/bulig` is read-only to both services on purpose. A release is installed by bulig, then handed back to root.
+- With no `aws` CLI the R2 calls go through a docker container fed by stdin and stdout, with no host mount (dockerd does not share this unit's private /tmp).
 - Everything uses a Postgres connection with an explicit host (`127.0.0.1`) and port, and passwords travel in a private PGPASSFILE, never on a
   command line (any user on this host can read other processes' arguments).

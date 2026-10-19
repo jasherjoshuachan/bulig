@@ -3,7 +3,7 @@
 # It writes only to fixed files under /etc/bulig and refuses anything else: there is no path argument.
 #   one secret, one root-only file (loaded by systemd LoadCredential= into the unit that needs it):
 #     set-secret.sh --credential <pg-url|gh-token|worker-tokens|claude-token|worker-token|drill-pw> < value
-#     security find-generic-password -s <item> -w | ssh ths-prod-01 '/opt/bulig/current/deploy/set-secret.sh --credential gh-token'
+#     security find-generic-password -s <item> -w | ssh ths-prod-01 '/usr/local/lib/bulig/current/set-secret.sh --credential gh-token'
 #   one R2 setting in /etc/bulig/backup.env (used only by the backup units):
 #     set-secret.sh --backup-key <R2_ENDPOINT|R2_BUCKET|AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|...> < value
 set -euo pipefail

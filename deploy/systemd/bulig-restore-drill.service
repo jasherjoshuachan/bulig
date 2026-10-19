@@ -14,7 +14,8 @@ UMask=0077
 LoadCredential=backup-env:/etc/bulig/backup.env
 LoadCredential=pg-url:/etc/bulig/pg-url
 LoadCredential=drill-pw:/etc/bulig/drill-pw
-ExecStart=/opt/bulig/current/deploy/restore-drill.sh
+# Run from the root-owned tools folder, never from the Node release tree (which bulig installs into).
+ExecStart=/usr/local/lib/bulig/current/restore-drill.sh
 TimeoutStartSec=60min
 Nice=15
 IOSchedulingClass=idle
@@ -25,6 +26,7 @@ PrivateTmp=true
 PrivateDevices=true
 ProtectSystem=strict
 ProtectHome=true
+ReadWritePaths=/var/lib/bulig-checks
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectKernelLogs=true

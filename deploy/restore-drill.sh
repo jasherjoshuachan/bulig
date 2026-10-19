@@ -27,11 +27,12 @@ case "$key" in "$R2_PREFIX/bulig-postgres-"*.dump) ;; *) die "the newest index e
 stamp="${key##*/bulig-postgres-}"
 stamp="${stamp%.dump}"
 [[ "$stamp" =~ ^([0-9]{4}-[0-9]{2}-[0-9]{2})T([0-9]{2})-([0-9]{2})-([0-9]{2})Z$ ]] || die "cannot read the time from the key '$key'"
-made="$(date -u -d "${BASH_REMATCH[1]} ${BASH_REMATCH[2]}:${BASH_REMATCH[3]}:${BASH_REMATCH[4]}" +%s)" || die "cannot read the time from the key '$key'"
+IFS=- read -r ky kmo kd <<<"${BASH_REMATCH[1]}"
+made="$(epoch_from_utc "$ky" "$kmo" "$kd" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" "${BASH_REMATCH[4]}")"
 age=$(($(date -u +%s) - made))
 [ "$age" -le 172800 ] || die "the newest backup is $((age / 3600)) hours old (limit 48). The nightly backup has stopped; look at bulig-backup.service."
 
-work="$(mktemp -d)"
+work="$(private_tmpdir)"
 scratch="bulig_drill_$(date -u +%Y%m%d%H%M%S)"
 started=$SECONDS
 

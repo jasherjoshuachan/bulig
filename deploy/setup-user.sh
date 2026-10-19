@@ -37,6 +37,9 @@ setup_folders
 
 # /opt/bulig: releases are unpacked here. Root owns /opt/bulig; release.sh hands a release to bulig only while it installs packages.
 install -d -m 0755 -o root -g root /opt/bulig /opt/bulig/releases
+# /usr/local/lib/bulig: the scripts ROOT runs (health, backup, drill, checks) and the unit files. Installed by release.sh from the delivered copy,
+# root-owned, never inside a tree bulig has owned. Units run from /usr/local/lib/bulig/current.
+install -d -m 0755 -o root -g root /usr/local/lib/bulig
 # /etc/bulig: root only. One secret per file (see credentials.example), loaded by systemd LoadCredential= into the unit that needs it.
 install -d -m 0700 -o root -g root /etc/bulig
 # worker-tokens (kernel side) and worker-token (worker side) are filled by the worker protocol (PR-C). Empty files let the units start before that exists.

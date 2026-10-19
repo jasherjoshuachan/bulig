@@ -42,7 +42,7 @@ else
 fi
 
 # 2. Read the lease row twice, as the bulig role over 127.0.0.1:5436 (password through a private PGPASSFILE, never a command line).
-work="$(mktemp -d)"
+work="$(private_tmpdir)"
 trap 'rm -rf "$work"' EXIT
 PGPASSFILE="$(pg_passfile "$(cred_path pg-url)" "$work")"
 export PGPASSFILE

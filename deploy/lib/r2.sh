@@ -4,7 +4,8 @@
 # otherwise the same pinned aws-cli image the commitments backup uses.
 
 R2_PREFIX="bulig/postgres"
-AWSCLI_IMAGE="${AWSCLI_IMAGE:-amazon/aws-cli:2.27.49}"
+# Pinned by digest: the tag 2.27.49 as it was on ths-prod-01 on 19 Oct 2026. A tag can be moved; a digest cannot.
+AWSCLI_IMAGE="${AWSCLI_IMAGE:-amazon/aws-cli@sha256:1b7003e3ecb737b7533d8e16a547b4bc36e912508c3532ae51003aad8d0cd41d}"
 
 # load_backup_env: export the R2 settings. In a unit they come from the credential "backup-env" (LoadCredential=), by hand from
 # /etc/bulig/backup.env. Read line by line, never sourced, so a value is never run as shell.
@@ -32,18 +33,23 @@ r2_aws() {
   if command -v aws >/dev/null 2>&1; then
     aws --endpoint-url "$R2_ENDPOINT" "$@"
   else
-    r2_docker "$@"
+    r2_docker "$@" </dev/null
   fi
 }
 
-# With docker there is no host mount at all: dockerd does not use this unit's private /tmp, so a -v folder would be a world-readable
-# path on the host. The file is streamed through the container's stdin and stdout instead, and written by this process into its own
-# private folder.
+# With docker there is no host mount at all (dockerd does not use this unit's private /tmp, so a -v folder would be a world-readable path on
+# the host), and the R2 key is not in docker's environment or arguments either (both show in `docker inspect` and in ps). It goes in on
+# stdin: two lines, then whatever data stream the caller supplies. The container's shell reads the two lines and starts aws.
 r2_docker() {
   command -v docker >/dev/null 2>&1 || die "neither aws nor docker is installed, so there is no way to reach R2"
-  docker run --rm -i -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_DEFAULT_REGION \
-    -e AWS_REQUEST_CHECKSUM_CALCULATION -e AWS_RESPONSE_CHECKSUM_VALIDATION \
-    "$AWSCLI_IMAGE" --endpoint-url "$R2_ENDPOINT" "$@"
+  {
+    printf '%s\n%s\n' "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY"
+    cat
+  } | docker run --rm -i --entrypoint sh \
+    -e "AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-auto}" \
+    -e "AWS_REQUEST_CHECKSUM_CALCULATION=${AWS_REQUEST_CHECKSUM_CALCULATION:-when_required}" \
+    -e "AWS_RESPONSE_CHECKSUM_VALIDATION=${AWS_RESPONSE_CHECKSUM_VALIDATION:-when_required}" \
+    "$AWSCLI_IMAGE" -c 'read -r AWS_ACCESS_KEY_ID; read -r AWS_SECRET_ACCESS_KEY; export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; endpoint="$1"; shift; exec aws --endpoint-url "$endpoint" "$@"' sh "$R2_ENDPOINT" "$@"
 }
 
 # r2_put <local file> <key>
@@ -62,7 +68,7 @@ r2_get() {
   if command -v aws >/dev/null 2>&1; then
     r2_aws s3 cp "s3://$R2_BUCKET/$key" "$file" --only-show-errors
   else
-    r2_docker s3 cp "s3://$R2_BUCKET/$key" - --only-show-errors >"$file"
+    r2_docker s3 cp "s3://$R2_BUCKET/$key" - --only-show-errors </dev/null >"$file"
   fi
 }
 

@@ -80,10 +80,29 @@ setup_folders() {
   make_dir 0700 bulig-worker bulig-worker "$BULIG_WORKER_WORK_DIR"
 }
 
+# private_tmpdir: a fresh 0700 folder inside /var/lib/bulig-checks (root's), for passfiles and downloads. Never the host's /tmp.
+private_tmpdir() {
+  ensure_checks_dir
+  mktemp -d -p "$BULIG_CHECKS_DIR" "work.XXXXXX"
+}
+
+# epoch_from_utc <Y> <M> <D> <h> <m> <s>: seconds since 1970 for a UTC time, in plain bash arithmetic (no GNU date -d, so it also runs in the tests).
+epoch_from_utc() {
+  local y=$((10#$1)) m=$((10#$2)) d=$((10#$3)) h=$((10#$4)) mi=$((10#$5)) s=$((10#$6)) era yoe doy doe days
+  [ "$m" -le 2 ] && y=$((y - 1))
+  era=$((y / 400))
+  yoe=$((y - era * 400))
+  doy=$(((153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1))
+  doe=$((yoe * 365 + yoe / 4 - yoe / 100 + doy))
+  days=$((era * 146097 + doe - 719468))
+  echo $((days * 86400 + h * 3600 + mi * 60 + s))
+}
+
 # Prefer the Postgres 16 client tools by path, so a newer client on PATH never talks to this cluster by accident.
 pg_bin() {
   local tool="$1" p="/usr/lib/postgresql/$BULIG_PG_VERSION/bin/$1"
-  if [ -x "$p" ]; then echo "$p"; else command -v "$tool" || die "$tool not found"; fi
+  # (In the tests, R is set and the tool is whatever stub is first on PATH.)
+  if [ -z "$R" ] && [ -x "$p" ]; then echo "$p"; else command -v "$tool" || die "$tool not found"; fi
 }
 
 # Run a command as the postgres OS user (peer auth over the local socket). Used only to create roles and databases at setup.

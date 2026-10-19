@@ -14,7 +14,8 @@ UMask=0077
 # The database URL and the R2 keys come in as credentials (read from $CREDENTIALS_DIRECTORY by the script). The kernel never loads backup.env.
 LoadCredential=pg-url:/etc/bulig/pg-url
 LoadCredential=backup-env:/etc/bulig/backup.env
-ExecStart=/opt/bulig/current/deploy/backup-postgres.sh
+# Run from the root-owned tools folder, never from the Node release tree (which bulig installs into).
+ExecStart=/usr/local/lib/bulig/current/backup-postgres.sh
 TimeoutStartSec=30min
 # A backup must not slow client production.
 Nice=15
@@ -38,4 +39,5 @@ LockPersonality=true
 # MemoryDenyWriteExecute is not set: the aws CLI is a frozen Python bundle and may need it off.
 SystemCallArchitectures=native
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
-ReadWritePaths=/var/backups/bulig
+# /var/lib/bulig-checks holds the private folder for the passfile (never the host /tmp).
+ReadWritePaths=/var/backups/bulig /var/lib/bulig-checks

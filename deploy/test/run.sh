@@ -4,37 +4,9 @@
 #   2. the snapshot ignores Bulig's own changes and catches changes to everything else it lists, end to end through precheck/postcheck.
 # usage: bash deploy/test/run.sh        Exit 0 only if every check passes.
 # The scripts run against a throwaway folder (BULIG_DEPLOY_TEST_ROOT) and fake system tools; nothing real is touched.
-# shellcheck disable=SC1091,SC2030,SC2031
+# shellcheck disable=SC1091,SC2030,SC2031,SC2154
 set -uo pipefail
-# No test may wait on a terminal: a refusal that falls through to reading stdin must fail, not hang.
-exec </dev/null
-here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-deploy="$(dirname "$here")"
-work="$(mktemp -d)"
-trap 'rm -rf "$work"' EXIT
-pass=0
-fail=0
-
-ok() { pass=$((pass + 1)); echo "  ok    $1"; }
-bad() { fail=$((fail + 1)); echo "  FAIL  $1"; }
-expect_ok() {
-  local label="$1"
-  shift
-  if "$@" >"$work/out" 2>&1; then ok "$label"; else bad "$label: $(head -c 300 "$work/out")"; fi
-}
-expect_fail() {
-  local label="$1"
-  shift
-  if "$@" >"$work/out" 2>&1; then bad "$label (it succeeded)"; else ok "$label"; fi
-}
-# expect_fail_msg <label> <text the output must contain> <command...>: the command must fail AND say why. A refusal that fails for another
-# reason (a missing folder, a typo in the test) does not count.
-expect_fail_msg() {
-  local label="$1" want="$2"
-  shift 2
-  if "$@" >"$work/out" 2>&1; then bad "$label (it succeeded)"; elif grep -qF -- "$want" "$work/out"; then ok "$label"; else bad "$label (failed, but not with '$want'): $(head -c 300 "$work/out")"; fi
-}
-mode() { if /usr/bin/stat -c %a "$1" >/dev/null 2>&1; then stat -c %a "$1"; else /usr/bin/stat -f %Lp "$1"; fi; }
+. "$(dirname "${BASH_SOURCE[0]}")/helpers.sh"
 
 # ---------- 1. set-secret.sh ----------
 echo "set-secret.sh"
@@ -264,6 +236,13 @@ echo 'LISTEN 0 1 0.0.0.0:8080 0.0.0.0:* users:(("python3",pid=7,fd=3))' >>"$w/da
 expect_fail_msg "postcheck.sh fails after a change, and shows it" "8080" bash "$deploy/postcheck.sh"
 if [ "$(find "$checks" -type f | wc -l | tr -d ' ')" = "1" ]; then ok "postcheck left no temp files"; else bad "postcheck left extra files in $checks"; fi
 
-echo
-echo "passed $pass, failed $fail"
-[ "$fail" -eq 0 ]
+
+finish
+suite_rc=$?
+# The other suites: the restore drill and backup (stubbed tools), and the server half of a release (stubbed systemd).
+for suite in drill.sh release.sh; do
+  echo
+  echo "== $suite"
+  bash "$here/$suite" || suite_rc=1
+done
+exit "$suite_rc"

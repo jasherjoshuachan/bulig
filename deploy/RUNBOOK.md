@@ -14,7 +14,8 @@ The two users, and why:
 
 | What | Path |
 |---|---|
-| Code, one folder per release | `/opt/bulig/releases/<sha>`, with `/opt/bulig/current` pointing at the live one (root-owned, read-only to both services) |
+| Node code, one folder per release | `/opt/bulig/releases/<sha>`, with `/opt/bulig/current` pointing at the live one (root-owned, read-only to both services). Run as `bulig` and `bulig-worker` only |
+| The scripts root runs, and the unit files | `/usr/local/lib/bulig/<sha>`, with `/usr/local/lib/bulig/current` pointing at the live one (root-owned, 0755/0644). Health, backup, drill, checks and `bulig-cli.sh` run from here, never from `/opt/bulig`. Nothing root executes lives in a tree bulig owned |
 | Secrets, one file each | `/etc/bulig/pg-url`, `gh-token`, `worker-tokens`, `claude-token`, `worker-token`, `drill-pw` (root, 0600). systemd hands each unit only its own through `LoadCredential=` (`credentials.example`) |
 | R2 settings | `/etc/bulig/backup.env` (root, 0600), loaded by the backup units only |
 | Kernel config | `/var/lib/bulig/.bulig/config.json` (root owns it, `bulig` can read it) |
@@ -25,7 +26,7 @@ The two users, and why:
 | Before and after snapshots | `/var/lib/bulig-checks` (root) |
 
 Run every script on the server as root. The Mac only runs `release.sh`. No script takes a free-form path: they write only to the fixed
-places above and refuse anything else. Files in `deploy/`: `setup-user.sh`, `setup-cluster.sh`, `set-secret.sh`, `release.sh`, `health.sh`,
+places above and refuse anything else. Files in `deploy/`: `setup-user.sh`, `setup-cluster.sh`, `set-secret.sh`, `release.sh`, `release-remote.sh`, `health.sh`,
 `bulig-cli.sh`, `precheck.sh`, `postcheck.sh`, `backup-postgres.sh`, `restore-drill.sh`, `systemd/`, `bulig.config.vps.json`, the
 name-only `credentials.example` and `backup.env.example`, and `test/run.sh` (run it on the Mac: `bash deploy/test/run.sh`).
 
@@ -68,22 +69,25 @@ Stop at the first failure and read the message: every script says what it refuse
    ```bash
    bash deploy/release.sh <ref>
    ```
-   It archives the ref, copies it to a private folder on the server, then (under a lock) installs packages as bulig, compares the folder with a
-   root-owned copy of what was delivered and refuses the release if anything outside `node_modules` changed (dependency build scripts run as bulig,
-   and some files here later run as root), hands the folder to root, renames it to `/opt/bulig/releases/<sha>`, swaps `current`, installs the units, creates the config on the first run (Telegram
-   off, local worker off), restarts both services and runs `health.sh`. It refuses if that sha is already live. A failed reload, restart or health check puts
-   the previous release and the previous unit files back.
+   It archives the ref and sends two trees to the server, both root-owned on arrival: the Node code to `/opt/bulig/releases/<sha>` and `deploy/` to
+   `/usr/local/lib/bulig/<sha>` (the root tools and unit files). The server half (`release-remote.sh`) is sent from your checkout over ssh, so it is
+   never a file bulig could have changed. The dependency install runs on a copy of the Node tree as a capped transient systemd unit
+   (`systemd-run`, as `bulig`), so every process a build script starts dies with the unit. The final Node tree is a fresh copy of what was delivered,
+   with only the `node_modules` folders moved in from the install, so a build script cannot change a file or keep a handle into the live release. It is
+   checked against the delivered copy, then both `current` symlinks and the unit files are swapped, the config is created on the first run (Telegram
+   off, local worker off), both services restart and `health.sh` runs. It refuses if that sha is already live. A failed install, reload, restart or
+   health check puts back both symlinks and the previous unit files. Note: this puts `/usr/local/lib/bulig` on the server (Bulig's own code, root-owned).
 
 6. **Health.** Run it any time. It checks both services, and reads the lease twice, 11 seconds apart.
    ```bash
-   ssh ths-prod-01 '/opt/bulig/current/deploy/health.sh'
+   ssh ths-prod-01 '/usr/local/lib/bulig/current/health.sh'
    ssh ths-prod-01 'systemctl show bulig.service bulig-worker.service -p Id -p User -p MemoryMax -p CPUQuotaPerSecUSec -p TasksMax'
    ```
 
 7. **Copy over the old record** (PR-E, `bulig migrate sqlite-to-postgres`). Dry run first, then the real copy. Stop the kernel first (only
    one writer), run the command in a capped transient unit, start the kernel again, run `health.sh`:
    ```bash
-   ssh ths-prod-01 'systemctl stop bulig.service && /opt/bulig/current/deploy/bulig-cli.sh migrate sqlite-to-postgres --from <file> --to-env BULIG_PG_URL --dry-run'
+   ssh ths-prod-01 'systemctl stop bulig.service && /usr/local/lib/bulig/current/bulig-cli.sh migrate sqlite-to-postgres --from <file> --to-env BULIG_PG_URL --dry-run'
    ```
    (`bulig-cli.sh` runs as user `bulig` with the same credentials as the kernel unit; how PR-E names the target is its own detail.)
 
@@ -94,7 +98,7 @@ Stop at the first failure and read the message: every script says what it refuse
 
 9. **Backup.** Fill the R2 settings, one name at a time, then run one backup by hand and look for the `bulig-backup: ok` line:
    ```bash
-   printf '%s' "$R2_ENDPOINT" | ssh ths-prod-01 'bash /opt/bulig/current/deploy/set-secret.sh --backup-key R2_ENDPOINT'
+   printf '%s' "$R2_ENDPOINT" | ssh ths-prod-01 'bash /usr/local/lib/bulig/current/set-secret.sh --backup-key R2_ENDPOINT'
    ```
    (repeat for `R2_BUCKET`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION`; names in `backup.env.example`)
    ```bash
@@ -115,7 +119,7 @@ Stop at the first failure and read the message: every script says what it refuse
 
 11. **Postcheck.** The "after" picture. It must say the snapshot is identical to the precheck (apart from Bulig's own things).
     ```bash
-    ssh ths-prod-01 '/opt/bulig/current/deploy/postcheck.sh'
+    ssh ths-prod-01 '/usr/local/lib/bulig/current/postcheck.sh'
     ```
     A diff of unrelated services that started or stopped on their own (a nightly job) needs a human read: check it is not Bulig's
     doing before calling it noise, and add the pattern to `SNAPSHOT_NOISE` in `lib/snapshot.sh` if it is.
@@ -128,7 +132,7 @@ two kernels must never poll one bot (Telegram answers the second `getUpdates` wi
 1. Stop the Mac: `launchctl bootout gui/$(id -u)/dev.bulig.serve`.
 2. Put the bot token on the server as a credential for the kernel only: add `telegram-token` to `BULIG_CREDENTIALS` in `lib/common.sh`
    and `LoadCredential=telegram-token:/etc/bulig/telegram-token` to `bulig.service` (a reviewed change, then `release.sh`), then
-   `security find-generic-password -s bulig-telegram-bot -w | ssh ths-prod-01 'bash /opt/bulig/current/deploy/set-secret.sh --credential telegram-token'`.
+   `security find-generic-password -s bulig-telegram-bot -w | ssh ths-prod-01 'bash /usr/local/lib/bulig/current/set-secret.sh --credential telegram-token'`.
 3. In `/var/lib/bulig/.bulig/config.json` add `"channel-telegram"` to `enabled`, add its grants and its `pluginConfig` block
    (`allowedChatIds`, `allowedUserIds`, `repos`; copy the shape from `bulig.config.example.json`). Keep the file owned by root, group bulig, mode 0640.
 4. `systemctl restart bulig` and run `health.sh`.
@@ -147,7 +151,7 @@ SQLite file is still the copy it was before the move, so going back loses anythi
 - **Stop Bulig, leave everything else alone.** `systemctl stop bulig-worker bulig`. The cluster keeps running. Jobs resume on the next start.
 - **Remove Bulig completely.** Only with Jasher's yes, and in this order: `systemctl disable --now bulig-worker bulig bulig-backup.timer bulig-restore-drill.timer`,
   remove `/etc/systemd/system/bulig*`, `systemctl daemon-reload`, `pg_dropcluster 16 bulig --stop`, then `userdel bulig`, `userdel bulig-worker`,
-  then `/opt/bulig`, `/etc/bulig`, `/var/lib/bulig`, `/var/lib/bulig-worker`, `/var/backups/bulig`. Run `postcheck.sh`; it should show nothing
+  then `/opt/bulig`, `/etc/bulig`, `/usr/local/lib/bulig`, `/var/lib/bulig`, `/var/lib/bulig-worker`, `/var/backups/bulig`, `/var/lib/bulig-checks` (after the last `postcheck.sh`). Run `postcheck.sh`; it should show nothing
   changed from the precheck.
 - **Restore the database from R2.** The restore drill is the rehearsal. For a real restore: `systemctl stop bulig-worker bulig`, take the
   newest dump (a custom-format `.dump` under `bulig/postgres/`; check its sha256 against `/var/backups/bulig/index`), create an empty
@@ -163,6 +167,7 @@ SQLite file is still the copy it was before the move, so going back loses anythi
   leaves `worker-claude-code` out of `enabled`: the kernel has no in-process worker here, all work goes through `bulig-worker`.
 - Both services are `Restart=always`. A lost lease makes `serve` exit non-zero and systemd starts it again within 5 seconds.
 - `/opt/bulig` is read-only to both services on purpose. A release is installed by bulig, then handed back to root.
-- With no `aws` CLI the R2 calls go through a docker container fed by stdin and stdout, with no host mount (dockerd does not share this unit's private /tmp).
+- With no `aws` CLI the R2 calls go through a docker container (image pinned by digest) fed by stdin and stdout: no host mount, and the R2 key travels on stdin, never in docker's arguments or environment.
+- Passfiles and downloads live in a 0700 folder under `/var/lib/bulig-checks` (root's), never in the host's `/tmp`, also when you run a script by hand.
 - Everything uses a Postgres connection with an explicit host (`127.0.0.1`) and port, and passwords travel in a private PGPASSFILE, never on a
   command line (any user on this host can read other processes' arguments).

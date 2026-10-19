@@ -1,0 +1,36 @@
+[Unit]
+Description=Restore the newest Bulig backup from R2 into a scratch database and check it
+After=postgresql@16-bulig.service network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/bulig/backup.env
+
+[Service]
+Type=oneshot
+# Root, to reach the postgres superuser over the local socket (peer auth) for CREATE DATABASE. Only port 5436 is ever used.
+User=root
+UMask=0077
+LoadCredential=backup-env:/etc/bulig/backup.env
+ExecStart=/opt/bulig/current/deploy/restore-drill.sh
+TimeoutStartSec=60min
+Nice=15
+IOSchedulingClass=idle
+MemoryMax=2G
+TasksMax=64
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+# MemoryDenyWriteExecute is not set: the aws CLI is a frozen Python bundle and may need it off.
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/backups/bulig

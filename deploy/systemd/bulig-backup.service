@@ -1,0 +1,40 @@
+[Unit]
+Description=Back up the Bulig Postgres database to R2
+After=postgresql@16-bulig.service network-online.target
+Wants=network-online.target
+# No R2 keys, no run: a timer that fires before the keys are in place should fail loudly, not quietly skip.
+ConditionPathExists=/etc/bulig/backup.env
+
+[Service]
+Type=oneshot
+# Root, because the keys and the database URL are root-only files and docker (the fallback for the aws CLI) needs it.
+User=root
+UMask=0077
+# The database URL and the R2 keys come in as credentials (read from $CREDENTIALS_DIRECTORY by the script). The kernel never loads backup.env.
+LoadCredential=pg-url:/etc/bulig/pg-url
+LoadCredential=backup-env:/etc/bulig/backup.env
+ExecStart=/opt/bulig/current/deploy/backup-postgres.sh
+TimeoutStartSec=30min
+# A backup must not slow client production.
+Nice=15
+IOSchedulingClass=idle
+MemoryMax=1G
+TasksMax=64
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+# MemoryDenyWriteExecute is not set: the aws CLI is a frozen Python bundle and may need it off.
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/backups/bulig

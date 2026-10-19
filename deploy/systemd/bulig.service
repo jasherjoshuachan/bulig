@@ -1,0 +1,78 @@
+[Unit]
+Description=Bulig kernel (bulig serve)
+Documentation=https://github.com/jasherjoshuachan/bulig
+# The kernel needs its own Postgres cluster up first. Wants, not Requires: if the cluster restarts, the kernel's lease logic
+# handles the gap and a restart of this unit is not forced.
+After=network-online.target postgresql@16-bulig.service
+Wants=network-online.target postgresql@16-bulig.service
+# No config, no start: a missing config would otherwise fall back to a SQLite file and run a second, empty record.
+ConditionPathExists=/var/lib/bulig/.bulig/config.json
+# A crash loop stops after 10 tries in 5 minutes instead of hammering the database.
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+# Its own user. Never root, never the user that runs anything else on this host.
+User=bulig
+Group=bulig
+WorkingDirectory=/opt/bulig/current
+# Secrets come in as credentials, not as environment: Claude sessions the worker starts inherit the unit's environment, and must not
+# hold the database URL or a token. Each is a root-only file (0600), one secret each. The process finds them in $CREDENTIALS_DIRECTORY.
+# A missing file stops the unit from starting, on purpose. See deploy/credentials.example.
+LoadCredential=pg-url:/etc/bulig/pg-url
+LoadCredential=gh-token:/etc/bulig/gh-token
+LoadCredential=claude-token:/etc/bulig/claude-token
+LoadCredential=worker-tokens:/etc/bulig/worker-tokens
+# HOME is where the config lives ($HOME/.bulig/config.json), and where claude and gh keep their sign-in.
+Environment=HOME=/var/lib/bulig
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:/var/lib/bulig/.local/bin
+ExecStart=/usr/bin/env node packages/cli/bin/bulig.mjs serve
+# Always restart: serve exits non-zero when it loses the lease, and a fresh start resumes from the record.
+Restart=always
+RestartSec=5
+# Give running workers time to stop; after that the whole control group is killed, claude children included.
+TimeoutStopSec=60
+KillMode=control-group
+UMask=0077
+
+# Caps, so a runaway job cannot starve client production on the same host.
+MemoryMax=4G
+CPUQuota=300%
+TasksMax=512
+# Under contention, client services win.
+CPUWeight=50
+Nice=10
+LimitNOFILE=65536
+
+# Hardening (same set as personal-credential-broker, minus what node, git and Claude Code need).
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=true
+PrivateDevices=true
+# Whole filesystem read-only except the line below. Worktrees, ~/.claude and ~/.config/gh live under /var/lib/bulig.
+ProtectSystem=strict
+ReadWritePaths=/var/lib/bulig
+# /home and /root become read-only, and the bulig home (/var/lib/bulig) is outside them, so Claude reaches its config in ReadWritePaths.
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+# Other users' processes are hidden. ProcSubset=pid is NOT set: node and claude read /proc/meminfo and /proc/cpuinfo.
+ProtectProc=invisible
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# NOT set on purpose:
+#   MemoryDenyWriteExecute  node's JIT needs writable+executable memory.
+#   RestrictNamespaces      Claude Code's own sandbox uses namespaces if it is switched on.
+#   /opt/bulig writable     releases are installed by release.sh and handed back to root; the service never rewrites its own code.
+
+[Install]
+WantedBy=multi-user.target

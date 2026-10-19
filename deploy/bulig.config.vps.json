@@ -1,0 +1,35 @@
+{
+  "store": { "kind": "postgres", "urlEnv": "BULIG_PG_URL" },
+  "dbPath": "/var/lib/bulig/state/bulig.sqlite",
+  "enabled": ["channel-cli", "worker-claude-code", "gate-evidence", "gate-promise", "github", "pipeline-dev"],
+  "grants": {
+    "channel-cli": ["channel.send:terminal", "approval.grant"],
+    "worker-claude-code": ["claude.run", "fs.worktree"],
+    "github": ["git.push", "gh.pr"],
+    "pipeline-dev": ["merge.request", "jobs.write"]
+  },
+  "pluginConfig": {
+    "gate-evidence": { "mode": "warn", "enabled": true },
+    "gate-promise": { "mode": "warn", "enabled": true },
+    "worker-claude-code": {
+      "claudeBin": "claude",
+      "timeoutMs": 1200000,
+      "extraArgs": ["--setting-sources", "project,local"]
+    },
+    "github": {
+      "tokenEnv": "BULIG_GH_TOKEN",
+      "authorName": "Bulig Bot",
+      "authorEmail": "<id>+<username>@users.noreply.github.com",
+      "allowNoChecks": false
+    },
+    "pipeline-dev": {
+      "models": { "strong": "opus", "standard": "sonnet" },
+      "maxBuildAttempts": 2,
+      "branchPrefix": "bulig",
+      "keepFailedWorktrees": false,
+      "scopeMode": "enforce",
+      "scopeAlwaysAllow": [],
+      "allowBroadScope": false
+    }
+  }
+}

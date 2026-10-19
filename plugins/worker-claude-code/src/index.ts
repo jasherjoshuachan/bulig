@@ -4,6 +4,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { definePlugin, type BuligEvent } from '@bulig/plugin-sdk';
 import { clipText } from '@bulig/text';
+import { readCredential } from '@bulig/credentials';
+
+export { CREDENTIAL_NAMES, readCredential } from '@bulig/credentials';
 
 export type StageMode = 'readonly' | 'edit';
 
@@ -35,9 +38,14 @@ export interface WorkerConfig {
   allowDomains?: string[];
   /** On stop, how long a run gets after SIGTERM before it is killed with SIGKILL, in ms. Default 10000. */
   stopGraceMs?: number;
+  /**
+   * Where stages come from. "direct" (the default) runs every stage.requested, as always. "gateway" is set by the CLI when worker-gateway
+   * is on: the gateway decides which worker takes a stage, and this one runs only the stage.assigned events addressed to "local".
+   */
+  via?: 'direct' | 'gateway';
 }
 
-const DEFAULT_TIMEOUT_MS = 20 * 60 * 1000;
+export const DEFAULT_TIMEOUT_MS = 20 * 60 * 1000;
 const KILL_GRACE_MS = 3000;
 const STOP_GRACE_MS = 10_000;
 
@@ -111,6 +119,21 @@ export function buildEnv(source: NodeJS.ProcessEnv, passEnv: readonly string[] =
 }
 
 /**
+ * `buildEnv` plus the Claude login from systemd's credentials, for a host (the server) that keeps it in a file and not in the
+ * environment. The token is read from `$CREDENTIALS_DIRECTORY/claude-token` into the child's environment only, and only when the
+ * environment has no login of its own. `CREDENTIALS_DIRECTORY` itself is not on the allowlist, so the child never learns where
+ * the other credentials (the database URL, the worker tokens) are.
+ */
+export function buildClaudeEnv(source: NodeJS.ProcessEnv, passEnv: readonly string[] = []): NodeJS.ProcessEnv {
+  const env = buildEnv(source, passEnv);
+  if (![...CLAUDE_AUTH].some((n) => env[n])) {
+    const token = readCredential('claude-token', source);
+    if (token) env.CLAUDE_CODE_OAUTH_TOKEN = token;
+  }
+  return env;
+}
+
+/**
  * Layer 2 of keeping an edit stage away from GitHub: the ambient credentials. HOME stays, because Claude Code
  * needs it to log in, and the signed-in gh and git's credential helper live under it. So gh gets an empty
  * config dir, git gets no global or system config and no credential helper, and nothing can prompt or ask
@@ -142,7 +165,7 @@ export const GITHUB_HOSTS = ['github.com', '*.github.com', 'api.github.com', 'gi
 /** Hosts a sandboxed command may reach: Claude's own API and the npm registry. Everything else is refused. */
 export const BASE_ALLOWED_DOMAINS = ['api.anthropic.com', 'registry.npmjs.org'];
 /** Credential files a sandboxed command may not even read. */
-export const DENY_READ = ['~/.config/gh', '~/.ssh', '~/.git-credentials', '~/.netrc', '~/.gitconfig', '~/.config/git'];
+export const DENY_READ = ['~/.config/gh', '~/.ssh', '~/.git-credentials', '~/.netrc', '~/.gitconfig', '~/.config/git', '/run/credentials'];
 
 const isGithubHost = (d: string) => /(^|\.)(github\.com|githubusercontent\.com)$/i.test(d.replace(/^\*\./, ''));
 
@@ -448,7 +471,8 @@ export function parseClaudeOutput(stdout: string): RunResult {
   return p.finish();
 }
 
-function run(
+/** Start one Claude run and wait for it. Exported so `bulig worker` runs exactly the same process, in the same sandbox, as the in-process worker. */
+export function run(
   bin: string,
   args: string[],
   cwd: string,
@@ -512,7 +536,7 @@ function run(
   });
 }
 
-function isRequest(p: unknown): p is StageRequest {
+export function isRequest(p: unknown): p is StageRequest {
   if (typeof p !== 'object' || p === null) return false;
   const r = p as Record<string, unknown>;
   return (
@@ -526,7 +550,7 @@ function isRequest(p: unknown): p is StageRequest {
 }
 
 /** SIGTERM now, SIGKILL after `graceMs` if it is still alive. */
-function terminate(child: ChildProcess, graceMs: number): void {
+export function terminate(child: ChildProcess, graceMs: number): void {
   if (child.exitCode !== null || child.signalCode !== null) return;
   signalGroup(child, 'SIGTERM');
   child.once('exit', () => signalGroup(child, 'SIGKILL')); // sweep anything the run left behind
@@ -577,7 +601,7 @@ export function createWorker() {
       sdk: '1',
       description: 'Runs one fresh Claude Code session per stage, inside the job worktree.',
       provides: { stages: ['*'] },
-      subscribes: ['stage.requested', 'job.status'],
+      subscribes: ['stage.requested', 'stage.assigned', 'job.status'],
       emits: ['stage.completed', 'stage.failed'],
       needs: ['claude.run', 'fs.worktree'],
     },
@@ -602,8 +626,12 @@ export function createWorker() {
         }
       });
 
-      ctx.on('stage.requested', async (event: BuligEvent) => {
+      // Both are subscribed either way (the manifest says so); which one counts depends on where stages come from.
+      const behindGateway = cfg.via === 'gateway';
+      const onStage = async (event: BuligEvent) => {
         const req = event.payload;
+        // Behind the gateway, a stage that went to a remote worker is not this worker's.
+        if (behindGateway && (req as { workerId?: unknown } | null)?.workerId !== 'local') return;
         if (!isRequest(req)) {
           ctx.emit('stage.failed', { stage: 'unknown', error: 'stage.requested payload is missing a field' }, event.jobId);
           return;
@@ -658,7 +686,7 @@ export function createWorker() {
             }
           }
           let spawned: ChildProcess | undefined;
-          const out = await run(bin, buildArgs(req, cfg.extraArgs, cfg.allowDomains), req.cwd, timeoutMs, buildEnv(process.env, cfg.passEnv), children, (child) => {
+          const out = await run(bin, buildArgs(req, cfg.extraArgs, cfg.allowDomains), req.cwd, timeoutMs, buildClaudeEnv(process.env, cfg.passEnv), children, (child) => {
             spawned = child;
             if (!jobId) return () => {};
             const set = byJob.get(jobId) ?? new Set<ChildProcess>();
@@ -690,7 +718,10 @@ export function createWorker() {
         } finally {
           leave();
         }
-      });
+      };
+      ctx.on(behindGateway ? 'stage.assigned' : 'stage.requested', onStage);
+      // The other one is subscribed too, and ignored.
+      ctx.on(behindGateway ? 'stage.requested' : 'stage.assigned', () => {});
     },
 
     /** SIGTERM every running Claude, then SIGKILL whatever is still alive after stopGraceMs. */

@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, lstatSync, readFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { z } from 'zod';
 
@@ -8,6 +8,8 @@ export const GATE_PLUGINS = ['gate-evidence', 'gate-promise'] as const;
 export const BUILTIN_PLUGINS = ['channel-cli', 'worker-claude-code', ...GATE_PLUGINS, 'github', 'pipeline-dev'] as const;
 /** Plugins the CLI ships but leaves off until the config turns them on, because they need setup. */
 export const OPT_IN_PLUGINS = ['channel-telegram'] as const;
+/** Plugins only `serve` loads, off until the config enables them: the endpoint for workers on other machines (ADR 0011). */
+export const SERVER_PLUGINS = ['worker-gateway'] as const;
 
 /**
  * Where the kernel keeps its record. SQLite at `dbPath` is the default. For Postgres the config holds only the NAME of the
@@ -20,6 +22,11 @@ const StoreSchema = z.discriminatedUnion('kind', [
     urlEnv: z
       .string()
       .regex(/^[A-Za-z_][A-Za-z0-9_]*$/, 'urlEnv is the name of an environment variable, such as BULIG_DATABASE_URL, not the connection string'),
+    /** A file in $CREDENTIALS_DIRECTORY (systemd LoadCredential=) that holds the connection string, for a server. When the file is there it wins over `urlEnv`. */
+    urlCredential: z
+      .string()
+      .regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/, 'urlCredential is a file name such as pg-url, not a path or the connection string')
+      .optional(),
   }),
 ]);
 export type StoreConfig = z.infer<typeof StoreSchema>;
@@ -63,16 +70,48 @@ const expand = (p: string, home: string, base: string) => {
   return isAbsolute(p) ? p : resolve(base, p);
 };
 
-/** Look for bulig.config.json in the working directory, then ~/.bulig/config.json. */
-export function findConfigFile(cwd: string, home: string): string | undefined {
+type Env = Record<string, string | undefined>;
+
+/**
+ * Where the config comes from, first match wins:
+ *  1. `$CREDENTIALS_DIRECTORY/config`: a systemd credential (LoadCredential=config:/etc/bulig/config.json). The directory is made
+ *     by systemd and private to the unit, so its mode is not checked.
+ *  2. The file `$BULIG_CONFIG` names. It must be a regular file that only its owner can read or write, like a token file, because
+ *     the config says where the secrets are. A path that is set but missing is an error, not a reason to look elsewhere.
+ *  3. bulig.config.json in the working directory.
+ *  4. ~/.bulig/config.json.
+ * Nothing set: 3 and 4, as before.
+ */
+export function findConfigFile(cwd: string, home: string, env: Env = process.env): string | undefined {
+  const dir = env.CREDENTIALS_DIRECTORY;
+  if (dir) {
+    const credential = join(dir, 'config');
+    try {
+      if (lstatSync(credential).isFile()) return credential;
+    } catch {
+      // no such credential: look further
+    }
+  }
+  if (env.BULIG_CONFIG) {
+    const file = resolve(cwd, env.BULIG_CONFIG);
+    let st;
+    try {
+      st = lstatSync(file);
+    } catch {
+      throw new ConfigError(`BULIG_CONFIG names ${file}, which does not exist.`);
+    }
+    if (!st.isFile()) throw new ConfigError(`BULIG_CONFIG names ${file}, which is not a regular file.`);
+    if (st.mode & 0o077) throw new ConfigError(`BULIG_CONFIG names ${file}, which can be read or written by its group or by anyone. Make it readable by its owner only (chmod 600).`);
+    return file;
+  }
   return [join(cwd, 'bulig.config.json'), join(home, '.bulig', 'config.json')].find((p) => existsSync(p));
 }
 
-export function loadConfig(cwd: string, home: string): { config: BuligConfig; path: string } {
-  const path = findConfigFile(cwd, home);
+export function loadConfig(cwd: string, home: string, env: Env = process.env): { config: BuligConfig; path: string } {
+  const path = findConfigFile(cwd, home, env);
   if (!path) {
     throw new ConfigError(
-      `No config found. Looked for ${join(cwd, 'bulig.config.json')} and ${join(home, '.bulig', 'config.json')}. ` +
+      `No config found. Looked for ${env.CREDENTIALS_DIRECTORY ? join(env.CREDENTIALS_DIRECTORY, 'config') : '$CREDENTIALS_DIRECTORY/config'}, $BULIG_CONFIG, ${join(cwd, 'bulig.config.json')} and ${join(home, '.bulig', 'config.json')}. ` +
         'Copy bulig.config.example.json and edit it.',
     );
   }
@@ -89,7 +128,7 @@ export function loadConfig(cwd: string, home: string): { config: BuligConfig; pa
   }
   const c = parsed.data;
   const enabled = c.enabled ?? defaultEnabled(c.pluginConfig ?? {});
-  const shipped: readonly string[] = [...BUILTIN_PLUGINS, ...OPT_IN_PLUGINS];
+  const shipped: readonly string[] = [...BUILTIN_PLUGINS, ...OPT_IN_PLUGINS, ...SERVER_PLUGINS];
   const unknown = enabled.filter((n) => !shipped.includes(n));
   if (unknown.length) throw new ConfigError(`Config enables plugins this CLI does not ship: ${unknown.join(', ')}`);
   return {

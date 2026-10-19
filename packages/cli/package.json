@@ -16,6 +16,7 @@
     "@bulig/plugin-sdk": "workspace:*",
     "@bulig/text": "workspace:*",
     "@bulig/worker-claude-code": "workspace:*",
+    "@bulig/worker-gateway": "workspace:*",
     "tsx": "^4.20.0",
     "zod": "^4.1.0"
   }

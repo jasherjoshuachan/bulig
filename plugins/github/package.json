@@ -3,7 +3,17 @@
   "version": "0.1.0",
   "type": "module",
   "license": "MIT",
-  "exports": { ".": "./src/index.ts" },
-  "dependencies": { "@bulig/plugin-sdk": "workspace:*", "@bulig/scope": "workspace:*", "@bulig/text": "workspace:*" },
-  "devDependencies": { "@bulig/core": "workspace:*" }
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@bulig/credentials": "workspace:*",
+    "@bulig/git": "workspace:*",
+    "@bulig/plugin-sdk": "workspace:*",
+    "@bulig/scope": "workspace:*",
+    "@bulig/text": "workspace:*"
+  },
+  "devDependencies": {
+    "@bulig/core": "workspace:*"
+  }
 }

@@ -7,7 +7,8 @@
     "channel-telegram": ["channel.send:telegram", "approval.grant"],
     "worker-claude-code": ["claude.run", "fs.worktree"],
     "github": ["git.push", "gh.pr"],
-    "pipeline-dev": ["merge.request", "jobs.write"]
+    "pipeline-dev": ["merge.request", "jobs.write"],
+    "worker-gateway": ["net.listen", "git.apply", "fs.worktree"]
   },
   "pluginConfig": {
     "channel-telegram": {
@@ -16,6 +17,14 @@
       "allowedUserIds": [123456789],
       "repos": { "my-project": "~/Projects/my-project" },
       "pollTimeoutSec": 30
+    },
+    "worker-gateway": {
+      "listen": ["127.0.0.1"],
+      "port": 7431,
+      "localSlots": 2,
+      "workers": {
+        "mac": { "tokenEnv": "BULIG_WORKER_TOKEN_MAC", "credential": "worker-tokens", "slots": 2 }
+      }
     },
     "gate-evidence": {
       "mode": "warn",

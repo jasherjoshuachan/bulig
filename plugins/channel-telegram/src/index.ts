@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { readCredential } from '@bulig/credentials';
 import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { definePlugin, type BuligEvent, type Job, type Plugin, type PluginContext, type Stage } from '@bulig/plugin-sdk';
@@ -10,6 +11,8 @@ export { TelegramApi, TelegramError } from './api.ts';
 export interface TelegramConfig {
   /** Name of the environment variable that holds the bot token. Default BULIG_TELEGRAM_TOKEN. */
   tokenEnv?: string;
+  /** A file name in $CREDENTIALS_DIRECTORY (systemd LoadCredential=) that holds the bot token. Default "telegram-token". It wins over tokenEnv when the file is there. */
+  tokenCredential?: string;
   /** Only these chats may talk to the bot. Everyone else is ignored without a reply. */
   allowedChatIds: number[];
   /**
@@ -223,8 +226,8 @@ export function createTelegramChannel(options: TelegramChannelOptions = {}): Plu
       ctx.require('approval.grant');
       const cfg = ctx.config as unknown as TelegramConfig;
       const tokenEnv = cfg.tokenEnv ?? 'BULIG_TELEGRAM_TOKEN';
-      const token = process.env[tokenEnv];
-      if (!token) throw new Error(`channel-telegram: the bot token is not set. Export it as ${tokenEnv}.`);
+      const token = readCredential(cfg.tokenCredential ?? 'telegram-token') ?? process.env[tokenEnv];
+      if (!token) throw new Error(`channel-telegram: the bot token is not set. Export it as ${tokenEnv}${cfg.tokenCredential ? `, or add the credential ${cfg.tokenCredential}` : ' (or give the unit a telegram-token credential)'}.`);
       const allowed = cfg.allowedChatIds;
       if (!Array.isArray(allowed) || allowed.length === 0 || !allowed.every((n) => Number.isInteger(n))) {
         throw new Error('channel-telegram: allowedChatIds must list at least one chat id (numbers).');

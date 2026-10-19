@@ -2,6 +2,8 @@ import { appendFileSync, existsSync, lstatSync, readFileSync, realpathSync } fro
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { definePlugin, type BuligEvent, type PluginContext } from '@bulig/plugin-sdk';
 import { isPlainRepoPath, isRepoPath, MAX_SCOPE_ENTRIES, matchesScope, normalizeScopeEntry } from '@bulig/scope';
+import { readCredential } from '@bulig/credentials';
+import { kernelGit } from '@bulig/git';
 import { exec, type ExecResult } from './exec.ts';
 import { clipText } from '@bulig/text';
 
@@ -12,6 +14,12 @@ export interface GithubConfig {
   gitBin?: string;
   /** Name of an environment variable that holds a GitHub token. It is passed on as GH_TOKEN. */
   tokenEnv?: string;
+  /**
+   * A file name in $CREDENTIALS_DIRECTORY (systemd LoadCredential=) that holds the token, for a server that keeps secrets out of the
+   * environment. Default "gh-token", used when that file exists. A credential wins over tokenEnv. Naming one that is not there, with
+   * no tokenEnv to fall back on, stops the plugin at start.
+   */
+  tokenCredential?: string;
   /** Name and email put on the commits this plugin makes. Without them, git's own identity is used. */
   authorName?: string;
   authorEmail?: string;
@@ -229,21 +237,33 @@ export default definePlugin({
 
     // The token goes only to calls that talk to GitHub: gh, and the git commands that push or fetch. Commits,
     // resets and status never get it. Without a tokenEnv, the ambient login is used, as before.
+    // A credential file first, then the variable. The token goes into the environment of the one child that needs it, never into this process's.
+    const tokenFromConfig = (): string | undefined => readCredential(cfg.tokenCredential ?? 'gh-token') ?? (cfg.tokenEnv ? process.env[cfg.tokenEnv] : undefined);
+    if (cfg.tokenCredential !== undefined && !tokenFromConfig()) {
+      throw new Error(`github: tokenCredential "${cfg.tokenCredential}" is not a file in $CREDENTIALS_DIRECTORY, and ${cfg.tokenEnv ? `the variable ${cfg.tokenEnv} is not set either` : 'tokenEnv is not set'}. Add the credential or set the variable.`);
+    }
     const env = (withToken: boolean): NodeJS.ProcessEnv => {
-      if (!withToken || !cfg.tokenEnv) return process.env;
-      const token = process.env[cfg.tokenEnv];
-      if (!token) throw new StepError(`config tokenEnv is "${cfg.tokenEnv}" but that environment variable is not set`);
-      return { ...process.env, GH_TOKEN: token };
+      if (!withToken) return process.env;
+      const token = tokenFromConfig();
+      if (token) return { ...process.env, GH_TOKEN: token };
+      if (cfg.tokenEnv) throw new StepError(`config tokenEnv is "${cfg.tokenEnv}" but that environment variable is not set`);
+      return process.env; // no token configured: the ambient login, as before
     };
-    // Every git call runs with hooks switched off. A job worktree is written by a Claude stage, so a hook it plants
-    // (.husky, .git/hooks, lefthook) would otherwise run here, outside the stage sandbox.
-    const NO_HOOKS = ['-c', 'core.hooksPath=/dev/null'];
+    // Every git call is built by @bulig/git: hooks, fsmonitor, pagers, editors, external diff and the rest switched off on the command
+    // line, where a repository's own config cannot undo them. A job worktree is written by a Claude stage, so a hook or config it plants
+    // would otherwise run here, outside the stage sandbox. Keep it that way: no git call may be made except through runGit.
     // The bot signs its own commits, so the history shows who did the work and your identity is never borrowed.
     if (Boolean(cfg.authorName) !== Boolean(cfg.authorEmail)) {
       throw new Error('github: set both authorName and authorEmail, or neither (only one of them is set)');
     }
     const IDENTITY = cfg.authorName && cfg.authorEmail ? ['-c', `user.name=${cfg.authorName}`, '-c', `user.email=${cfg.authorEmail}`] : [];
-    const runGit = (cwd: string, args: string[], withToken = false) => exec(git, [...NO_HOOKS, ...args], { cwd, env: env(withToken) });
+    // `withToken` calls talk to the remote, so they keep the user's global git config (the credential helper lives there). A commit made
+    // without a configured bot identity keeps it too: the author then comes from the machine user, as it always has.
+    const runGit = (cwd: string, args: string[], withToken = false) => {
+      const ambient = withToken || (args.includes('commit') && IDENTITY.length === 0);
+      const cmd = kernelGit(args, { ambientConfig: ambient, baseEnv: env(withToken) });
+      return exec(git, cmd.args, { cwd, env: cmd.env });
+    };
     const runGh = (cwd: string, args: string[], signal?: AbortSignal) =>
       exec(gh, args, { cwd, env: env(true), timeoutMs: cfg.ghTimeoutMs ?? 120_000, ...(signal && { signal }) });
     // For calls that talk to GitHub. A temporary failure is tried again; any other failure is returned at once.

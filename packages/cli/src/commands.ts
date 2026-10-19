@@ -9,11 +9,13 @@ import gatePromise from '@bulig/gate-promise';
 import github from '@bulig/github';
 import pipeline from '@bulig/pipeline-dev';
 import type { Job, JobStatus, Plugin, Stage } from '@bulig/plugin-sdk';
-import worker from '@bulig/worker-claude-code';
+import worker, { readCredential } from '@bulig/worker-claude-code';
+import gateway from '@bulig/worker-gateway';
 import { ConfigError, defaultDbPath, loadConfig, type BuligConfig } from './config.ts';
 import { clipText } from '@bulig/text';
 import { acquireLock } from './lock.ts';
 import { cmdGates, ensureSoakStarted } from './gates.ts';
+import { cmdWorker } from './worker-cmd.ts';
 
 export interface Io {
   out(line: string): void;
@@ -48,9 +50,10 @@ Usage:
   bulig resume <jobId>
   bulig status [jobId]
   bulig history <jobId>
+  bulig worker --kernel <url> --id <workerId> (--token-env <VAR> | --token-file <path>) [--slots 2] --repo <kernelPath>=<localClone> ...
 
 A job id can be shortened to any unique start of it.
-Config: bulig.config.json in the current folder, or ~/.bulig/config.json.`;
+Config, first found wins: $CREDENTIALS_DIRECTORY/config, the file $BULIG_CONFIG names, bulig.config.json in the current folder, ~/.bulig/config.json.`;
 
 /** Where a driven job comes to rest. */
 const RESTING: JobStatus[] = ['awaiting_approval', 'done', 'failed', 'cancelled'];
@@ -78,6 +81,8 @@ export async function runCli(argv: string[], io: Io): Promise<number> {
         return await cmdHistory(rest, io);
       case 'gates':
         return await cmdGates(rest, io, { readStore, withKernel, UserError });
+      case 'worker':
+        return await cmdWorker(rest, io);
       case undefined:
       case 'help':
       case '--help':
@@ -117,11 +122,23 @@ export const promiseInput = (enabled: readonly string[]) =>
  * The plugin config the kernel gets: the user's, with the gate wiring on top. The wiring is computed from `enabled`
  * and wins over anything the user wrote for it, because a hand-set `input` that nothing feeds would hang every stage.
  */
-export function kernelPluginConfig(config: BuligConfig, resume: 'all' | false | string[]): Record<string, Record<string, unknown>> {
+export function kernelPluginConfig(config: BuligConfig, resume: 'all' | false | string[], gatewayOn = false): Record<string, Record<string, unknown>> {
   const input = promiseInput(config.enabled);
   const result = gateResultEvent(config.enabled);
+  const evidenceFrom = config.pluginConfig['gate-evidence']?.evidenceSources;
   return {
     ...config.pluginConfig,
+    // Behind the worker gateway, the in-process worker takes only the stages the gateway gives it, and the gateway's stage.completed
+    // carries the evidence a remote worker's Claude run produced, so the evidence gate trusts it as it trusts the in-process worker.
+    ...(gatewayOn && {
+      'worker-claude-code': { ...config.pluginConfig['worker-claude-code'], via: 'gateway' },
+      // A kernel that does not run the in-process worker (gateway only, as on the server where Claude runs as another user) has no
+      // local slots, whatever the gateway config says: a stage given to a worker that is not there would wait for ever.
+      ...(!config.enabled.includes('worker-claude-code') && { 'worker-gateway': { ...config.pluginConfig['worker-gateway'], localSlots: 0 } }),
+      ...(config.enabled.includes('gate-evidence') && {
+        'gate-evidence': { ...config.pluginConfig['gate-evidence'], evidenceSources: [...new Set([...(Array.isArray(evidenceFrom) ? evidenceFrom : ['worker-claude-code']), 'worker-gateway'])] },
+      }),
+    }),
     // The pipeline takes its results from the last gate of the chain, not straight from the worker:
     // worker -> stage.completed -> gate-evidence -> stage.checked -> gate-promise -> stage.screened -> pipeline.
     // Each gate reads the event the one before it says, so a gate can be on alone or with the other, in any order in `enabled`.
@@ -164,8 +181,10 @@ async function openSession(
 ): Promise<Session> {
   const channel = createCliChannel({ write: (l) => io.out(l), ...(onlyJob && { onlyJob }) });
   const plugins = pluginsFor(channel);
-  const pluginConfig = kernelPluginConfig(config, resume);
-  assertWiring(plugins, config.enabled, pluginConfig, pluginsFor === terminalPlugins ? ['channel-telegram'] : []);
+  // The gateway belongs to `serve`: a one-shot command must not open the port or hand its stages to anyone.
+  const gatewayOn = config.enabled.includes('worker-gateway') && plugins.includes(gateway);
+  const pluginConfig = kernelPluginConfig(config, resume, gatewayOn);
+  assertWiring(plugins, config.enabled, pluginConfig, pluginsFor === terminalPlugins ? ['channel-telegram', 'worker-gateway'] : []);
   // Settle the store's URL first: if the variable is missing or malformed, nothing has been locked yet.
   const postgresUrl = !io.openStore && config.store.kind === 'postgres' ? connectionString(config, io) : undefined;
   mkdirSync(dirname(config.dbPath), { recursive: true });
@@ -261,7 +280,7 @@ async function cmdRun(args: string[], io: Io): Promise<number> {
   if (!values.repo || !values.title) throw new UserError('run needs --repo <path> and --title <text>');
   const repo = resolve(io.cwd, values.repo);
   if (!existsSync(resolve(repo, '.git'))) throw new UserError(`${repo} is not a git repository`);
-  const { config } = loadConfig(io.cwd, io.home);
+  const { config } = loadConfig(io.cwd, io.home, io.env);
 
   const session = await openSession(config, io, false);
   try {
@@ -276,7 +295,7 @@ async function cmdRun(args: string[], io: Io): Promise<number> {
 async function cmdApprove(args: string[], io: Io): Promise<number> {
   const [idArg, kind, stageArg, ...extra] = args;
   if (!idArg || (kind !== 'plan' && kind !== 'merge') || extra.length) throw new UserError('usage: bulig approve <jobId> <plan|merge> <stageId>');
-  const { config } = loadConfig(io.cwd, io.home);
+  const { config } = loadConfig(io.cwd, io.home, io.env);
   const { job, stages } = await lookup(config, io, idArg);
   const waiting = stages.find((s) => s.name.startsWith('approve-') && s.status === 'running');
   if (job.status !== 'awaiting_approval' || !waiting) {
@@ -299,7 +318,7 @@ async function cmdApprove(args: string[], io: Io): Promise<number> {
 async function cmdDeny(args: string[], io: Io): Promise<number> {
   const [idArg, stageArg, ...extra] = args;
   if (!idArg || extra.length) throw new UserError('usage: bulig deny <jobId> <stageId>');
-  const { config } = loadConfig(io.cwd, io.home);
+  const { config } = loadConfig(io.cwd, io.home, io.env);
   const { job, stages } = await lookup(config, io, idArg);
   const waiting = stages.find((s) => s.name.startsWith('approve-') && s.status === 'running');
   if (job.status !== 'awaiting_approval' || !waiting) throw new UserError(`job ${job.id} is ${job.status.replace('_', ' ')}, not waiting for an approval`);
@@ -328,7 +347,7 @@ function checkStage(jobId: string, waiting: { id: string; name: string }, stageA
 async function cmdResume(args: string[], io: Io): Promise<number> {
   const [idArg, ...extra] = args;
   if (!idArg || extra.length) throw new UserError('usage: bulig resume <jobId>');
-  const { config } = loadConfig(io.cwd, io.home);
+  const { config } = loadConfig(io.cwd, io.home, io.env);
   const { job } = await lookup(config, io, idArg);
   if (job.status !== 'running' && job.status !== 'queued') throw new UserError(`job ${job.id} is ${job.status.replace('_', ' ')}; only running jobs resume`);
   const session = await openSession(config, io, [job.id], job.id);
@@ -356,7 +375,7 @@ async function withKernel<T>(io: Io, fn: (kernel: Kernel) => Promise<T>): Promis
  */
 async function cmdServe(args: string[], io: Io): Promise<number> {
   if (args.length) throw new UserError('usage: bulig serve');
-  const { config } = loadConfig(io.cwd, io.home);
+  const { config } = loadConfig(io.cwd, io.home, io.env);
   if (!config.enabled.includes('channel-telegram') && !config.enabled.includes('channel-cli')) {
     throw new UserError('serve needs a channel. Enable "channel-telegram" in the config.');
   }
@@ -368,7 +387,7 @@ async function cmdServe(args: string[], io: Io): Promise<number> {
     io,
     'all',
     undefined,
-    (channel) => io.servePlugins ?? [telegram, channel.plugin, ...CORE_PLUGINS],
+    (channel) => io.servePlugins ?? [telegram, gateway, channel.plugin, ...CORE_PLUGINS],
     (reason) => {
       // Lost lease means stop writing at once (ADR 0010). The kernel has already stopped writing. Stop the workers too, and
       // end non-zero so a supervisor restarts serve; the next start resumes from the record.
@@ -403,7 +422,7 @@ async function cmdServe(args: string[], io: Io): Promise<number> {
 /** The config the read commands need: the store only. With no config file at all they look at the default SQLite file. */
 function storeConfigFor(io: Io): Pick<BuligConfig, 'store' | 'dbPath'> {
   try {
-    const { config } = loadConfig(io.cwd, io.home);
+    const { config } = loadConfig(io.cwd, io.home, io.env);
     return { store: config.store, dbPath: config.dbPath };
   } catch (err) {
     if (err instanceof ConfigError && err.message.startsWith('No config found')) return { store: { kind: 'sqlite' }, dbPath: defaultDbPath(io.home) };
@@ -415,7 +434,9 @@ function storeConfigFor(io: Io): Pick<BuligConfig, 'store' | 'dbPath'> {
 function connectionString(config: Pick<BuligConfig, 'store'>, io: Io): string {
   if (config.store.kind !== 'postgres') throw new Error('connectionString is only for a postgres store');
   const name = config.store.urlEnv;
-  const url = (io.env ?? process.env)[name];
+  const env = io.env ?? process.env;
+  // On a server the string is a systemd credential file, which wins; on the Mac it is the environment variable, as before.
+  const url = (config.store.urlCredential ? readCredential(config.store.urlCredential, env) : undefined) ?? env[name];
   if (!url) throw new UserError(`store.urlEnv is "${name}", but that environment variable is not set. Set it to the Postgres connection string.`);
   try {
     assertPostgresUrl(url);

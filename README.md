@@ -163,6 +163,19 @@ A gate is an ordinary plugin that needs no capability. It subscribes to the even
 
 Gates chain: `stage.completed -> gate-evidence -> stage.checked -> gate-promise -> stage.screened -> pipeline-dev`. Each gate forwards what it read, so with both on neither drops the other's marks and the pipeline hears one event per stage. The CLI sets `stageResultEvent` to the last gate that is on (`stage.checked` behind `gate-evidence` alone, `stage.screened` behind `gate-promise`), whatever the order in `enabled`.
 
+### Soak counter and the switch to enforce
+
+The gates ship in `warn` mode. Before they are switched to `enforce`, they run for a soak: 7 days and 10 jobs that reached a gate, with no warning judged wrong. The counter reads the verdicts the gates already leave in the event log.
+
+```
+pnpm bulig gates soak start                      # starts the clock; run it once, when the gates go live
+pnpm bulig gates status                          # days, jobs, verdicts per gate, every warning with its event id, and "bar met" or "bar not met: ..."
+pnpm bulig gates mark-false <event-id> --reason "<text>"   # a warning that was wrong
+pnpm bulig gates enforce [--force]               # sets gate-evidence and gate-promise to "enforce" in the config file
+```
+
+`soak start` needs the store to exist, so run it after `serve` has started once. Starting twice is refused; `--restart` begins a new soak (use it after fixing a gate that warned wrongly, since a false warning keeps the bar unmet) and only events after the newest start count. `enforce` refuses until the bar is met unless `--force`, changes only the two `mode` keys in the config file (the old file is kept as `<config>.bak`, the new one is written atomically), and does not restart anything: a running `serve` has to be restarted to pick it up. The two operator events (`gates.soak.started`, `gates.warning.false`) are appended straight to the record by the command, with source `cli`, and no plugin listens to them, so they work while `serve` is running.
+
 ### Scope guard
 
 Every plan ends with a block that names the files the job may change:

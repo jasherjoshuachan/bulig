@@ -13,6 +13,7 @@ import worker from '@bulig/worker-claude-code';
 import { ConfigError, defaultDbPath, loadConfig, type BuligConfig } from './config.ts';
 import { clipText } from '@bulig/text';
 import { acquireLock } from './lock.ts';
+import { cmdGates } from './gates.ts';
 
 export interface Io {
   out(line: string): void;
@@ -74,6 +75,8 @@ export async function runCli(argv: string[], io: Io): Promise<number> {
         return await cmdStatus(rest, io);
       case 'history':
         return await cmdHistory(rest, io);
+      case 'gates':
+        return await cmdGates(rest, io, { readStore, UserError });
       case undefined:
       case 'help':
       case '--help':

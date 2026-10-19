@@ -8,6 +8,8 @@ export const GATE_PLUGINS = ['gate-evidence', 'gate-promise'] as const;
 export const BUILTIN_PLUGINS = ['channel-cli', 'worker-claude-code', ...GATE_PLUGINS, 'github', 'pipeline-dev'] as const;
 /** Plugins the CLI ships but leaves off until the config turns them on, because they need setup. */
 export const OPT_IN_PLUGINS = ['channel-telegram'] as const;
+/** Plugins only `serve` loads, off until the config enables them: the endpoint for workers on other machines (ADR 0011). */
+export const SERVER_PLUGINS = ['worker-gateway'] as const;
 
 /**
  * Where the kernel keeps its record. SQLite at `dbPath` is the default. For Postgres the config holds only the NAME of the
@@ -20,6 +22,11 @@ const StoreSchema = z.discriminatedUnion('kind', [
     urlEnv: z
       .string()
       .regex(/^[A-Za-z_][A-Za-z0-9_]*$/, 'urlEnv is the name of an environment variable, such as BULIG_DATABASE_URL, not the connection string'),
+    /** A file in $CREDENTIALS_DIRECTORY (systemd LoadCredential=) that holds the connection string, for a server. When the file is there it wins over `urlEnv`. */
+    urlCredential: z
+      .string()
+      .regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/, 'urlCredential is a file name such as pg-url, not a path or the connection string')
+      .optional(),
   }),
 ]);
 export type StoreConfig = z.infer<typeof StoreSchema>;
@@ -89,7 +96,7 @@ export function loadConfig(cwd: string, home: string): { config: BuligConfig; pa
   }
   const c = parsed.data;
   const enabled = c.enabled ?? defaultEnabled(c.pluginConfig ?? {});
-  const shipped: readonly string[] = [...BUILTIN_PLUGINS, ...OPT_IN_PLUGINS];
+  const shipped: readonly string[] = [...BUILTIN_PLUGINS, ...OPT_IN_PLUGINS, ...SERVER_PLUGINS];
   const unknown = enabled.filter((n) => !shipped.includes(n));
   if (unknown.length) throw new ConfigError(`Config enables plugins this CLI does not ship: ${unknown.join(', ')}`);
   return {

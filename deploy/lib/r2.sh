@@ -1,4 +1,4 @@
-# shellcheck shell=bash
+# shellcheck shell=bash disable=SC2034
 # R2 access for the backup and the restore drill. Source it after common.sh; do not run it.
 # Credentials come from the environment (the unit loads /etc/bulig/backup.env). Uses the aws CLI when it is installed,
 # otherwise the same pinned aws-cli image the commitments backup uses.
@@ -10,7 +10,7 @@ AWSCLI_IMAGE="${AWSCLI_IMAGE:-amazon/aws-cli:2.27.49}"
 # /etc/bulig/backup.env. Read line by line, never sourced, so a value is never run as shell.
 load_backup_env() {
   local f line
-  f="$BULIG_ENV_FILE"
+  f="$BULIG_BACKUP_ENV_FILE"
   if [ -n "${CREDENTIALS_DIRECTORY:-}" ] && [ -r "$CREDENTIALS_DIRECTORY/backup-env" ]; then f="$CREDENTIALS_DIRECTORY/backup-env"; fi
   [ -r "$f" ] || die "no R2 settings at $f. Fill it (names are in deploy/backup.env.example)."
   while IFS= read -r line; do
@@ -68,11 +68,4 @@ r2_get() {
 # r2_size <key>: the object's byte size, or fail if the object is not there (the head-object check).
 r2_size() {
   r2_aws s3api head-object --bucket "$R2_BUCKET" --key "$1" --query ContentLength --output text
-}
-
-# r2_newest_dump: the key of the newest dump under the Bulig prefix. Keys carry a UTC timestamp, so the last one sorted is the newest.
-r2_newest_dump() {
-  # shellcheck disable=SC2016
-  local q='Contents[?ends_with(Key, `.sql.gz`)] | sort_by(@, &Key)[-1].Key'
-  r2_aws s3api list-objects-v2 --bucket "$R2_BUCKET" --prefix "$R2_PREFIX/" --query "$q" --output text
 }

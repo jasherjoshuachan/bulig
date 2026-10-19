@@ -13,30 +13,32 @@ StartLimitBurst=10
 
 [Service]
 Type=simple
-# Its own user. Never root, never the user that runs anything else on this host.
+# The kernel's own user. The worker (which runs Claude Code) is a different user in bulig-worker.service.
 User=bulig
 Group=bulig
+# bulig-work: shared with bulig-worker, for /var/lib/bulig/work. Files written there are group-writable (UMask=0002) so the kernel can
+# commit what the worker edited.
+SupplementaryGroups=bulig-work
 WorkingDirectory=/opt/bulig/current
-# Secrets come in as credentials, not as environment: Claude sessions the worker starts inherit the unit's environment, and must not
-# hold the database URL or a token. Each is a root-only file (0600), one secret each. The process finds them in $CREDENTIALS_DIRECTORY.
-# A missing file stops the unit from starting, on purpose. See deploy/credentials.example.
+# Secrets come in as credentials: root-only files (0600), one secret each, found in $CREDENTIALS_DIRECTORY. This unit holds the database URL,
+# the GitHub token and the table of worker tokens. It does NOT hold the Claude token: that goes only to bulig-worker.service, a different
+# user. A missing file stops the unit from starting, on purpose. See deploy/credentials.example.
 LoadCredential=pg-url:/etc/bulig/pg-url
 LoadCredential=gh-token:/etc/bulig/gh-token
-LoadCredential=claude-token:/etc/bulig/claude-token
 LoadCredential=worker-tokens:/etc/bulig/worker-tokens
-# HOME is where the config lives ($HOME/.bulig/config.json), and where claude and gh keep their sign-in.
+# HOME is where the config lives ($HOME/.bulig/config.json), and where gh keeps its sign-in.
 Environment=HOME=/var/lib/bulig
 Environment=PATH=/usr/local/bin:/usr/bin:/bin:/var/lib/bulig/.local/bin
 ExecStart=/usr/bin/env node packages/cli/bin/bulig.mjs serve
 # Always restart: serve exits non-zero when it loses the lease, and a fresh start resumes from the record.
 Restart=always
 RestartSec=5
-# Give running workers time to stop; after that the whole control group is killed, claude children included.
+# Give running work time to stop; after that the whole control group is killed.
 TimeoutStopSec=60
 KillMode=control-group
-UMask=0077
+UMask=0002
 
-# Caps, so a runaway job cannot starve client production on the same host.
+# Caps, so a runaway kernel cannot starve client production on the same host. (The worker has its own, in bulig-worker.service.)
 MemoryMax=4G
 CPUQuota=300%
 TasksMax=512
@@ -45,16 +47,16 @@ CPUWeight=50
 Nice=10
 LimitNOFILE=65536
 
-# Hardening (same set as personal-credential-broker, minus what node, git and Claude Code need).
+# Hardening (same set as personal-credential-broker, minus what node and git need).
 NoNewPrivileges=true
 CapabilityBoundingSet=
 AmbientCapabilities=
 PrivateTmp=true
 PrivateDevices=true
-# Whole filesystem read-only except the line below. Worktrees, ~/.claude and ~/.config/gh live under /var/lib/bulig.
+# Whole filesystem read-only except the line below (state, config, worktrees under work/, ~/.config/gh).
 ProtectSystem=strict
 ReadWritePaths=/var/lib/bulig
-# /home and /root become read-only, and the bulig home (/var/lib/bulig) is outside them, so Claude reaches its config in ReadWritePaths.
+# /home and /root become read-only. The bulig home (/var/lib/bulig) is outside them and is in ReadWritePaths.
 ProtectHome=read-only
 ProtectKernelTunables=true
 ProtectKernelModules=true
@@ -62,7 +64,7 @@ ProtectKernelLogs=true
 ProtectControlGroups=true
 ProtectClock=true
 ProtectHostname=true
-# Other users' processes are hidden. ProcSubset=pid is NOT set: node and claude read /proc/meminfo and /proc/cpuinfo.
+# Other users' processes are hidden. ProcSubset=pid is NOT set: node reads /proc/meminfo and /proc/cpuinfo.
 ProtectProc=invisible
 RestrictSUIDSGID=true
 RestrictRealtime=true
@@ -71,7 +73,6 @@ SystemCallArchitectures=native
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 # NOT set on purpose:
 #   MemoryDenyWriteExecute  node's JIT needs writable+executable memory.
-#   RestrictNamespaces      Claude Code's own sandbox uses namespaces if it is switched on.
 #   /opt/bulig writable     releases are installed by release.sh and handed back to root; the service never rewrites its own code.
 
 [Install]

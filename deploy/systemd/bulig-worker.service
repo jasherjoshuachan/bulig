@@ -1,0 +1,67 @@
+[Unit]
+Description=Bulig worker (bulig worker): runs Claude Code for the kernel
+Documentation=https://github.com/jasherjoshuachan/bulig
+# The worker connects to the kernel's gateway on 127.0.0.1:7431. It can start first and retry, but ordering it after the kernel is tidier.
+After=network-online.target bulig.service
+Wants=network-online.target bulig.service
+ConditionPathExists=/var/lib/bulig-worker
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+# Its own user, apart from the kernel's. This is the user that runs Claude Code and the commands Claude runs, so it must not be able to
+# read the kernel's secrets: /etc/bulig is root-only, and the kernel's $CREDENTIALS_DIRECTORY belongs to the other user.
+User=bulig-worker
+Group=bulig-worker
+SupplementaryGroups=bulig-work
+WorkingDirectory=/opt/bulig/current
+# Only two credentials: the Claude token, and this worker's own token for the gateway. Not the database URL, not the GitHub token.
+LoadCredential=claude-token:/etc/bulig/claude-token
+LoadCredential=worker-token:/etc/bulig/worker-token
+Environment=HOME=/var/lib/bulig-worker
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:/var/lib/bulig-worker/.local/bin
+# %d is this unit's credentials directory. --slots 2: at most two jobs at once on this machine.
+ExecStart=/usr/bin/env node packages/cli/bin/bulig.mjs worker --kernel http://127.0.0.1:7431 --id vps --token-file %d/worker-token --slots 2
+Restart=always
+RestartSec=5
+TimeoutStopSec=60
+KillMode=control-group
+# Group-writable files in /var/lib/bulig/work, so the kernel (user bulig) can commit what this worker edited.
+UMask=0002
+
+# Caps. Together with the kernel (4G, 300%) this leaves the rest of the 8 CPUs and 15 GB to client production.
+MemoryMax=3G
+CPUQuota=250%
+TasksMax=512
+CPUWeight=50
+Nice=10
+LimitNOFILE=65536
+
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=true
+PrivateDevices=true
+# Read-only everywhere except the worktrees and this user's own home (Claude's sign-in and settings).
+ProtectSystem=strict
+ReadWritePaths=/var/lib/bulig/work /var/lib/bulig-worker
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# NOT set on purpose:
+#   MemoryDenyWriteExecute  node's JIT needs writable+executable memory.
+#   RestrictNamespaces      Claude Code's own sandbox uses namespaces if it is switched on.
+
+[Install]
+WantedBy=multi-user.target

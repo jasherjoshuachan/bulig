@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Take the "before" picture of ths-prod-01, so postcheck.sh can prove Bulig changed nothing that is not Bulig's.
-# Read-only: it runs list commands and writes one file under /var/lib/bulig-checks. Run as root, before setup-user.sh.
-# usage: precheck.sh [output-file]
+# Read-only except for one file: /var/lib/bulig-checks/precheck.snapshot (Bulig's own folder). No arguments, no other path.
+# Run as root, before setup-user.sh.
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/common.sh
@@ -9,11 +9,11 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/snapshot.sh
 . "$here/lib/snapshot.sh"
 need_root
+[ "$#" -eq 0 ] || die "takes no arguments: it writes only to $BULIG_CHECKS_DIR"
 
-dir=/var/lib/bulig-checks
-out="${1:-$dir/precheck.snapshot}"
-install -d -m 0700 "$(dirname "$out")"
-tmp="$(mktemp "$out.XXXXXX")"
+ensure_checks_dir
+out="$BULIG_CHECKS_DIR/precheck.snapshot"
+tmp="$(mktemp "$BULIG_CHECKS_DIR/precheck.XXXXXX")"
 snapshot >"$tmp"
 mv "$tmp" "$out"
 chmod 600 "$out"

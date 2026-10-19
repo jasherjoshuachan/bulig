@@ -2,8 +2,9 @@
 Description=Back up the Bulig Postgres database to R2
 After=postgresql@16-bulig.service network-online.target
 Wants=network-online.target
-# No R2 keys, no run: a timer that fires before the keys are in place should fail loudly, not quietly skip.
-ConditionPathExists=/etc/bulig/backup.env
+# No R2 keys or database URL, no run, and the failure is loud (Assert fails the unit; Condition would skip it silently and the backup would look fine).
+AssertPathExists=/etc/bulig/backup.env
+AssertPathExists=/etc/bulig/pg-url
 
 [Service]
 Type=oneshot

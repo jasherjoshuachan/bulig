@@ -9,7 +9,7 @@ need_root
 
 command -v pg_createcluster >/dev/null 2>&1 || die "pg_createcluster not found (postgresql-common is not installed)"
 [ -d "/usr/lib/postgresql/$BULIG_PG_VERSION/bin" ] || die "postgresql-$BULIG_PG_VERSION is not installed"
-[ -d /etc/bulig ] || die "/etc/bulig is missing. Run setup-user.sh first."
+need_dir "$BULIG_CRED_DIR"
 
 # 1. Is port 5436 free, or already ours? Check what listens, and what any cluster (running or not) is configured for.
 ours_exists=0
@@ -20,9 +20,13 @@ if pg_lsclusters -h | awk -v v="$BULIG_PG_VERSION" -v c="$BULIG_PG_CLUSTER" '$1 
 fi
 other="$(pg_lsclusters -h | awk -v v="$BULIG_PG_VERSION" -v c="$BULIG_PG_CLUSTER" -v p="$BULIG_PG_PORT" '$3 == p && !($1 == v && $2 == c) {print $1 "/" $2}')"
 [ -z "$other" ] || die "port $BULIG_PG_PORT is configured for cluster $other. Not touching it."
-listening="$(ss -H -ltn "sport = :$BULIG_PG_PORT" 2>/dev/null || true)"
+listening="$(ss -H -ltnp "sport = :$BULIG_PG_PORT" 2>/dev/null || true)"
 if [ -n "$listening" ] && [ "$ours_exists" -eq 0 ]; then
   die "something is already listening on port $BULIG_PG_PORT and it is not the $BULIG_PG_VERSION $BULIG_PG_CLUSTER cluster. Pick another port."
+fi
+# Even when the cluster is ours, what listens must be Postgres. A different program on 5436 means a mix-up; stop and look.
+if [ -n "$listening" ] && ! printf '%s\n' "$listening" | grep -Eq 'users:\(\("(postgres|postmaster)"'; then
+  die "port $BULIG_PG_PORT has a listener that is not postgres: $listening"
 fi
 
 # 2. The cluster. scram-sha-256 for TCP, peer for the local socket (so root and postgres need no password locally).
@@ -87,8 +91,22 @@ else
 fi
 psql_admin -c "REVOKE CONNECT ON DATABASE bulig FROM PUBLIC"
 
+# The restore drill's own login. It can create databases (its scratch ones) and nothing else: not a superuser, no role creation, and it
+# cannot connect to the bulig database. Its password is a credential for the drill unit only. Reused on a re-run.
+drill_pw="$(cat "$BULIG_CRED_DIR/drill-pw" 2>/dev/null || true)"
+[ -n "$drill_pw" ] || drill_pw="$(openssl rand -hex 24)"
+if [ "$(psql_admin -tA -c "SELECT 1 FROM pg_roles WHERE rolname = 'bulig_drill'")" != "1" ]; then
+  psql_admin -c "CREATE ROLE bulig_drill LOGIN NOSUPERUSER NOCREATEROLE CREATEDB NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 5"
+  echo "role bulig_drill: created"
+else
+  echo "role bulig_drill: already there"
+fi
+printf "ALTER ROLE bulig_drill PASSWORD '%s';\n" "$drill_pw" | psql_admin -f - >/dev/null
+printf '%s' "$drill_pw" | cred_write drill-pw >/dev/null
+echo "credential: $BULIG_CRED_DIR/drill-pw written (mode 600, root)"
+
 # 6. The URL, with an explicit host (a URL without one would fall back to the default socket and port, which may be another cluster).
-# It goes into a credential file (loaded by systemd LoadCredential=), not an environment file: Claude sessions inherit the unit's environment.
+# It goes into a root-only credential file, loaded by systemd LoadCredential= into the kernel unit and the backup units only.
 printf 'postgres://bulig:%s@127.0.0.1:%s/bulig' "$pw" "$BULIG_PG_PORT" | cred_write pg-url >/dev/null
 echo "credential: $BULIG_CRED_DIR/pg-url written (mode 600, root)"
 

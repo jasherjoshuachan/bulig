@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Is Bulig healthy on this host? Run as root on ths-prod-01. Exit 0 only if all three hold:
-#   1. bulig.service is active
+#   1. bulig.service and bulig-worker.service are active
 #   2. the kernel holds the executor lease and keeps renewing it (two reads 11 s apart, the heartbeat is every 10 s)
 #   3. the Postgres cluster "16 bulig" is online on port 5436
 # usage: health.sh [--wait <seconds>]   (--wait: how long to give the service to take the lease after a start, default 30)
@@ -34,9 +34,21 @@ else
   exit 1
 fi
 
-# 2. Read the lease row twice. psql_admin goes in over the local socket as postgres, so health needs no password.
+# The worker is a separate unit under a separate user. It must be up, but a worker problem does not hide the kernel checks below.
+if systemctl is-active --quiet bulig-worker.service; then
+  ok "bulig-worker.service active"
+else
+  bad "bulig-worker.service is $(systemctl is-active bulig-worker.service 2>&1 || true)"
+fi
+
+# 2. Read the lease row twice, as the bulig role over 127.0.0.1:5436 (password through a private PGPASSFILE, never a command line).
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+PGPASSFILE="$(pg_passfile "$(cred_path pg-url)" "$work")"
+export PGPASSFILE
 lease_row() {
-  psql_admin -d bulig -tA -F '|' -c "SELECT holder, generation, expires_at > clock_timestamp(), to_char(expires_at, 'YYYY-MM-DD HH24:MI:SS.US') FROM executor_lease" 2>&1 || true
+  "$(pg_bin psql)" -X -q -w -h 127.0.0.1 -p "$BULIG_PG_PORT" -U bulig -d bulig -tA -F '|' \
+    -c "SELECT holder, generation, expires_at > clock_timestamp(), to_char(expires_at, 'YYYY-MM-DD HH24:MI:SS.US') FROM executor_lease" 2>&1 || true
 }
 row1=""
 for _ in $(seq 1 "$wait_s"); do

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# The "after" picture: compare ths-prod-01 to the precheck and fail on any change that is not Bulig's.
-# Read-only. Run as root after the last Bulig step.
-# usage: postcheck.sh [precheck-file]
+# The "after" picture: compare ths-prod-01 to the precheck and fail on any difference in what the snapshot covers (see lib/snapshot.sh),
+# apart from Bulig's own users, units, cluster and folders. Read-only except for a temp file in /var/lib/bulig-checks.
+# It does NOT prove anything it does not list: files outside the snapshot, data inside other databases, and live behaviour are not checked.
+# No arguments: it compares against /var/lib/bulig-checks/precheck.snapshot.
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/common.sh
@@ -9,25 +10,21 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/snapshot.sh
 . "$here/lib/snapshot.sh"
 need_root
+[ "$#" -eq 0 ] || die "takes no arguments: it reads only $BULIG_CHECKS_DIR/precheck.snapshot"
 
-dir=/var/lib/bulig-checks
-before="${1:-$dir/precheck.snapshot}"
+before="$BULIG_CHECKS_DIR/precheck.snapshot"
 [ -r "$before" ] || die "no precheck file at $before. Run precheck.sh before anything else."
-after="$(mktemp "$dir/postcheck.XXXXXX")"
+need_dir "$BULIG_CHECKS_DIR"
+after="$(mktemp "$BULIG_CHECKS_DIR/postcheck.XXXXXX")"
 trap 'rm -f "$after" "$after.diff"' EXIT
 snapshot >"$after"
 
 if diff -u --label precheck --label postcheck "$before" "$after" >"$after.diff"; then
-  echo "postcheck: no change outside Bulig (compared with $before)"
+  echo "postcheck: the snapshot is identical to the precheck (apart from Bulig's own things)"
   rc=0
 else
-  echo "postcheck: FAILED. Something that is not Bulig's changed:"
+  echo "postcheck: FAILED. Something the snapshot covers changed, and it is not Bulig's:"
   cat "$after.diff"
   rc=1
-fi
-
-# What did change must be Bulig's: its cluster exists, and the service is the only new thing.
-if ! pg_lsclusters -h | awk -v v="$BULIG_PG_VERSION" -v c="$BULIG_PG_CLUSTER" -v p="$BULIG_PG_PORT" '$1 == v && $2 == c && $3 == p {found = 1} END {exit !found}'; then
-  echo "postcheck: note: cluster $BULIG_PG_VERSION $BULIG_PG_CLUSTER on $BULIG_PG_PORT does not exist (nothing of Bulig's to check)"
 fi
 exit "$rc"

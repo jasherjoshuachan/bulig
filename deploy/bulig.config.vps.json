@@ -1,20 +1,38 @@
 {
-  "store": { "kind": "postgres", "urlEnv": "BULIG_PG_URL" },
+  "store": {
+    "kind": "postgres",
+    "urlEnv": "BULIG_PG_URL"
+  },
   "dbPath": "/var/lib/bulig/state/bulig.sqlite",
-  "enabled": ["channel-cli", "worker-claude-code", "gate-evidence", "gate-promise", "github", "pipeline-dev"],
+  "enabled": [
+    "channel-cli",
+    "gate-evidence",
+    "gate-promise",
+    "github",
+    "pipeline-dev"
+  ],
   "grants": {
-    "channel-cli": ["channel.send:terminal", "approval.grant"],
-    "worker-claude-code": ["claude.run", "fs.worktree"],
-    "github": ["git.push", "gh.pr"],
-    "pipeline-dev": ["merge.request", "jobs.write"]
+    "channel-cli": [
+      "channel.send:terminal",
+      "approval.grant"
+    ],
+    "github": [
+      "git.push",
+      "gh.pr"
+    ],
+    "pipeline-dev": [
+      "merge.request",
+      "jobs.write"
+    ]
   },
   "pluginConfig": {
-    "gate-evidence": { "mode": "warn", "enabled": true },
-    "gate-promise": { "mode": "warn", "enabled": true },
-    "worker-claude-code": {
-      "claudeBin": "claude",
-      "timeoutMs": 1200000,
-      "extraArgs": ["--setting-sources", "project,local"]
+    "gate-evidence": {
+      "mode": "warn",
+      "enabled": true
+    },
+    "gate-promise": {
+      "mode": "warn",
+      "enabled": true
     },
     "github": {
       "tokenEnv": "BULIG_GH_TOKEN",
@@ -23,7 +41,10 @@
       "allowNoChecks": false
     },
     "pipeline-dev": {
-      "models": { "strong": "opus", "standard": "sonnet" },
+      "models": {
+        "strong": "opus",
+        "standard": "sonnet"
+      },
       "maxBuildAttempts": 2,
       "branchPrefix": "bulig",
       "keepFailedWorktrees": false,

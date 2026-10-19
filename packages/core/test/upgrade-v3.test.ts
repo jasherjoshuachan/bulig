@@ -189,6 +189,9 @@ for (const adapter of ADAPTERS) {
       expect(started).toMatchObject({ jobId: JOB, name: 'build', attempt: 2, status: 'running' });
       const stages = await k.jobs.stages(JOB);
       expect(stages.find((s) => s.id === RUNNING_STAGE)).toMatchObject({ status: 'running', attempt: 1 }); // untouched: the pipeline closes it as interrupted
+      // the old stage has no claim, so it has no claimGeneration, and resume reads that as left by a kernel that is gone; the new one has this kernel's
+      expect(stages.find((s) => s.id === RUNNING_STAGE)).not.toHaveProperty('claimGeneration');
+      expect(stages.find((s) => s.id === started.id)).toMatchObject({ claimGeneration: 1 });
       // exactly one claim, for attempt 2, held under this kernel's generation
       expect(await adapter.claims()).toEqual([{ stage: 'build', attempt: 2, generation: 1, released: false }]);
       // and it is a real claim: a second start of the same stage is refused

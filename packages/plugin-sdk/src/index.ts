@@ -7,7 +7,7 @@ import { z } from 'zod';
 export const SDK_VERSION = '1';
 
 /** The full release of the contract. v1 candidate until the freeze is tagged. */
-export const SDK_RELEASE = '1.0.0-rc.6';
+export const SDK_RELEASE = '1.0.0-rc.7';
 
 /**
  * Majors the kernel loads. "0" is the pre-freeze contract: it loads unchanged, with a deprecation warning, and is
@@ -130,6 +130,12 @@ export interface Stage {
   startedAt: string;
   endedAt: string | null;
   output: unknown;
+  /**
+   * The executor-lease generation under which this attempt's claim was taken (ADR 0010). Compare it with `ctx.generation`: a
+   * running stage with a smaller number was left by a kernel that is gone or lost its lease. Absent for a stage that began
+   * before claims existed (`1.0.0-rc.6`), which no live kernel owns. Added in `1.0.0-rc.7`.
+   */
+  claimGeneration?: number;
 }
 
 export interface BuligEvent {
@@ -195,6 +201,11 @@ export interface PluginContext {
    * or a denied capability. Use it when a lost event would leave work stuck, and always await it.
    */
   emitCommitted(type: string, payload?: unknown, jobId?: string): Promise<void>;
+  /**
+   * The executor-lease generation this kernel holds. It goes up by one on every kernel start, so it is larger than the
+   * `claimGeneration` of any stage a kernel before this one claimed. Added in `1.0.0-rc.7`.
+   */
+  readonly generation: number;
   can(capability: string): boolean;
   /** Throws CapabilityDeniedError unless declared in needs AND granted in config. */
   require(capability: string): void;

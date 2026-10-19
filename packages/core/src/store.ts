@@ -161,7 +161,11 @@ export class StageNotClaimedError extends Error {
 
 /** An event with this id is already in the log. */
 export class DuplicateEventError extends Error {
-  constructor(public readonly eventId: string) {
+  constructor(
+    public readonly eventId: string,
+    /** The event the log already holds under this id, so a caller that treats the write as already done can hand it back. */
+    public readonly existing?: BuligEvent,
+  ) {
     super(`Event ${eventId} is already in the log, so it was not written a second time`);
     this.name = 'DuplicateEventError';
   }

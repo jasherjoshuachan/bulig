@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { DEPRECATED_SDK_MAJORS, type BuligEvent, type Logger, type Plugin } from '@bulig/plugin-sdk';
-import { Bus } from './bus.ts';
+import { Bus, ReplayedError, type Cause } from './bus.ts';
 import { DEFAULT_EVENT_CAPABILITIES } from './capabilities.ts';
 import { buildContext, selectPlugins, type JobsTx, type KernelJobs, type LoadedPlugin } from './loader.ts';
 import { StoreBrokenError, StoreQueue, type QueueTx } from './queue.ts';
@@ -19,6 +19,11 @@ export interface KernelOptions {
    * refuses every later store call, and logs one error. Default 120000, never less than storeTimeoutMs.
    */
   storeBrokenMs?: number;
+  /**
+   * How long stop() waits for handlers and queued writes to finish before it stops waiting on them. Default 10000. The lease is
+   * kept alive for the whole of stop(), so work that is still queued after this does not lose it.
+   */
+  stopWaitMs?: number;
   /** How long stop() waits for the store's own close() before it stops waiting and says so. Default 10000. */
   storeCloseMs?: number;
   /**
@@ -80,10 +85,16 @@ export function createKernel(options: KernelOptions) {
   });
 
   // The job calls as they run on one task of the queue. A change and the event that announces it are written in the same task.
-  const inTask = (tx: QueueTx): JobsTx => ({
+  // `cause` is the handler run that asked for the change, if one did: the event that announces it gets its id from there.
+  // If that event is already in the log the whole task is a replay: it is rolled back and the call answers with the record as it is.
+  const inTask = (tx: QueueTx, cause: Cause | undefined): JobsTx => ({
     async create(input) {
       const job = await tx.createJob(input);
-      await bus.record(tx, { type: 'job.created', source: 'kernel', jobId: job.id, payload: job });
+      await bus.record(tx, { type: 'job.created', source: 'kernel', jobId: job.id, payload: job }, cause).catch((err: unknown) => {
+        // The job the first run made, not the one this rolled-back task just made.
+        if (err instanceof ReplayedError) err.result = err.existing.payload;
+        throw err;
+      });
       return job;
     },
     get: (id) => tx.getJob(id),
@@ -91,7 +102,11 @@ export function createKernel(options: KernelOptions) {
     async setStatus(id, status) {
       const before = await tx.getJob(id);
       const job = await tx.setJobStatus(id, status);
-      await bus.record(tx, { type: 'job.status', source: 'kernel', jobId: id, payload: { from: before?.status, to: status } });
+      await bus.record(tx, { type: 'job.status', source: 'kernel', jobId: id, payload: { from: before?.status, to: status } }, cause).catch((err: unknown) => {
+        // The job as the first run left it (or a later change did), not the status this rolled-back task just set.
+        if (err instanceof ReplayedError) err.result = before;
+        throw err;
+      });
       return job;
     },
     stages: (jobId) => tx.listStages(jobId),
@@ -99,7 +114,13 @@ export function createKernel(options: KernelOptions) {
     finishStage: (id, status, output) => tx.finishStage(id, status, output),
     stageName: async (id) => (await tx.getStage(id))?.name,
   });
-  const atomic: KernelJobs['atomic'] = (fn) => queue.run('jobs', (tx) => fn(inTask(tx)));
+  const atomic: KernelJobs['atomic'] = (fn) => {
+    const cause = bus.currentCause();
+    return queue.run('jobs', (tx) => fn(inTask(tx, cause))).catch((err: unknown) => {
+      if (err instanceof ReplayedError && err.result !== undefined) return err.result as Awaited<ReturnType<typeof fn>>;
+      throw err;
+    });
+  };
   const jobs: KernelJobs = {
     atomic,
     create: (input) => atomic((t) => t.create(input)),
@@ -142,10 +163,13 @@ export function createKernel(options: KernelOptions) {
     }
   }
 
+  /** Set once stop() has begun, or a start has failed. From then on the process is on its way out, so a lost lease is logged but does not ask the owner to exit non-zero. */
+  let ending = false;
+
   /** Tell the owner the lease is gone, once, whichever path (the heartbeat or a task's own check) noticed first. */
   let leaseLostTold = false;
   function tellLeaseLost(reason: string): void {
-    if (leaseLostTold) return;
+    if (leaseLostTold || ending) return;
     leaseLostTold = true;
     options.onLeaseLost?.(reason);
   }
@@ -189,9 +213,11 @@ export function createKernel(options: KernelOptions) {
     history: (jobId: string): Promise<BuligEvent[]> => bus.history(jobId),
 
     async start(): Promise<void> {
+      // A start after a failed one is a new attempt: the process is not on its way out any more.
+      ending = false;
       // Validate everything before any plugin runs.
       loaded = selectPlugins(options.plugins, options.enabled);
-      const base = {
+      const shared = {
         grants: options.grants ?? {},
         pluginConfig: options.pluginConfig ?? {},
         bus,
@@ -206,23 +232,34 @@ export function createKernel(options: KernelOptions) {
       generation = await takeLease();
       queue.setFence({ holder, generation });
       startHeartbeat(generation);
-      for (const { manifest } of loaded) {
-        if (DEPRECATED_SDK_MAJORS.includes(manifest.sdk)) {
-          logger.warn(`Plugin "${manifest.name}" targets sdk ${manifest.sdk}, which is deprecated. Set "sdk" to "1" after it passes the conformance suite.`);
+      try {
+        for (const { manifest } of loaded) {
+          if (DEPRECATED_SDK_MAJORS.includes(manifest.sdk)) {
+            logger.warn(`Plugin "${manifest.name}" targets sdk ${manifest.sdk}, which is deprecated. Set "sdk" to "1" after it passes the conformance suite.`);
+          }
         }
+        for (const { plugin, manifest } of loaded) {
+          await plugin.register(buildContext(manifest, { ...shared, generation }));
+        }
+        // Wait for it to be written and handed to the handlers, so start() returns with the plugins running, as it always did.
+        await bus.emit({
+          type: 'kernel.started',
+          source: 'kernel',
+          payload: { plugins: loaded.map((l) => l.manifest.name) },
+        });
+      } catch (err) {
+        ending = true;
+        // A kernel that did not start must not go on holding the lease: the heartbeat would renew it until the process exits,
+        // and the next kernel would wait for it for nothing.
+        if (heartbeat) clearInterval(heartbeat);
+        heartbeat = undefined;
+        await record.releaseLease(holder, generation).catch(() => {});
+        throw err;
       }
-      for (const { plugin, manifest } of loaded) {
-        await plugin.register(buildContext(manifest, base));
-      }
-      // Wait for it to be written and handed to the handlers, so start() returns with the plugins running, as it always did.
-      await bus.emit({
-        type: 'kernel.started',
-        source: 'kernel',
-        payload: { plugins: loaded.map((l) => l.manifest.name) },
-      });
     },
 
     async stop(): Promise<void> {
+      ending = true;
       for (const { plugin, manifest } of [...loaded].reverse()) {
         try {
           await plugin.stop?.();
@@ -231,11 +268,12 @@ export function createKernel(options: KernelOptions) {
         }
       }
       // Let handlers that are still working (a git command, a killed Claude run) finish before the log closes.
-      await bus.idle();
+      await bus.idle(options.stopWaitMs ?? 10_000);
+      // The heartbeat runs until the queue is empty: a task still queued after the wait above must find the lease alive.
+      await queue.idle();
       if (heartbeat) clearInterval(heartbeat);
       heartbeat = undefined;
       // Hand the lease back once the queued work is done, so the next kernel need not wait for it to run out.
-      await queue.idle();
       if (generation !== undefined) await record.releaseLease(holder, generation).catch(() => {});
       await queue.close();
     },

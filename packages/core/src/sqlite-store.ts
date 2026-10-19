@@ -76,7 +76,7 @@ const MIGRATIONS: string[] = [
     PRIMARY KEY (job_id, stage, attempt)
   );
   CREATE UNIQUE INDEX claims_live ON claims(job_id, stage) WHERE released_at IS NULL;`,
-  // 6: an event id is a key. An id written twice is refused. The kernel does not pass fixed ids yet (bus.record makes a fresh one), so this index is a guard for later; handler idempotency today comes from the stageId guards.
+  // 6: an event id is a key. An id written twice is refused. Events a handler causes get ids derived from their cause (bus.ts), so a handler run twice meets this index; the stageId guards cover effects outside the record.
   `CREATE UNIQUE INDEX events_id ON events(id);`,
 ];
 
@@ -92,6 +92,8 @@ interface JobRow { id: string; repo: string; title: string; body: string; status
 interface StageRow {
   id: string; job_id: string; name: string; status: StageStatus; attempt: number;
   started_at: string; ended_at: string | null; output: string | null;
+  /** From the stage's claim; null for a stage that began before claims existed. */
+  claim_generation: number | null;
 }
 interface EventRow { seq: number; id: string; type: string; job_id: string | null; source: string; payload: string | null; at: string }
 
@@ -106,7 +108,10 @@ const toJob = (r: JobRow): Job => ({
 const toStage = (r: StageRow): Stage => ({
   id: r.id, jobId: r.job_id, name: r.name, status: r.status, attempt: r.attempt,
   startedAt: r.started_at, endedAt: r.ended_at, output: r.output === null ? null : JSON.parse(r.output),
+  ...(r.claim_generation !== null && { claimGeneration: r.claim_generation }),
 });
+/** A stage with the generation its claim was taken under (ADR 0010). */
+const STAGE_SELECT = 'SELECT s.*, c.generation AS claim_generation FROM stages s LEFT JOIN claims c ON c.job_id = s.job_id AND c.stage = s.name AND c.attempt = s.attempt';
 const toEvent = (r: EventRow): BuligEvent => ({
   id: r.id, seq: r.seq, type: r.type, ...(r.job_id !== null && { jobId: r.job_id }),
   source: r.source, payload: r.payload === null ? null : JSON.parse(r.payload), at: r.at,
@@ -327,7 +332,7 @@ export class SqliteStore implements Store {
 
   private readStage(id: string): Stage | undefined {
     id = text('stage id', id);
-    const row = this.db.prepare('SELECT * FROM stages WHERE id = ?').get(id) as StageRow | undefined;
+    const row = this.db.prepare(`${STAGE_SELECT} WHERE s.id = ?`).get(id) as StageRow | undefined;
     return row && toStage(row);
   }
 
@@ -339,7 +344,7 @@ export class SqliteStore implements Store {
 
   async listStages(jobId: string): Promise<Stage[]> {
     jobId = text('job id', jobId);
-    const rows = this.db.prepare('SELECT * FROM stages WHERE job_id = ? ORDER BY started_at, rowid').all(jobId);
+    const rows = this.db.prepare(`${STAGE_SELECT} WHERE s.job_id = ? ORDER BY s.started_at, s.rowid`).all(jobId);
     return (rows as StageRow[]).map(toStage);
   }
 
@@ -389,7 +394,7 @@ export class SqliteStore implements Store {
     const res = this.db
       .prepare('INSERT INTO events (id, type, job_id, source, payload, at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO NOTHING')
       .run(id, e.type, e.jobId ?? null, e.source, json, at);
-    if (res.changes === 0) throw new DuplicateEventError(id);
+    if (res.changes === 0) throw new DuplicateEventError(id, toEvent(this.db.prepare('SELECT * FROM events WHERE id = ?').get(id) as EventRow));
     return toEvent(this.db.prepare('SELECT * FROM events WHERE seq = ?').get(res.lastInsertRowid) as EventRow);
   }
 

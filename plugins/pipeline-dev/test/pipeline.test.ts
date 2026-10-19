@@ -604,6 +604,51 @@ describe('resume after a restart', () => {
     expect((await r.k.jobs.get(job.id))!.status).not.toBe('failed');
   });
 
+  it('resume goes by claim generation, not by the clock: a stage left by an older kernel is resumed even when its startedAt is in the future', async () => {
+    const db = newDb();
+    const first = rig({}, { hangCommit: true }, {}, db);
+    await first.k.start();
+    await settle(first.k);
+    const job = await jobOf(first.k);
+    await settle(first.k);
+    first.human.grant(job.id, 'plan');
+    await settle(first.k);
+    expect((await first.k.jobs.stages(job.id)).at(-1)).toMatchObject({ name: 'build', status: 'running' });
+    await first.k.stop();
+
+    // The machine that ran the first kernel had a clock far ahead of this one.
+    const file = new Database(db);
+    file.prepare("UPDATE stages SET started_at = '2999-01-01T00:00:00.000Z' WHERE status = 'running'").run();
+    file.close();
+
+    const second = rig({}, {}, {}, db);
+    await second.k.start();
+    await settle(second.k);
+    expect(second.worker.map((w) => w.stage)).toEqual(['build', 'test', 'docs', 'review']);
+    const builds = (await second.k.jobs.stages(job.id)).filter((s) => s.name === 'build');
+    expect(builds.find((s) => s.attempt === 1)).toMatchObject({ status: 'failed', output: { interrupted: true, reason: 'interrupted' } });
+    expect((await second.k.jobs.get(job.id))!.status).toBe('awaiting_approval');
+  });
+
+  it('resume goes by claim generation, not by the clock: a stage this kernel claimed is left alone even when its startedAt is long ago', async () => {
+    const r = rig({ build: () => 'hang' });
+    await r.k.start();
+    await settle(r.k);
+    const job = await jobOf(r.k);
+    await settle(r.k);
+    r.human.grant(job.id, 'plan');
+    await settle(r.k);
+    expect((await r.k.jobs.stages(job.id)).filter((s) => s.name === 'build').map((s) => s.status)).toEqual(['running']);
+    // A clock that was behind when the stage began: by the clock, it looks older than this kernel.
+    const file = new Database(r.db);
+    file.prepare("UPDATE stages SET started_at = '2000-01-01T00:00:00.000Z' WHERE name = 'build'").run();
+    file.close();
+    await r.k.bus.emit({ type: 'kernel.started', source: 'kernel', payload: { plugins: [] } });
+    await settle(r.k);
+    expect(r.worker.filter((s) => s.stage === 'build')).toHaveLength(1);
+    expect((await r.k.jobs.stages(job.id)).filter((s) => s.name === 'build').map((s) => `${s.attempt}:${s.status}`)).toEqual(['1:running']);
+  });
+
   it('a start that finds its stage already claimed (a rival got in between the read and the write) is a duplicate, not a failure: the job carries on', async () => {
     // A rival kernel opens plan after this one has read that the job is ready for it and before its own startStage lands.
     const inner = new SqliteStore(newDb());

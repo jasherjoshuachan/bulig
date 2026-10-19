@@ -7,7 +7,7 @@ Steps 1 and 2 of the build order are done. The record can be Postgres (ADR 0007)
 Four things are true today and shape the choices below.
 
 - **The kernel and its worker are one process.** `worker-claude-code` runs inside `bulig serve`, so a stage can only be built on the machine the kernel is on. A second machine has nothing to talk to.
-- **ths-prod-01 is shared.** Client production runs there: Postgres on 5432, 5433, 5434, 5435 and 5490, NanoClaw, Temporal and dozens of other units. It has 8 CPUs and about 15 GB of RAM, of which about 8 GB is free. Bulig must not be able to slow any of it down, and a Bulig mistake must not be able to reach any of it.
+- **ths-prod-01 is shared.** Client production runs there: Postgres on 5432, 5433, 5434, 5435 and 5490 and dozens of other units. It has 8 CPUs and about 15 GB of RAM, of which about 8 GB is free. Bulig must not be able to slow any of it down, and a Bulig mistake must not be able to reach any of it.
 - **The gates only warn.** `gate-evidence` and `gate-promise` run with `mode: "warn"`. Nothing counts the verdicts, so nobody can say whether turning them on would have blocked a good job.
 - **ADR 0010 left a known limit.** A replayed run can open a new stage attempt, and nothing replays events yet. Redelivery (a worker that lost its stage, a standby) makes it real.
 
@@ -104,7 +104,7 @@ We are moving the household into a flat in a shared building. Other families liv
 - **One kernel, no standby.** If ths-prod-01 is down, Bulig is down until systemd or Jasher brings it back. The nightly dump covers disaster recovery, and the drill says how long that takes. A standby is a later step (target spec section 6).
 - **Tailscale has no tags or ACLs for Bulig yet.** Both machines are on the tailnet with no tags. Until tags and ACLs are set in the admin console (only Jasher can), the token is the only gate on the worker endpoint.
 - **The `bulig` user has no Claude login.** Sessions on the VPS need a token made with `claude setup-token`, which is interactive and is Jasher's to do. Until then the VPS worker cannot run real stages, and the Mac worker takes everything.
-- **Claude usage is shared.** Bulig jobs and Cyndra jobs draw on the same quota. The slot caps limit how much Bulig can use at once. They do not cap how much it uses over a day.
+- **Claude usage is shared.** Bulig jobs and the other jobs on the server draw on the same Claude quota. The slot caps limit how much Bulig can use at once. They do not cap how much it uses over a day.
 - **A kernel crash costs up to 30 s,** as in ADR 0010, and a worker lost mid-stage costs the lease (30 s) plus the stage's work so far, because the second attempt starts the stage again.
 - **A worker that is alive but cut off from the kernel keeps running its Claude session** until its next heartbeat is refused. The fence stops its result from being written. It cannot recall a `git push` already sent, which is why the guards sit at the effect.
 - **Output is posted at the end of a stage, not streamed.** Progress lines come later.

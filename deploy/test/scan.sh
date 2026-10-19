@@ -55,6 +55,19 @@ x1="X1""1-unix"
 offends "the X socket folder" x-display "/tmp/.$x1/foo" "$x1"
 offends "an X display name" x-display "display X$((90 + 9))" ""
 offends "an X server flag" x-server-flag "someserver :1 -$(printf 'a')c" ""
+mk="scan-forbidden: ""allow-addresses"
+mkrepo "$repo"
+printf '%s\n' "refuse $pub4 and peer 100.$((64 - 1)).0.1 and v6 $g6 // $mk" >"$repo/marked.txt"
+git -C "$repo" add marked.txt
+expect_ok "a line marked allow-addresses may name addresses outside the allowed ranges" run_scan "$repo"
+offends "the marker does not excuse a port number" "port-1" "127.0.0.1:$p1 // $mk" "$p1"
+offends "the marker does not excuse an X display name" x-display "display X$((90 + 9)) // $mk" ""
+mkrepo "$repo"
+printf '%s\nssh %s\n' "// $mk" "$pub4" >"$repo/bad.txt"
+git -C "$repo" add bad.txt
+run_scan "$repo" >"$work/scan.out" 2>&1
+rc=$?
+if [ "$rc" -ne 0 ] && grep -q "bad.txt:2 (ipv4-outside-allowed-ranges)" "$work/scan.out"; then ok "a marker on another line excuses nothing"; else bad "a marker on line 1 excused line 2 (rc=$rc)"; fi
 mkrepo "$repo"
 printf 'tar -xzf x; has-ac-in-a-word; 22922 is fine; 1.2.3.4.5; 300.1.1.1\n' >"$repo/ok2.txt"
 git -C "$repo" add ok2.txt

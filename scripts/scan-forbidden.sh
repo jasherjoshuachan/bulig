@@ -43,10 +43,13 @@ for f in files:
     except (UnicodeDecodeError, IsADirectoryError, FileNotFoundError):
         continue
     for n, line in enumerate(text.split("\n"), 1):
-        for m in v4.finditer(line):
+        # A test that must name addresses just outside an allowed range marks the line itself; the marker
+        # skips only the address rules, never the port or display words.
+        addresses_ok = "scan-forbidden: allow-addresses" in line
+        for m in ([] if addresses_ok else v4.finditer(line)):
             if not allowed4([int(x) for x in m.groups()]):
                 print(path + ":" + str(n) + " (ipv4-outside-allowed-ranges)")
-        for m in v6.finditer(line):
+        for m in ([] if addresses_ok else v6.finditer(line)):
             if not m.group(1).lower().replace("0db8", "db8").startswith("2001:db8"):
                 print(path + ":" + str(n) + " (ipv6-global-address)")
         for name, rx in words:

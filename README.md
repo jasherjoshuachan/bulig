@@ -165,16 +165,21 @@ Gates chain: `stage.completed -> gate-evidence -> stage.checked -> gate-promise 
 
 ### Soak counter and the switch to enforce
 
-The gates ship in `warn` mode. Before they are switched to `enforce`, they run for a soak: 7 days and 10 jobs that reached a gate, with no warning judged wrong. The counter reads the verdicts the gates already leave in the event log.
+The gates ship in `warn` mode. Before they are switched to `enforce`, they run for a soak: 7 days and 10 real jobs that reached a gate, with no warning judged wrong. The counter reads the verdicts the gates already leave in the event log.
 
 ```
-pnpm bulig gates soak start                      # starts the clock; run it once, when the gates go live
 pnpm bulig gates status                          # days, jobs, verdicts per gate, every warning with its event id, and "bar met" or "bar not met: ..."
 pnpm bulig gates mark-false <event-id> --reason "<text>"   # a warning that was wrong
+pnpm bulig gates soak start --restart            # begin the soak again
 pnpm bulig gates enforce [--force]               # sets gate-evidence and gate-promise to "enforce" in the config file
 ```
 
-`soak start` needs the store to exist, so run it after `serve` has started once. Starting twice is refused; `--restart` begins a new soak (use it after fixing a gate that warned wrongly, since a false warning keeps the bar unmet) and only events after the newest start count. `enforce` refuses until the bar is met unless `--force`, changes only the two `mode` keys in the config file (the old file is kept as `<config>.bak`, the new one is written atomically), and does not restart anything: a running `serve` has to be restarted to pick it up. The two operator events (`gates.soak.started`, `gates.warning.false`) are appended straight to the record by the command, with source `cli`, and no plugin listens to them, so they work while `serve` is running.
+- **The clock starts by itself.** The first time `serve` starts with a gate on, it writes `gates.soak.started` through the kernel's own queue. A restart of `serve` never moves it. If the record was copied from another machine, it already holds that machine's start: run `soak start --restart` once on the new one.
+- **Writes need the kernel to themselves.** `mark-false` and `soak start --restart` start a kernel the way `deny` does, with the same lock and lease, and write through its queue. While `serve` runs they are refused ("only one kernel may do that at a time"): stop `serve`, run the command, start `serve` again. `status` only reads and works at any time.
+- **`--restart`** is for after a gate that warned wrongly was fixed, since a false mark keeps the bar unmet. Only events after the newest start count.
+- **Real jobs.** Every job with a gate verdict since the start counts and is listed with its PR head. Jobs whose title starts with `[synthetic]` (the server deploy's test jobs) are left out, along with their warnings, and `status` says how many.
+- **No commit on a verdict.** The gate events carry no commit SHA: the gates run before the PR exists. `status` shows each job's PR head from its `pr.opened` event instead, and `-` where there is none. That is a known gap.
+- `enforce` refuses until the bar is met unless `--force`. It changes only the two `mode` keys in the config file (the old file is kept as `<config>.bak`, the new one is written atomically) and restarts nothing: a running `serve` has to be restarted to pick it up.
 
 ### Scope guard
 

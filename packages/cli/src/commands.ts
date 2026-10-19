@@ -13,7 +13,7 @@ import worker from '@bulig/worker-claude-code';
 import { ConfigError, defaultDbPath, loadConfig, type BuligConfig } from './config.ts';
 import { clipText } from '@bulig/text';
 import { acquireLock } from './lock.ts';
-import { cmdGates } from './gates.ts';
+import { cmdGates, ensureSoakStarted } from './gates.ts';
 
 export interface Io {
   out(line: string): void;
@@ -76,7 +76,7 @@ export async function runCli(argv: string[], io: Io): Promise<number> {
       case 'history':
         return await cmdHistory(rest, io);
       case 'gates':
-        return await cmdGates(rest, io, { readStore, UserError });
+        return await cmdGates(rest, io, { readStore, withKernel, UserError });
       case undefined:
       case 'help':
       case '--help':
@@ -338,6 +338,17 @@ async function cmdResume(args: string[], io: Io): Promise<number> {
   }
 }
 
+/** A kernel of our own for a command that writes (`bulig gates mark-false`): the same lock and lease as `deny`, refused while `serve` holds the record. */
+async function withKernel<T>(io: Io, fn: (kernel: Kernel) => Promise<T>): Promise<T> {
+  const { config } = loadConfig(io.cwd, io.home);
+  const session = await openSession(config, io, false);
+  try {
+    return await fn(session.kernel);
+  } finally {
+    await session.close();
+  }
+}
+
 /**
  * Keep the kernel running until told to stop. This is the mode for Telegram: jobs start, wait for
  * approvals and finish while the process stays up. Unfinished jobs are picked up on start.
@@ -365,6 +376,8 @@ async function cmdServe(args: string[], io: Io): Promise<number> {
       stop();
     },
   );
+  // The soak clock (step 5) starts the first time a kernel with a gate runs on a record. A failure here must not take serve down.
+  await ensureSoakStarted(session.kernel, config.enabled).catch((err: unknown) => io.err(`warn: could not record the soak start: ${err instanceof Error ? err.message : String(err)}`));
   const forget = io.onStop?.(stop);
   io.out(`bulig: serving with ${config.enabled.join(', ')}. Stop with Ctrl-C.`);
   try {

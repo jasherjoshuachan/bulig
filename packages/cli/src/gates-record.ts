@@ -16,6 +16,10 @@ export const SOAK_DAYS = 7;
 /** Jobs that must have reached a gate in that time. */
 export const SOAK_JOBS = 10;
 
+/** Jobs whose title starts with this are test jobs (the server deploy runs some). They are not counted, and their warnings cannot be marked. */
+export const SYNTHETIC_PREFIX = '[synthetic]';
+export const isSynthetic = (job: Job | undefined): boolean => job?.title.trimStart().toLowerCase().startsWith(SYNTHETIC_PREFIX) ?? false;
+
 export const SOAK_STARTED = 'gates.soak.started';
 export const WARNING_FALSE = 'gates.warning.false';
 
@@ -93,6 +97,8 @@ export interface JobRow {
   jobId: string;
   verdicts: number;
   warned: number;
+  /** The head of the job's pull request, from its newest `pr.opened` event. The gate events carry no commit; this is the nearest the log has. */
+  headSha: string | undefined;
 }
 
 export interface GateRow {
@@ -109,6 +115,8 @@ export interface Report {
   gates: GateRow[];
   /** Every warning since the start, oldest first, with the reason it was marked false (if it was). */
   warnings: Array<Verdict & { falseReason?: string }>;
+  /** Jobs left out because they are test jobs (see SYNTHETIC_PREFIX). */
+  synthetic: number;
   bar: Bar;
 }
 
@@ -117,10 +125,13 @@ export function buildReport(events: readonly BuligEvent[], jobs: readonly Job[],
   const start = soakStart(events);
   if (!start) {
     const bar = checkBar(0, 0, 0);
-    return { started: false, daysElapsed: 0, jobs: [], gates: GATES.map((gate) => ({ gate, clean: 0, warned: 0 })), warnings: [], bar: { ...bar, line: `${bar.line} (the soak has not started: run bulig gates soak start)` } };
+    return { started: false, daysElapsed: 0, jobs: [], gates: GATES.map((gate) => ({ gate, clean: 0, warned: 0 })), warnings: [], synthetic: 0, bar: { ...bar, line: `${bar.line} (the soak has not started: run bulig gates soak start)` } };
   }
   const since = events.filter((e) => e.seq !== undefined && e.seq > start.seq!).sort((a, b) => a.seq! - b.seq!);
-  const verdicts = since.map(verdictOf).filter((v): v is Verdict => v !== undefined);
+  const jobById = new Map(jobs.map((j) => [j.id, j]));
+  const all = since.map(verdictOf).filter((v): v is Verdict => v !== undefined);
+  const verdicts = all.filter((v) => !isSynthetic(jobById.get(v.jobId)));
+  const synthetic = new Set(all.filter((v) => isSynthetic(jobById.get(v.jobId))).map((v) => v.jobId)).size;
   const warned = new Map(verdicts.filter((v) => v.warned).map((v) => [v.eventId, v]));
   // A mark counts only if it points at a warning inside the window; the first reason given for a warning is the one shown.
   const marks = new Map<string, string>();
@@ -130,9 +141,13 @@ export function buildReport(events: readonly BuligEvent[], jobs: readonly Job[],
     if (typeof p.target === 'string' && warned.has(p.target) && !marks.has(p.target)) marks.set(p.target, String(p.reason ?? ''));
   }
   const byJob = new Map<string, JobRow>();
-  const jobById = new Map(jobs.map((j) => [j.id, j]));
+  const heads = new Map<string, string>();
+  for (const e of [...events].sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0))) {
+    const sha = e.type === 'pr.opened' && e.jobId ? asRecord(e.payload).headSha : undefined;
+    if (typeof sha === 'string' && e.jobId) heads.set(e.jobId, sha);
+  }
   for (const v of verdicts) {
-    const row = byJob.get(v.jobId) ?? { job: jobById.get(v.jobId), jobId: v.jobId, verdicts: 0, warned: 0 };
+    const row = byJob.get(v.jobId) ?? { job: jobById.get(v.jobId), jobId: v.jobId, verdicts: 0, warned: 0, headSha: heads.get(v.jobId) };
     row.verdicts += 1;
     if (v.warned) row.warned += 1;
     byJob.set(v.jobId, row);
@@ -148,6 +163,7 @@ export function buildReport(events: readonly BuligEvent[], jobs: readonly Job[],
       return { gate, clean: mine.filter((v) => !v.warned).length, warned: mine.filter((v) => v.warned).length };
     }),
     warnings: [...warned.values()].map((v) => (marks.has(v.eventId) ? { ...v, falseReason: marks.get(v.eventId)! } : v)),
+    synthetic,
     bar: checkBar(daysElapsed, byJob.size, marks.size),
   };
 }

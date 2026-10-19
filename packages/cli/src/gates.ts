@@ -1,22 +1,27 @@
 import { copyFileSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { parseArgs } from 'node:util';
-import { type Store } from '@bulig/core';
+import { derivedEventId, type Kernel, type Store } from '@bulig/core';
 import { clipText } from '@bulig/text';
 import { loadConfig, GATE_PLUGINS, type BuligConfig } from './config.ts';
-import { GATES, SOAK_DAYS, SOAK_JOBS, SOAK_STARTED, WARNING_FALSE, buildReport, findWarning, type Report } from './gates-record.ts';
+import { GATES, SOAK_DAYS, SOAK_JOBS, SOAK_STARTED, WARNING_FALSE, buildReport, findWarning, soakStart, type Report } from './gates-record.ts';
 import type { Io } from './commands.ts';
 
 /** What `bulig gates` borrows from commands.ts, so that file gets one registration line and no new exports. */
 export interface GatesDeps {
-  /** Opens the store the config names, runs `fn`, closes it. A Postgres store opened this way is a reader: it never takes the kernel's writer lock. */
+  /** Opens the store the config names, runs `fn`, closes it. Read-only use only: on Postgres this is a reader that takes no writer lock and writes nothing fenced by the lease (ADR 0001, ADR 0010). */
   readStore<T>(io: Io, fn: (store: Store) => Promise<T>): Promise<T>;
+  /**
+   * Starts a kernel the way `deny` does (the pid lock on SQLite, the writer lock and the executor lease on Postgres), runs `fn`, and stops it.
+   * Every write goes through `kernel.bus.emit`, the kernel's fenced queue. It fails while another kernel, such as `serve`, holds the record.
+   */
+  withKernel<T>(io: Io, fn: (kernel: Kernel) => Promise<T>): Promise<T>;
   /** The error class runCli prints as a plain message and answers with exit code 2. */
   UserError: new (message: string) => Error;
 }
 
 const USAGE = `usage:
-  bulig gates soak start [--restart]
+  bulig gates soak start --restart
   bulig gates status
   bulig gates mark-false <event-id> --reason "<text>"
   bulig gates enforce [--force]`;
@@ -52,22 +57,53 @@ async function report(io: Io, deps: GatesDeps): Promise<Report> {
   return deps.readStore(io, async (store) => buildReport(await store.eventsAfter(0), await store.listJobs(), nowOf(io)));
 }
 
+/** The id of the one `gates.soak.started` a kernel writes by itself. A second try reads the same id, so it can only be written once. */
+const AUTO_START_ID = derivedEventId('gates.soak', SOURCE, 0, SOAK_STARTED);
+
+/**
+ * `serve` calls this once it is up: the soak clock starts the first time a kernel with a gate runs on a record, and never again by itself.
+ * The write is the kernel's own, through its fenced queue. Returns the start event if it wrote one.
+ */
+export async function ensureSoakStarted(kernel: Kernel, enabled: readonly string[]): Promise<{ id: string; at: string } | undefined> {
+  if (!GATES.some((g) => enabled.includes(g))) return undefined;
+  if (soakStart(await kernel.bus.replay(0))) return undefined;
+  const e = await kernel.bus.emit({ id: AUTO_START_ID, type: SOAK_STARTED, source: SOURCE, payload: { days: SOAK_DAYS, jobs: SOAK_JOBS, auto: true } });
+  return { id: e.id, at: e.at };
+}
+
+/**
+ * Run `fn` with a kernel of our own. While `serve` (or any other bulig process) holds the record this is refused, and that is intended:
+ * one writer, fenced by the lease. Say what to do instead of passing on the lock's bare message.
+ */
+async function withWriter<T>(io: Io, deps: GatesDeps, what: string, fn: (kernel: Kernel) => Promise<T>): Promise<T> {
+  try {
+    return await deps.withKernel(io, fn);
+  } catch (err) {
+    const m = err instanceof Error ? err.message : String(err);
+    if (/Another bulig process|Another Bulig kernel|executor lease/i.test(m)) {
+      throw new deps.UserError(`${what} writes to the record, and only one kernel may do that at a time. A running serve holds it: ${m}\nStop serve, run the command again, then start serve. bulig gates status can be read at any time.`);
+    }
+    throw err;
+  }
+}
+
 async function soak(args: string[], io: Io, deps: GatesDeps): Promise<number> {
   const [what, ...rest] = args;
-  if (what !== 'start') throw new deps.UserError('usage: bulig gates soak start [--restart]');
+  if (what !== 'start') throw new deps.UserError('usage: bulig gates soak start --restart');
   const { values } = parseArgs({ args: rest, options: { restart: { type: 'boolean' } }, strict: true });
-  await deps.readStore(io, async (store) => {
-    const events = await store.eventsAfter(0);
-    const before = buildReport(events, [], nowOf(io));
-    if (before.started && !values.restart) {
-      throw new deps.UserError(`the soak already started at ${before.start!.at}. Restarting throws away the record so far; do it only after a gate was fixed: bulig gates soak start --restart`);
-    }
-    const e = await store.appendEvent({
+  if (!values.restart) {
+    throw new deps.UserError(
+      'the soak clock starts by itself the first time serve runs with a gate on, so there is nothing to start. To begin again (after a gate was fixed, or when the record came from another machine): bulig gates soak start --restart',
+    );
+  }
+  await withWriter(io, deps, 'soak start --restart', async (kernel) => {
+    const prior = soakStart(await kernel.bus.replay(0));
+    const e = await kernel.bus.emit({
       type: SOAK_STARTED,
       source: SOURCE,
-      payload: { days: SOAK_DAYS, jobs: SOAK_JOBS, ...(before.started && { restartOf: before.start!.id }) },
+      payload: { days: SOAK_DAYS, jobs: SOAK_JOBS, restart: true, ...(prior && { restartOf: prior.id }) },
     });
-    io.out(`bulig: the soak started at ${e.at} (event ${e.id}). The bar: ${SOAK_DAYS} days and ${SOAK_JOBS} jobs with zero false warnings. See bulig gates status.`);
+    io.out(`bulig: the soak started again at ${e.at} (event ${e.id}). The bar: ${SOAK_DAYS} days and ${SOAK_JOBS} jobs with zero false warnings. See bulig gates status.`);
   });
   return 0;
 }
@@ -84,15 +120,16 @@ async function status(args: string[], io: Io, deps: GatesDeps): Promise<number> 
   io.out(`soak      started ${r.start!.at} (event ${r.start!.id})`);
   io.out(`elapsed   ${r.daysElapsed.toFixed(1)} of ${SOAK_DAYS} days`);
   io.out(`jobs      ${r.jobs.length} of ${SOAK_JOBS} reached a gate`);
+  if (r.synthetic) io.out(`ignored   ${r.synthetic} test job${r.synthetic === 1 ? '' : 's'} (title starts with [synthetic])`);
   io.out(`false     ${r.bar.falseWarnings} warning${r.bar.falseWarnings === 1 ? '' : 's'} marked false`);
   io.out('');
   io.out(`${pad('gate', 16)}${pad('clean', 8)}warned`);
   for (const g of r.gates) io.out(`${pad(g.gate, 16)}${pad(String(g.clean), 8)}${g.warned}`);
   if (r.jobs.length) {
     io.out('');
-    io.out(`${pad('job', 10)}${pad('status', 18)}${pad('gates', 7)}${pad('warned', 8)}title (repo)`);
+    io.out(`${pad('job', 10)}${pad('status', 18)}${pad('gates', 7)}${pad('warned', 8)}${pad('pr head', 9)}title (repo)`);
     for (const j of r.jobs) {
-      io.out(`${pad(j.jobId.slice(0, 8), 10)}${pad(j.job?.status ?? '-', 18)}${pad(String(j.verdicts), 7)}${pad(String(j.warned), 8)}${j.job ? `${clipText(oneLine(j.job.title), 40)} (${j.job.repo})` : '-'}`);
+      io.out(`${pad(j.jobId.slice(0, 8), 10)}${pad(j.job?.status ?? '-', 18)}${pad(String(j.verdicts), 7)}${pad(String(j.warned), 8)}${pad(j.headSha?.slice(0, 7) ?? '-', 9)}${j.job ? `${clipText(oneLine(j.job.title), 40)} (${j.job.repo})` : '-'}`);
     }
   }
   if (r.warnings.length) {
@@ -120,14 +157,14 @@ async function markFalse(args: string[], io: Io, deps: GatesDeps): Promise<numbe
   const [idArg, ...extra] = parsed.positionals;
   const reason = parsed.values.reason?.trim();
   if (!idArg || extra.length || !reason) throw new deps.UserError(usage);
-  await deps.readStore(io, async (store) => {
-    const r = buildReport(await store.eventsAfter(0), [], nowOf(io));
-    if (!r.started) throw new deps.UserError('the soak has not started, so there is no warning to mark. Start it with: bulig gates soak start');
+  await withWriter(io, deps, 'mark-false', async (kernel) => {
+    const r = buildReport(await kernel.bus.replay(0), await kernel.jobs.list(), nowOf(io));
+    if (!r.started) throw new deps.UserError('the soak has not started, so there is no warning to mark. It starts when serve first runs with a gate on.');
     const found = findWarning(r, idArg);
     if (!found.ok) throw new deps.UserError(found.why);
     const w = found.warning;
     if (w.falseReason !== undefined) throw new deps.UserError(`warning ${w.eventId} is already marked false: ${oneLine(w.falseReason)}`);
-    const e = await store.appendEvent({
+    const e = await kernel.bus.emit({
       type: WARNING_FALSE,
       source: SOURCE,
       jobId: w.jobId,

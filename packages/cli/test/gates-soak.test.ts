@@ -7,6 +7,8 @@ import { definePlugin, type BuligEvent } from '@bulig/plugin-sdk';
 import gateEvidence from '../../../plugins/gate-evidence/src/index.ts';
 import gatePromise from '../../../plugins/gate-promise/src/index.ts';
 import { describePg, usePgServer, type PgDatabase } from '../../core/test/pg-throwaway.ts';
+import { createCliChannel } from '@bulig/channel-cli';
+import { ensureSoakStarted } from '../src/gates.ts';
 import { checkBar, verdictOf, SOAK_DAYS } from '../src/gates-record.ts';
 import { runCli, type Io } from '../src/index.ts';
 
@@ -31,6 +33,16 @@ interface World {
   readConfig(): Record<string, any>;
 }
 
+/** What a command that starts a kernel (mark-false, soak start --restart) needs from the config, as `deny` does. */
+const kernelConfig = () => ({
+  grants: {
+    'channel-cli': ['channel.send:terminal', 'approval.grant'],
+    'pipeline-dev': ['merge.request', 'jobs.write'],
+    'worker-claude-code': ['claude.run', 'fs.worktree'],
+    github: ['git.push', 'gh.pr'],
+  },
+});
+
 function sqliteWorld(config: Record<string, unknown> = {}, text?: (c: Record<string, unknown>) => string): World {
   const root = mkdtempSync(join(tmpdir(), 'bulig-soak-'));
   dirs.push(root);
@@ -42,7 +54,7 @@ function sqliteWorld(config: Record<string, unknown> = {}, text?: (c: Record<str
   mkdirSync(join(root, 'db'));
   // The kernel makes the file the first time it runs; a store opened and closed stands in for that.
   void new SqliteStore(dbPath).close();
-  return build(cwd, home, { dbPath, ...config }, text, async (fn) => {
+  return build(cwd, home, { dbPath, ...kernelConfig(), ...config }, text, async (fn) => {
     const store = new SqliteStore(dbPath);
     try {
       return await fn(store);
@@ -90,6 +102,9 @@ async function cleanJobs(s: Store, n: number): Promise<string[]> {
   return ids;
 }
 
+/** What a serve with a gate on does by itself (see ensureSoakStarted), written straight in because the seed stands in for that kernel. */
+const startSoak = (w: World) => w.seed((s) => s.appendEvent({ type: 'gates.soak.started', source: 'cli', payload: { days: 7, jobs: 10, auto: true } }));
+
 const startedAt = async (w: World): Promise<string> => (await w.seed((s) => s.eventsAfter(0))).filter((e) => e.type === 'gates.soak.started').at(-1)!.at;
 const eventsOf = (w: World, type: string) => w.seed(async (s) => (await s.eventsAfter(0)).filter((e) => e.type === type));
 
@@ -105,29 +120,62 @@ function soakSuite(make: Make) {
     expect(r.out).toContain('bulig gates soak start');
   });
 
-  it('soak start records the clock once; a second start is refused; --restart starts over and drops the earlier record', async () => {
+  it('there is no manual start: soak start alone is refused, and --restart writes a new start and drops the earlier record', async () => {
     const w = await make();
-    const first = await w.run('gates', 'soak', 'start');
-    expect(first.err).toBe('');
-    expect(first.code).toBe(0);
-    expect(await eventsOf(w, 'gates.soak.started')).toHaveLength(1);
-    const again = await w.run('gates', 'soak', 'start');
-    expect(again.code).toBe(2);
-    expect(again.err).toContain('already started');
+    await startSoak(w);
+    const plain = await w.run('gates', 'soak', 'start');
+    expect(plain.code).toBe(2);
+    expect(plain.err).toContain('starts by itself');
     expect(await eventsOf(w, 'gates.soak.started')).toHaveLength(1);
 
     await w.seed((s) => cleanJobs(s, 3));
     w.clockAt(await startedAt(w), 1 * DAY);
     expect((await w.run('gates', 'status')).out).toContain('jobs      3 of 10');
     const restart = await w.run('gates', 'soak', 'start', '--restart');
+    expect(restart.err).toBe('');
     expect(restart.code).toBe(0);
-    expect(await eventsOf(w, 'gates.soak.started')).toHaveLength(2);
+    const starts = await eventsOf(w, 'gates.soak.started');
+    expect(starts).toHaveLength(2);
+    expect(starts[1]).toMatchObject({ source: 'cli', payload: { restart: true, restartOf: starts[0]!.id } });
     expect((await w.run('gates', 'status')).out).toContain('jobs      0 of 10');
+  });
+
+  it('test jobs (title starts with [synthetic]) are not counted, are said so in status, and cannot be marked', async () => {
+    const w = await make();
+    await startSoak(w);
+    const warnId = await w.seed(async (s) => {
+      await cleanJobs(s, 2);
+      const job = await s.createJob({ repo: '/r', title: '[synthetic] deploy check' });
+      await evidence(s, job.id, 'plan');
+      return (await evidence(s, job.id, 'test', ['Unverified: a'])).id;
+    });
+    w.clockAt(await startedAt(w), DAY);
+    const r = await w.run('gates', 'status');
+    expect(r.out).toContain('jobs      2 of 10');
+    expect(r.out).toContain('ignored   1 test job');
+    expect(r.out).not.toContain('deploy check');
+    expect(r.out).not.toContain(warnId);
+    expect(r.out).toMatch(/gate-evidence\s+2\s+0/);
+    expect((await w.run('gates', 'mark-false', warnId, '--reason', 'x')).err).toContain('not a gate warning');
+  });
+
+  it("shows each job's PR head from its pr.opened event, and a dash where there is none", async () => {
+    const w = await make();
+    await startSoak(w);
+    await w.seed(async (s) => {
+      const [a] = await cleanJobs(s, 2);
+      await s.appendEvent({ type: 'pr.opened', source: 'github', jobId: a!, payload: { url: 'u', number: 1, headSha: 'abcdef0123456789' } });
+    });
+    w.clockAt(await startedAt(w), DAY);
+    const r = await w.run('gates', 'status');
+    expect(r.out).toMatch(/Job 0 \(\/repo\/0\)/);
+    expect(r.out).toMatch(/abcdef0\s+Job 0/);
+    expect(r.out).toMatch(/-\s+Job 1/);
   });
 
   it('bar not met by days: enough clean jobs, too little time', async () => {
     const w = await make();
-    await w.run('gates', 'soak', 'start');
+    await startSoak(w);
     await w.seed((s) => cleanJobs(s, 12));
     w.clockAt(await startedAt(w), 2.5 * DAY);
     const r = await w.run('gates', 'status');
@@ -140,7 +188,7 @@ function soakSuite(make: Make) {
 
   it('bar not met by jobs: enough time, too few jobs', async () => {
     const w = await make();
-    await w.run('gates', 'soak', 'start');
+    await startSoak(w);
     await w.seed((s) => cleanJobs(s, 4));
     w.clockAt(await startedAt(w), 8 * DAY);
     const r = await w.run('gates', 'status');
@@ -150,7 +198,7 @@ function soakSuite(make: Make) {
 
   it('bar not met by a false warning, even with the time and the jobs', async () => {
     const w = await make();
-    await w.run('gates', 'soak', 'start');
+    await startSoak(w);
     const warnId = await w.seed(async (s) => {
       await cleanJobs(s, 10);
       const job = await s.createJob({ repo: '/repo/w', title: 'Warned job' });
@@ -170,7 +218,7 @@ function soakSuite(make: Make) {
 
   it('bar met at exactly 7 days and 10 jobs, with a true warning still on the list', async () => {
     const w = await make();
-    await w.run('gates', 'soak', 'start');
+    await startSoak(w);
     await w.seed(async (s) => {
       const ids = await cleanJobs(s, 9);
       await evidence(s, ids[0]!, 'test', ['Unverified: no record']);
@@ -195,7 +243,7 @@ function soakSuite(make: Make) {
       await evidence(s, job.id, 'plan', ['Unverified: x']);
       return job.id;
     });
-    await w.run('gates', 'soak', 'start');
+    await startSoak(w);
     await w.seed(async (s) => {
       const job = await s.createJob({ repo: '/r', title: 'After' });
       // A gate that is off passes results through. A look-alike from another plugin. A promise event that only carries the evidence lines along.
@@ -216,7 +264,7 @@ function soakSuite(make: Make) {
 
   it('an enforce-mode block counts as a warning and can be marked', async () => {
     const w = await make();
-    await w.run('gates', 'soak', 'start');
+    await startSoak(w);
     const id = await w.seed(async (s) => {
       const job = await s.createJob({ repo: '/r', title: 'Blocked' });
       return (await s.appendEvent({ type: 'stage.failed', source: 'gate-promise', jobId: job.id, payload: { stage: 'test', error: 'promise gate: x', blocked: true, promises: ['Unfulfilled promise: no job id'] } })).id;
@@ -240,7 +288,7 @@ function soakSuite(make: Make) {
     usage(await w.run('gates', 'mark-false', 'abc', 'def', '--reason', 'x'));
     expect((await w.run('gates', 'mark-false', 'abc', '--reason', 'x')).err).toContain('soak has not started');
 
-    await w.run('gates', 'soak', 'start');
+    await startSoak(w);
     const ids = await w.seed(async (s) => {
       const job = await s.createJob({ repo: '/r', title: 'T' });
       const clean = await evidence(s, job.id, 'plan');
@@ -276,7 +324,7 @@ function soakSuite(make: Make) {
 
   it('a mark from before a restart does not count against the new soak', async () => {
     const w = await make();
-    await w.run('gates', 'soak', 'start');
+    await startSoak(w);
     const id = await w.seed(async (s) => {
       const job = await s.createJob({ repo: '/r', title: 'T' });
       return (await evidence(s, job.id, 'test', ['Unverified: a'])).id;
@@ -298,7 +346,7 @@ function soakSuite(make: Make) {
     });
 
     async function meetBar(w: World) {
-      await w.run('gates', 'soak', 'start');
+      await startSoak(w);
       await w.seed((s) => cleanJobs(s, 10));
       w.clockAt(await startedAt(w), 7 * DAY);
     }
@@ -309,7 +357,7 @@ function soakSuite(make: Make) {
       const notStarted = await w.run('gates', 'enforce');
       expect(notStarted.code).toBe(2);
       expect(notStarted.err).toContain('bar not met');
-      await w.run('gates', 'soak', 'start');
+      await startSoak(w);
       await w.seed((s) => cleanJobs(s, 3));
       w.clockAt(await startedAt(w), 2 * DAY);
       const r = await w.run('gates', 'enforce');
@@ -410,7 +458,7 @@ describePg('bulig gates on Postgres', () => {
     dirs.push(root);
     mkdirSync(join(root, 'home'));
     mkdirSync(join(root, 'work'));
-    return build(join(root, 'work'), join(root, 'home'), { store: { kind: 'postgres', urlEnv: 'BULIG_TEST_DATABASE_URL' }, ...config }, text, async (fn) => {
+    return build(join(root, 'work'), join(root, 'home'), { store: { kind: 'postgres', urlEnv: 'BULIG_TEST_DATABASE_URL' }, ...kernelConfig(), ...config }, text, async (fn) => {
       const store = await PostgresStore.open(db.url);
       try {
         return await fn(store);
@@ -421,23 +469,33 @@ describePg('bulig gates on Postgres', () => {
   };
   soakSuite(make);
 
-  it('works while a running kernel holds the writer lock', async () => {
+  it('is refused while another kernel holds the record, and writes nothing; once it lets go the same command goes through', async () => {
     const w = await make();
+    await startSoak(w);
     const db = dbs.at(-1)!;
-    const kernelStore = await PostgresStore.open(db.url);
+    const jobId = await w.seed(async (s) => (await cleanJobs(s, 1))[0]!);
+    const warn = await w.seed((s) => evidence(s, jobId, 'test', ['Unverified: a']));
+    const holder = await PostgresStore.open(db.url);
     try {
-      const jobId = (await cleanJobs(kernelStore, 1))[0]!;
-      const started = await w.run('gates', 'soak', 'start');
-      expect(started.err).toBe('');
-      const warn = await evidence(kernelStore, jobId, 'test', ['Unverified: a']);
-      w.clockAt(await startedAtFrom(kernelStore), DAY);
-      expect((await w.run('gates', 'status')).out).toContain(warn.id);
-      const marked = await w.run('gates', 'mark-false', warn.id, '--reason', 'x');
-      expect(marked.err).toBe('');
-      expect((await w.run('gates', 'status')).out).toContain('marked false: x');
+      for (const argv of [['gates', 'mark-false', warn.id, '--reason', 'x'], ['gates', 'soak', 'start', '--restart']]) {
+        const r = await w.run(...argv);
+        expect(r.code).toBe(2);
+        expect(r.err).toMatch(/only one kernel may do that at a time/);
+        expect(r.err).toContain('Stop serve');
+      }
+      // Look through the holder's own connection: a second writer would be refused too.
+      const log = await holder.eventsAfter(0);
+      expect(log.filter((e) => e.type === 'gates.warning.false')).toHaveLength(0);
+      expect(log.filter((e) => e.type === 'gates.soak.started')).toHaveLength(1);
+      // Reading is never refused.
+      expect((await w.run('gates', 'status')).code).toBe(0);
     } finally {
-      await kernelStore.close();
+      await holder.close();
     }
+    const ok = await w.run('gates', 'mark-false', warn.id, '--reason', 'x');
+    expect(ok.err).toBe('');
+    expect(ok.code).toBe(0);
+    expect(await eventsOf(w, 'gates.warning.false')).toHaveLength(1);
   });
 });
 
@@ -496,5 +554,115 @@ describe('the bar', () => {
     expect(checkBar(7, 10, 1).met).toBe(false);
     expect(checkBar(0, 0, 0).line).toBe('bar not met: needs 7 more days / 10 more jobs');
     expect(checkBar(6, 9, 2).line).toBe('bar not met: needs 1 more day / 1 more job / 2 false warnings found');
+  });
+});
+
+/** A SQLite store that notes where each event append happens: inside a transaction (the kernel's fenced queue) or outside one. */
+function watched(path: string) {
+  const inside: string[] = [];
+  const outside: string[] = [];
+  const store = new SqliteStore(path);
+  // The adapter may hand the store itself to a transaction, so tell the two apart by whether a transaction is running.
+  let open = 0;
+  const transaction = store.transaction.bind(store);
+  store.transaction = async (fn) => {
+    open++;
+    try {
+      return await transaction(fn);
+    } finally {
+      open--;
+    }
+  };
+  const append = store.appendEvent.bind(store);
+  store.appendEvent = (e) => ((open > 0 ? inside : outside).push(e.type), append(e));
+  return { store, inside, outside };
+}
+
+describe('the soak clock starts by itself, through the kernel', () => {
+  const quiet = { debug() {}, info() {}, warn() {}, error() {} };
+  const kernelOn = (store: Store, root: string) => {
+    const k = createKernel({ dbPath: join(root, 'unused.sqlite'), store, plugins: [], enabled: [], logger: quiet });
+    kernels.push(k);
+    return k;
+  };
+
+  it('ensureSoakStarted writes gates.soak.started once, inside the kernel\'s transaction, and never a second one', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'bulig-soak-c-'));
+    dirs.push(root);
+    const { store, inside, outside } = watched(join(root, 'c.sqlite'));
+    const k = kernelOn(store, root);
+    await k.start();
+    expect(await ensureSoakStarted(k, ['worker-claude-code'])).toBeUndefined(); // no gate on: no soak
+    expect(inside).not.toContain('gates.soak.started');
+    const first = await ensureSoakStarted(k, ['gate-evidence', 'gate-promise']);
+    expect(first).toBeDefined();
+    expect(await ensureSoakStarted(k, ['gate-evidence'])).toBeUndefined();
+    expect(inside.filter((t) => t === 'gates.soak.started')).toHaveLength(1);
+    expect(outside.filter((t) => t.startsWith('gates.'))).toEqual([]);
+    const starts = (await k.bus.replay(0)).filter((e) => e.type === 'gates.soak.started');
+    expect(starts).toHaveLength(1);
+    expect(starts[0]).toMatchObject({ source: 'cli', payload: { auto: true } });
+  });
+
+  it('a restarted kernel on the same record does not move the clock, even if it asks twice at once', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'bulig-soak-c-'));
+    dirs.push(root);
+    const path = join(root, 'c.sqlite');
+    const k1 = kernelOn(new SqliteStore(path), root);
+    await k1.start();
+    const [a, b] = await Promise.all([ensureSoakStarted(k1, ['gate-evidence']), ensureSoakStarted(k1, ['gate-evidence'])]);
+    // The second one reads the record before the first has written, but the id is fixed, so it is a replay and writes nothing.
+    expect([a, b].filter(Boolean).length).toBeGreaterThanOrEqual(1);
+    await k1.stop();
+    const k2 = kernelOn(new SqliteStore(path), root);
+    await k2.start();
+    expect(await ensureSoakStarted(k2, ['gate-evidence'])).toBeUndefined();
+    expect((await k2.bus.replay(0)).filter((e) => e.type === 'gates.soak.started')).toHaveLength(1);
+  });
+
+  it('bulig serve with a gate on starts the clock; while it runs, mark-false and soak start --restart are refused with the reason, and work after it stops', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'bulig-soak-s-'));
+    dirs.push(root);
+    const w = sqliteWorld({ enabled: ['channel-cli', 'gate-evidence', 'gate-promise'] });
+    const cwd = join(w.cfgPath, '..');
+    const out: string[] = [];
+    const err: string[] = [];
+    let stop: () => void = () => {};
+    const io: Io = {
+      out: (l) => out.push(l),
+      err: (l) => err.push(l),
+      cwd,
+      home: join(cwd, '..', 'home'),
+      onStop(fn) {
+        stop = fn;
+        return () => {};
+      },
+      servePlugins: [createCliChannel({ write: () => {} }).plugin, gateEvidence, gatePromise],
+    };
+    const done = runCli(['serve'], io);
+    for (let i = 0; i < 200 && !out.some((l) => l.includes('serving')); i++) await new Promise((r) => setTimeout(r, 25));
+    expect(err.join('\n')).toBe('');
+    expect(out.some((l) => l.includes('serving'))).toBe(true);
+
+    expect(await eventsOf(w, 'gates.soak.started')).toHaveLength(1);
+    const refused = await w.run('gates', 'mark-false', 'abc', '--reason', 'x');
+    expect(refused.code).toBe(2);
+    expect(refused.err).toMatch(/only one kernel may do that at a time.*Another bulig process/s);
+    expect(refused.err).toContain('Stop serve');
+    expect((await w.run('gates', 'soak', 'start', '--restart')).code).toBe(2);
+    expect(await eventsOf(w, 'gates.soak.started')).toHaveLength(1);
+
+    stop();
+    expect(await done).toBe(0);
+    const restart = await w.run('gates', 'soak', 'start', '--restart');
+    expect(restart.err).toBe('');
+    expect(await eventsOf(w, 'gates.soak.started')).toHaveLength(2);
+
+    // A second serve on the same record: the clock stays where it was.
+    const again = runCli(['serve'], { ...io, out: (l) => out.push(l) });
+    for (let i = 0; i < 200 && out.filter((l) => l.includes('serving')).length < 2; i++) await new Promise((r) => setTimeout(r, 25));
+    stop();
+    expect(await again).toBe(0);
+    expect(await eventsOf(w, 'gates.soak.started')).toHaveLength(2);
   });
 });

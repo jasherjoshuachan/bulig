@@ -1,0 +1,98 @@
+[Unit]
+Description=Bulig kernel (bulig serve)
+Documentation=https://github.com/jasherjoshuachan/bulig
+# The kernel needs its own Postgres cluster up first. Wants, not Requires: if the cluster restarts, the kernel's lease logic
+# handles the gap and a restart of this unit is not forced.
+After=network-online.target postgresql@16-bulig.service bulig-loopback.service systemd-resolved.service
+Wants=network-online.target postgresql@16-bulig.service systemd-resolved.service
+# The gateway's own loopback address. Without it the worker's packets would carry source 127.0.0.1, which this unit must not accept.
+Requires=bulig-loopback.service
+# No config, no start, and a loud failure (Assert fails the unit; Condition would skip it silently): a missing config would otherwise
+# fall back to a SQLite file and run a second, empty record.
+AssertPathExists=/etc/bulig/config.json
+# A crash loop stops after 10 tries in 5 minutes instead of hammering the database.
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+# The kernel's own user. The worker (which runs Claude Code) is a different user in bulig-worker.service.
+User=bulig
+Group=bulig
+# THE INVARIANT: systemd, not a script, makes /var/lib/bulig and owns it (bulig:bulig, 0700). Root never creates, writes or chowns anything
+# inside it. The kernel creates its own repos/, state and worktrees there as user bulig. ProtectSystem=strict below makes this folder
+# (and only this one) writable.
+StateDirectory=bulig
+StateDirectoryMode=0700
+# Read-only, root-owned. The kernel reads its config from the credential below, so nothing in the working directory matters.
+WorkingDirectory=/opt/bulig/current
+# Everything the kernel reads from outside its own folder comes in as a credential: a root-only file (0600), one thing each, found in
+# $CREDENTIALS_DIRECTORY. The kernel looks for its config at $CREDENTIALS_DIRECTORY/config first (PR #50). It does NOT hold the Claude
+# token: that goes only to bulig-worker.service, a different user. A missing file stops the unit from starting, on purpose.
+LoadCredential=config:/etc/bulig/config.json
+LoadCredential=pg-url:/etc/bulig/pg-url
+LoadCredential=gh-token:/etc/bulig/gh-token
+LoadCredential=worker-tokens:/etc/bulig/worker-tokens
+Environment=HOME=/var/lib/bulig
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/node /opt/bulig/current/packages/cli/bin/bulig.mjs serve
+# Always restart: serve exits non-zero when it loses the lease, and a fresh start resumes from the record.
+Restart=always
+RestartSec=5
+# Give running work time to stop; after that the whole control group is killed.
+TimeoutStopSec=60
+KillMode=control-group
+# Everything the kernel writes (repos, worktrees, state) is private to bulig.
+UMask=0077
+
+# Caps, so a runaway kernel cannot starve client production on the same host. The kernel runs no Claude (the worker unit does), so these
+# are small. Assumed (ADR 0011, item 13), not measured.
+MemoryMax=1G
+CPUQuota=100%
+TasksMax=256
+# Under contention, client services win.
+CPUWeight=50
+Nice=10
+LimitNOFILE=65536
+
+# Hardening (same set as personal-credential-broker, minus what node and git need).
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=true
+PrivateDevices=true
+# The whole filesystem is read-only; the StateDirectory above is the one writable place.
+ProtectSystem=strict
+# /home, /root and /run/user are empty. The kernel's own folder is under /var/lib, outside them.
+ProtectHome=yes
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+# Other users' processes are hidden. ProcSubset=pid is NOT set: node reads /proc/meminfo and /proc/cpuinfo.
+ProtectProc=invisible
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+SystemCallArchitectures=native
+# NETWORK. Other services on this host listen on loopback and on the container bridges with no login of their own, so the kernel
+# reaches only what it needs: its own gateway address (the VPS worker connects to it; with 127.74.3.1 on lo, both ends of the loopback
+# conversation carry it), one Tailscale peer when the Mac worker is set up (a /32 in a root-owned drop-in, bulig.service.d/20-mac-worker.conf,
+# written by set-mac-worker.sh; none until then), and the public internet (GitHub). IPAddressDeny/Allow match ADDRESSES, NOT PORTS, so a service
+# listening on every address is also reachable at 127.74.3.1, with a loopback source (it may treat that as trusted). It reaches Postgres over the unix socket.
+# KNOWN LIMIT: this unit keeps AF_UNIX (the Postgres socket), so it can still reach other tenants' ABSTRACT unix sockets.
+# It runs no worker code (the worker is a different unit with no AF_UNIX); an AppArmor profile (deny unix addr=@**,) is the next step.
+# DNS comes from resolved's upstream list, not the 127.0.0.53 stub (see bulig-worker.service).
+IPAddressDeny=localhost link-local multicast 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7
+IPAddressAllow=127.74.3.1/32
+BindReadOnlyPaths=/run/systemd/resolve/resolv.conf:/etc/resolv.conf
+InaccessiblePaths=-/run/tailscale -/run/snapd.socket -/run/docker.sock -/var/run/docker.sock
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# NOT set on purpose:
+#   MemoryDenyWriteExecute  node's JIT needs writable+executable memory.
+#   /opt/bulig writable     releases are installed by release.sh as root; the service never rewrites its own code.
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,12 @@
+[Unit]
+Description=Weekly Bulig restore drill
+
+[Timer]
+# Sunday 04:30 UTC, well after the 03:15 backup.
+OnCalendar=Sun *-*-* 04:30:00 UTC
+Persistent=true
+RandomizedDelaySec=5m
+Unit=bulig-restore-drill.service
+
+[Install]
+WantedBy=timers.target

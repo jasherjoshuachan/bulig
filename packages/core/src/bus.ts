@@ -18,6 +18,41 @@ export interface Cause {
   handler: string;
   /** Events this run has written so far. The next one takes this number, so two emits of one type in one run get different ids. */
   next: number;
+  /** Stages this run has opened so far. Counted apart from `next`, so opening a stage never moves the id of an event. */
+  nextOpen: number;
+}
+
+/**
+ * A handler run again for an event wrote different content into a place the first run already filled (same event, handler,
+ * position and type). The first content stays, because that is what was delivered. The new content was not written, and this says so.
+ */
+export class ReplayDivergedError extends Error {
+  constructor(
+    public readonly existing: BuligEvent,
+    public readonly wanted: { payload: unknown; jobId: string | undefined },
+  ) {
+    super(
+      `A replayed handler run wrote "${existing.type}" with different content than the first run did, so the first was kept and this was not written ` +
+        `(event ${existing.id}). The handler branched on the record, and the record changed between the runs.`,
+    );
+    this.name = 'ReplayDivergedError';
+  }
+}
+
+/** JSON with object keys sorted, after the round trip a store would give it, so the same content compares equal on both engines. */
+function canonical(value: unknown): string {
+  const sort = (v: unknown): unknown =>
+    Array.isArray(v) ? v.map(sort) : v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).map(([k, x]) => [k, sort(x)])) : v;
+  return JSON.stringify(sort(JSON.parse(JSON.stringify(value ?? null))));
+}
+
+/** True when a replayed emit asked for different content than the stored event holds. A value that cannot be compared is not called different. */
+function differs(input: EmitInput, existing: BuligEvent): boolean {
+  try {
+    return canonical(input.payload) !== canonical(existing.payload) || (input.jobId ?? undefined) !== (existing.jobId ?? undefined);
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -107,7 +142,14 @@ export class Bus {
     const cause = this.currentCause();
     const written = this.queue.run(`emit ${input.type}`, (tx) => this.record(tx, input, cause)).catch((err: unknown) => {
       // A replay is not a failure: the event is already in the log and was delivered then.
-      if (err instanceof ReplayedError) return err.existing;
+      if (err instanceof ReplayedError) {
+        // But if the replayed run now asks for other content in that place, the old content is kept and the difference is said out loud,
+        // where it used to be dropped without a word. Only for an id derived from a cause: a source that names its own id has its own rule.
+        if (cause && input.id === undefined && differs(input, err.existing)) {
+          this.onError(new ReplayDivergedError(err.existing, { payload: input.payload, jobId: input.jobId }), input);
+        }
+        return err.existing;
+      }
       throw err;
     });
     // A caller that waits for the answer (emitCommitted) hears the failure itself; no need to log it as well.
@@ -211,7 +253,7 @@ export class Bus {
       for (const sub of this.subs) {
         if (!matchesPattern(sub.pattern, event.type)) continue;
         try {
-          const cause: Cause = { eventId: event.id, handler: sub.key, next: 0 };
+          const cause: Cause = { eventId: event.id, handler: sub.key, next: 0, nextOpen: 0 };
           const result = this.causes.run(cause, () => sub.handler(event));
           if (result) {
             const tracked: Promise<void> = result.catch((err: unknown) => this.fail(sub, event, err));

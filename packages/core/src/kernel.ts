@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { DEPRECATED_SDK_MAJORS, type BuligEvent, type Logger, type Plugin } from '@bulig/plugin-sdk';
-import { Bus, ReplayedError, type Cause } from './bus.ts';
+import { Bus, ReplayDivergedError, ReplayedError, derivedEventId, type Cause } from './bus.ts';
 import { DEFAULT_EVENT_CAPABILITIES } from './capabilities.ts';
 import { buildContext, selectPlugins, type JobsTx, type KernelJobs, type LoadedPlugin } from './loader.ts';
 import { StoreBrokenError, StoreQueue, type QueueTx } from './queue.ts';
@@ -51,6 +51,9 @@ export interface KernelOptions {
   logger?: Logger;
 }
 
+/** The plugin name the kernel keeps its own notes under in plugin state. A plugin name is lower-case kebab, so no plugin can have this one. */
+const KERNEL_STATE = '$kernel';
+
 const defaultLogger: Logger = {
   debug() {},
   info() {},
@@ -81,6 +84,8 @@ export function createKernel(options: KernelOptions) {
   const bus = new Bus(queue, { ...DEFAULT_EVENT_CAPABILITIES, ...options.eventCapabilities }, (err, input) => {
     // Once the queue is broken one error already said so. Every event after it would only repeat it.
     if (err instanceof StoreBrokenError) return;
+    // Not a failed write: a replayed run wanted different content in a place that was already filled. Said once, in plain words.
+    if (err instanceof ReplayDivergedError) return void logger.error(err.message);
     logger.error(`Could not write event "${input.type}" to the log: it was not written and not delivered`, err);
   });
 
@@ -110,7 +115,22 @@ export function createKernel(options: KernelOptions) {
       return job;
     },
     stages: (jobId) => tx.listStages(jobId),
-    startStage: (jobId, name) => tx.startStage(jobId, name),
+    async startStage(jobId, name) {
+      // Opening a stage writes no event, so a replay cannot find it by event id. A run that opens a stage leaves its key in the record,
+      // in the same task as the stage, so a replay of that run finds the attempt it opened and hands it back instead of opening another.
+      const key = cause ? `open:${derivedEventId(cause.eventId, cause.handler, cause.nextOpen++, `stage.open:${jobId}:${name}`)}` : undefined;
+      if (key) {
+        const known = await tx.getState(KERNEL_STATE, key);
+        const stage = typeof known === 'string' ? await tx.getStage(known) : undefined;
+        if (stage) {
+          logger.info(`A replayed run asked to open "${name}" for job ${jobId}: attempt ${stage.attempt} is the one this run opened, so no new attempt was opened.`);
+          return stage;
+        }
+      }
+      const stage = await tx.startStage(jobId, name);
+      if (key) await tx.setState(KERNEL_STATE, key, stage.id);
+      return stage;
+    },
     finishStage: (id, status, output) => tx.finishStage(id, status, output),
     stageName: async (id) => (await tx.getStage(id))?.name,
   });

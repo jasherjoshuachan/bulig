@@ -55,7 +55,7 @@ A claim is the key to one room. Only one key per room can be out at a time, and 
 
 - **Resume compares wall-clock time.** Fixed in the addendum of 18 Oct 2026: it now compares claim generations.
 - A non-lease break of the queue (a store call stuck past `storeBrokenMs`) stops writing and now stops the heartbeat, but `serve` does not exit for it. Only a lost lease does. A lost lease ends `serve` whichever path found it: the queue marks the break with the `LeaseLostError` as its `cause`, and the kernel passes that on to `onLeaseLost`, guarded so it fires once.
-- A replay rolls back one queue task, not the whole handler run. A replayed run can open a new stage attempt (`startStage` is its own task and writes no event) whose `stage.requested` is then dropped as already done, leaving the attempt running with no worker until the next start. A handler that branches on record state can also write new content into an old (type, ordinal) slot, which is dropped. Nothing redelivers events today; before a standby or redelivery lands (step 4), a replayed run must not open stages, or stage opens must be keyed to their cause.
+- **A replay rolls back one queue task, not the whole handler run.** Fixed in the addendum of 19 Oct 2026: a stage open is keyed to the run that made it, and a replay that writes other content into a filled place is logged.
 
 ## Assumed (to confirm)
 
@@ -115,3 +115,43 @@ Until now `bus.record` never passed an id, so the unique index on `events.id` ne
 15. **In enforce mode, a repeated request is refused if the commit it finds holds files outside the scope the request carries** (`commit.failed` with `outOfScope`, as a new commit would be). The alternative is to hand the commit back and report the files, which would let enforce mode pass out-of-scope files. It also means a repeated request without a valid scope is now refused, where before it got the commit back.
 16. **A lost lease while stopping is logged but not reported to the owner.** The alternative is to keep exit code 1 for it. A real loss during a clean stop (a rival took over while the queue drained) then exits 0 with the error in the log.
 17. **A failed start does not undo what registered.** Plugins that registered before the failure stay subscribed, and the queue keeps its fence, so a late write from one is refused (the lease is gone) and logged, not applied. `serve` exits on the rejected `start()` anyway.
+
+## Addendum, 19 Oct 2026: a replayed run never opens a stage
+
+This closes the known limit "a replay rolls back one queue task, not the whole handler run". It had to be closed before step 4, because the remote worker will redeliver events.
+
+### The problem
+
+A replay (a duplicate derived event id) rolls back the one task that met it. The rest of the handler run goes on. `startStage` is its own task and writes no event, so a replayed run could open a new attempt of a stage, and the `stage.requested` that followed was then dropped as already done. The attempt stayed running with no worker until the next start. A handler that branches on the record could also write other content into a (type, ordinal) slot that was already filled, and that write was dropped without a word.
+
+### Decided: a stage open is keyed to the run that made it
+
+- Inside a handler run, `startStage` takes a key: a hash of the event being handled, the handler, the number of stages this run has opened so far, and the job and stage name. The kernel saves the key and the id of the attempt it opened in the same task, under the plugin name `$kernel` in plugin state. A plugin name is lower-case kebab, so no plugin can read or write that name.
+- If the key is already there and the attempt exists, `startStage` hands that attempt back and opens nothing. This holds whether the attempt is still running or has since finished. It also holds when the first run died after opening the stage and before asking for it: the replay is handed the same attempt, and its `stage.requested` is not a duplicate, so it is written and a worker starts. Within one kernel, nothing is left running without a request (across kernels, see the standby takeover limit below).
+- The count of opened stages is kept apart from the event ordinal, so opening a stage moves no event id. Ids written before this change stay valid.
+- A call outside a handler run (the CLI, a test, anything with no cause) has no key and opens a stage as before.
+- The kernel is still the only writer, and the key rides in the same transaction as the stage, so the two commit together or not at all. No SDK change: the SDK stays at `1.0.0-rc.7`. No schema change: the stores are untouched, and the record format the copy-over tool (step 4) has to read is unchanged.
+
+### Why not "the rest of a replayed run is a replay"
+
+That was the first idea: once a run meets a duplicate, refuse every later write in it. Two things against it.
+- A run only learns it is a replay when an event write meets a duplicate. `startStage` is often the first write of a run, before any event, so the rule would not have seen the case that caused the bug.
+- Refusing means throwing, and `pipeline-dev` turns a thrown error in a handler into a failed job. A harmless redelivery would have failed real jobs.
+
+### Decided: other content in a filled place is kept as it was, and logged
+
+If a replayed run emits the same type at the same position with other content (payload or job), the first content stays, because that is what was delivered. It is not written. Before, this was dropped without a word. Now the kernel logs one error line that names the event ("... wrote ... with different content than the first run did, so the first was kept and this was not written"). Events written at a position the first run never used are written, as for any first run: a replay that branches is not blocked from writing what is new. The handler is told the stored event, as for any replay, so it carries on.
+
+### Known limits (what is still true)
+
+- A replay that branches to a different stage name or type opens or writes that new thing. It is new content, and the run cannot tell it from a first run.
+- `finishStage` and `setStatus` without a changed status are not keyed. Closing a stage twice, or setting a status twice, ends in the same record.
+- One plugin-state row stays per stage open, for the life of the record. It is a few dozen bytes per stage.
+- **Standby takeover.** If a standby kernel redelivers an event before its resume runs, the stored stage key hands back the old attempt even while it is still running under the previous kernel's claim, skipping the takeover startStage would do. The replay would then request that attempt and resume would also open a new one, so two Claude runs could edit one worktree. Before a standby kernel exists: when the key is found but the stage is running under an older claim generation than the current kernel's, open a new attempt (taking the old one over), overwrite the key, and test it. No standby exists in this goal, so this is not built.
+- A worker that is handed a request twice still has to refuse the second one. That is the worker's attempt fence, not the kernel's.
+
+## Assumed (to confirm), added 19 Oct 2026
+
+18. **The key is kept in plugin state, not in a new column.** A `cause_key` column on `stages` would be tidier, but it changes the record that the copy-over tool (PR-E) reads, and it needs a migration on both stores. Moving it later is a one-off copy.
+19. **A replay that writes other content is logged as an error and not written, not written over the first.** The first content is what the subscribers heard. Overwriting it would make the log say something nobody was told.
+20. **The comparison is on payload and job id.** The source is the plugin's name either way, and the type is part of the id. Content that differs only by a lone surrogate or a NUL (the stores rewrite those) may be logged as different when it is not. That costs a log line and nothing else.

@@ -1,0 +1,15 @@
+# TEMPLATE for /etc/bulig/fence-extra-probes.txt. Copy it, fill it in on the server, and install it with
+#     set-secret.sh --fence-extra-probes < filled-in-file
+# The real file is root-owned (0600) and never goes into git: it names what else runs on THIS machine.
+#
+# One probe per line:   expect   sets   name   kind   target
+#   expect  deny (must NOT be reachable from the Bulig units), or known (a limit you accept and want reported)
+#   sets    comma list of: worker kernel build cli-worker cli-kernel   (usually all five; unix and abstract sockets: worker,build,cli-worker)
+#   kind    tcp for host:port, unix for a socket file, abstract for an abstract socket name (without the leading @)
+#
+# Fill it from the machine itself (RUNBOOK, "The extra probes"):
+#     ss -ltnp             one tcp probe for each listener you do not want a Bulig unit to reach: <ADDRESS>:<PORT>
+#     ss -xlp | grep '@'   one abstract probe for each abstract socket that is not Bulig's: <NAME>
+# Replace every <...> placeholder. set-secret.sh refuses a file that still has one, or that has no probe in it.
+deny  worker,kernel,build,cli-worker,cli-kernel  <NAME-1>  tcp       <ADDRESS>:<PORT>
+deny  worker,build,cli-worker                    <NAME-2>  abstract  <ABSTRACT-NAME>

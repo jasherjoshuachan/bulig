@@ -395,6 +395,48 @@ describe('commit.requested', () => {
     expect(git(cwd, 'rev-list', '--count', 'main..HEAD')).toBe('1');
   });
 
+  it('makes one commit per stage attempt: a second request for the same attempt gets the first commit back, even with new changes on disk', async () => {
+    const h = await setup();
+    h.fire('worktree.requested', { repoPath: h.repo, branch: 'bulig/c-3' });
+    const { cwd } = (await h.waitFor('worktree.ready')).payload as { cwd: string };
+    writeFileSync(join(cwd, 'c.txt'), 'c\n');
+    h.fire('commit.requested', { cwd, message: 'build', scope: SCOPE_TXT, stageId: 'attempt-1' });
+    const first = (await h.waitFor('commit.done')).payload as { sha: string };
+    expect(git(cwd, 'log', '-1', '--format=%B')).toContain('Bulig-Stage: attempt-1');
+    h.seen.length = 0;
+    // The request comes again (a restart, a repeated event) and the tree has changed in between.
+    writeFileSync(join(cwd, 'later.txt'), 'later\n');
+    h.fire('commit.requested', { cwd, message: 'build', scope: SCOPE_TXT, stageId: 'attempt-1' });
+    const second = (await h.waitFor('commit.done')).payload as { sha: string };
+    expect(second.sha).toBe(first.sha);
+    expect(git(cwd, 'rev-list', '--count', 'main..HEAD')).toBe('1');
+    expect(git(cwd, 'status', '--porcelain')).toContain('later.txt'); // left alone, not swept into a second commit
+  });
+
+  it('returns the attempt\'s own commit, not the newest one, when a later attempt has committed since', async () => {
+    const h = await setup();
+    h.fire('worktree.requested', { repoPath: h.repo, branch: 'bulig/c-4' });
+    const { cwd } = (await h.waitFor('worktree.ready')).payload as { cwd: string };
+    writeFileSync(join(cwd, 'one.txt'), '1\n');
+    h.fire('commit.requested', { cwd, message: 'build', scope: SCOPE_TXT, stageId: 'attempt-1' });
+    const one = (await h.waitFor('commit.done')).payload as { sha: string };
+    h.seen.length = 0;
+    writeFileSync(join(cwd, 'two.txt'), '2\n');
+    h.fire('commit.requested', { cwd, message: 'test', scope: SCOPE_TXT, stageId: 'attempt-2' });
+    const two = (await h.waitFor('commit.done')).payload as { sha: string };
+    expect(two.sha).not.toBe(one.sha);
+    h.seen.length = 0;
+    h.fire('commit.requested', { cwd, message: 'build', scope: SCOPE_TXT, stageId: 'attempt-1' });
+    expect(((await h.waitFor('commit.done')).payload as { sha: string }).sha).toBe(one.sha);
+    expect(git(cwd, 'rev-list', '--count', 'main..HEAD')).toBe('2');
+  });
+
+  it('refuses a stage id that is not a plain id', async () => {
+    const h = await setup();
+    h.fire('commit.requested', { cwd: h.repo, message: 'x', scope: SCOPE_TXT, stageId: 'a\n\nSigned-off-by: someone' });
+    expect(((await h.waitFor('commit.failed')).payload as { error: string }).error).toMatch(/stageId/);
+  });
+
   it('emits commit.failed when the directory is not a repo', async () => {
     const h = await setup();
     h.fire('commit.requested', { cwd: h.root, message: 'x', scope: SCOPE_TXT });
@@ -1448,6 +1490,41 @@ describe('scope guard on commit.requested', () => {
     expect(r.type).toBe('commit.done');
     expect((r.payload as { outOfScope?: string[] }).outOfScope).toEqual(['test-results/.last-run.json']);
     expect(committed(cwd)).toEqual(['README.md', 'test-results/.last-run.json']);
+  });
+
+  it('a repeated request for a stage attempt that has a commit reports the commit\'s out-of-scope files, as the first answer did', async () => {
+    const h = await setup();
+    const cwd = await worktree(h, 'bulig/s-20b');
+    write(cwd, 'README.md');
+    write(cwd, 'test-results/.last-run.json');
+    const first = await commit(h, cwd, { scope: ['README.md'], scopeMode: 'warn', stageId: 'attempt-w' });
+    expect(first.type).toBe('commit.done');
+    expect((first.payload as { outOfScope?: string[] }).outOfScope).toEqual(['test-results/.last-run.json']);
+    const again = await commit(h, cwd, { scope: ['README.md'], scopeMode: 'warn', stageId: 'attempt-w' });
+    expect(again.type).toBe('commit.done');
+    expect(again.payload).toEqual(first.payload); // same sha, same base, same outOfScope
+  });
+
+  it('a repeated request for a commit that is fully in scope reports no outOfScope', async () => {
+    const h = await setup();
+    const cwd = await worktree(h, 'bulig/s-20c');
+    write(cwd, 'README.md');
+    const first = await commit(h, cwd, { scope: ['README.md'], scopeMode: 'warn', stageId: 'attempt-x' });
+    const again = await commit(h, cwd, { scope: ['README.md'], scopeMode: 'warn', stageId: 'attempt-x' });
+    expect(again.type).toBe('commit.done');
+    expect(again.payload).toEqual(first.payload);
+    expect(again.payload).not.toHaveProperty('outOfScope');
+  });
+
+  it('in enforce mode a repeated request does not hand back a commit that holds files outside the scope it now carries', async () => {
+    const h = await setup();
+    const cwd = await worktree(h, 'bulig/s-20d');
+    write(cwd, 'README.md');
+    write(cwd, 'extra.txt');
+    expect((await commit(h, cwd, { scope: ['README.md', 'extra.txt'], stageId: 'attempt-y' })).type).toBe('commit.done');
+    const again = await commit(h, cwd, { scope: ['README.md'], stageId: 'attempt-y' });
+    expect(again.type).toBe('commit.failed');
+    expect(failure(again).outOfScope).toEqual(['extra.txt']);
   });
 
   it('warn mode still refuses an invalid scope and still never follows a symlink', async () => {

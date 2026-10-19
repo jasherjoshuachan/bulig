@@ -1,7 +1,12 @@
+import { createRequire } from 'node:module';
 import { describe, expect, it } from 'vitest';
 import type { Stage } from '@bulig/plugin-sdk';
+import { SqliteStore, type Store, type StoreTx } from '@bulig/core';
 import { decide, parseVerdict, renderPrompt } from '../src/index.ts';
-import { boot, fakeGithub, fakeHuman, fakeWorker, newDb, raw, stageNames, types, type Script, type Sent, settle } from './harness.ts';
+import { boot, fakeGithub, fakeHuman, fakeWorker, newDb, openApproval, raw, stageNames, types, type Script, type Sent, settle } from './harness.ts';
+
+// better-sqlite3 belongs to @bulig/core, not to this plugin: load it the way core does.
+const Database = createRequire(new URL('../../../packages/core/package.json', import.meta.url))('better-sqlite3') as typeof import('better-sqlite3');
 
 const PASS = 'All good.\nVERDICT: PASS';
 const FAIL = (why: string) => `${why}\nVERDICT: FAIL`;
@@ -50,6 +55,24 @@ describe('happy path', () => {
       'worktree:passed', 'plan:passed', 'critique:passed', 'approve-plan:passed', 'build:passed',
       'test:passed', 'docs:passed', 'review:passed', 'pr:passed', 'approve-merge:passed', 'merge:passed',
     ]);
+  });
+
+  it('every commit request carries the stageId of the stage attempt that is running, so the github plugin can make one commit per attempt', async () => {
+    const r = rig();
+    await r.k.start();
+    await settle(r.k);
+    const job = await jobOf(r.k);
+    await settle(r.k);
+    r.human.grant(job.id, 'plan');
+    await settle(r.k);
+    const commits = r.github.filter((g) => g.type === 'commit.requested').map((g) => g.payload as { stageId?: unknown });
+    expect(commits).toHaveLength(3);
+    for (const c of commits) expect(typeof c.stageId).toBe('string');
+    // the id is the one the worker was asked to run, and the one the stage row has
+    const edits = (await r.k.jobs.stages(job.id)).filter((s) => ['build', 'test', 'docs'].includes(s.name));
+    expect(commits.map((c) => c.stageId)).toEqual(edits.map((s) => s.id));
+    expect(commits.map((c) => c.stageId)).toEqual(r.worker.filter((w) => ['build', 'test', 'docs'].includes(w.stage)).map((w) => w.stageId));
+    expect(new Set(commits.map((c) => c.stageId)).size).toBe(3);
   });
 
   it('uses the strong model for plan, critique and review and the standard one for the rest', async () => {
@@ -563,6 +586,125 @@ describe('resume after a restart', () => {
     expect((await stageNames(second.k, job.id)).filter((s) => s.startsWith('approve-merge'))).toEqual(['approve-merge:passed']);
   });
 
+  it('a stage this kernel is already running is not closed and run a second time when kernel.started comes (a live claim is left alone)', async () => {
+    const r = rig({ build: () => 'hang' });
+    await r.k.start();
+    await settle(r.k);
+    const job = await jobOf(r.k);
+    await settle(r.k);
+    r.human.grant(job.id, 'plan');
+    await settle(r.k);
+    const running = (await r.k.jobs.stages(job.id)).filter((s) => s.name === 'build');
+    expect(running.map((s) => s.status)).toEqual(['running']);
+    // Resume looks at a stage that began after this kernel started. That is a live claim, not the leftovers of a dead kernel.
+    await r.k.bus.emit({ type: 'kernel.started', source: 'kernel', payload: { plugins: [] } });
+    await settle(r.k);
+    expect(r.worker.filter((s) => s.stage === 'build')).toHaveLength(1);
+    expect((await r.k.jobs.stages(job.id)).filter((s) => s.name === 'build').map((s) => `${s.attempt}:${s.status}`)).toEqual(['1:running']);
+    expect((await r.k.jobs.get(job.id))!.status).not.toBe('failed');
+  });
+
+  it('resume goes by claim generation, not by the clock: a stage left by an older kernel is resumed even when its startedAt is in the future', async () => {
+    const db = newDb();
+    const first = rig({}, { hangCommit: true }, {}, db);
+    await first.k.start();
+    await settle(first.k);
+    const job = await jobOf(first.k);
+    await settle(first.k);
+    first.human.grant(job.id, 'plan');
+    await settle(first.k);
+    expect((await first.k.jobs.stages(job.id)).at(-1)).toMatchObject({ name: 'build', status: 'running' });
+    await first.k.stop();
+
+    // The machine that ran the first kernel had a clock far ahead of this one.
+    const file = new Database(db);
+    file.prepare("UPDATE stages SET started_at = '2999-01-01T00:00:00.000Z' WHERE status = 'running'").run();
+    file.close();
+
+    const second = rig({}, {}, {}, db);
+    await second.k.start();
+    await settle(second.k);
+    expect(second.worker.map((w) => w.stage)).toEqual(['build', 'test', 'docs', 'review']);
+    const builds = (await second.k.jobs.stages(job.id)).filter((s) => s.name === 'build');
+    expect(builds.find((s) => s.attempt === 1)).toMatchObject({ status: 'failed', output: { interrupted: true, reason: 'interrupted' } });
+    expect((await second.k.jobs.get(job.id))!.status).toBe('awaiting_approval');
+  });
+
+  it('resume goes by claim generation, not by the clock: a stage this kernel claimed is left alone even when its startedAt is long ago', async () => {
+    const r = rig({ build: () => 'hang' });
+    await r.k.start();
+    await settle(r.k);
+    const job = await jobOf(r.k);
+    await settle(r.k);
+    r.human.grant(job.id, 'plan');
+    await settle(r.k);
+    expect((await r.k.jobs.stages(job.id)).filter((s) => s.name === 'build').map((s) => s.status)).toEqual(['running']);
+    // A clock that was behind when the stage began: by the clock, it looks older than this kernel.
+    const file = new Database(r.db);
+    file.prepare("UPDATE stages SET started_at = '2000-01-01T00:00:00.000Z' WHERE name = 'build'").run();
+    file.close();
+    await r.k.bus.emit({ type: 'kernel.started', source: 'kernel', payload: { plugins: [] } });
+    await settle(r.k);
+    expect(r.worker.filter((s) => s.stage === 'build')).toHaveLength(1);
+    expect((await r.k.jobs.stages(job.id)).filter((s) => s.name === 'build').map((s) => `${s.attempt}:${s.status}`)).toEqual(['1:running']);
+  });
+
+  it('a start that finds its stage already claimed (a rival got in between the read and the write) is a duplicate, not a failure: the job carries on', async () => {
+    // A rival kernel opens plan after this one has read that the job is ready for it and before its own startStage lands.
+    const inner = new SqliteStore(newDb());
+    let armed: string | undefined;
+    let rivalled = false;
+    const store = Object.create(inner) as Store;
+    Object.assign(store, {
+      close: inner.close.bind(inner),
+      abort: inner.abort?.bind(inner),
+      schemaVersion: inner.schemaVersion.bind(inner),
+      acquireLease: inner.acquireLease.bind(inner),
+      renewLease: inner.renewLease.bind(inner),
+      releaseLease: inner.releaseLease.bind(inner),
+      transaction: async <T,>(fn: (tx: StoreTx) => Promise<T>) => {
+        if (armed && !rivalled) {
+          rivalled = true;
+          const jobId = armed;
+          // The rival holds the same generation (a stalled twin of this kernel), so its claim is live, not a leftover to take over.
+          await inner.transaction(async (tx) => {
+            await tx.assertLease('kernel-under-test', 1);
+            await tx.startStage(jobId, 'plan');
+          });
+        }
+        return inner.transaction((tx) =>
+          fn(
+            new Proxy(tx, {
+              get(target, prop) {
+                if (prop === 'listStages') {
+                  return async (jobId: string) => {
+                    const stages = await target.listStages(jobId);
+                    if (stages.some((s) => s.name === 'worktree' && s.status === 'passed') && !stages.some((s) => s.name === 'plan')) armed = jobId;
+                    return stages;
+                  };
+                }
+                const v = (target as unknown as Record<string | symbol, unknown>)[prop];
+                return typeof v === 'function' ? v.bind(target) : v;
+              },
+            }),
+          ),
+        );
+      },
+    });
+    const warnings: string[] = [];
+    const worker: Sent[] = [];
+    const k = boot('unused', [fakeWorker({}, worker), fakeGithub([]), fakeHuman().plugin], {}, { store, leaseHolder: 'kernel-under-test', logger: { debug() {}, info() {}, warn: (m: string) => void warnings.push(m), error() {} } });
+    await k.start();
+    await settle(k);
+    const job = await jobOf(k);
+    await settle(k);
+    expect(rivalled).toBe(true);
+    expect(warnings.join('\n')).toMatch(/already claimed/);
+    expect(worker).toEqual([]); // nothing was asked for twice
+    expect((await k.jobs.get(job.id))!.status).toBe('running'); // and the job was not failed for it
+    expect((await k.jobs.stages(job.id)).map((s) => `${s.name}:${s.status}`)).toEqual(['worktree:passed', 'plan:running']);
+  });
+
   it('a new process continues from the plan approval', async () => {
     const db = newDb();
     const first = rig({}, {}, {}, db);
@@ -579,7 +721,8 @@ describe('resume after a restart', () => {
     // Starting up alone must not run anything: the job is waiting on a person.
     expect(second.worker).toHaveLength(0);
     expect((await second.k.jobs.get(job.id))!.status).toBe('awaiting_approval');
-    second.human.grant(job.id, 'plan');
+    // The card was sent by the first process; the person answers it, so the grant names its stage.
+    second.human.grant(job.id, 'plan', await openApproval(second.k, job.id));
     await settle(second.k);
     expect(second.worker.map((s) => s.stage)).toEqual(['build', 'test', 'docs', 'review']);
     expect(second.worker[0]!.cwd).toBe(`/fake/wt/${job.id}`);
@@ -591,7 +734,7 @@ describe('resume after a restart', () => {
     await third.k.start();
     await settle(third.k);
     expect(third.github).toHaveLength(0);
-    third.human.grant(job.id, 'merge');
+    third.human.grant(job.id, 'merge', await openApproval(third.k, job.id));
     await settle(third.k);
     expect(third.github.map((g) => g.type)).toEqual(['merge.requested']);
     expect(third.github[0]!.payload).toMatchObject({ number: 1, headSha: 'abc1234' });
@@ -938,7 +1081,11 @@ describe('scope guard: the plan declares its scope', () => {
     const job = await jobOf(r.k);
     await settle(r.k);
     const plan = (await r.k.jobs.stages(job.id)).find((s) => s.name === 'plan')!;
-    (await r.k.jobs.finishStage(plan.id, 'passed', { result: 'An old plan with no scope recorded' }));
+    // An older job's plan was written before scopes existed. Write it that way into the file, under the kernel: the store itself
+    // (rightly) refuses to finish a stage twice, so the kernel's API cannot make an old record.
+    const file = new Database(r.db);
+    file.prepare('UPDATE stages SET output = ? WHERE id = ?').run(JSON.stringify({ result: 'An old plan with no scope recorded' }), plan.id);
+    file.close();
     r.human.grant(job.id, 'plan');
     await settle(r.k);
     expect(r.worker.map((s) => s.stage)).toEqual(['plan', 'critique']);

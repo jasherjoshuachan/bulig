@@ -33,6 +33,8 @@ export type Script = Record<string, Reply | Reply[]>;
 
 export interface Sent {
   stage: string;
+  /** The stage attempt the request is for (ADR 0010). */
+  stageId?: string;
   prompt: string;
   model: string;
   mode: string;
@@ -151,8 +153,8 @@ export function fakeGithub(sent: { type: string; payload: unknown }[], b: Github
 
 /** Lets a test play the human: grant, deny. */
 export function fakeHuman() {
-  let granted: (jobId: string, kind: string) => void = () => {};
-  let denied: (jobId: string) => void = () => {};
+  let granted: (jobId: string, kind: string, stageId?: string) => void = () => {};
+  let denied: (jobId: string, stageId?: string) => void = () => {};
   const requests: BuligEvent[] = [];
   const plugin = definePlugin({
     manifest: {
@@ -166,11 +168,22 @@ export function fakeHuman() {
     },
     register(ctx) {
       ctx.on('approval.requested', (e) => void requests.push(e));
-      granted = (jobId, kind) => ctx.emit('approval.granted', { jobId, kind }, jobId);
-      denied = (jobId) => ctx.emit('approval.denied', { jobId }, jobId);
+      granted = (jobId, kind, stageId) => ctx.emit('approval.granted', { jobId, kind, ...(stageId !== undefined && { stageId }) }, jobId);
+      denied = (jobId, stageId) => ctx.emit('approval.denied', { jobId, ...(stageId !== undefined && { stageId }) }, jobId);
     },
   });
-  return { plugin, requests, grant: (j: string, k: string) => granted(j, k), deny: (j: string) => denied(j) };
+  /** The stage id of the newest question for a job (of one kind, when given): what a person answering the card in front of them sends. */
+  const latest = (jobId: string, kind?: string): string | undefined => {
+    const p = requests.filter((e) => e.jobId === jobId && (!kind || (e.payload as { kind?: string }).kind === kind)).at(-1)?.payload as { stageId?: string } | undefined;
+    return p?.stageId;
+  };
+  // `stage` undefined: answer the newest card. A string: answer that stage (an old card). null: name no stage (a card from before stage ids).
+  return {
+    plugin,
+    requests,
+    grant: (j: string, k: string, stage?: string | null) => granted(j, k, stage === undefined ? latest(j, k) : (stage ?? undefined)),
+    deny: (j: string, stage?: string | null) => denied(j, stage === undefined ? latest(j) : (stage ?? undefined)),
+  };
 }
 
 export const logger = { debug() {}, info() {}, warn() {}, error() {} };
@@ -188,6 +201,9 @@ export function boot(dbPath: string, plugins: Plugin[], config: PipelineConfig =
   kernels.push(k);
   return k;
 }
+
+/** The id of the approval stage open now for a job, read from the store: what a person sees when they look again. */
+export const openApproval = async (k: Kernel, jobId: string): Promise<string | undefined> => (await k.jobs.stages(jobId)).find((s) => s.name.startsWith('approve-') && s.status === 'running')?.id;
 
 export const types = async (k: Kernel, jobId: string) => (await k.history(jobId)).map((e) => e.type);
 export const stageNames = async (k: Kernel, jobId: string) => (await k.jobs.stages(jobId)).map((s) => `${s.name}:${s.status}`);

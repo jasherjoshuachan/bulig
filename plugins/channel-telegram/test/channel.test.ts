@@ -2,7 +2,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { SqliteStore } from '@bulig/core';
 import { progressLine, safeLink } from '../src/index.ts';
-import { boot, CHAT, shutdown, startFake, tempDir, TOKEN_ENV } from './harness.ts';
+import { boot, CHAT, shutdown, stageRef, startFake, tempDir, TOKEN_ENV } from './harness.ts';
 import { until } from './fake-telegram.ts';
 
 const STRANGER = 999;
@@ -55,7 +55,7 @@ describe('who may talk to it', () => {
     const b = await boot(fake);
     const job = await b.d.waitForApproval('plan');
     await until(() => fake.of('sendMessage').length === 1, 'approval message');
-    fake.press(STRANGER, 1, 'x', `ap:${job.id}:plan`);
+    fake.press(STRANGER, 1, 'x', `ap:${job.id}:plan:${job.ref}`);
     fake.say(CHAT, '/help');
     await until(() => fake.texts().length === 2, 'help');
     expect(fake.of('answerCallbackQuery')).toEqual([]);
@@ -263,7 +263,7 @@ describe('approvals', () => {
     expect(sent.text).toContain('approval needed: merge');
     expect(sent.text).toContain('https://example.test/pull/7');
     const [row] = sent.reply_markup.inline_keyboard;
-    expect(row.map((x: any) => x.callback_data)).toEqual([`ap:${job.id}:merge`, `dn:${job.id}:merge`]);
+    expect(row.map((x: any) => x.callback_data)).toEqual([`ap:${job.id}:merge:${job.ref}`, `dn:${job.id}:merge:${job.ref}`]);
     expect(row.map((x: any) => x.text)).toEqual(['✅ Approve', '❌ Deny']);
   });
 
@@ -273,14 +273,14 @@ describe('approvals', () => {
     const job = await b.d.waitForApproval('plan');
     await until(() => fake.of('sendMessage').length === 1, 'approval message');
     const sent = fake.of('sendMessage')[0]!.params;
-    fake.press(CHAT, sent.__id, sent.text, `ap:${job.id}:plan`);
+    fake.press(CHAT, sent.__id, sent.text, `ap:${job.id}:plan:${job.ref}`);
     await until(() => fake.of('editMessageText').length === 1, 'edit');
     expect(fake.of('answerCallbackQuery')[0]!.params.text).toBe('Approved');
     const edit = fake.of('editMessageText')[0]!.params;
     expect(edit).toMatchObject({ chat_id: CHAT, message_id: sent.__id, reply_markup: { inline_keyboard: [] } });
     expect(edit.text).toContain('Approved by @jasher');
     expect(b.d.seen.map((e) => [e.type, e.jobId, e.source, e.payload])).toEqual([
-      ['approval.granted', job.id, 'channel-telegram', { jobId: job.id, kind: 'plan' }],
+      ['approval.granted', job.id, 'channel-telegram', { jobId: job.id, kind: 'plan', stageId: job.stageId }],
     ]);
   });
 
@@ -290,7 +290,7 @@ describe('approvals', () => {
     const job = await b.d.waitForApproval('merge');
     await until(() => fake.of('sendMessage').length === 1, 'approval message');
     const sent = fake.of('sendMessage')[0]!.params;
-    fake.press(CHAT, sent.__id, sent.text, `dn:${job.id}:merge`);
+    fake.press(CHAT, sent.__id, sent.text, `dn:${job.id}:merge:${job.ref}`);
     await until(() => fake.of('editMessageText').length === 1, 'edit');
     expect(fake.of('answerCallbackQuery')[0]!.params.text).toBe('Denied');
     expect(fake.of('editMessageText')[0]!.params.text).toContain('Denied by @jasher');
@@ -306,11 +306,37 @@ describe('approvals', () => {
     // The pipeline has moved on: the approval stage is closed and the job is running again.
     for (const s of await b.d.ctx.jobs.stages(job.id)) await b.d.ctx.jobs.finishStage(s.id, 'passed');
     await b.d.ctx.jobs.setStatus(job.id, 'running');
-    fake.press(CHAT, sent.__id, sent.text, `ap:${job.id}:plan`);
+    fake.press(CHAT, sent.__id, sent.text, `ap:${job.id}:plan:${job.ref}`);
     await until(() => fake.of('editMessageText').length === 1, 'edit');
     expect(fake.of('answerCallbackQuery')[0]!.params.text).toMatch(/no longer open/);
     expect(fake.of('editMessageText')[0]!.params.text).toContain('Expired');
     expect(b.d.seen).toEqual([]);
+  });
+
+  it('a card from before stage ids, or one naming another stage, is expired and emits nothing, even while the job waits', async () => {
+    const fake = await startFake();
+    const b = await boot(fake);
+    const job = await b.d.waitForApproval('merge');
+    await until(() => fake.of('sendMessage').length === 1, 'approval message');
+    const sent = fake.of('sendMessage')[0]!.params;
+    const other = stageRef('00000000-0000-4000-9000-0000000000ff');
+    for (const [n, data] of [`ap:${job.id}:merge`, `dn:${job.id}:merge`, `ap:${job.id}:merge:${other}`, `dn:${job.id}:merge:${other}`].entries()) {
+      fake.press(CHAT, sent.__id, sent.text, data);
+      await until(() => fake.of('answerCallbackQuery').length === n + 1, `answer ${n + 1}`);
+      expect(fake.of('answerCallbackQuery')[n]!.params.text).toBe('That approval is no longer open.');
+    }
+    expect(b.d.seen).toEqual([]);
+    expect((await b.d.ctx.jobs.get(job.id))!.status).toBe('awaiting_approval');
+  });
+
+  it('a request that names no approval stage gets a card without buttons', async () => {
+    const fake = await startFake();
+    const b = await boot(fake);
+    const job = await b.d.waitForApproval('plan', { stageId: undefined });
+    await until(() => fake.of('sendMessage').length === 1, 'message');
+    const sent = fake.of('sendMessage')[0]!.params;
+    expect(sent.reply_markup).toBeUndefined();
+    expect(sent.text).toContain(`approval needed: plan, but the request names no approval stage, so there are no buttons. Use /cancel ${job.id.slice(0, 8)}.`);
   });
 
   it('ignores a button with data it does not understand', async () => {
@@ -567,7 +593,7 @@ describe('/status, /history, /cancel', () => {
     const job = await b.d.waitForApproval('plan');
     fake.say(CHAT, `/cancel ${job.id}`);
     await until(() => b.d.seen.length === 1, 'denied event');
-    expect(b.d.seen[0]).toMatchObject({ type: 'approval.denied', payload: { jobId: job.id, kind: 'plan' } });
+    expect(b.d.seen[0]).toMatchObject({ type: 'approval.denied', payload: { jobId: job.id, kind: 'plan', stageId: job.stageId } });
   });
 
   it('/cancel on a finished job changes nothing', async () => {
@@ -869,7 +895,7 @@ describe('per-user approvals in a group chat', () => {
     const job = await b.d.waitForApproval('plan');
     await until(() => fake.of('sendMessage').length === 1, 'approval message');
     const sent = fake.of('sendMessage')[0]!.params;
-    fake.press(CHAT, sent.__id, sent.text, `ap:${job.id}:plan`, { id: MEMBER, username: 'member' });
+    fake.press(CHAT, sent.__id, sent.text, `ap:${job.id}:plan:${job.ref}`, { id: MEMBER, username: 'member' });
     await until(() => fake.of('answerCallbackQuery').length === 1, 'answer');
     expect(fake.of('answerCallbackQuery')[0]!.params.text).toMatch(/not allowed/);
     expect(fake.of('editMessageText')).toEqual([]);
@@ -884,7 +910,7 @@ describe('per-user approvals in a group chat', () => {
     const job = await b.d.waitForApproval('merge');
     await until(() => fake.of('sendMessage').length === 1, 'approval message');
     const sent = fake.of('sendMessage')[0]!.params;
-    fake.press(CHAT, sent.__id, sent.text, `dn:${job.id}:merge`, { id: MEMBER });
+    fake.press(CHAT, sent.__id, sent.text, `dn:${job.id}:merge:${job.ref}`, { id: MEMBER });
     await until(() => fake.of('answerCallbackQuery').length === 1, 'answer');
     expect(fake.of('answerCallbackQuery')[0]!.params.text).toMatch(/not allowed/);
     expect(b.d.seen).toEqual([]);
@@ -896,7 +922,7 @@ describe('per-user approvals in a group chat', () => {
     const job = await b.d.waitForApproval('plan');
     await until(() => fake.of('sendMessage').length === 1, 'approval message');
     const sent = fake.of('sendMessage')[0]!.params;
-    fake.press(CHAT, sent.__id, sent.text, `ap:${job.id}:plan`, { id: OWNER, username: 'owner' });
+    fake.press(CHAT, sent.__id, sent.text, `ap:${job.id}:plan:${job.ref}`, { id: OWNER, username: 'owner' });
     await until(() => fake.of('editMessageText').length === 1, 'edit');
     expect(fake.of('answerCallbackQuery')[0]!.params.text).toBe('Approved');
     expect(b.d.seen.map((e) => e.type)).toEqual(['approval.granted']);
@@ -920,7 +946,7 @@ describe('per-user approvals in a group chat', () => {
     const job = await b.d.waitForApproval('plan');
     await until(() => fake.of('sendMessage').length === 1, 'approval message');
     const sent = fake.of('sendMessage')[0]!.params;
-    fake.press(CHAT, sent.__id, sent.text, `ap:${job.id}:plan`, { id: MEMBER });
+    fake.press(CHAT, sent.__id, sent.text, `ap:${job.id}:plan:${job.ref}`, { id: MEMBER });
     await until(() => fake.of('editMessageText').length === 1, 'edit');
     expect(b.d.seen.map((e) => e.type)).toEqual(['approval.granted']);
   });

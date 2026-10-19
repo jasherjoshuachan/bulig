@@ -48,6 +48,8 @@ export interface LoadOptions {
   /** Reads and writes one plugin's state. The kernel passes the store. */
   state: { get(plugin: string, key: string): Promise<unknown>; set(plugin: string, key: string, value: unknown): Promise<void> };
   logger: Logger;
+  /** The executor-lease generation of this kernel (ADR 0010). Plugins read it as `ctx.generation`. */
+  generation: number;
 }
 
 export interface LoadedPlugin {
@@ -151,6 +153,7 @@ export function buildContext(manifest: Manifest, opts: Omit<LoadOptions, 'plugin
       }
       return opts.bus.emitFrom(name, caps, { type, payload, jobId }, { report: false }).then(() => undefined);
     },
+    generation: opts.generation,
     can: (cap) => caps.has(cap),
     require(cap) {
       if (!caps.has(cap)) {

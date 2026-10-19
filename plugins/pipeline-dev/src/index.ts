@@ -60,6 +60,7 @@ export default definePlugin({
       'worktree.failed',
       'worktree.reset.done',
       'worktree.reset.failed',
+      'worktree.cleaned',
       'commit.done',
       'commit.failed',
       'job.status',
@@ -96,6 +97,13 @@ export default definePlugin({
       throw new Error(`pipeline-dev: stageResultEvent must be "stage.completed", "stage.checked" or "stage.screened", not ${JSON.stringify(resultEvent)}`);
     }
 
+    /**
+     * A running stage whose claim was taken under an older lease generation than this kernel's was left by a kernel that is gone
+     * or lost its lease (ADR 0010). One of this generation is live work and resume leaves it alone. A stage with no claim began
+     * before claims existed, so no live kernel owns it. Generations come from the record, so two machines' clocks do not matter.
+     */
+    const leftByOldKernel = (s: Stage) => s.status === 'running' && (s.claimGeneration ?? 0) < ctx.generation;
+
     /** Edit stages whose Claude run is done and whose commit is still being made. Lost on a restart, which just reruns the stage. */
     const committing = new Map<string, { stage: string; status: 'passed' | 'failed'; out: StageOutput }>();
     const stagesOf = async (jobId: string) => (await ctx.jobs.stages(jobId)).filter((s) => !outputOf(s).interrupted);
@@ -130,23 +138,46 @@ export default definePlugin({
      * or recreate, a worktree that was just removed. Every stage that closes calls this again.
      */
     async function cleanupIfIdle(jobId: string): Promise<void> {
-      if (cfg.keepFailedWorktrees || cleanupAsked.has(jobId)) return;
+      if (cleanupAsked.has(jobId)) return;
       const job = await ctx.jobs.get(jobId);
       if (!job || (job.status !== 'failed' && job.status !== 'cancelled')) return;
       const stages = await ctx.jobs.stages(jobId);
       // A stage waiting for a person has no process behind it, so it does not hold the cleanup up.
       if (stages.some((s) => s.status === 'running' && !s.name.startsWith('approve-'))) return;
-      const wt = lastOf(stages.filter((s) => !outputOf(s).interrupted), 'worktree');
-      const branch = wt?.status === 'passed' ? outputOf(wt).branch : undefined;
+      // A worktree stage whose close timed out is failed but still carries its branch (a stage that failed to make one has none).
+      const branch = outputOf(lastOf(stages.filter((s) => !outputOf(s).interrupted), 'worktree') ?? ({ output: null } as Stage)).branch;
       if (typeof branch !== 'string' || !branch) return;
       cleanupAsked.add(jobId);
+      if (cfg.keepFailedWorktrees) {
+        // Kept on purpose. Say so, so a later restart with the setting off does not remove what was kept.
+        await ctx.state.set(`kept:${jobId}`, true);
+        return;
+      }
+      // Written before the request, so a request that is lost can be told from a job that never had one.
+      await ctx.state.set(`cleanup-asked:${jobId}`, true);
       for (const s of stages) if (s.status === 'running') await ctx.jobs.finishStage(s.id, 'failed', { cancelled: true });
       await announce('worktree.cleanup.requested', { repoPath: job.repo, branch }, jobId);
     }
 
-    /** Close a stage, then see whether that was the last thing holding up a cleanup. */
+    /**
+     * Close a stage as failed with the reason an error gives, and say nothing if that fails too. It is for a handler that
+     * is about to fail the job: a stage left running holds up the cleanup. If this write is lost as well, the stage stays
+     * running until the next start, where resume closes it (the backstop).
+     */
+    async function abandon(s: Stage, err: unknown, output?: unknown): Promise<void> {
+      // Keep what the stage was going to record (a worktree's cwd and branch, a resume's interrupted marker); the error goes on top.
+      const kept = output && typeof output === 'object' && !Array.isArray(output) ? (output as Record<string, unknown>) : {};
+      await ctx.jobs.finishStage(s.id, 'failed', { ...kept, error: err instanceof Error ? err.message : String(err) }).catch(() => {});
+    }
+
+    /** Close a stage, then see whether that was the last thing holding up a cleanup. A close that fails is tried once more as a failure, then the error goes on to fail the job. */
     async function finish(s: Stage, status: 'passed' | 'failed', output?: unknown): Promise<void> {
-      await ctx.jobs.finishStage(s.id, status, output);
+      try {
+        await ctx.jobs.finishStage(s.id, status, output);
+      } catch (err) {
+        await abandon(s, err, output);
+        throw err;
+      }
       await cleanupIfIdle(s.jobId);
     }
 
@@ -155,8 +186,8 @@ export default definePlugin({
      * act on it second; if the second write is lost, nobody is told, and the job would wait for ever. So a lost event
      * is an error here, and the handler's guard turns it into a failed job with this reason. If failing the job cannot be
      * written either, the job stays as it is until the next start, where resume handles a running job. A job that is
-     * waiting for an approval nobody was asked for is not picked up again: re-asking is left out until an approval is
-     * bound to the exact stage it was asked for (an old card must not approve a later question).
+     * waiting for an approval nobody was asked for is not picked up again. Approvals are now bound to the exact stage
+     * they were asked for (ADR 0008), so asking again on start would be safe, but it is not done yet.
      */
     async function announce(type: string, payload: unknown, jobId: string): Promise<void> {
       try {
@@ -171,7 +202,7 @@ export default definePlugin({
       try {
         await announce(type, payload, jobId);
       } catch (err) {
-        await finish(stage, 'failed', { error: err instanceof Error ? err.message : String(err) }).catch(() => {});
+        await abandon(stage, err);
         throw err;
       }
     }
@@ -213,6 +244,11 @@ export default definePlugin({
       try {
         await body();
       } catch (err) {
+        // The stage is already claimed by a live worker (ADR 0010). Asking for it again is a duplicate, not a failure of the job.
+        if (err instanceof Error && err.name === 'StageClaimedError') {
+          ctx.log.warn(`pipeline-dev: ${err.message}. Nothing was started.`);
+          return;
+        }
         const reason = err instanceof Error ? err.message : String(err);
         ctx.log.error(`pipeline-dev: ${reason}`);
         if (jobId) await fail(jobId, reason);
@@ -284,6 +320,8 @@ export default definePlugin({
             'stage.requested',
             {
               stage: name,
+              // The attempt this request is for (ADR 0010). A worker that finds it is no longer the running one does nothing.
+              stageId: opened.id,
               prompt,
               model: STRONG.has(name) ? strong : standard,
               mode: READONLY.has(name) ? 'readonly' : 'edit',
@@ -295,11 +333,11 @@ export default definePlugin({
         }
         case 'approve': {
           const stageName = `approve-${action.which}`;
-          await ctx.jobs.startStage(job.id, stageName);
+          const asked = await ctx.jobs.startStage(job.id, stageName);
           await ctx.jobs.setStatus(job.id, 'awaiting_approval');
           if (action.which === 'plan') {
             const summary = withEvidence(evidenceBlock(stages, ['plan', 'critique']), `PLAN\n${textOf(stages, 'plan')}\n\nCRITIQUE\n${textOf(stages, 'critique')}`);
-            await announce('approval.requested', { jobId: job.id, kind: 'plan', summary: clip(summary, 4000), scope: scopeOf(stages) ?? [] }, job.id);
+            await announce('approval.requested', { jobId: job.id, kind: 'plan', stageId: asked.id, summary: clip(summary, 4000), scope: scopeOf(stages) ?? [] }, job.id);
           } else {
             const pr = outputOf(lastOf(stages, 'pr')!);
             const review = textOf(stages, 'review');
@@ -308,6 +346,7 @@ export default definePlugin({
               {
                 jobId: job.id,
                 kind: 'merge',
+                stageId: asked.id,
                 url: pr.url,
                 headSha: pr.headSha,
                 summary: clip(
@@ -362,8 +401,11 @@ export default definePlugin({
             // the cleanup that was waiting for it can go ahead.
             await attempt(job.id, async () => {
               for (const s of await ctx.jobs.stages(job.id)) {
-                if (s.status === 'running') await finish(s, 'failed', { interrupted: true, reason: 'interrupted', error: 'process stopped mid-stage' });
+                if (leftByOldKernel(s)) await finish(s, 'failed', { interrupted: true, reason: 'interrupted', error: 'process stopped mid-stage' });
               }
+              // A cleanup request that was lost leaves the worktree behind. Ask again until a cleanup is on record (it is safe to repeat).
+              // Only a job whose cleanup was asked for: a worktree kept on purpose, or one from before these records, is left alone.
+              if (!(await ctx.state.get(`cleaned:${job.id}`)) && !(await ctx.state.get(`kept:${job.id}`)) && (await ctx.state.get(`cleanup-asked:${job.id}`))) await cleanupIfIdle(job.id);
             });
             continue;
           }
@@ -372,7 +414,7 @@ export default definePlugin({
             // A stage still marked running belongs to a process that is gone. Mark it, and it runs again.
             let mayHaveHalfDoneEdits = false;
             for (const s of await ctx.jobs.stages(job.id)) {
-              if (s.status !== 'running') continue;
+              if (!leftByOldKernel(s)) continue;
               await finish(s, 'failed', { interrupted: true, reason: 'interrupted', error: 'process stopped mid-stage' });
               if (EDITING.has(s.name)) mayHaveHalfDoneEdits = true;
             }
@@ -446,6 +488,13 @@ export default definePlugin({
       const to = (e.payload as { to?: string } | null)?.to;
       if (!e.jobId || (to !== 'failed' && to !== 'cancelled')) return;
       return guard(e.jobId, () => cleanupIfIdle(e.jobId!));
+    });
+
+    // Remember that the cleanup finished, so a restart can tell a job whose cleanup was lost from one that is done with.
+    ctx.on('worktree.cleaned', (e) => {
+      return guard(e.jobId, async () => {
+        if (e.jobId) await ctx.state.set(`cleaned:${e.jobId}`, true);
+      });
     });
 
     // A channel asks to stop a job. Ending a job needs jobs.write, which only this plugin holds.
@@ -538,18 +587,21 @@ export default definePlugin({
             if (!verdict) out.result = `${result}\n\n(The ${p.stage} stage did not end with a VERDICT line, so it counts as a fail.)`;
           }
         }
-        const live = await ctx.jobs.get(e.jobId);
-        const ended = live?.status === 'failed' || live?.status === 'cancelled';
-        if (!READONLY.has(p.stage as ClaudeStage) && !ended) {
-          // Hold the result until the work is committed.
-          const wt = outputOf(lastOf(await stagesOf(e.jobId), 'worktree')!);
-          committing.set(e.jobId, { stage: p.stage, status, out });
-          const job = await ctx.jobs.get(e.jobId);
-          try {
+        // Until the stage is closed below, a failed read or write here would fail the job and leave the stage running.
+        try {
+          const live = await ctx.jobs.get(e.jobId);
+          const ended = live?.status === 'failed' || live?.status === 'cancelled';
+          if (!READONLY.has(p.stage as ClaudeStage) && !ended) {
+            // Hold the result until the work is committed.
+            const wt = outputOf(lastOf(await stagesOf(e.jobId), 'worktree')!);
+            committing.set(e.jobId, { stage: p.stage, status, out });
+            const job = await ctx.jobs.get(e.jobId);
             await announce(
               'commit.requested',
               {
                 cwd: String(wt.cwd),
+                // The attempt this commit is for (ADR 0010): the github plugin makes one commit per attempt, however often it is asked.
+                stageId: s.id,
                 message: `${job?.title ?? 'work'} (${p.stage})`,
                 scope: scopeOf(await stagesOf(e.jobId)) ?? [],
                 scopeAllow,
@@ -558,13 +610,13 @@ export default definePlugin({
               },
               e.jobId,
             );
-          } catch (err) {
-            // Nothing will answer, so nothing will close this stage. Close it here, or the cleanup that waits for it never runs.
-            committing.delete(e.jobId);
-            await finish(s, 'failed', { error: err instanceof Error ? err.message : String(err) }).catch(() => {});
-            throw err;
+            return;
           }
-          return;
+        } catch (err) {
+          // Nothing will answer, so nothing will close this stage. Close it here, or the cleanup that waits for it never runs.
+          committing.delete(e.jobId);
+          await abandon(s, err);
+          throw err;
         }
         await finish(s, status, out);
         await advance(e.jobId);
@@ -584,10 +636,11 @@ export default definePlugin({
 
     ctx.on('approval.granted', (e) => {
       return guard(e.jobId, async () => {
-        const p = e.payload as { jobId?: string; kind?: string };
+        const p = e.payload as { jobId?: string; kind?: string; stageId?: unknown };
         const jobId = e.jobId ?? p.jobId;
         const s = jobId && p.kind && await runningStage(jobId, `approve-${p.kind}`);
         if (!jobId || !s) return;
+        if (p.stageId !== s.id) return void ignoreStale('grant', jobId, s, p.stageId, e.source);
         await finish(s, 'passed', { grantedBy: e.source });
         await ctx.jobs.setStatus(jobId, 'running');
         await advance(jobId);
@@ -596,14 +649,24 @@ export default definePlugin({
 
     ctx.on('approval.denied', (e) => {
       return guard(e.jobId, async () => {
-        const p = e.payload as { jobId?: string };
+        const p = e.payload as { jobId?: string; stageId?: unknown };
         const jobId = e.jobId ?? p.jobId;
         const s = jobId && (await ctx.jobs.stages(jobId)).find((x) => x.name.startsWith('approve-') && x.status === 'running');
         if (!jobId || !s) return;
+        if (p.stageId !== s.id) return void ignoreStale('deny', jobId, s, p.stageId, e.source);
         await finish(s, 'failed', { deniedBy: e.source });
         await ctx.jobs.setStatus(jobId, 'cancelled');
       });
     });
+
+    /**
+     * A grant or deny must carry the id of the approval stage that is open now. One that names another stage, or none
+     * (a card sent before stage ids existed), was meant for an earlier question. It changes nothing.
+     */
+    function ignoreStale(what: string, jobId: string, s: Stage, ref: unknown, source: string): void {
+      const named = typeof ref === 'string' && ref !== '' ? `stage ${shortLine(ref, 36)}` : 'no stage';
+      ctx.log.warn(`pipeline-dev: ignored a ${what} from ${source} for job ${jobId}: it names ${named}, but the open question is ${s.name} ${s.id}. The card has expired.`);
+    }
 
     ctx.on('pr.opened', (e) => {
       return guard(e.jobId, async () => {

@@ -5,6 +5,8 @@ const J1 = fakeJobId(1);
 const ev = (type: string, payload: unknown = {}) => ({ type, jobId: J1, payload });
 const done = (stage: string, result: string) => ev('stage.completed', { stage, ok: true, result });
 const SCOPE = 'PLAN\nSCOPE:\n- README.md';
+// The fake store numbers stages in the order they open. A grant names the approval stage it answers.
+const stageNo = (n: number) => `00000000-0000-4000-9000-${String(n).padStart(12, '0')}`;
 
 describeConformance('pipeline-dev', {
   strictEmits: true,
@@ -22,7 +24,7 @@ describeConformance('pipeline-dev', {
         ev('worktree.ready', { cwd: '/tmp/none/.worktrees/x', branch: 'bulig/add-a-thing' }),
         done('plan', SCOPE),
         done('critique', 'fine'),
-        ev('approval.granted', { jobId: J1, kind: 'plan' }),
+        ev('approval.granted', { jobId: J1, kind: 'plan', stageId: stageNo(4) }),
         done('build', 'built'),
         ev('commit.done', { sha: 'a1', base: 'b0' }),
         done('test', 'VERDICT: PASS'),
@@ -31,7 +33,7 @@ describeConformance('pipeline-dev', {
         ev('commit.done', { sha: 'a3', base: 'b0' }),
         done('review', 'VERDICT: PASS'),
         ev('pr.opened', { url: 'https://example.test/pr/1', number: 1, headSha: 'a3' }),
-        ev('approval.granted', { jobId: J1, kind: 'merge' }),
+        ev('approval.granted', { jobId: J1, kind: 'merge', stageId: stageNo(10) }),
         ev('pr.merged', { number: 1 }),
       ],
     },

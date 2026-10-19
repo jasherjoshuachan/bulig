@@ -58,12 +58,19 @@ describe('format', () => {
     expect(failed.join('\n')).toContain('outside the approved scope: test-results/.last-run.json');
   });
 
-  it('an approval request shows the summary and the exact commands', () => {
-    const lines = format(ev('approval.requested', { jobId: 'abcdef1234567890', kind: 'plan', summary: 'PLAN\nstep one' }))!;
+  it('an approval request shows the summary and the exact commands, naming its stage', () => {
+    const lines = format(ev('approval.requested', { jobId: 'abcdef1234567890', kind: 'plan', stageId: 'stage-7', summary: 'PLAN\nstep one' }))!;
     expect(lines[0]).toBe('[abcdef12] approval needed: plan');
     expect(lines.join('\n')).toContain('| step one');
-    expect(lines.join('\n')).toContain('bulig approve abcdef1234567890 plan');
-    expect(lines.join('\n')).toContain('bulig deny abcdef1234567890');
+    expect(lines.join('\n')).toContain('bulig approve abcdef1234567890 plan stage-7');
+    expect(lines.join('\n')).toContain('bulig deny abcdef1234567890 stage-7');
+  });
+
+  it('an approval request that names no stage prints no commands and says where to look', () => {
+    const text = format(ev('approval.requested', { jobId: 'abcdef1234567890', kind: 'merge', summary: 'REVIEW' }))!.join('\n');
+    expect(text).not.toContain('bulig approve');
+    expect(text).not.toContain('bulig deny');
+    expect(text).toContain('this request names no approval stage, so no command is printed. See the open stage with: bulig history abcdef1234567890');
   });
 
   it('says nothing for events it does not know', () => {
@@ -136,11 +143,12 @@ describe('channel-cli plugin', () => {
     const { k, channel } = boot(['channel.send:terminal', 'approval.grant']);
     await k.start();
     const job = await channel.submit({ repo: '/r', title: 't' });
-    channel.grant(job.id, 'plan');
-    channel.deny(job.id);
+    channel.grant(job.id, 'plan', 'stage-1');
+    channel.deny(job.id, 'stage-2');
     const mine = (await k.history(job.id)).filter((e) => e.source === 'channel-cli');
     expect(mine.map((e) => e.type)).toEqual(['approval.granted', 'approval.denied']);
-    expect(mine[0]!.payload).toEqual({ jobId: job.id, kind: 'plan' });
+    expect(mine[0]!.payload).toEqual({ jobId: job.id, kind: 'plan', stageId: 'stage-1' });
+    expect(mine[1]!.payload).toEqual({ jobId: job.id, stageId: 'stage-2' });
   });
 
   it('will not start without approval.grant, because it emits approvals', async () => {

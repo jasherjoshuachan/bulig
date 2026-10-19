@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { definePlugin, type BuligEvent, type Job, type Plugin, type PluginContext, type Stage } from '@bulig/plugin-sdk';
@@ -43,6 +44,12 @@ interface Update {
 }
 
 const MAX_TEXT = 4000;
+/**
+ * What a button carries to name its approval stage: 12 characters of a hash of the stage id. Button data is at most 64
+ * bytes, too few for a job id and a whole stage id; ap:<36-char job id>:merge:<12> is 58. A hash, not a prefix, because
+ * stage ids from one store can share their first characters. The channel turns it back into the full id before emitting.
+ */
+const stageRef = (stageId: string): string => createHash('sha256').update(stageId).digest('base64url').slice(0, 12);
 const SUBSCRIPTIONS = [
   'approval.requested',
   'job.status',
@@ -295,12 +302,17 @@ export function createTelegramChannel(options: TelegramChannelOptions = {}): Plu
         const kind = String(p.kind);
         const head = [`[${short(jobId)}] approval needed: ${kind}`];
         if (kind === 'merge' && p.url) head.push(`PR ${one(p.url)}`);
+        // The buttons name this exact approval stage, so a card left over from an earlier question cannot answer a later one.
+        if (typeof p.stageId !== 'string' || p.stageId === '') {
+          ctx.log.warn(`channel-telegram: approval.requested for job ${jobId} names no approval stage, so its card has no buttons`);
+          return sayJob(jobId, `[${short(jobId)}] approval needed: ${kind}, but the request names no approval stage, so there are no buttons. Use /cancel ${short(jobId)}.`);
+        }
         const buttons = {
           reply_markup: {
             inline_keyboard: [
               [
-                { text: '✅ Approve', callback_data: `ap:${jobId}:${kind}` },
-                { text: '❌ Deny', callback_data: `dn:${jobId}:${kind}` },
+                { text: '✅ Approve', callback_data: `ap:${jobId}:${kind}:${stageRef(p.stageId)}` },
+                { text: '❌ Deny', callback_data: `dn:${jobId}:${kind}:${stageRef(p.stageId)}` },
               ],
             ],
           },
@@ -472,7 +484,7 @@ export function createTelegramChannel(options: TelegramChannelOptions = {}): Plu
         const waiting = (await ctx.jobs.stages(job.id)).find((s) => s.name.startsWith('approve-') && s.status === 'running');
         if (waiting) {
           // Same path as pressing Deny, so the pipeline closes the approval stage itself.
-          ctx.emit('approval.denied', { jobId: job.id, kind: waiting.name.slice(8) }, job.id);
+          ctx.emit('approval.denied', { jobId: job.id, kind: waiting.name.slice(8), stageId: waiting.id }, job.id);
         } else {
           // Ending a job needs jobs.write, which the pipeline holds and this channel does not. Ask it.
           ctx.emit('cancel.requested', { jobId: job.id }, job.id);
@@ -560,7 +572,8 @@ export function createTelegramChannel(options: TelegramChannelOptions = {}): Plu
         }
       }
 
-      const CALLBACK = /^(ap|dn):([0-9a-f-]{36}):(plan|merge)$/;
+      // The stage part is optional only so that a card sent before stage ids existed is recognised and told it has expired.
+      const CALLBACK = /^(ap|dn):([0-9a-f-]{36}):(plan|merge)(?::([0-9A-Za-z_-]{12}))?$/;
 
       async function handleButton(q: NonNullable<Update['callback_query']>): Promise<void> {
         const msg = q.message;
@@ -575,7 +588,7 @@ export function createTelegramChannel(options: TelegramChannelOptions = {}): Plu
           return;
         }
         if (!m) return void (await reply('Unknown button.'));
-        const [, action, jobId, kind] = m as unknown as [string, 'ap' | 'dn', string, string];
+        const [, action, jobId, kind, ref] = m as unknown as [string, 'ap' | 'dn', string, string, string | undefined];
         const edit = (note: string) =>
           api.call('editMessageText', {
             chat_id: msg.chat.id,
@@ -585,7 +598,10 @@ export function createTelegramChannel(options: TelegramChannelOptions = {}): Plu
           });
 
         const job = await ctx.jobs.get(jobId);
-        const waiting = job?.status === 'awaiting_approval' && (await ctx.jobs.stages(jobId)).some((s) => s.name === `approve-${kind}` && s.status === 'running');
+        const open = job?.status === 'awaiting_approval' ? (await ctx.jobs.stages(jobId)).find((s) => s.name === `approve-${kind}` && s.status === 'running') : undefined;
+        // The card must name the stage that is open now. A card from an earlier question of the same kind, or from before
+        // stage ids, names another stage or none, and has expired. The pipeline makes the same check and ignores it too.
+        const waiting = open !== undefined && ref !== undefined && stageRef(open.id) === ref;
         if (!waiting) {
           await reply('That approval is no longer open.');
           await edit('Expired: the job is not waiting for this any more.').catch(() => undefined);
@@ -593,11 +609,11 @@ export function createTelegramChannel(options: TelegramChannelOptions = {}): Plu
         }
         const who = q.from?.username ? `@${q.from.username}` : (q.from?.first_name ?? 'you');
         if (action === 'ap') {
-          ctx.emit('approval.granted', { jobId, kind }, jobId);
+          ctx.emit('approval.granted', { jobId, kind, stageId: open.id }, jobId);
           await reply('Approved');
           await edit(`Approved by ${who}`);
         } else {
-          ctx.emit('approval.denied', { jobId, kind }, jobId);
+          ctx.emit('approval.denied', { jobId, kind, stageId: open.id }, jobId);
           await reply('Denied');
           await edit(`Denied by ${who}`);
         }

@@ -77,7 +77,9 @@ for (const adapter of ADAPTERS) {
       const { job, cwd } = await r.newJob();
       const waiting = r.claim(TOKENS.mac);
       const stageId = await r.driver.ask(job, cwd, 'plan', 'readonly', 'You are planning');
-      const got = await waiting;
+      // On a loaded machine opening the stage can outlast one claim window (204); then ask again, as take() does.
+      const first = await waiting;
+      const got = first.status === 204 ? await r.take(TOKENS.mac) : first;
       expect(got.status).toBe(200);
       expect(got.json).toMatchObject({
         jobId: job.id,

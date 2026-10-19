@@ -15,3 +15,4 @@ export { StoreQueue, StoreTimeoutError, StoreClosedError, StoreBrokenError, type
 export { Bus, ReplayDivergedError, ReplayedError, derivedEventId, type Cause, type EmitInput } from './bus.ts';
 export { DEFAULT_EVENT_CAPABILITIES, effectiveCapabilities } from './capabilities.ts';
 export { buildContext, parseManifest, selectPlugins, type JobsTx, type KernelJobs, type LoadedPlugin, type LoadOptions } from './loader.ts';
+export { copySqliteToPostgres, CopyRefusedError, COPY_SCHEMA_VERSION, COPY_TABLES, type CopyOptions, type CopyReport, type CopyTable, type TableComparison } from './copy-sqlite-to-postgres.ts';

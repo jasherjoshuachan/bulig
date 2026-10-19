@@ -70,6 +70,7 @@ export async function runCli(argv: string[], io: Io): Promise<number> {
         return await cmdDeny(rest, io);
       case 'resume':
         return await cmdResume(rest, io);
+      case 'migrate': return await (await import('./migrate.ts')).cmdMigrate(rest, io);
       case 'status':
         return await cmdStatus(rest, io);
       case 'history':

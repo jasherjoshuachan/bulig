@@ -127,7 +127,7 @@ A replay (a duplicate derived event id) rolls back the one task that met it. The
 ### Decided: a stage open is keyed to the run that made it
 
 - Inside a handler run, `startStage` takes a key: a hash of the event being handled, the handler, the number of stages this run has opened so far, and the job and stage name. The kernel saves the key and the id of the attempt it opened in the same task, under the plugin name `$kernel` in plugin state. A plugin name is lower-case kebab, so no plugin can read or write that name.
-- If the key is already there and the attempt exists, `startStage` hands that attempt back and opens nothing. This holds whether the attempt is still running or has since finished. It also holds when the first run died after opening the stage and before asking for it: the replay is handed the same attempt, and its `stage.requested` is not a duplicate, so it is written and a worker starts. Nothing is left running without a request.
+- If the key is already there and the attempt exists, `startStage` hands that attempt back and opens nothing. This holds whether the attempt is still running or has since finished. It also holds when the first run died after opening the stage and before asking for it: the replay is handed the same attempt, and its `stage.requested` is not a duplicate, so it is written and a worker starts. Within one kernel, nothing is left running without a request (across kernels, see the standby takeover limit below).
 - The count of opened stages is kept apart from the event ordinal, so opening a stage moves no event id. Ids written before this change stay valid.
 - A call outside a handler run (the CLI, a test, anything with no cause) has no key and opens a stage as before.
 - The kernel is still the only writer, and the key rides in the same transaction as the stage, so the two commit together or not at all. No SDK change: the SDK stays at `1.0.0-rc.7`. No schema change: the stores are untouched, and the record format the copy-over tool (step 4) has to read is unchanged.
@@ -147,6 +147,7 @@ If a replayed run emits the same type at the same position with other content (p
 - A replay that branches to a different stage name or type opens or writes that new thing. It is new content, and the run cannot tell it from a first run.
 - `finishStage` and `setStatus` without a changed status are not keyed. Closing a stage twice, or setting a status twice, ends in the same record.
 - One plugin-state row stays per stage open, for the life of the record. It is a few dozen bytes per stage.
+- **Standby takeover.** If a standby kernel redelivers an event before its resume runs, the stored stage key hands back the old attempt even while it is still running under the previous kernel's claim, skipping the takeover startStage would do. The replay would then request that attempt and resume would also open a new one, so two Claude runs could edit one worktree. Before a standby kernel exists: when the key is found but the stage is running under an older claim generation than the current kernel's, open a new attempt (taking the old one over), overwrite the key, and test it. No standby exists in this goal, so this is not built.
 - A worker that is handed a request twice still has to refuse the second one. That is the worker's attempt fence, not the kernel's.
 
 ## Assumed (to confirm), added 19 Oct 2026

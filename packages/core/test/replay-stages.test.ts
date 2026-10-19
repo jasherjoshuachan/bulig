@@ -22,7 +22,7 @@ for (const adapter of adapters) {
       const logs: string[] = [];
       const errors: string[] = [];
       const answers: Stage[] = [];
-      const flags = { die: false, branch: false };
+      const flags = { die: false, branch: false, twice: false, otherJob: undefined as string | undefined };
       const logger = {
         debug() {},
         info: (m: string) => void logs.push(m),
@@ -35,8 +35,13 @@ for (const adapter of adapters) {
           ctx.on('demo.go', async (e) => {
             const stage = await ctx.jobs.startStage(e.jobId!, 'build');
             answers.push(stage);
+            if (flags.twice) {
+              // The same stage of the same job, opened a second time by the one run (after the first attempt is closed).
+              if (stage.status === 'running') await ctx.jobs.finishStage(stage.id, 'passed'); // a replay is handed it already closed
+              answers.push(await ctx.jobs.startStage(e.jobId!, 'build'));
+            }
             if (flags.die) throw new Error('died between opening the stage and asking for it');
-            await ctx.emitCommitted('demo.request', { stageId: stage.id, n: flags.branch ? 2 : 1 }, e.jobId);
+            await ctx.emitCommitted('demo.request', { stageId: stage.id, n: flags.branch ? 2 : 1 }, flags.otherJob ?? e.jobId);
             if (flags.branch) await ctx.emitCommitted('demo.extra', { fresh: true }, e.jobId);
           });
           ctx.on('plugin.error', (e) => void errors.push(JSON.stringify(e.payload)));
@@ -127,6 +132,39 @@ for (const adapter of adapters) {
       // A genuinely new place is written, as it would be for a first run.
       expect(events.filter((e) => e.type === 'demo.extra')).toHaveLength(1);
       expect(await k.jobs.stages(job.id)).toHaveLength(1);
+    });
+
+    it('hands a run that opens the same stage of the same job twice two different attempts, and the same two back on a replay', async () => {
+      const store = await adapter.make();
+      const { k, flags, answers, errors } = setup(store);
+      flags.twice = true;
+      await k.start();
+      const job = await k.jobs.create({ repo: 'r', title: 't' });
+      const go = await k.bus.emit({ type: 'demo.go', source: 'test', jobId: job.id });
+      await k.bus.idle();
+      const [one, two] = answers;
+      expect(one!.id).not.toBe(two!.id);
+      expect([one!.attempt, two!.attempt]).toEqual([1, 2]);
+      redeliver(k, go);
+      await k.bus.idle();
+      expect(answers.map((s) => s.id)).toEqual([one!.id, two!.id, one!.id, two!.id]);
+      expect((await k.jobs.stages(job.id)).map((s) => s.attempt)).toEqual([1, 2]); // the replay opened nothing
+      expect(errors).toEqual([]);
+    });
+
+    it('calls a replay that asks for the same payload on another job a different content', async () => {
+      const store = await adapter.make();
+      const { k, flags, logs } = setup(store);
+      await k.start();
+      const job = await k.jobs.create({ repo: 'r', title: 't' });
+      const other = await k.jobs.create({ repo: 'r', title: 'u' });
+      const go = await k.bus.emit({ type: 'demo.go', source: 'test', jobId: job.id });
+      await k.bus.idle();
+      flags.otherJob = other.id;
+      redeliver(k, go);
+      await k.bus.idle();
+      expect(logs.filter((l) => l.includes('different content'))).toHaveLength(1);
+      expect(requests(await k.bus.replay())[0]!.jobId).toBe(job.id); // the first stays
     });
 
     it('opens a stage as usual for a run with no cause, and for a different event', async () => {

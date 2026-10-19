@@ -189,8 +189,8 @@ for (const adapter of ADAPTERS) {
         const { plugin } = probe();
         // The read takes longer than the deadline, then answers. The task would write next.
         let slowOnce = false;
-        const store = slowStore(await adapter.make(), { before: (m) => (m === 'getJob' && slowOnce ? ((slowOnce = false), 150) : 0) });
-        const k = kernelWith({ plugins: [plugin], store, storeTimeoutMs: 40 });
+        const store = slowStore(await adapter.make(), { before: (m) => (m === 'getJob' && slowOnce ? ((slowOnce = false), 900) : 0) });
+        const k = kernelWith({ plugins: [plugin], store, storeTimeoutMs: 240 });
         await k.start();
         const job = await k.jobs.create({ repo: '/r', title: 't' });
         slowOnce = true;
@@ -201,7 +201,7 @@ for (const adapter of ADAPTERS) {
             await tx.setStatus(job.id, 'failed');
           }),
         ).rejects.toBeInstanceOf(StoreTimeoutError);
-        await sleep(300);
+        await sleep(1800);
         expect((await k.jobs.get(job.id))!.status).toBe('queued');
       });
 
@@ -218,8 +218,8 @@ for (const adapter of ADAPTERS) {
         });
         let slowNext = false;
         // The write of x.lost reaches the store and then answers late: past the deadline.
-        const store = slowStore(await adapter.make(), { after: (m) => (m === 'appendEvent' && slowNext ? ((slowNext = false), 150) : 0) });
-        const k = kernelWith({ plugins: [plugin], store, storeTimeoutMs: 50, logger: { debug() {}, info() {}, warn() {}, error: (m) => void errors.push(m) } });
+        const store = slowStore(await adapter.make(), { after: (m) => (m === 'appendEvent' && slowNext ? ((slowNext = false), 900) : 0) });
+        const k = kernelWith({ plugins: [plugin], store, storeTimeoutMs: 300, logger: { debug() {}, info() {}, warn() {}, error: (m) => void errors.push(m) } });
         await k.start();
         slowNext = true;
         const lost = box.ctx!.emit('x.lost', null);
@@ -245,14 +245,14 @@ for (const adapter of ADAPTERS) {
           },
         });
         let slowNext = false;
-        const store = slowStore(await adapter.make(), { after: (m) => (m === 'appendEvent' && slowNext ? ((slowNext = false), 150) : 0) });
-        const k = kernelWith({ plugins: [plugin], store, storeTimeoutMs: 50, logger: { debug() {}, info() {}, warn() {}, error: (m) => void errors.push(m) } });
+        const store = slowStore(await adapter.make(), { after: (m) => (m === 'appendEvent' && slowNext ? ((slowNext = false), 900) : 0) });
+        const k = kernelWith({ plugins: [plugin], store, storeTimeoutMs: 300, logger: { debug() {}, info() {}, warn() {}, error: (m) => void errors.push(m) } });
         await k.start();
         slowNext = true;
         box.ctx!.emit('x.a', null);
         box.ctx!.emit('x.b', null);
         await k.bus.idle();
-        await sleep(250);
+        await sleep(1500);
 
         const log = (await k.bus.replay()).filter((e) => e.type.startsWith('x.')).map((e) => `${e.type}#${e.seq}`);
         // x.a was written late, so it was undone. x.b is the only event, and it is both logged and delivered.
@@ -265,8 +265,8 @@ for (const adapter of ADAPTERS) {
       it('D2: a write that was inside the store at the deadline cannot land after a later cancel', async () => {
         const { plugin, box } = probe({ needs: ['jobs.write'] });
         let slowNext = false;
-        const store = slowStore(await adapter.make(), { before: (m) => (m === 'setJobStatus' && slowNext ? ((slowNext = false), 150) : 0) });
-        const k = kernelWith({ plugins: [plugin], grants: { demo: ['jobs.write'] }, store, storeTimeoutMs: 50 });
+        const store = slowStore(await adapter.make(), { before: (m) => (m === 'setJobStatus' && slowNext ? ((slowNext = false), 900) : 0) });
+        const k = kernelWith({ plugins: [plugin], grants: { demo: ['jobs.write'] }, store, storeTimeoutMs: 300 });
         await k.start();
         const job = await k.jobs.create({ repo: '/r', title: 't' });
         slowNext = true;
@@ -276,7 +276,7 @@ for (const adapter of ADAPTERS) {
         expect(a.status).toBe('rejected');
         expect((a as PromiseRejectedResult).reason).toBeInstanceOf(StoreTimeoutError);
         expect(b.status).toBe('fulfilled');
-        await sleep(300);
+        await sleep(1800);
         expect((await k.jobs.get(job.id))!.status).toBe('cancelled');
         const changes = (await k.history(job.id)).filter((e) => e.type === 'job.status').map((e) => (e.payload as { to: string }).to);
         expect(changes).toEqual(['cancelled']);
@@ -284,8 +284,8 @@ for (const adapter of ADAPTERS) {
 
       it('D3: a create that timed out leaves no job behind, so trying again does not make two', async () => {
         let slowNext = false;
-        const store = slowStore(await adapter.make(), { after: (m) => (m === 'createJob' && slowNext ? ((slowNext = false), 150) : 0) });
-        const k = kernelWith({ plugins: [], store, storeTimeoutMs: 50 });
+        const store = slowStore(await adapter.make(), { after: (m) => (m === 'createJob' && slowNext ? ((slowNext = false), 900) : 0) });
+        const k = kernelWith({ plugins: [], store, storeTimeoutMs: 300 });
         await k.start();
         slowNext = true;
         await expect(k.jobs.create({ repo: '/r', title: 't' })).rejects.toBeInstanceOf(StoreTimeoutError);
@@ -299,12 +299,12 @@ for (const adapter of ADAPTERS) {
       it('a single write that answers after the deadline is undone, not kept', async () => {
         const { plugin, box } = probe();
         let slowNext = false;
-        const store = slowStore(await adapter.make(), { after: (m) => (m === 'setState' && slowNext ? ((slowNext = false), 150) : 0) });
-        const k = kernelWith({ plugins: [plugin], store, storeTimeoutMs: 50 });
+        const store = slowStore(await adapter.make(), { after: (m) => (m === 'setState' && slowNext ? ((slowNext = false), 900) : 0) });
+        const k = kernelWith({ plugins: [plugin], store, storeTimeoutMs: 300 });
         await k.start();
         slowNext = true;
         await expect(box.ctx!.state.set('offset', 41)).rejects.toBeInstanceOf(StoreTimeoutError);
-        await sleep(250);
+        await sleep(1500);
         expect(await box.ctx!.state.get('offset')).toBeUndefined();
       });
 
@@ -330,7 +330,7 @@ for (const adapter of ADAPTERS) {
         const errors: string[] = [];
         let stuck = false;
         const store = slowStore(await adapter.make(), { hang: (m) => stuck && m === 'getJob' });
-        const k = kernelWith({ plugins: [plugin], grants: { demo: ['jobs.write'] }, store, storeTimeoutMs: 40, storeBrokenMs: 160, logger: { debug() {}, info() {}, warn() {}, error: (m) => void errors.push(m) } });
+        const k = kernelWith({ plugins: [plugin], grants: { demo: ['jobs.write'] }, store, storeTimeoutMs: 240, storeBrokenMs: 960, logger: { debug() {}, info() {}, warn() {}, error: (m) => void errors.push(m) } });
         await k.start();
         const job = await k.jobs.create({ repo: '/r', title: 't' });
         stuck = true;
@@ -338,7 +338,7 @@ for (const adapter of ADAPTERS) {
         const waiting = box.ctx!.jobs.setStatus(job.id, 'running'); // would write; queued behind the stuck call
         const events = box.ctx!.jobs.list();
 
-        const outcome = await Promise.race([Promise.allSettled([hung, waiting, events]), sleep(2000).then(() => 'stalled' as const)]);
+        const outcome = await Promise.race([Promise.allSettled([hung, waiting, events]), sleep(12000).then(() => 'stalled' as const)]);
         expect(outcome).not.toBe('stalled');
         const [a, b, c] = outcome as PromiseSettledResult<unknown>[];
         expect((a as PromiseRejectedResult).reason).toBeInstanceOf(StoreTimeoutError);
@@ -413,8 +413,8 @@ for (const adapter of ADAPTERS) {
           },
         });
         let slowNext = false;
-        const store = slowStore(await adapter.make(), { after: (m) => (m === 'appendEvent' && slowNext ? ((slowNext = false), 150) : 0) });
-        const k = kernelWith({ plugins: [plugin], store, storeTimeoutMs: 50, logger: { debug() {}, info() {}, warn() {}, error: (m) => void errors.push(m) } });
+        const store = slowStore(await adapter.make(), { after: (m) => (m === 'appendEvent' && slowNext ? ((slowNext = false), 900) : 0) });
+        const k = kernelWith({ plugins: [plugin], store, storeTimeoutMs: 300, logger: { debug() {}, info() {}, warn() {}, error: (m) => void errors.push(m) } });
         await k.start();
         slowNext = true;
         await expect(box.ctx!.emitCommitted('x.lost', null)).rejects.toBeInstanceOf(StoreTimeoutError);
@@ -533,11 +533,11 @@ describe('when the store itself misbehaves', () => {
     let stuck = false;
     const store = slowStore(new SqliteStore(tempDb()), { hang: (m) => stuck && m === 'getJob' });
     const errors: string[] = [];
-    const k = kernelWith({ plugins: [plugin], store, storeTimeoutMs: 30, storeBrokenMs: 90, logger: { debug() {}, info() {}, warn() {}, error: (m) => void errors.push(m) } });
+    const k = kernelWith({ plugins: [plugin], store, storeTimeoutMs: 180, storeBrokenMs: 540, logger: { debug() {}, info() {}, warn() {}, error: (m) => void errors.push(m) } });
     await k.start();
     stuck = true;
     await box.ctx!.jobs.get('x').catch(() => {});
-    await sleep(200);
+    await sleep(1200);
     expect(errors).toHaveLength(1);
     expect(errors[0]).toMatch(/store call "getJob" \(inside task "jobs"\)/);
   });

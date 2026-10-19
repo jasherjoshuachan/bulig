@@ -35,8 +35,16 @@ for (const adapter of ADAPTERS) {
         return { job, cwd: addWorktree(world.repo, job.id) };
       };
       const claim = (token: string | undefined, workerId = 'mac', slots = 2) => post(boot.url, '/claim', token, { workerId, slots });
+      // A claim for a stage that is known to be waiting. On a loaded machine packing the repository can outlast one claim window, so ask again.
+      const take = async (token: string | undefined, workerId = 'mac', slots = 2) => {
+        for (let i = 0; i < 6; i++) {
+          const res = await claim(token, workerId, slots);
+          if (res.status !== 204) return res;
+        }
+        return claim(token, workerId, slots);
+      };
       const types = (t: string) => driver.events.filter((e) => e.type === t);
-      return { ...boot, world, driver, newJob, claim, types };
+      return { ...boot, world, driver, newJob, claim, take, types };
     }
 
     it('answers 401 with nothing to read to a missing, wrong or borrowed token, on every route, and does not reveal which routes exist', async () => {
@@ -115,7 +123,7 @@ for (const adapter of ADAPTERS) {
       git(cwd, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'earlier stage');
       writeFileSync(join(cwd, 'README.md'), 'hi, edited\n');
       const stageId = await r.driver.ask(job, cwd, 'build', 'edit');
-      const got = (await r.claim(TOKENS.mac)).json;
+      const got = (await r.take(TOKENS.mac)).json;
       const patch = Buffer.from(got.workspace.patch, 'base64').toString('utf8');
       expect(patch).toContain('committed.txt');
       expect(patch).toContain('README.md');
@@ -137,7 +145,7 @@ for (const adapter of ADAPTERS) {
       const r = await rig();
       const { job, cwd } = await r.newJob();
       const stageId = await r.driver.ask(job, cwd, 'build', 'edit');
-      const got = (await r.claim(TOKENS.mac)).json;
+      const got = (await r.take(TOKENS.mac)).json;
       let patch: string;
       if (expected) {
         plant(r.world.clone);
@@ -160,7 +168,7 @@ for (const adapter of ADAPTERS) {
       const r = await rig();
       const { job, cwd } = await r.newJob();
       const stageId = await r.driver.ask(job, cwd, 'review', 'readonly');
-      const got = (await r.claim(TOKENS.mac)).json;
+      const got = (await r.take(TOKENS.mac)).json;
       const change = await patchOf(r.world.clone, { 'sneaky.txt': 'written by a read-only stage\n' });
       const res = await post(r.url, '/result', TOKENS.mac, { stageId, attempt: 1, generation: got.generation, outcome: 'completed', output: { result: 'VERDICT: PASS' }, patch: change });
       expect(res.status).toBe(400);
@@ -170,7 +178,7 @@ for (const adapter of ADAPTERS) {
       // the same result without a patch is fine
       const next = await r.newJob('next');
       const second = await r.driver.ask(next.job, next.cwd, 'review', 'readonly');
-      const got2 = (await r.claim(TOKENS.mac)).json;
+      const got2 = (await r.take(TOKENS.mac)).json;
       expect(got2.stageId).toBe(second);
       expect((await post(r.url, '/result', TOKENS.mac, { stageId: second, attempt: 1, generation: got2.generation, outcome: 'completed', output: { result: 'VERDICT: PASS' } })).status).toBe(200);
     });
@@ -180,7 +188,7 @@ for (const adapter of ADAPTERS) {
       const r = await rig({ hooks: { afterApply: () => { if (fail) { fail = false; throw new Error('the store went away'); } } } });
       const { job, cwd } = await r.newJob();
       const stageId = await r.driver.ask(job, cwd, 'build', 'edit');
-      const got = (await r.claim(TOKENS.mac)).json;
+      const got = (await r.take(TOKENS.mac)).json;
       const change = await patchOf(r.world.clone, { 'src/new.txt': 'new\n' });
       const body = { stageId, attempt: 1, generation: got.generation, outcome: 'completed', output: { result: 'built' }, patch: change };
       expect((await post(r.url, '/result', TOKENS.mac, body)).status).toBe(500);
@@ -198,7 +206,7 @@ for (const adapter of ADAPTERS) {
       const r = await rig({ gateway: { maxPatchBytes: 1024 } });
       const { job, cwd } = await r.newJob();
       const stageId = await r.driver.ask(job, cwd, 'build', 'edit');
-      const got = (await r.claim(TOKENS.mac)).json;
+      const got = (await r.take(TOKENS.mac)).json;
       expect(got.maxPatchBytes).toBe(1024);
       const change = await patchOf(r.world.clone, { 'big.txt': 'x'.repeat(4000) + '\n' });
       const res = await post(r.url, '/result', TOKENS.mac, { stageId, attempt: 1, generation: got.generation, outcome: 'completed', output: { result: 'built' }, patch: change });
@@ -212,7 +220,7 @@ for (const adapter of ADAPTERS) {
       const r = await rig();
       const { job, cwd } = await r.newJob();
       const stageId = await r.driver.ask(job, cwd, 'build', 'edit');
-      const got = (await r.claim(TOKENS.mac)).json;
+      const got = (await r.take(TOKENS.mac)).json;
       const change = await patchOf(r.world.clone, { 'README.md': 'something else entirely\n' });
       writeFileSync(join(cwd, 'README.md'), 'a different edit\n');
       const res = await post(r.url, '/result', TOKENS.mac, { stageId, attempt: 1, generation: got.generation, outcome: 'completed', output: {}, patch: change });
@@ -226,7 +234,7 @@ for (const adapter of ADAPTERS) {
         const r = await rig();
         const { job, cwd } = await r.newJob();
         const stageId = await r.driver.ask(job, cwd, 'plan');
-        const got = (await r.claim(TOKENS.mac)).json;
+        const got = (await r.take(TOKENS.mac)).json;
         const ok = { stageId, attempt: got.attempt, generation: got.generation };
         const bad = [
           { ...ok, attempt: ok.attempt + 1 },
@@ -249,7 +257,7 @@ for (const adapter of ADAPTERS) {
         const r = await rig();
         const { job, cwd } = await r.newJob();
         const stageId = await r.driver.ask(job, cwd, 'plan');
-        const got = (await r.claim(TOKENS.pi, 'pi', 1)).json;
+        const got = (await r.take(TOKENS.pi, 'pi', 1)).json;
         const ids = { stageId, attempt: 1, generation: got.generation };
         // someone else closes the stage (another path of the pipeline, a restart's clean-up)
         await r.driver.ctx().jobs.finishStage(stageId, 'failed', { cancelled: true });
@@ -266,7 +274,7 @@ for (const adapter of ADAPTERS) {
         const r = await rig();
         const { job, cwd } = await r.newJob();
         const first = await r.driver.ask(job, cwd, 'build', 'edit');
-        const old = (await r.claim(TOKENS.mac)).json;
+        const old = (await r.take(TOKENS.mac)).json;
         expect(old.stageId).toBe(first);
         // mac goes quiet. After the loss timeout the kernel closes the attempt and offers the stage again.
         const second = await waitFor(() => r.types('stage.requested').length === 2, 30_000, 'the stage to be offered again').then(() => (r.types('stage.requested')[1]!.payload as { stageId: string }).stageId);
@@ -277,7 +285,7 @@ for (const adapter of ADAPTERS) {
         expect(stages.find((s) => s.id === second)).toMatchObject({ status: 'running', attempt: 2 });
 
         // the new holder
-        const fresh = (await r.claim(TOKENS.pi, 'pi', 1)).json;
+        const fresh = (await r.take(TOKENS.pi, 'pi', 1)).json;
         expect(fresh).toMatchObject({ stageId: second, attempt: 2 });
         // the old worker wakes up and reports: stale, ignored, and its patch is not applied
         const change = await patchOf(r.world.clone, { 'late.txt': 'late\n' });
@@ -299,7 +307,7 @@ for (const adapter of ADAPTERS) {
         const r = await rig({ hooks: { afterFenceRead: () => (armed ? ((armed = false), hold) : undefined) } });
         const { job, cwd } = await r.newJob();
         const first = await r.driver.ask(job, cwd, 'build', 'edit');
-        const got = (await r.claim(TOKENS.mac)).json;
+        const got = (await r.take(TOKENS.mac)).json;
         const change = await patchOf(r.world.clone, { 'late.txt': 'late\n' });
         armed = true;
         const late = post(r.url, '/result', TOKENS.mac, { stageId: first, attempt: 1, generation: got.generation, outcome: 'completed', output: { result: 'late' }, patch: change });
@@ -311,14 +319,14 @@ for (const adapter of ADAPTERS) {
         // the new attempt is still the open one, and still unclaimed work for someone else
         const stages = await r.k.jobs.stages(job.id);
         expect(stages.filter((s) => s.name === 'build').map((s) => `${s.attempt}:${s.status}`)).toEqual(['1:failed', '2:running']);
-        expect((await r.claim(TOKENS.pi, 'pi', 1)).json).toMatchObject({ attempt: 2 });
+        expect((await r.take(TOKENS.pi, 'pi', 1)).json).toMatchObject({ attempt: 2 });
       });
 
       it('a result that takes longer to handle than the loss timeout is not a silent worker: the stage is not taken back mid-write', async () => {
         const r = await rig({ hooks: { afterApply: () => sleep(3500) } }); // the loss timeout is 2 s
         const { job, cwd } = await r.newJob();
         const stageId = await r.driver.ask(job, cwd, 'build', 'edit');
-        const got = (await r.claim(TOKENS.mac)).json;
+        const got = (await r.take(TOKENS.mac)).json;
         const change = await patchOf(r.world.clone, { 'slow.txt': 'slow\n' });
         const res = await post(r.url, '/result', TOKENS.mac, { stageId, attempt: 1, generation: got.generation, outcome: 'completed', output: { result: 'built' }, patch: change });
         expect(res.status).toBe(200);
@@ -332,7 +340,7 @@ for (const adapter of ADAPTERS) {
         const r = await rig();
         const { job, cwd } = await r.newJob();
         const stageId = await r.driver.ask(job, cwd, 'plan');
-        const got = (await r.claim(TOKENS.mac)).json;
+        const got = (await r.take(TOKENS.mac)).json;
         const until = Date.now() + 4500; // more than twice the 2 s loss timeout
         while (Date.now() < until) {
           expect((await post(r.url, '/heartbeat', TOKENS.mac, { stageId, attempt: 1, generation: got.generation })).status).toBe(200);
@@ -348,7 +356,7 @@ for (const adapter of ADAPTERS) {
         await r.claim(TOKENS.mac);
         await waitFor(() => r.types('stage.requested').length === 2, 30_000, 'the re-offer');
         const second = (r.types('stage.requested')[1]!.payload as { stageId: string }).stageId;
-        expect((await r.claim(TOKENS.mac)).json.stageId).toBe(second);
+        expect((await r.take(TOKENS.mac)).json.stageId).toBe(second);
         await waitFor(() => r.types('stage.failed').length === 1, 30_000, 'the stage to fail');
         expect(r.types('stage.requested')).toHaveLength(2);
         expect(r.types('stage.failed')[0]!.payload).toMatchObject({ stage: 'build', error: expect.stringContaining('went silent') });
@@ -360,7 +368,7 @@ for (const adapter of ADAPTERS) {
         const r = await rig();
         const { job, cwd } = await r.newJob();
         const stageId = await r.driver.ask(job, cwd, 'build', 'edit');
-        const got = (await r.claim(TOKENS.mac)).json;
+        const got = (await r.take(TOKENS.mac)).json;
         await r.driver.ctx().jobs.setStatus(job.id, 'running').catch(() => {});
         await r.k.jobs.setStatus(job.id, 'cancelled');
         await waitFor(() => r.types('stage.failed').length === 1, 30_000, 'the stage to close');
@@ -422,11 +430,11 @@ for (const adapter of ADAPTERS) {
         const { job, cwd } = await r.newJob();
         const one = await r.driver.ask(job, cwd, 'plan');
         const two = await r.driver.ask(job, cwd, 'critique');
-        const got = (await r.claim(TOKENS.mac)).json;
+        const got = (await r.take(TOKENS.mac)).json;
         expect(got.stageId).toBe(one);
         expect((await r.claim(TOKENS.mac)).status).toBe(204); // mac has a free slot, but the job's lane is busy
         await post(r.url, '/result', TOKENS.mac, { stageId: one, attempt: 1, generation: got.generation, outcome: 'completed', output: { result: 'x' } });
-        expect((await r.claim(TOKENS.mac)).json.stageId).toBe(two);
+        expect((await r.take(TOKENS.mac)).json.stageId).toBe(two);
       });
 
       it('the in-process worker comes first: a stage goes to it while it has a free slot, and to a remote worker only after', async () => {
@@ -439,7 +447,7 @@ for (const adapter of ADAPTERS) {
         expect(r.types('stage.assigned')[0]!.payload).toMatchObject({ stageId: first, workerId: 'local', cwd: a.cwd, prompt: 'You are planning' });
         // local is full: the next one is for a remote worker
         const second = await r.driver.ask(b.job, b.cwd, 'plan');
-        const got = (await r.claim(TOKENS.mac)).json;
+        const got = (await r.take(TOKENS.mac)).json;
         expect(got.stageId).toBe(second);
         expect(r.types('stage.assigned')).toHaveLength(1);
         // the local stage ends: a free local slot takes the next one, even though a remote worker is waiting
@@ -463,7 +471,7 @@ for (const adapter of ADAPTERS) {
       const r = await rig({ gateway: { maxPatchBytes: 1024 } });
       const { job, cwd } = await r.newJob();
       const stageId = await r.driver.ask(job, cwd, 'plan');
-      const got = (await r.claim(TOKENS.mac)).json;
+      const got = (await r.take(TOKENS.mac)).json;
       const res = await post(r.url, '/result', TOKENS.mac, { stageId, attempt: 1, generation: got.generation, outcome: 'completed', output: { result: 'x'.repeat(9 * 1024 * 1024) } }).catch((e: unknown) => ({ status: 413, json: e }));
       expect(res.status).toBe(413);
       expect((await post(r.url, '/heartbeat', TOKENS.mac, { stageId, attempt: 1, generation: got.generation })).status).toBe(200);

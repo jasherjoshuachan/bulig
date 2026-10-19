@@ -1,8 +1,8 @@
 import type { ChildProcess } from 'node:child_process';
 import { mkdirSync } from 'node:fs';
-import { isIP } from 'node:net';
 import { join } from 'node:path';
 import { buildArgs, buildClaudeEnv, DEFAULT_TIMEOUT_MS, run, terminate, type StageRequest } from '@bulig/worker-claude-code';
+import { isLoopbackOrTailnet } from './address.ts';
 import { CLAIM_PATH, HEARTBEAT_PATH, RESULT_PATH, type Assignment, type ClaimRequest, type HeartbeatRequest, type ResultRequest } from './protocol.ts';
 import { collectChanges, prepareWorkspace, removeWorkspace } from './workspace.ts';
 
@@ -38,6 +38,8 @@ export interface RemoteWorkerOptions {
   maxPatchBytes?: number | undefined;
   /** First wait after a failed call, in ms; it doubles up to 5 s. Default 1000. */
   retryMs?: number | undefined;
+  /** Host names (not addresses) the kernel may be reached at over plain http, such as a MagicDNS name on the tailnet. */
+  allowHttpHosts?: string[] | undefined;
   fetch?: typeof fetch | undefined;
   log?: ((line: string) => void) | undefined;
   /** For tests: act as a worker whose heartbeats do not get through while its Claude carries on. */
@@ -52,10 +54,11 @@ export interface RemoteWorker {
 }
 
 /**
- * The token travels in a header, so the road must be private. Allowed without TLS: this machine, a Tailscale address (WireGuard
- * encrypts it), a *.ts.net name. Anything else must be https.
+ * The token travels in a header, so the road must be private. Allowed without TLS: this machine and a Tailscale address (WireGuard
+ * encrypts the tunnel), written as an IP address or as `localhost`. A name is allowed only when it is listed in `allowHttpHosts`
+ * (for example a MagicDNS name such as box.tailnet.ts.net): a name is not proof of where it points. Anything else must be https.
  */
-export function assertSafeKernelUrl(raw: string): URL {
+export function assertSafeKernelUrl(raw: string, allowHttpHosts: readonly string[] = []): URL {
   let url: URL;
   try {
     url = new URL(raw);
@@ -65,19 +68,15 @@ export function assertSafeKernelUrl(raw: string): URL {
   if (url.protocol === 'https:') return url;
   if (url.protocol !== 'http:') throw new Error('--kernel must start with http:// or https://');
   const host = url.hostname.replace(/^\[|\]$/g, '').toLowerCase();
-  const v4 = isIP(host) === 4 ? host.split('.').map(Number) : undefined;
-  const loopback = host === 'localhost' || host === '::1' || (v4 !== undefined && v4[0] === 127);
-  const tailscale4 = v4 !== undefined && v4[0] === 100 && v4[1]! >= 64 && v4[1]! <= 127;
-  const tailscale6 = isIP(host) === 6 && host.startsWith('fd7a:115c:a1e0:');
-  if (loopback || tailscale4 || tailscale6 || host.endsWith('.ts.net')) return url;
-  throw new Error(`--kernel ${url.origin} is plain http over a network that is not Tailscale or this machine, which would send the token in the clear. Use https, or the Tailscale address.`);
+  if (host === 'localhost' || isLoopbackOrTailnet(host) || allowHttpHosts.map((h) => h.toLowerCase()).includes(host)) return url;
+  throw new Error(`--kernel ${url.origin} is plain http to a host that is not this machine or a Tailscale address, which would send the token in the clear. Use https, the Tailscale address, or name the host with --allow-http-host.`);
 }
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 const SAFE_ID = /^[A-Za-z0-9_-]{1,100}$/;
 
 export function startRemoteWorker(opts: RemoteWorkerOptions): RemoteWorker {
-  const base = assertSafeKernelUrl(opts.kernelUrl);
+  const base = assertSafeKernelUrl(opts.kernelUrl, opts.allowHttpHosts);
   // Made with the process's umask and never chmod-ed, so a shared group's access (umask 0002) is whatever the unit asked for.
   mkdirSync(opts.workdir, { recursive: true });
   const doFetch = opts.fetch ?? fetch;

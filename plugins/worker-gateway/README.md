@@ -8,9 +8,9 @@ Off by default. Enable it for `bulig serve` only: `"enabled": [..., "worker-gate
 
 | key | default | meaning |
 |---|---|---|
-| `listen` | `["127.0.0.1"]` | Addresses to bind: IP literals only. `0.0.0.0` and `::` are refused at start. Use the Tailscale address to take a Mac. |
+| `listen` | `["127.0.0.1"]` | Addresses to bind: IP literals in 127.0.0.0/8, `::1`, 100.64.0.0/10 or fd7a:115c:a1e0::/48 only. `0.0.0.0`, `::`, public and LAN addresses are refused at start. |
 | `port` | `7431` | One port for every address. |
-| `workers` | none | `{ "<id>": { tokenEnv, tokenFile, credential, slots, projects } }`. A token comes from a `credential` (a file in `$CREDENTIALS_DIRECTORY` with `id=token` lines, as systemd `LoadCredential=` makes), a `tokenFile` (one token, owner-readable only), or the variable `tokenEnv` names. A file wins over the variable. |
+| `workers` | none | `{ "<id>": { tokenEnv, tokenFile, credential, slots, projects } }`. A token comes from a `credential` (a file in `$CREDENTIALS_DIRECTORY` with `id=token` lines, as systemd `LoadCredential=` makes), a `tokenFile` (one token; any group or other permission is refused), or the variable `tokenEnv` names. A file wins over the variable. |
 | `localSlots` | `2` | Stages the in-process worker may run at once. `0` sends everything to remote workers. |
 | `workerSlots` | `2` | Default cap per remote worker. |
 | `claimWaitMs` | `25000` | How long a claim is held open before it answers `204`. |
@@ -49,4 +49,4 @@ scripts/worker-with-keychain.sh mac --kernel http://100.x.y.z:7431 --repo /srv/b
 
 Flags: `--token-env <VAR>` or `--token-file <path>` (a systemd credential; owner-readable only), `--claude-token-file <path>` (becomes `CLAUDE_CODE_OAUTH_TOKEN` in Claude's environment only), `--work-dir <dir>` (where stage folders are made; created with the process's umask and never chmod-ed, so a unit with `UMask=0002` makes them group-writable), `--slots`, and one `--repo <kernelPath>=<localClone>` per repository.
 
-`bulig worker` refuses plain `http` to anything that is not this machine or Tailscale. Claude gets an allowlisted environment (PATH, HOME, LANG, TERM, TMPDIR and its own login variables), so the worker's token, the database URL and the GitHub and Telegram tokens never reach it.
+The gateway has no TLS. It relies on the road being private: it will only bind 127.0.0.0/8, `::1` or a Tailscale address (100.64.0.0/10, fd7a:115c:a1e0::/48), where the tunnel (WireGuard) encrypts traffic. `bulig worker` refuses plain `http` to anything else; a MagicDNS name must be named with `--allow-http-host`, or use the Tailscale IP. Claude gets an allowlisted environment (PATH, HOME, LANG, TERM, TMPDIR and its own login variables), so the worker's token, the database URL and the GitHub and Telegram tokens never reach it.

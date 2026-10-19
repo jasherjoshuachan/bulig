@@ -28,8 +28,16 @@ describe('where the endpoint may listen', () => {
     expect(() => assertBindable(address)).toThrow(GatewayConfigError);
   });
 
-  it('accepts named addresses: loopback, a Tailscale address, IPv6', () => {
-    expect(parseGatewayConfig({ listen: ['127.0.0.1', '100.101.102.103', '::1', 'fd7a:115c:a1e0::1'], workers }, env).listen).toHaveLength(4);
+  it.each(['127.0.0.1', '127.5.5.5', '::1', '[::1]', '100.64.0.1', '100.101.102.103', '100.127.255.255', 'fd7a:115c:a1e0::1', 'fd7a:115c:a1e0:ab12::7'])('accepts %s: this machine or the Tailscale tunnel', (address) => {
+    expect(parseGatewayConfig({ listen: [address], workers }, env).listen).toHaveLength(1);
+  });
+
+  it.each([
+    '203.0.113.5', '8.8.8.8', '192.168.1.10', '10.0.0.1', '172.16.0.1', '169.254.1.1', '100.63.255.255', '100.128.0.1', '126.255.255.255', '128.0.0.1',
+    '2001:db8::1', 'fe80::1', 'fd7a:115c:a1e1::1', 'fd7a:115c:a1df::1', 'fc00::1',
+    '::ffff:203.0.113.5', '::ffff:127.0.0.1', '::ffff:100.64.0.1', '::ffff:cb00:7105',
+  ])('refuses %s: it is not this machine or Tailscale, so a token could cross an open network', (address) => {
+    expect(() => parseGatewayConfig({ listen: [address], workers }, env)).toThrow(/neither this machine nor the Tailscale tunnel/);
   });
 
   it('refuses a heartbeat timeout under twice the heartbeat, like the lease', () => {
@@ -102,12 +110,20 @@ describe('worker tokens', () => {
       expect(parseGatewayConfig({ workers: { mac: { tokenFile: f, tokenEnv: 'T1' } } }, env).workers[0]!.token).toBe('file-token-0123456789abc');
     });
 
-    it('a token file anyone can read is refused', () => {
+    it.each([0o644, 0o640, 0o660, 0o604, 0o620, 0o602])('a token file with mode %o is refused: any group or other permission', (mode) => {
       const d = credDir();
       const f = join(d, 'mac.token');
       writeFileSync(f, 'file-token-0123456789abc\n');
-      chmodSync(f, 0o644);
+      chmodSync(f, mode);
       expect(() => parseGatewayConfig({ workers: { mac: { tokenFile: f } } }, env)).toThrow(/readable by its owner only/);
+    });
+
+    it.each([0o600, 0o400])('a token file with mode %o is accepted', (mode) => {
+      const d = credDir();
+      const f = join(d, 'mac.token');
+      writeFileSync(f, 'file-token-0123456789abc\n');
+      chmodSync(f, mode);
+      expect(parseGatewayConfig({ workers: { mac: { tokenFile: f } } }, env).workers[0]!.token).toBe('file-token-0123456789abc');
     });
 
     it('a credential name cannot climb out of the credentials directory', () => {

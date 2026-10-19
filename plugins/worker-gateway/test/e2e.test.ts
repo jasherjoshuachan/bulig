@@ -1,3 +1,6 @@
+import { execFileSync } from 'node:child_process';
+import { chmodSync, existsSync, rmSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 
 // Whole jobs on a loaded machine: give each test room.
@@ -33,6 +36,28 @@ for (const adapter of ADAPTERS) {
       expect(done).toHaveLength(6);
       expect(done.every((e) => (e.payload as { workerId: string }).workerId === 'mac' && e.source === 'worker-gateway')).toBe(true);
       expect(prCreates(rig.world.ghLog)).toBe(1);
+    });
+
+    it('a program named in the repository\'s own config (fsmonitor) is never run by the kernel\'s git, which commits the worker\'s code', async () => {
+      const rig = await bootPipeline(await adapter.open());
+      rig.remote('mac');
+      const marker = join(rig.world.root, 'fsmonitor-ran');
+      const script = join(rig.world.root, 'fsmonitor.sh');
+      writeFileSync(script, `#!/bin/sh\necho ran >> "${marker}"\nexit 1\n`);
+      chmodSync(script, 0o755);
+      git(rig.world.repo, 'config', 'core.fsmonitor', script);
+      // control: plain git in this repository does run it
+      execFileSync('git', ['status'], { cwd: rig.world.repo, env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null' } });
+      expect(existsSync(marker)).toBe(true);
+      rmSync(marker);
+
+      const job = await rig.startJob();
+      rig.human.grant(job.id, 'plan');
+      await waitFor(() => rig.human.asking(job.id, 'merge'), 120_000, 'the merge question');
+      // the kernel made the commit (status, add, commit, push all ran) and the script never ran
+      const branch = git(rig.world.origin, 'branch', '--list', 'bulig/*').replace(/^[* ]+/, '');
+      expect(git(rig.world.origin, 'show', `${branch}:src/multiply.js`)).toContain('a * b');
+      expect(existsSync(marker)).toBe(false);
     });
 
     it('with the in-process worker free, it takes every stage and the remote worker is never used', async () => {

@@ -89,8 +89,15 @@ describe('bulig worker, arguments', () => {
     const viaFile = good.filter((a) => a !== '--token-env' && a !== 'TOK');
     let code = await runCli([...viaFile, '--token-file', f], w.io);
     expect(code).toBe(2);
-    expect(w.err.join('\n')).toMatch(/can be read by anyone/);
+    expect(w.err.join('\n')).toMatch(/group or by anyone/);
     expect(w.err.join('\n')).not.toContain('file-token');
+    w.err.length = 0;
+    for (const mode of [0o640, 0o660, 0o604]) {
+      chmodSync(f, mode);
+      w.err.length = 0;
+      expect(await runCli([...viaFile, '--token-file', f], w.io), mode.toString(8)).toBe(2);
+      expect(w.err.join('\n')).toMatch(/group or by anyone/);
+    }
     w.err.length = 0;
     chmodSync(f, 0o600);
     code = await runCli([...good, '--token-file', f], w.io); // both given

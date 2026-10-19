@@ -156,6 +156,25 @@ for (const adapter of ADAPTERS) {
       expect(git(cwd, 'status', '--porcelain')).toBe('');
     });
 
+    it('changes sent for a stage that may not change files are refused: 400, the stage fails, nothing is applied', async () => {
+      const r = await rig();
+      const { job, cwd } = await r.newJob();
+      const stageId = await r.driver.ask(job, cwd, 'review', 'readonly');
+      const got = (await r.claim(TOKENS.mac)).json;
+      const change = await patchOf(r.world.clone, { 'sneaky.txt': 'written by a read-only stage\n' });
+      const res = await post(r.url, '/result', TOKENS.mac, { stageId, attempt: 1, generation: got.generation, outcome: 'completed', output: { result: 'VERDICT: PASS' }, patch: change });
+      expect(res.status).toBe(400);
+      expect(existsSync(join(cwd, 'sneaky.txt'))).toBe(false);
+      expect(r.types('stage.completed')).toHaveLength(0);
+      expect(r.types('stage.failed')[0]!.payload).toMatchObject({ stage: 'review', error: expect.stringContaining('may not change files') });
+      // the same result without a patch is fine
+      const next = await r.newJob('next');
+      const second = await r.driver.ask(next.job, next.cwd, 'review', 'readonly');
+      const got2 = (await r.claim(TOKENS.mac)).json;
+      expect(got2.stageId).toBe(second);
+      expect((await post(r.url, '/result', TOKENS.mac, { stageId: second, attempt: 1, generation: got2.generation, outcome: 'completed', output: { result: 'VERDICT: PASS' } })).status).toBe(200);
+    });
+
     it('a patch that does not apply fails the stage and leaves the folder as it was', async () => {
       const r = await rig();
       const { job, cwd } = await r.newJob();

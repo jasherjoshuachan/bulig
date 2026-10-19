@@ -17,7 +17,7 @@ function readSecretFile(flag: string, path: string, cwd: string): string {
     throw new ConfigError(`${flag} ${file} does not exist`);
   }
   if (!st.isFile()) throw new ConfigError(`${flag} ${file} is not a regular file`);
-  if (st.mode & 0o004) throw new ConfigError(`${flag} ${file} can be read by anyone. Make it readable by its owner only (chmod 600).`);
+  if (st.mode & 0o077) throw new ConfigError(`${flag} ${file} can be read or written by its group or by anyone. Make it readable by its owner only (chmod 600).`);
   const value = readFileSync(file, 'utf8').replace(/\r?\n$/, '');
   if (!value) throw new ConfigError(`${flag} ${file} is empty`);
   return value;
@@ -38,6 +38,7 @@ export async function cmdWorker(args: string[], io: Io): Promise<number> {
       'claude-token-file': { type: 'string' },
       slots: { type: 'string' },
       repo: { type: 'string', multiple: true },
+      'allow-http-host': { type: 'string', multiple: true },
       'work-dir': { type: 'string' },
       workdir: { type: 'string' },
       'claude-bin': { type: 'string' },
@@ -93,6 +94,7 @@ export async function cmdWorker(args: string[], io: Io): Promise<number> {
     repos,
     workdir: workDir ? resolve(io.cwd, workDir) : join(io.home, '.bulig', 'worker', values.id),
     claudeToken,
+    allowHttpHosts: values['allow-http-host'],
     claudeBin: values['claude-bin'] ?? (typeof claude.claudeBin === 'string' ? claude.claudeBin : undefined),
     timeoutMs: typeof claude.timeoutMs === 'number' ? claude.timeoutMs : undefined,
     extraArgs: strs(claude.extraArgs),

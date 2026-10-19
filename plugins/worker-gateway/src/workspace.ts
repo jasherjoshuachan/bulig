@@ -1,7 +1,7 @@
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { git, text } from './git.ts';
+import { git, gitText as text } from '@bulig/git';
 
 // Moving work between the kernel's job folder and a remote worker's folder. Code travels as a git patch against a commit both
 // sides have (the commit the job branch grew from, which is on the remote). The kernel is the only side that commits: a worker's
@@ -15,9 +15,6 @@ export class WorkspaceError extends Error {
 }
 
 const IDENTITY = ['-c', 'user.name=bulig-worker', '-c', 'user.email=worker@bulig.invalid', '-c', 'commit.gpgsign=false'];
-
-/** A symlink in a patch. Nothing Bulig commits is ever a symlink, and a link planted by one patch could be written through by the next. */
-const SYMLINK_MODE = /^(?:(?:new file|deleted file|new|old) mode 120000|index [0-9a-f]+\.\.[0-9a-f]+ 120000)$/m;
 
 /** The most paths one patch may name; a patch with more is not a stage's work. */
 const MAX_PATHS = 20_000;
@@ -67,10 +64,55 @@ async function pathsOf(dir: string, patch: Buffer): Promise<string[]> {
   return parts.map((p) => p.split('\t').slice(2).join('\t'));
 }
 
-/** Apply a patch to a folder, all or nothing. It refuses symlinks, anything under .git, and paths that climb out of the folder. */
+/** File modes a patch may never create: a symlink, and a gitlink (submodule). Compared as git reports them in an index, not as a patch spells them. */
+const REFUSED_MODES = new Set(['120000', '160000']);
+
+/** The entries of an index as "mode sha stage<TAB>path" lines, keyed by path. */
+async function indexEntries(dir: string, env: NodeJS.ProcessEnv): Promise<Map<string, string>> {
+  const r = await git(dir, ['ls-files', '-s', '-z'], { env, maxOut: 256 * 1024 * 1024 });
+  if (r.code !== 0) throw new WorkspaceError(`git ls-files failed: ${text(r)}`);
+  const out = new Map<string, string>();
+  for (const entry of r.stdout.toString('utf8').split('\0').filter(Boolean)) {
+    const tab = entry.indexOf('\t');
+    out.set(entry.slice(tab + 1), entry.slice(0, tab));
+  }
+  return out;
+}
+
+/**
+ * Ask git what the patch would do, without doing it: apply it to a scratch copy of the folder's index and look at the entries it
+ * created or changed. git has parsed the patch by then (modes are octal, so "0120000" and "120000" are the same thing to git and
+ * different to a regex), and what is checked is the mode git will write. Throws if any entry would be a symlink or a gitlink.
+ */
+async function assertNoSpecialFiles(dir: string, patch: Buffer): Promise<void> {
+  const scratch = await mkdtemp(join(tmpdir(), 'bulig-apply-'));
+  try {
+    const env = { GIT_INDEX_FILE: join(scratch, 'index') };
+    // The folder as it is now (including edits nobody committed), so a patch made against it applies.
+    for (const args of [['read-tree', 'HEAD'], ['add', '-A']]) {
+      const r = await git(dir, args, { env });
+      if (r.code !== 0) throw new WorkspaceError(`git ${args[0]} failed: ${text(r)}`);
+    }
+    const before = await indexEntries(dir, env);
+    const applied = await git(dir, ['apply', '--cached', '--binary', '--whitespace=nowarn', '-'], { env, input: patch });
+    if (applied.code !== 0) throw new WorkspaceError(`the patch did not apply: ${text(applied)}`);
+    for (const [path, entry] of await indexEntries(dir, env)) {
+      if (before.get(path) === entry) continue;
+      const mode = entry.split(' ')[0]!;
+      if (REFUSED_MODES.has(mode)) throw new WorkspaceError(`the patch makes ${JSON.stringify(path.slice(0, 200))} a ${mode === '120000' ? 'symlink' : 'submodule'}, which is never allowed`);
+    }
+  } finally {
+    await rm(scratch, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Apply a patch to a folder, all or nothing. It refuses symlinks and submodules (judged by git's own reading of the patch, see
+ * assertNoSpecialFiles), anything under .git, and paths that climb out of the folder. The real apply also runs with
+ * core.symlinks=false, so a link that somehow got past the checks would be written as a plain file.
+ */
 export async function applyPatch(dir: string, patch: Buffer): Promise<void> {
   if (patch.length === 0) return;
-  if (SYMLINK_MODE.test(patch.toString('latin1'))) throw new WorkspaceError('the patch contains a symlink');
   const paths = await pathsOf(dir, patch);
   if (paths.length > MAX_PATHS) throw new WorkspaceError(`the patch changes ${paths.length} files`);
   for (const p of paths) {
@@ -79,7 +121,8 @@ export async function applyPatch(dir: string, patch: Buffer): Promise<void> {
       throw new WorkspaceError(`the patch names a path it may not touch: ${JSON.stringify(p.slice(0, 200))}`);
     }
   }
-  const r = await git(dir, ['apply', '--binary', '--whitespace=nowarn', '-'], { input: patch });
+  await assertNoSpecialFiles(dir, patch);
+  const r = await git(dir, ['-c', 'core.symlinks=false', 'apply', '--binary', '--whitespace=nowarn', '-'], { input: patch });
   if (r.code !== 0) throw new WorkspaceError(`the patch did not apply: ${text(r)}`);
 }
 
@@ -92,7 +135,7 @@ export async function applyPatch(dir: string, patch: Buffer): Promise<void> {
 export async function prepareWorkspace(clone: string, dir: string, base: string, patch: Buffer | undefined): Promise<void> {
   if ((await git(clone, ['cat-file', '-e', `${base}^{commit}`])).code !== 0) {
     // Not here yet: ask the remote. A worker that cannot reach it says so, and the stage fails with that reason.
-    const f = await git(clone, ['fetch', '--quiet', 'origin']);
+    const f = await git(clone, ['fetch', '--quiet', 'origin'], { ambientConfig: true });
     if (f.code !== 0) throw new WorkspaceError(`could not fetch from origin: ${text(f)}`);
     if ((await git(clone, ['cat-file', '-e', `${base}^{commit}`])).code !== 0) throw new WorkspaceError(`commit ${base.slice(0, 12)} is not in this clone even after a fetch`);
   }

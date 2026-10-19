@@ -3,12 +3,18 @@
   "version": "0.1.0",
   "type": "module",
   "license": "MIT",
-  "exports": { ".": "./src/index.ts", "./client": "./src/client.ts" },
+  "exports": {
+    ".": "./src/index.ts",
+    "./client": "./src/client.ts"
+  },
   "dependencies": {
+    "@bulig/git": "workspace:*",
     "@bulig/plugin-sdk": "workspace:*",
     "@bulig/text": "workspace:*",
     "@bulig/worker-claude-code": "workspace:*",
     "zod": "^4.1.0"
   },
-  "devDependencies": { "@bulig/core": "workspace:*" }
+  "devDependencies": {
+    "@bulig/core": "workspace:*"
+  }
 }

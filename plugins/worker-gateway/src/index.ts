@@ -429,6 +429,12 @@ export function createGateway(options: GatewayOptions = {}): Plugin & { addresse
         const p = a.pending;
         try {
           if (r.outcome === 'completed') {
+            // Only an edit stage changes files. A read-only stage that sends changes is wrong or hostile: fail it, and nothing is applied.
+            if (r.patch && p.payload.mode !== 'edit') {
+              if (!(await failStage(p, `worker "${workerId}" sent changes for a ${p.stage} stage, which may not change files, so they were not applied`))) throw new Error('could not record the failure');
+              finish(a, workerId);
+              return send(res, 400, { error: 'this stage may not send changes' });
+            }
             if (r.patch && !a.applied) {
               const patch = Buffer.from(r.patch, 'base64');
               if (patch.length > cfg.maxPatchBytes) throw new WorkspaceError(`the changes are larger than ${Math.round(cfg.maxPatchBytes / 1024 / 1024)} MiB`);

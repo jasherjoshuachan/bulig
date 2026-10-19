@@ -1,6 +1,7 @@
 import { lstatSync, readFileSync } from 'node:fs';
 import { isIP } from 'node:net';
 import { isAbsolute } from 'node:path';
+import { isLoopbackOrTailnet, isWildcard } from './address.ts';
 import { readCredential } from '@bulig/worker-claude-code';
 import { z } from 'zod';
 
@@ -21,21 +22,19 @@ export class GatewayConfigError extends Error {
   }
 }
 
-/** Addresses that mean "every interface". The endpoint never binds to one: it listens on named addresses only. */
-const WILDCARDS = new Set(['0.0.0.0', '[::]', '[::ffff:0:0]']);
-
 /**
- * Throws for an address the endpoint must not bind. Only IP literals are accepted, so there is no name that could resolve to
- * something wider than it looks. The URL parser writes every spelling of an IPv6 address the same way, so `::`, `0:0:0:0:0:0:0:0`
- * and `::ffff:0.0.0.0` all come out as a wildcard here.
+ * Throws for an address the endpoint must not bind. Only the places a token may safely travel are accepted: this machine (127.0.0.0/8,
+ * ::1) and the Tailscale tunnel (100.64.0.0/10, fd7a:115c:a1e0::/48). Everything else is refused: "every interface" (0.0.0.0, ::),
+ * a public or LAN address, a name. IPv4 written as ::ffff:a.b.c.d is refused too: spell it as IPv4.
  */
 export function assertBindable(address: string): string {
   const bare = address.replace(/%.*$/, '').replace(/^\[|\]$/g, '');
-  const family = isIP(bare);
-  if (family === 0) throw new GatewayConfigError(`listen address ${JSON.stringify(address)} is not an IP address. Use 127.0.0.1 or the Tailscale address, not a name.`);
-  const normal = family === 6 ? new URL(`http://[${bare}]`).hostname : bare;
-  if (WILDCARDS.has(normal)) {
+  if (isIP(bare) === 0) throw new GatewayConfigError(`listen address ${JSON.stringify(address)} is not an IP address. Use 127.0.0.1 or the Tailscale address, not a name.`);
+  if (isWildcard(bare)) {
     throw new GatewayConfigError(`listen address ${JSON.stringify(address)} would accept connections on every interface. Name the address to listen on (127.0.0.1, or the Tailscale address).`);
+  }
+  if (!isLoopbackOrTailnet(bare)) {
+    throw new GatewayConfigError(`listen address ${JSON.stringify(address)} is neither this machine nor the Tailscale tunnel (127.0.0.0/8, ::1, 100.64.0.0/10, fd7a:115c:a1e0::/48), so a worker token could cross an open network. Use one of those.`);
   }
   return bare;
 }
@@ -86,7 +85,7 @@ function readTokenFile(path: string): string | undefined {
     return undefined;
   }
   if (!st.isFile()) throw new GatewayConfigError(`tokenFile ${JSON.stringify(path)} is not a regular file`);
-  if (st.mode & 0o004) throw new GatewayConfigError(`tokenFile ${JSON.stringify(path)} can be read by anyone. Make it readable by its owner only (chmod 600).`);
+  if (st.mode & 0o077) throw new GatewayConfigError(`tokenFile ${JSON.stringify(path)} can be read or written by its group or by anyone. Make it readable by its owner only (chmod 600).`);
   return readFileSync(path, 'utf8').replace(/\r?\n$/, '') || undefined;
 }
 

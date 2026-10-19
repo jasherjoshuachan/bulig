@@ -163,6 +163,25 @@ A gate is an ordinary plugin that needs no capability. It subscribes to the even
 
 Gates chain: `stage.completed -> gate-evidence -> stage.checked -> gate-promise -> stage.screened -> pipeline-dev`. Each gate forwards what it read, so with both on neither drops the other's marks and the pipeline hears one event per stage. The CLI sets `stageResultEvent` to the last gate that is on (`stage.checked` behind `gate-evidence` alone, `stage.screened` behind `gate-promise`), whatever the order in `enabled`.
 
+### Soak counter and the switch to enforce
+
+The gates ship in `warn` mode. Before they are switched to `enforce`, they run for a soak: 7 days and 10 real jobs that reached a gate, with no warning judged wrong. The counter reads the verdicts the gates already leave in the event log.
+
+```
+pnpm bulig gates status                          # days, jobs, verdicts per gate, every warning with its event id, and "bar met" or "bar not met: ..."
+pnpm bulig gates mark-false <event-id> --reason "<text>"   # a warning that was wrong
+pnpm bulig gates soak start --restart            # begin the soak again
+pnpm bulig gates enforce [--force]               # sets gate-evidence and gate-promise to "enforce" in the config file
+```
+
+- **The clock starts by itself.** The first time `serve` starts with a gate on, it writes `gates.soak.started` through the kernel's own queue. A restart of `serve` never moves it. If the record was copied from another machine, it already holds that machine's start: run `soak start --restart` once on the new one.
+- **Only a gate that is on starts it.** A gate that is left out of `enabled`, or switched off with `"enabled": false`, passes everything through and does not start the clock. Days with the gates switched off still count once the clock runs. After turning them back on, run `bulig gates soak start --restart`.
+- **Writes need the kernel to themselves.** `mark-false` and `soak start --restart` start a kernel the way `deny` does, with the same lock and lease, and write through its queue. While `serve` runs they are refused ("only one kernel may do that at a time"): stop `serve`, run the command, start `serve` again. `status` only reads and works at any time.
+- **`--restart`** is for after a gate that warned wrongly was fixed, since a false mark keeps the bar unmet. Only events after the newest start count.
+- **Real jobs.** Every job with a gate verdict since the start counts and is listed with its PR head. Jobs whose title starts with `[synthetic]` (the server deploy's test jobs) are left out, along with their warnings, and `status` says how many.
+- **No commit on a verdict.** The gate events carry no commit SHA: the gates run before the PR exists. `status` shows each job's PR head from its `pr.opened` event instead, and `-` where there is none. That is a known gap.
+- `enforce` refuses until the bar is met unless `--force`. It changes only the two `mode` keys in the config file (the old file is kept as `<config>.bak`, the new one is written atomically) and restarts nothing: a running `serve` has to be restarted to pick it up. Like `mark-false` it writes through its own kernel, so it is refused while `serve` runs. Each time it succeeds it records `gates.enforced` with `forced: true|false` and the bar it was judged on, and `status` shows it, so the record says whether the bar was bypassed.
+
 ### Scope guard
 
 Every plan ends with a block that names the files the job may change:

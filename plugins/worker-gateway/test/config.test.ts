@@ -33,7 +33,7 @@ describe('where the endpoint may listen', () => {
   });
 
   it.each([
-    '203.0.113.5', '8.8.8.8', '192.168.1.10', '10.0.0.1', '172.16.0.1', '169.254.1.1', '100.63.255.255', '100.128.0.1', '126.255.255.255', '128.0.0.1',
+    '203.0.113.5', '8.8.8.8', '192.168.1.10', '10.0.0.1', '172.16.0.1', '169.254.1.1', '100.63.255.255', '100.128.0.1', '126.255.255.255', '128.0.0.1', // scan-forbidden: allow-addresses (refusal boundaries)
     '2001:db8::1', 'fe80::1', 'fd7a:115c:a1e1::1', 'fd7a:115c:a1df::1', 'fc00::1',
     '::ffff:203.0.113.5', '::ffff:127.0.0.1', '::ffff:100.64.0.1', '::ffff:cb00:7105',
   ])('refuses %s: it is not this machine or Tailscale, so a token could cross an open network', (address) => {

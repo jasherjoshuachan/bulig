@@ -12,7 +12,7 @@ describe('assertSafeKernelUrl', () => {
     expect(() => assertSafeKernelUrl(url)).not.toThrow();
   });
 
-  it.each(['http://example.com', 'http://203.0.113.5:7431', 'http://100.128.0.1', 'http://100.63.0.1', 'http://192.168.1.10:7431', 'http://box.tail1234.ts.net:7431', 'http://[::ffff:127.0.0.1]:7431', 'ftp://127.0.0.1', 'nonsense'])('refuses %s: a token must not cross an open network in the clear', (url) => {
+  it.each(['http://example.com', 'http://203.0.113.5:7431', 'http://100.128.0.1', 'http://100.63.0.1', 'http://192.168.1.10:7431', 'http://box.tail1234.ts.net:7431', 'http://[::ffff:127.0.0.1]:7431', 'ftp://127.0.0.1', 'nonsense'])('refuses %s: a token must not cross an open network in the clear', (url) => { // scan-forbidden: allow-addresses (refusal boundaries)
     expect(() => assertSafeKernelUrl(url)).toThrow();
   });
 });

@@ -1,0 +1,161 @@
+#!/usr/bin/env bash
+# Tests for the setup scripts and the guards under them, with a throwaway root and stubbed system tools. They prove:
+#   - a setup script refuses to run while any process of either Bulig user exists, and changes nothing when it refuses;
+#   - setup creates the users with --no-create-home and creates NO folder for either user (systemd does, from StateDirectory=);
+#   - every folder setup makes is root's, under a root-owned parent, with the right mode, and a second run changes nothing;
+#   - a link where a root folder belongs is refused, not followed, and every chown carries -h;
+#   - need_dir refuses a path inside a user's folder, and (as real root) a path with a parent that is not root's or is writable by others.
+# shellcheck disable=SC1091,SC2030,SC2031,SC2154
+set -uo pipefail
+. "$(dirname "${BASH_SOURCE[0]}")/helpers.sh"
+
+stubs="$work/stubs"
+log="$work/log"
+mkdir -p "$stubs" "$log"
+export STUB_LOG="$log"
+
+cat >"$stubs/id" <<'STUB'
+#!/usr/bin/env bash
+if [ "$1" = "-u" ]; then echo 0; exit 0; fi
+for u in ${STUB_USERS:-} $(cat "$STUB_LOG/created-users" 2>/dev/null); do [ "$u" = "$1" ] && exit 0; done
+exit 1
+STUB
+cat >"$stubs/pgrep" <<'STUB'
+#!/usr/bin/env bash
+echo "pgrep $*" >>"$STUB_LOG/calls"
+for u in ${STUB_RUNNING:-}; do [ "$u" = "$2" ] && exit 0; done
+exit 1
+STUB
+cat >"$stubs/useradd" <<'STUB'
+#!/usr/bin/env bash
+echo "useradd $*" >>"$STUB_LOG/calls"
+for a in "$@"; do last="$a"; done
+echo "$last" >>"$STUB_LOG/created-users"
+STUB
+cat >"$stubs/getent" <<'STUB'
+#!/usr/bin/env bash
+name="$2"
+var="STUB_HOME_${name//-/_}"
+echo "$name:x:999:999::${!var:-/var/lib/$name}:/usr/sbin/nologin"
+STUB
+cat >"$stubs/runuser" <<'STUB'
+#!/usr/bin/env bash
+case "$*" in
+  *"--version"*) echo "v22.1.0" ;;
+  *"command -v "*) echo "/usr/bin/${*##*command -v }" ;;
+esac
+STUB
+# chown that records its arguments, and follows a link unless it gets -h (the way the real one does), by leaving a mark in the target.
+cat >"$stubs/chown" <<'STUB'
+#!/usr/bin/env bash
+echo "chown $*" >>"$STUB_LOG/chown"
+h=0; args=()
+for a in "$@"; do if [ "$a" = "-h" ]; then h=1; else args+=("$a"); fi; done
+target="${args[1]}"
+if [ "$h" -eq 0 ] && [ -L "$target" ]; then echo "followed" >"$STUB_LOG/followed"; fi
+exit 0
+STUB
+# stat for need_dir's walk as root: "%u %a" from a table "path owner mode" (default: root 755).
+cat >"$stubs/stat" <<'STUB'
+#!/usr/bin/env bash
+path="${*: -1}"
+while read -r p o m; do
+  if [ "$p" = "$path" ]; then echo "$o $m"; exit 0; fi
+done <"${STUB_STAT_TABLE:-/dev/null}"
+echo "0 755"
+STUB
+chmod +x "$stubs"/*
+export PATH="$stubs:/usr/bin:/bin:/usr/sbin:/sbin"
+
+new_root() { # new_root <dir>: a fake host with the root-owned parents the setup scripts expect
+  rm -rf "${1:?}" "${log:?}"/*
+  mkdir -p "$1/opt" "$1/usr/local/lib" "$1/etc" "$1/var/backups" "$1/var/lib"
+}
+listing() { (cd "$1" && find . | sort); }
+
+root="$work/host"
+export BULIG_DEPLOY_TEST_ROOT="$root"
+su="$deploy/setup-user.sh"
+
+# --- 1. refusals while a user's process exists ---
+echo "setup refuses while a Bulig process exists"
+new_root "$root"
+before="$(listing "$root")"
+export STUB_USERS="bulig bulig-worker"
+export STUB_RUNNING="bulig"
+expect_fail_msg "setup-user.sh refuses while a kernel process exists" "processes of user bulig are running" bash "$su"
+expect_fail_msg "setup-user.sh refuses while a worker process exists" "processes of user bulig-worker are running" env STUB_RUNNING=bulig-worker bash "$su"
+expect_fail_msg "setup-cluster.sh refuses too" "processes of user bulig are running" bash "$deploy/setup-cluster.sh"
+if [ "$(listing "$root")" = "$before" ] && ! grep -q '^useradd' "$log/calls"; then ok "a refusal creates and changes nothing"; else bad "something changed during a refusal: $(listing "$root")"; fi
+if grep -q '^pgrep -u bulig' "$log/calls" && grep -q '^pgrep -u bulig-worker' "$log/calls"; then ok "it asks pgrep about both users by name"; else bad "pgrep calls: $(cat "$log/calls")"; fi
+
+# --- 2. a normal setup ---
+echo "setup-user.sh"
+new_root "$root"
+unset STUB_USERS STUB_RUNNING
+expect_ok "setup runs when no Bulig process exists" bash "$su"
+for pair in "opt/bulig 755" "opt/bulig/releases 755" "usr/local/lib/bulig 755" "etc/bulig 700" "var/backups/bulig 700" "var/lib/bulig-checks 700"; do
+  read -r dir_ want_ <<<"$pair"
+  if [ -d "$root/$dir_" ] && [ "$(mode "$root/$dir_")" = "$want_" ]; then ok "/$dir_ exists with mode $want_"; else bad "/$dir_: $(mode "$root/$dir_" 2>&1)"; fi
+done
+if [ ! -e "$root/var/lib/bulig" ] && [ ! -e "$root/var/lib/bulig-worker" ]; then ok "NO folder was created for either user (systemd makes /var/lib/bulig and /var/lib/bulig-worker)"; else bad "a user folder was created: $(ls "$root/var/lib")"; fi
+if grep -q '^useradd --system --no-create-home --home-dir /var/lib/bulig --shell /usr/sbin/nologin --user-group bulig$' "$log/calls" && grep -q '^useradd --system --no-create-home --home-dir /var/lib/bulig-worker --shell /usr/sbin/nologin --user-group bulig-worker$' "$log/calls"; then ok "both users are made with --system --no-create-home and their /var/lib home"; else bad "useradd calls: $(grep useradd "$log/calls")"; fi
+if grep -q ' -h ' "$log/chown" && ! grep -qv ' -h ' "$log/chown"; then ok "every chown carries -h"; else bad "chown calls: $(cat "$log/chown" 2>&1)"; fi
+if [ ! -e "$log/followed" ]; then ok "no chown followed a link"; else bad "a chown followed a link"; fi
+if [ -z "$(find "$root" -type f -print -quit)" ]; then ok "setup writes no files at all (no placeholder secrets, no config)"; else bad "files created: $(find "$root" -type f)"; fi
+
+# --- 3. a second run changes nothing ---
+after1="$(listing "$root")"
+rm -f "$log/calls"
+export STUB_USERS="bulig bulig-worker"
+expect_ok "a second run works" bash "$su"
+if [ "$(listing "$root")" = "$after1" ] && ! grep -q '^useradd' "$log/calls"; then ok "and changes nothing (no useradd, same folders)"; else bad "second run changed things"; fi
+chmod 755 "$root/etc/bulig"
+bash "$su" >/dev/null 2>&1
+if [ "$(mode "$root/etc/bulig")" = "700" ]; then ok "a loosened root folder is put back to 0700"; else bad "etc/bulig mode $(mode "$root/etc/bulig")"; fi
+expect_fail_msg "a user that exists with another home is refused" "exists with home /home/bulig" env STUB_HOME_bulig=/home/bulig bash "$su"
+
+# --- 4. links where a root folder belongs ---
+echo "links"
+new_root "$root"
+unset STUB_USERS
+victim="$work/victim"
+mkdir -p "$victim"
+chmod 777 "$victim"
+ln -s "$victim" "$root/opt/bulig"
+expect_fail_msg "a link in place of /opt/bulig is refused" "is a link" bash "$su"
+if [ "$(mode "$victim")" = "777" ] && [ -z "$(ls -A "$victim")" ] && [ ! -e "$log/followed" ]; then ok "and it was not followed (the target is unchanged and empty)"; else bad "victim changed: $(mode "$victim") $(ls -A "$victim")"; fi
+rm "$root/opt/bulig"
+mkdir -p "$root/opt/bulig"
+ln -s "$victim" "$root/opt/bulig/releases"
+expect_fail_msg "a link in place of /opt/bulig/releases is refused" "is a link" bash "$su"
+rm "$root/opt/bulig/releases"
+ln -s "$victim" "$root/etc/bulig"
+expect_fail_msg "a link in place of /etc/bulig is refused" "is a link" bash "$su"
+if [ "$(mode "$victim")" = "777" ] && [ -z "$(ls -A "$victim")" ]; then ok "none of the three was followed"; else bad "victim changed"; fi
+rm "$root/etc/bulig"
+# a secret written while /etc/bulig is a link is refused too
+ln -s "$victim" "$root/etc/bulig"
+expect_fail_msg "a secret is not written through a link at /etc/bulig" "is missing (or is a link)" bash -c "echo v | '$deploy/set-secret.sh' --credential pg-url"
+if [ -z "$(ls -A "$victim")" ]; then ok "and nothing landed in the target"; else bad "a secret landed in the link target"; fi
+rm "$root/etc/bulig"
+
+# --- 5. need_dir as real root ---
+echo "need_dir as root"
+real="$work/realish"
+mkdir -p "$real/a/b"
+nd() { env -u BULIG_DEPLOY_TEST_ROOT STUB_STAT_TABLE="$work/stat-table" bash -c ". '$deploy/lib/common.sh'; need_dir '$1'"; }
+: >"$work/stat-table"
+expect_ok "a folder with root-owned, unwritable parents is accepted" nd "$real/a/b"
+printf '%s 998 755\n' "$(cd -P "$real/a" && pwd)" >"$work/stat-table"
+expect_fail_msg "a parent owned by another user is refused" "is not owned by root" nd "$real/a/b"
+printf '%s 0 775\n' "$(cd -P "$real/a" && pwd)" >"$work/stat-table"
+expect_fail_msg "a parent writable by its group is refused" "writable by its group" nd "$real/a/b"
+printf '%s 0 757\n' "$(cd -P "$real/a" && pwd)" >"$work/stat-table"
+expect_fail_msg "a parent writable by anyone is refused" "writable by anyone" nd "$real/a/b"
+printf '%s 0 1707\n' "$(cd -P "$real" && pwd)" >"$work/stat-table"
+expect_fail_msg "a sticky world-writable parent (like /tmp) is refused" "writable by anyone" nd "$real/a/b"
+printf '%s 0 700\n%s 0 750\n' "$(cd -P "$real/a" && pwd)" "$(cd -P "$real" && pwd)" >"$work/stat-table"
+expect_ok "700 and 750 parents are accepted" nd "$real/a/b"
+
+finish

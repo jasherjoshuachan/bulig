@@ -230,6 +230,8 @@ When a job needs you, the bot sends the plan or the PR with **Approve** and **De
 
 Only one Bulig process may use a database, so stop `serve` before you use `bulig run` or `bulig approve`. When `serve` stops (Ctrl-C or SIGTERM) it exits cleanly, and the next start picks up unfinished jobs. The bot remembers its place in your chat in the database, so a restart does not replay old commands. If Telegram limits the bot, it waits as long as Telegram asks; on network errors it backs off and tries again.
 
+To run the kernel on a server instead, see [deploy/RUNBOOK.md](deploy/RUNBOOK.md).
+
 ## License
 
 MIT. See [LICENSE](LICENSE).

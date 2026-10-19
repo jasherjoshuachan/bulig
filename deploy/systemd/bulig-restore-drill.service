@@ -1,0 +1,41 @@
+[Unit]
+Description=Restore the newest Bulig backup from R2 into a scratch database and check it
+After=postgresql@16-bulig.service network-online.target
+Wants=network-online.target
+AssertPathExists=/etc/bulig/backup.env
+AssertPathExists=/etc/bulig/pg-url
+AssertPathExists=/etc/bulig/drill-pw
+
+[Service]
+Type=oneshot
+# Root, to read the credentials. Postgres is reached over 127.0.0.1:5436 as the bulig_drill role (no superuser) and as bulig (read-only counts).
+User=root
+UMask=0077
+LoadCredential=backup-env:/etc/bulig/backup.env
+LoadCredential=pg-url:/etc/bulig/pg-url
+LoadCredential=drill-pw:/etc/bulig/drill-pw
+# Run from the root-owned tools folder, never from the Node release tree (which bulig installs into).
+ExecStart=/usr/local/lib/bulig/current/restore-drill.sh
+TimeoutStartSec=60min
+Nice=15
+IOSchedulingClass=idle
+MemoryMax=2G
+TasksMax=64
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/bulig-checks
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+# MemoryDenyWriteExecute is not set: the aws CLI is a frozen Python bundle and may need it off.
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

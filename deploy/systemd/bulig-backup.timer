@@ -1,0 +1,13 @@
+[Unit]
+Description=Nightly Bulig PostgreSQL backup
+
+[Timer]
+# 03:15 UTC. The commitments backup runs at 02:45, so the two never overlap.
+OnCalendar=*-*-* 03:15:00 UTC
+# If the host was off at 03:15, run once when it comes back.
+Persistent=true
+RandomizedDelaySec=2m
+Unit=bulig-backup.service
+
+[Install]
+WantedBy=timers.target

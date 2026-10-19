@@ -3,15 +3,27 @@
 #   1. bulig.service and bulig-worker.service are active
 #   2. the kernel holds the executor lease and keeps renewing it (two reads 11 s apart, the heartbeat is every 10 s)
 #   3. the Postgres cluster "16 bulig" is online on port 5436
-# usage: health.sh [--wait <seconds>]   (--wait: how long to give the service to take the lease after a start, default 30)
+#   4. the fence holds (fence-check.sh): from inside each Bulig unit's properties, other tenants' services, the docker bridge, tailscale, the
+#      machine's own addresses and unix sockets (an abstract X server, tailscaled, docker) cannot be reached, and what the units need can
+#   It also WARNS (does not fail) when the host's addresses no longer match the worker's drop-in, or a new service listens on every address.
+# usage: health.sh [--wait <seconds>] [--no-fence]   (--wait: how long to give the service to take the lease after a start, default 30)
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/common.sh
 . "$here/lib/common.sh"
+# shellcheck source=lib/fence.sh
+. "$here/lib/fence.sh"
 need_root
 
 wait_s=30
-if [ "${1:-}" = "--wait" ]; then wait_s="${2:?--wait needs a number of seconds}"; fi
+fence=1
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --wait) wait_s="${2:?--wait needs a number of seconds}"; shift 2 ;;
+    --no-fence) fence=0; shift ;;
+    *) die "usage: health.sh [--wait <seconds>] [--no-fence]" ;;
+  esac
+done
 fail=0
 bad() { echo "FAIL  $*"; fail=1; }
 ok() { echo "ok    $*"; }
@@ -80,6 +92,39 @@ if [ "$fail" -eq 0 ]; then
     bad "lease is held but not renewing (expires_at stayed $e1)"
   else
     ok "lease renewing: expires_at $e1 -> $e2 (generation $g2)"
+  fi
+fi
+
+warn() { echo "warn  $*"; }
+
+# Warnings: the host's own addresses against the worker's drop-in, and services that listen on every address (an allowed address such as
+# 127.74.3.1 reaches all of them, because the IP filter matches addresses and not ports).
+want_addrs="$(host_addresses | tr '\n' ' ')"
+have_addrs="$(unit_list bulig-worker.service IPAddressDeny | tr ' ' '\n' | { grep -E '^[0-9a-f:.]+/(32|128)$' || true; } | sort -u | tr '\n' ' ')"
+for a in $want_addrs; do
+  case " $have_addrs " in *" $a "*) ;; *) warn "the host address $a is not in the worker's IPAddressDeny. Run host-addresses.sh and restart bulig-worker." ;; esac
+done
+baseline="$BULIG_CHECKS_DIR/precheck.snapshot"
+if [ -r "$baseline" ]; then
+  known="$(awk '/^## listening tcp sockets/ {on=1; next} /^## / {on=0} on {print $1}' "$baseline" | sort -u)"
+  while IFS= read -r l; do
+    [ -n "$l" ] || continue
+    case "
+$known
+" in *"
+$l
+"*) ;; *) warn "a service listens on every address now ($l) and was not there at the precheck. The worker can reach it through 127.74.3.1." ;; esac
+  done < <(wildcard_listeners)
+else
+  warn "no precheck snapshot at $baseline, so new listeners on every address cannot be noticed"
+fi
+
+# 4. The fence: probes from inside each property set. Needs the kernel to be up for the gateway probe, which is why it runs last.
+if [ "$fail" -eq 0 ] && [ "$fence" -eq 1 ]; then
+  if "$here/fence-check.sh" all --no-late && "$here/fence-check.sh" worker cli-worker --late-only --late-strict; then
+    ok "the fence holds"
+  else
+    bad "the fence does not hold (see FAIL lines above)"
   fi
 fi
 

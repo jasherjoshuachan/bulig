@@ -7,11 +7,25 @@ set -uo pipefail
 
 stubs="$work/stubs"
 mkdir -p "$stubs"
+# the machine's addresses, as `ip -o addr show scope global` prints them on ths-prod-01
+cat >"$stubs/ip" <<'STUB'
+#!/usr/bin/env bash
+case "$*" in
+  *"scope global"*)
+    cat <<'DATA'
+2: eth0    inet 91.98.153.155/32 metric 100 scope global dynamic eth0
+2: eth0    inet6 2a01:4f8:c17:a0b6::1/64 scope global
+6: tailscale0    inet 100.85.168.22/32 scope global tailscale0
+7: docker0    inet 172.17.0.1/16 brd 172.17.255.255 scope global docker0
+DATA
+    ;;
+esac
+STUB
 cat >"$stubs/systemd-run" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$@" >"$STUB_OUT"
 STUB
-chmod +x "$stubs/systemd-run"
+chmod +x "$stubs/systemd-run" "$stubs/ip"
 export PATH="$stubs:/usr/bin:/bin:/usr/sbin:/sbin"
 export BULIG_DEPLOY_TEST_ROOT="$work/root" STUB_OUT="$work/argv"
 mkdir -p "$work/root/etc/bulig"
@@ -38,8 +52,11 @@ absent "no Claude token" "claude-token"
 absent "no ReadWritePaths (StateDirectory is the writable place)" "ReadWritePaths"
 check "capped memory" "MemoryMax=1G"
 check "home hidden" "ProtectHome=yes"
-check "the kernel's one-off commands cannot reach localhost, private ranges or the docker bridges" "IPAddressDeny=localhost link-local multicast 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 fc00::/7"
-check "only the gateway address, DNS and Tailscale are let through" "IPAddressAllow=127.74.3.1/32 127.0.0.53/32 100.64.0.0/10"
+check "the kernel's one-off commands cannot reach localhost, private ranges, Tailscale or the docker bridges" "IPAddressDeny=localhost link-local multicast 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7"
+check "only the gateway address is let through (no DNS stub, no Tailscale range)" "IPAddressAllow=127.74.3.1/32"
+check "the kernel's one-off commands keep AF_UNIX (Postgres)" "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6"
+check "and cannot see the tailscale, snapd or docker sockets" "InaccessiblePaths=-/run/tailscale -/run/snapd.socket -/run/docker.sock -/var/run/docker.sock"
+check "and resolve names through resolved's upstream list" "BindReadOnlyPaths=/run/systemd/resolve/resolv.conf:/etc/resolv.conf"
 check "the CLI is run from the root-owned release" "/opt/bulig/current/packages/cli/bin/bulig.mjs"
 if [ "$(tail -1 "$work/argv")" = "status" ]; then ok "the arguments reach the CLI"; else bad "last arg: $(tail -1 "$work/argv")"; fi
 check "a pipe for stdin and stdout" "--pipe"
@@ -52,8 +69,12 @@ check "with the Claude token" "LoadCredential=claude-token:$work/root/etc/bulig/
 check "and its own worker token" "LoadCredential=worker-token:$work/root/etc/bulig/worker-token"
 absent "none of the kernel's secrets or its config" "pg-url|gh-token|worker-tokens|config.json"
 absent "no ReadWritePaths" "ReadWritePaths"
-check "the worker's one-off commands also cannot reach Tailscale" "IPAddressDeny=localhost link-local multicast 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7"
-check "only the gateway address and DNS are let through" "IPAddressAllow=127.74.3.1/32 127.0.0.53/32"
+check "the worker's one-off commands cannot reach Tailscale or this machine's own public addresses" "IPAddressDeny=localhost link-local multicast 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7 2a01:4f8:c17:a0b6::1/128 91.98.153.155/32"
+check "only the gateway address is let through" "IPAddressAllow=127.74.3.1/32"
+check "the worker's one-off commands have no unix sockets at all" "RestrictAddressFamilies=AF_INET AF_INET6"
+if [ "$(grep -c '^RestrictAddressFamilies=' "$work/argv")" = "1" ] && ! grep -q 'RestrictAddressFamilies=.*AF_UNIX' "$work/argv"; then ok "and nothing else in the command line gives AF_UNIX back"; else bad "address-family lines: $(grep Restrict "$work/argv")"; fi
+check "and cannot see the tailscale, snapd or docker sockets" "InaccessiblePaths=-/run/tailscale -/run/snapd.socket -/run/docker.sock -/var/run/docker.sock"
+check "and resolve names through resolved's upstream list" "BindReadOnlyPaths=/run/systemd/resolve/resolv.conf:/etc/resolv.conf"
 if [ "$(tail -4 "$work/argv" | tr '\n' ' ')" = "git clone https://example.invalid/r /var/lib/bulig-worker/work/r " ]; then ok "--exec runs the program as given"; else bad "tail: $(tail -4 "$work/argv" | tr '\n' ' ')"; fi
 absent "--exec does not run the bulig CLI" "bulig.mjs"
 

@@ -69,6 +69,21 @@ cat >"$stubs/systemctl" <<'STUB'
 echo "systemctl $*" >>"$STUB_LOG/calls"
 exit 0
 STUB
+# the machine's addresses, as `ip -o addr show scope global` prints them on ths-prod-01
+cat >"$stubs/ip" <<'STUB'
+#!/usr/bin/env bash
+case "$*" in
+  *"scope global"*)
+    cat <<'DATA'
+2: eth0    inet 91.98.153.155/32 metric 100 scope global dynamic eth0
+2: eth0    inet6 2a01:4f8:c17:a0b6::1/64 scope global
+6: tailscale0    inet 100.85.168.22/32 scope global tailscale0
+7: docker0    inet 172.17.0.1/16 brd 172.17.255.255 scope global docker0
+DATA
+    ;;
+esac
+STUB
+
 cat >"$stubs/flock" <<'STUB'
 #!/usr/bin/env bash
 exit 0
@@ -206,9 +221,14 @@ extract_call="$(grep -- '--unit=bulig-extract-' "$STUB_LOG/calls" | head -1)"
 for p in DynamicUser=yes PrivateTmp=yes KillMode=control-group ProtectSystem=strict NoNewPrivileges=yes MemoryMax= TasksMax=; do
   case "$build_call" in *"$p"*) ok "the build unit has $p" ;; *) bad "the build unit lacks $p: $build_call" ;; esac
 done
-case "$build_call" in *"-p IPAddressDeny=localhost link-local multicast 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7 "*) ok "the build cannot reach localhost, link-local, multicast, private ranges, Tailscale or the docker bridges (IPAddressDeny)" ;; *) bad "the build's IPAddressDeny: $build_call" ;; esac
-case "$build_call" in *"-p IPAddressAllow=127.0.0.53/32 "*) ok "the build may reach the DNS stub, and nothing else local (IPAddressAllow)" ;; *) bad "the build's IPAddressAllow: $build_call" ;; esac
-case "$build_call" in *"-p IPAddressAllow=127.0.0.53/32 -p "*) ok "and that is the whole Allow list (nothing after it)" ;; *) bad "the build's Allow list is longer than the DNS stub: $build_call" ;; esac
+DENY="localhost link-local multicast 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7"
+case "$build_call" in *"-p IPAddressDeny=$DENY 2a01:4f8:c17:a0b6::1/128 91.98.153.155/32 -p "*) ok "the build cannot reach localhost, link-local, multicast, private ranges, Tailscale, the docker bridges or this machine's own public addresses (read from ip at run time)" ;; *) bad "the build's IPAddressDeny: $build_call" ;; esac
+case "$build_call" in *"IPAddressAllow"*) bad "the build allows an address: $build_call" ;; *) ok "and the build allows no address at all (not even the DNS stub)" ;; esac
+case "$build_call" in *"-p RestrictAddressFamilies=AF_INET AF_INET6 -p "*) ok "the build gets IP sockets only: no AF_UNIX, so a tenant's abstract socket is out of reach" ;; *) bad "the build's address families: $build_call" ;; esac
+case "$build_call" in *"-p InaccessiblePaths=-/run/tailscale -/run/snapd.socket -/run/docker.sock -/var/run/docker.sock "*) ok "the build cannot see the tailscale, snapd or docker sockets" ;; *) bad "the build's InaccessiblePaths: $build_call" ;; esac
+case "$build_call" in *"-p BindReadOnlyPaths=/run/systemd/resolve/resolv.conf:/etc/resolv.conf "*) ok "the build resolves names through resolved's upstream list, not the 127.0.0.53 stub" ;; *) bad "the build's resolver: $build_call" ;; esac
+wd="$r/etc/systemd/system/bulig-worker.service.d/10-host-addresses.conf"
+if [ -f "$wd" ] && grep -qx "IPAddressDeny=2a01:4f8:c17:a0b6::1/128 91.98.153.155/32" "$wd"; then ok "each release refreshes the worker's drop-in with the machine's current public addresses"; else bad "worker drop-in: $(cat "$wd" 2>&1)"; fi
 case "$build_call" in *"--uid="* | *" -p User="*) bad "the build is tied to a named user: $build_call" ;; *) ok "the build runs as a throwaway user, not as bulig or bulig-worker" ;; esac
 case "$build_call" in *"$r"* | *"/var/lib/bulig-checks"* | *"/usr/local/lib/bulig"*) bad "a path of root's trees reached the build's arguments: $build_call" ;; *) ok "no path of root's trees is in the build's arguments (the source goes in on stdin)" ;; esac
 if grep -q "^systemctl enable bulig-loopback.service bulig.service bulig-worker.service" "$STUB_LOG/calls" && grep -q "^systemctl start bulig-loopback.service" "$STUB_LOG/calls"; then ok "the gateway address unit is enabled and started before the services restart"; else bad "systemctl calls: $(grep systemctl "$STUB_LOG/calls" | head -5)"; fi

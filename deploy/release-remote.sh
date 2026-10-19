@@ -86,8 +86,9 @@ final="$work/final"
 
 # --- the build -------------------------------------------------------------------------------------------------------------------
 # build_modules <source dir> <out tar>: tar of the source in on stdin, tar of every node_modules folder out on stdout.
-# IPAddressDeny/Allow: the build runs dependency scripts, so it may reach the public internet (the npm registry) and DNS, and nothing local:
-# not 127.0.0.1 (other tenants' services), not the docker bridges, not private ranges, not Tailscale.
+# FENCE_BUILD (lib/common.sh): the build runs dependency scripts, so it reaches the public internet (the npm registry) and nothing else: no
+# unix socket at all (no AF_UNIX: a tenant's abstract socket would be reachable otherwise), not 127.0.0.1 (other tenants' services), not the
+# docker bridges, private ranges, Tailscale or this host's own public addresses; DNS through resolved's upstream list.
 # DynamicUser: a throwaway uid with no files, no home and no credentials. PrivateTmp: /tmp and /var/tmp are private and systemd removes
 # them when the unit ends, so nothing it wrote survives and root never has to enter them. KillMode=control-group: every process a
 # build script started dies with the unit. pnpm's own output goes to stderr so stdout is only the tar.
@@ -100,11 +101,11 @@ cd /var/tmp/build
 tar -x --no-same-owner -f -
 pnpm install --frozen-lockfile --prod=false --config.package-import-method=copy --store-dir /var/tmp/pnpm-store </dev/null >&2
 find . -name node_modules -type d -prune -print0 | tar -c --null -T - -f -'
-  tar -c -C "$src" . | systemd-run --quiet --pipe --wait --collect --unit="bulig-build-$short-$$" \
-    -p DynamicUser=yes -p PrivateTmp=yes -p ProtectSystem=strict -p ProtectHome=yes -p PrivateDevices=yes -p NoNewPrivileges=yes \
+  build_fence_props
+  tar -c -C "$src" . | systemd-run --quiet --pipe --wait --collect --unit="bulig-build-$short-$$" "${FENCE_BUILD[@]}" \
+    -p PrivateTmp=yes -p ProtectSystem=strict -p ProtectHome=yes -p PrivateDevices=yes -p NoNewPrivileges=yes \
     -p ProtectKernelTunables=yes -p ProtectKernelModules=yes -p ProtectControlGroups=yes -p RestrictSUIDSGID=yes -p LockPersonality=yes \
-    -p RestrictAddressFamilies="AF_UNIX AF_INET AF_INET6" -p UMask=0022 \
-    -p "IPAddressDeny=$BULIG_IP_DENY_PRIVATE" -p "IPAddressAllow=$BULIG_IP_ALLOW_DNS" \
+    -p UMask=0022 \
     -p KillMode=control-group -p SendSIGKILL=yes -p MemoryMax=2G -p CPUQuota=200% -p TasksMax=512 -p RuntimeMaxSec=1800 \
     --setenv=HOME=/var/tmp/home --setenv=PATH=/usr/local/bin:/usr/bin:/bin --setenv=CI=true \
     -- /bin/sh -c "$script" >"$out"
@@ -184,6 +185,7 @@ apply_release() {
     install -m 0600 "$tk_rel/bulig.config.vps.json" "$BULIG_CRED_DIR/config.json" || return 1
     echo "config: created $BULIG_CRED_DIR/config.json from the VPS template (Telegram off, no local worker). Edit it as root; it is never overwritten."
   fi
+  write_host_dropin bulig-worker.service || return 1
   systemctl daemon-reload || return 1
   systemctl enable bulig-loopback.service bulig.service bulig-worker.service >/dev/null 2>&1 || return 1
   systemctl start bulig-loopback.service || return 1

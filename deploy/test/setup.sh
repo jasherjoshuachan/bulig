@@ -14,6 +14,38 @@ log="$work/log"
 mkdir -p "$stubs" "$log"
 export STUB_LOG="$log"
 
+# the machine's addresses, as `ip -o addr show scope global` prints them on ths-prod-01
+cat >"$stubs/ip" <<'STUB'
+#!/usr/bin/env bash
+case "$*" in
+  *"scope global"*)
+    cat <<'DATA'
+2: eth0    inet 91.98.153.155/32 metric 100 scope global dynamic eth0
+2: eth0    inet6 2a01:4f8:c17:a0b6::1/64 scope global
+6: tailscale0    inet 100.85.168.22/32 scope global tailscale0
+7: docker0    inet 172.17.0.1/16 brd 172.17.255.255 scope global docker0
+DATA
+    ;;
+esac
+STUB
+# install that drops -o/-g (the tests run as a normal user while the id stand-in says root)
+cat >"$stubs/install" <<'STUB'
+#!/usr/bin/env bash
+rest=(); skip=0
+for a in "$@"; do
+  if [ "$skip" -eq 1 ]; then skip=0; continue; fi
+  case "$a" in -o | -g) skip=1 ;; *) rest+=("$a") ;; esac
+done
+exec /usr/bin/install "${rest[@]}"
+STUB
+# mv without -T (this Mac has none), keeping its meaning
+cat >"$stubs/mv" <<'STUB'
+#!/usr/bin/env bash
+args=(); t=0
+for a in "$@"; do if [ "$a" = "-T" ]; then t=1; else args+=("$a"); fi; done
+if [ "$t" -eq 1 ] && [ -L "${args[1]}" ]; then rm -f "${args[1]}"; fi
+exec /bin/mv "${args[@]}"
+STUB
 cat >"$stubs/id" <<'STUB'
 #!/usr/bin/env bash
 if [ "$1" = "-u" ]; then echo 0; exit 0; fi
@@ -70,7 +102,7 @@ export PATH="$stubs:/usr/bin:/bin:/usr/sbin:/sbin"
 
 new_root() { # new_root <dir>: a fake host with the root-owned parents the setup scripts expect
   rm -rf "${1:?}" "${log:?}"/*
-  mkdir -p "$1/opt" "$1/usr/local/lib" "$1/etc" "$1/var/backups" "$1/var/lib"
+  mkdir -p "$1/opt" "$1/usr/local/lib" "$1/etc/systemd/system" "$1/var/backups" "$1/var/lib"
 }
 listing() { (cd "$1" && find . | sort); }
 
@@ -103,7 +135,9 @@ if [ ! -e "$root/var/lib/bulig" ] && [ ! -e "$root/var/lib/bulig-worker" ]; then
 if grep -q '^useradd --system --no-create-home --home-dir /var/lib/bulig --shell /usr/sbin/nologin --user-group bulig$' "$log/calls" && grep -q '^useradd --system --no-create-home --home-dir /var/lib/bulig-worker --shell /usr/sbin/nologin --user-group bulig-worker$' "$log/calls"; then ok "both users are made with --system --no-create-home and their /var/lib home"; else bad "useradd calls: $(grep useradd "$log/calls")"; fi
 if grep -q ' -h ' "$log/chown" && ! grep -qv ' -h ' "$log/chown"; then ok "every chown carries -h"; else bad "chown calls: $(cat "$log/chown" 2>&1)"; fi
 if [ ! -e "$log/followed" ]; then ok "no chown followed a link"; else bad "a chown followed a link"; fi
-if [ -z "$(find "$root" -type f -print -quit)" ]; then ok "setup writes no files at all (no placeholder secrets, no config)"; else bad "files created: $(find "$root" -type f)"; fi
+files="$(cd "$root" && find . -type f | sort | tr '\n' ' ')"
+if [ "$files" = "./etc/systemd/system/bulig-worker.service.d/10-host-addresses.conf " ]; then ok "setup writes one file only, the worker's host-address drop-in (no placeholder secrets, no config)"; else bad "files created: $files"; fi
+if grep -qx "IPAddressDeny=2a01:4f8:c17:a0b6::1/128 91.98.153.155/32" "$root/etc/systemd/system/bulig-worker.service.d/10-host-addresses.conf"; then ok "and that drop-in denies the machine's own public addresses, read from ip"; else bad "drop-in: $(cat "$root/etc/systemd/system/bulig-worker.service.d/10-host-addresses.conf")"; fi
 
 # --- 3. a second run changes nothing ---
 after1="$(listing "$root")"

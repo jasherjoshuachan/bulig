@@ -92,7 +92,7 @@ Stop at the first failure and read the message: every script says what it refuse
    5. installs `deploy/` as `/usr/local/lib/bulig/<sha>` (the scripts root runs and the unit files, root-owned);
    6. swaps both `current` links, installs the unit files, creates `/etc/bulig/config.json` from the template **only if it is missing** (root, 0600; never overwritten), enables and starts `bulig-loopback.service` (the gateway address), restarts both services, and runs `health.sh`. Any failure puts back both links and the unit files. It refuses a sha that is already live (exit 3).
 
-6. **Health.** Run it any time. It checks both services, and reads the lease twice, 11 seconds apart.
+6. **Health.** Run it any time. It checks both services and the gateway-address unit, reads the lease twice, 11 seconds apart, and then runs the fence check (`fence-check.sh`, see "What each unit can reach"): a probe from inside each unit's network and socket properties that must not reach other tenants' services and must still reach DNS, GitHub and (for the worker) the gateway. It also warns when the host's addresses changed or a new service listens on every address. `health.sh --no-fence` skips the probes.
    ```bash
    ssh ths-prod-01 '/usr/local/lib/bulig/current/health.sh'
    ssh ths-prod-01 'systemctl show bulig.service bulig-worker.service -p Id -p User -p MemoryMax -p CPUQuotaPerSecUSec -p TasksMax -p StateDirectory'
@@ -112,7 +112,12 @@ Stop at the first failure and read the message: every script says what it refuse
    ```
    (How PR-E names the target is its own detail. `bulig-cli.sh` runs as user `bulig` with the kernel's credentials.)
 
-9. **Synthetic jobs.** One on the VPS worker, one on the Mac worker over Tailscale. Exactly one PR each, on the sandbox repo. Jobs run through the two services; one-off commands go through `bulig-cli.sh`. For the Mac worker, add its token (`set-secret.sh --worker-token mac`), add the VPS's Tailscale address (100.85.168.22 when checked on 19 Oct 2026) next to `127.74.3.1` in `listen` in `/etc/bulig/config.json` (root edit), and restart `bulig.service`. The kernel unit already lets Tailscale peers in (`IPAddressAllow=100.64.0.0/10`).
+9. **Synthetic jobs.** One on the VPS worker, one on the Mac worker over Tailscale. Exactly one PR each, on the sandbox repo. Jobs run through the two services; one-off commands go through `bulig-cli.sh`. For the Mac worker, add its token (`set-secret.sh --worker-token mac`), let that one peer in with its Tailscale address (the kernel allows no Tailscale peer until you do, and then exactly one /32), add the VPS's own Tailscale address (100.85.168.22 when checked on 19 Oct 2026) next to `127.74.3.1` in `listen` in `/etc/bulig/config.json` (root edit), and restart `bulig.service`:
+    ```bash
+    ssh ths-prod-01 'bash /usr/local/lib/bulig/current/set-mac-worker.sh <the Mac'"'"'s 100.x address>'
+    ssh ths-prod-01 'systemctl restart bulig.service'
+    ```
+    `set-mac-worker.sh` writes a root-owned drop-in, `/etc/systemd/system/bulig.service.d/20-mac-worker.conf`, with `IPAddressAllow=<that address>/32`; `--remove` takes it away again. Only an IPv4 address in 100.64.0.0/10 is accepted.
 
 10. **Backup.** Fill the R2 settings, one name at a time, then run one backup by hand and look for the `bulig-backup: ok` line:
     ```bash
@@ -136,24 +141,37 @@ Stop at the first failure and read the message: every script says what it refuse
     ```
     A diff of unrelated services that started or stopped on their own (a nightly job) needs a human read: check it is not Bulig's doing before calling it noise, and add the pattern to `SNAPSHOT_NOISE` in `lib/snapshot.sh` if it is.
 
-## What each unit can reach (network)
+## What each unit can reach (network and sockets)
 
-On this host `127.0.0.1` carries other tenants' services with no login (a browser debugging port with a live client session, a workflow server, model servers, about fifty more) and `172.17.0.1` and the other bridges carry containers. Claude (the worker, steered by prompts) and dependency scripts (the build) run code Bulig does not control, so systemd filters every IP packet of each unit in both directions (`IPAddressDeny=`, `IPAddressAllow=`: an Allow match wins, then a Deny match, then the packet is let through, which leaves the public internet):
+On this host `127.0.0.1` carries other tenants' services with no login (a browser debugging port with a live client session, a workflow server, model servers, about fifty more), `172.17.0.1` and the other bridges carry containers, and an X server owned by another tenant listens on an **abstract unix socket** (`@/tmp/.X11-unix/X99`, started with `-ac`) that no file permission and no `PrivateTmp` hides. Claude (the worker, steered by prompts) and dependency scripts (the build) run code Bulig does not control, so there are two fences:
+
+- **Sockets.** `RestrictAddressFamilies=AF_INET AF_INET6` on the worker, the release build and the worker's one-off commands: they cannot open a unix socket at all, abstract ones included, and no netlink socket. Pipes and `socketpair()` are not affected (`systemd.exec`: "sockets created with socketpair() ... are unaffected"), and node's `child_process` uses `socketpair`, so Claude's tools and `pnpm` build scripts still start children. `InaccessiblePaths=-/run/tailscale -/run/snapd.socket -/run/docker.sock -/var/run/docker.sock` hides the other sockets as well, on the worker, the build, and the kernel (the `-` ignores a path that is not there).
+- **Addresses.** systemd filters every IP packet of each unit in both directions (`IPAddressDeny=`, `IPAddressAllow=`: an Allow match wins, then a Deny match, then the packet is let through, which leaves the public internet). **The filter matches addresses, not ports.**
 
 | Unit | Denied | Let through (Allow) |
 |---|---|---|
-| `bulig-worker.service` and the worker's `bulig-cli.sh` commands | localhost, link-local, multicast, `10/8`, `172.16/12`, `192.168/16`, `100.64/10`, `fc00::/7` | `127.74.3.1/32` (the kernel gateway), `127.0.0.53/32` (DNS) |
-| the release build (transient `bulig-build-*`) | the same | `127.0.0.53/32` |
-| `bulig.service` and the kernel's `bulig-cli.sh` commands | localhost, link-local, multicast, `10/8`, `172.16/12`, `192.168/16`, `fc00::/7` | `127.74.3.1/32`, `127.0.0.53/32`, `100.64.0.0/10` (Tailscale peers: the Mac worker, inbound and replies) |
-| `bulig-backup.service`, `bulig-restore-drill.service` | the worker's list | `127.0.0.53/32` |
+| `bulig-worker.service`, the worker's `bulig-cli.sh` commands | localhost, link-local, multicast, `10/8`, `172.16/12`, `192.168/16`, `100.64/10`, `fc00::/7`, and this machine's own public addresses | `127.74.3.1/32` (the kernel gateway) |
+| the release build (transient `bulig-build-*`) | the same | nothing |
+| `bulig.service`, the kernel's `bulig-cli.sh` commands | localhost, link-local, multicast, `10/8`, `172.16/12`, `192.168/16`, `100.64/10`, `fc00::/7` | `127.74.3.1/32`, plus the Mac worker's one Tailscale `/32` once `set-mac-worker.sh` has run |
+| `bulig-backup.service`, `bulig-restore-drill.service` | localhost, link-local, multicast, `10/8`, `172.16/12`, `192.168/16`, `100.64/10`, `fc00::/7` | nothing |
 | `bulig-loopback.service` | everything (`any`) | nothing |
 
-- **Postgres needs no TCP at all.** The kernel, backup, drill and health reach it over the unix socket, which IP filtering does not touch.
+- **The host's own addresses** (the public IPv4 and IPv6 of `eth0`) are read from `ip -o addr` at setup time into a root-owned drop-in, `/etc/systemd/system/bulig-worker.service.d/10-host-addresses.conf` (and into the build and one-off units at run time). They are never typed into a unit file. After the host's address changes run `host-addresses.sh` and restart the worker; `health.sh` warns when they differ.
+- **Because the filter matches addresses, `127.74.3.1` reaches every service listening on *all* addresses** (on this host 22, 80, 443, v4 and v6: public anyway). `health.sh` warns when a new listener on every address appears that was not in the precheck snapshot.
+- **DNS.** `/etc/resolv.conf` is the `systemd-resolved` stub on `127.0.0.53`. Allowing that address would also reach every listener on it (nginx on :80 answers there), so no unit allows it. Each unit that needs names gets resolved's upstream list instead, bind-mounted over `/etc/resolv.conf` (`BindReadOnlyPaths=/run/systemd/resolve/resolv.conf:/etc/resolv.conf`): public servers, which the deny list leaves alone. (Binding onto the stub's symlink follows the link inside the unit; this is the part of the design that only the first real run can confirm. If names do not resolve, `fence-check.sh` says so on its `dns-lookup` probe.)
+- **Postgres needs no TCP at all.** The kernel, backup, drill and health reach it over the unix socket, which IP filtering does not touch. The kernel (not the worker) keeps `AF_UNIX` for it.
 - **Why `127.74.3.1` is put on `lo`.** `ip route get 127.74.3.1` on this host says `src 127.0.0.1`: a connection to a loopback address that is not assigned as its own address carries source `127.0.0.1`. Then the kernel unit would have to let `127.0.0.1` in and out (the filter checks the peer address: destination on the way out, source on the way in), which is exactly where the other tenants are. With `127.74.3.1/32` on `lo` the route says `src 127.74.3.1`, both ends of the conversation carry it, and each side allows that one address. (For a Tailscale peer the source is the peer's own `100.x` address.)
-- **`127.0.0.53` is allowed for DNS.** `/etc/resolv.conf` points at the `systemd-resolved` stub there. It answers DNS and nothing else. Without it no unit can look up a name.
-- **What stays reachable:** the public internet, and services bound to `0.0.0.0` on the host's own address (22, 80, 443: public anyway).
 - **Docker.** With no `aws` CLI the backup runs the pinned image through `docker run`. That container's traffic belongs to dockerd's cgroup, not to the backup unit, so the unit's filter does not cover it. The container gets the R2 key on stdin and the dump, nothing else. The docker client's config folder is `DOCKER_CONFIG=/var/lib/bulig-checks/docker` (root-owned, made by `setup-user.sh`), because `ProtectHome=yes` hides `/root`.
 - **The gateway bind.** `bulig serve` binds the gateway to `127.74.3.1` (config `listen`). PR #50 accepts any address in `127.0.0.0/8`, `::1` and the Tailscale ranges and refuses wildcards; `bulig worker` accepts plain `http` to the same set.
+
+### The runtime fence check (`fence-check.sh`, run by `health.sh`)
+
+Unit files being right is not the same as the machine enforcing them. `fence-check.sh` starts one short transient unit per set (worker, kernel, build, and the worker and kernel one-off commands) with exactly that set's properties and runs `fence-probe.py` inside it. The worker and kernel sets are read from the installed unit file **and its drop-ins**, so a drop-in that opens a hole is tested too. The probe list is one file, `deploy/fence/probes.txt`.
+
+- It must FAIL to connect to: `127.0.0.1:9222`, `127.0.0.1:8233`, `[::1]:8000`, `172.17.0.1:5433`, this machine's own Tailscale address `:46841`, its own public addresses `:22`, `127.0.0.53:80` and `:53`, the abstract X socket, `/run/tailscale/tailscaled.sock`, `/run/snapd.socket` and `/run/docker.sock` (and, for the worker sets, the Postgres socket). Any unexpected success fails health. A target that is not listening even without the fence is reported as *inconclusive* (a warning), because a failed connection to nothing proves nothing: the same list is first tried as root, outside every fence.
+- It must SUCCEED at: a DNS lookup, an HTTPS handshake with `api.github.com`, a user lookup for the running uid (a `DynamicUser` has no passwd entry, so this is the probe that would show a need for `AF_UNIX` in the build), `socketpair()`, and running a child process. The gateway `GET /healthz` is a separate, later check for the worker sets, run only after the kernel's lease is confirmed, and a miss then is a failure (before that it is a warning).
+- The kernel sets keep `AF_UNIX`, so the abstract X socket is listed there as a *known limit*: reported, never failing.
+- If something the worker or the build really needs turns out to need `AF_UNIX`, the check will say which probe failed; do not reopen the family list without Jasher.
 
 ## Footprint on ths-prod-01
 
@@ -186,8 +204,15 @@ To undo: remove `channel-telegram` from `enabled`, restart, then start the Mac s
   bash deploy/release.sh <older-sha>
   ```
 - **Stop Bulig, leave everything else alone.** `systemctl stop bulig-worker bulig`. The cluster keeps running. Jobs resume on the next start.
-- **Remove Bulig completely.** Only with Jasher's yes, and in this order: `systemctl disable --now bulig-worker bulig bulig-backup.timer bulig-restore-drill.timer`, remove `/etc/systemd/system/bulig*`, `systemctl daemon-reload`, `pg_dropcluster 16 bulig --stop`, then `userdel bulig`, `userdel bulig-worker`, then `/opt/bulig`, `/etc/bulig`, `/usr/local/lib/bulig`, `/var/lib/bulig`, `/var/lib/bulig-worker`, `/var/backups/bulig`, `/var/lib/bulig-checks` (after the last `postcheck.sh`). Run `postcheck.sh`; it should show nothing changed from the precheck.
+- **Remove Bulig completely.** Only with Jasher's yes, and in this order: `systemctl stop bulig-worker bulig` first, then `systemctl stop bulig-loopback` (it takes `127.74.3.1` off `lo`; stopping it while the services run would cut them off), then `systemctl disable --now bulig-worker bulig bulig-loopback bulig-backup.timer bulig-restore-drill.timer`, remove `/etc/systemd/system/bulig*` (the unit files and the `bulig*.service.d` drop-in folders), `systemctl daemon-reload`, `pg_dropcluster 16 bulig --stop`, then `userdel bulig`, `userdel bulig-worker`, then `/opt/bulig`, `/etc/bulig`, `/usr/local/lib/bulig`, `/var/lib/bulig`, `/var/lib/bulig-worker`, `/var/backups/bulig`, `/var/lib/bulig-checks` (after the last `postcheck.sh`). Run `postcheck.sh`; it should show nothing changed from the precheck.
 - **Restore the database from R2.** The restore drill is the rehearsal. For a real restore: `systemctl stop bulig-worker bulig`, take the newest dump (a custom-format `.dump` under `bulig/postgres/`; check its sha256 against `/var/backups/bulig/index`), create an empty database as `bulig`, `pg_restore --no-owner --role=bulig -h /var/run/postgresql -p 5436 -U bulig -d <db> <dump>`, point the config at it, start the services.
+
+## Known limits
+
+- **The kernel can reach other tenants' abstract unix sockets.** `bulig.service` keeps `AF_UNIX` because it talks to Postgres over a unix socket, and an abstract socket (an X server on this host) has no file permission to stop it. It runs no worker code (the worker is a separate unit with no `AF_UNIX`), and the fence check lists this as a known limit. The next hardening is an AppArmor profile for the kernel with `deny unix addr=@**,`; that is a change to the host's security setup and needs Jasher's yes before it is made.
+- **`127.74.3.1` reaches every listener on all addresses** (22, 80, 443 here; see above). The filter matches addresses, not ports.
+- **The backup's docker container is outside the unit's IP filter** (see above).
+- **The fence is untested on a real machine until the server phase.** Everything about it was checked as text and with stand-ins; `fence-check.sh` is the first real test, and `systemd-analyze verify` only checks syntax.
 
 ## Things to know
 

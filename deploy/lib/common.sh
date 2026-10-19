@@ -19,12 +19,18 @@ BULIG_PG_HOST=/var/run/postgresql
 # The kernel's worker gateway (ADR 0011): its own loopback address, plus the Tailscale address for the Mac worker.
 BULIG_GATEWAY_ADDR=127.74.3.1
 BULIG_GATEWAY_PORT=7431
-# IP filtering (systemd IPAddressDeny=/IPAddressAllow=) for units that run code Bulig does not control: everything local or private is denied,
-# so the public internet is what is left. DNS needs the systemd-resolved stub that /etc/resolv.conf points to. The unit files carry the same
-# lists as text and deploy/test/units.sh checks them; the transient units (release build, bulig-cli.sh) take them from here.
+# What the units that run code Bulig does not control (the worker, the release build, one-off worker commands) may reach. The unit files carry
+# the same values as text and deploy/test/units.sh checks them; the transient units (release build, bulig-cli.sh) take them from here, and
+# fence-check.sh tests the result against the real machine.
+#  - IPAddressDeny: everything local or private (the public internet is what is left), plus the host's own public addresses (host_addresses).
+#  - RestrictAddressFamilies without AF_UNIX: no unix socket at all, abstract ones included. socketpair() is not affected by it.
+#  - InaccessiblePaths: the other unix sockets that could be reached if AF_UNIX were ever allowed ("-" = ignore a missing path).
+#  - BindReadOnlyPaths: resolved's upstream resolver list instead of the 127.0.0.53 stub, so no localhost address has to be allowed for DNS.
 BULIG_IP_DENY_PRIVATE="localhost link-local multicast 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7"
-BULIG_IP_DENY_KERNEL="localhost link-local multicast 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 fc00::/7"
-BULIG_IP_ALLOW_DNS="127.0.0.53/32"
+BULIG_AF_NO_UNIX="AF_INET AF_INET6"
+BULIG_AF_WITH_UNIX="AF_UNIX AF_INET AF_INET6"
+BULIG_INACCESSIBLE="-/run/tailscale -/run/snapd.socket -/run/docker.sock -/var/run/docker.sock"
+BULIG_RESOLV_BIND="/run/systemd/resolve/resolv.conf:/etc/resolv.conf"
 
 # The tests run the scripts against a throwaway folder: BULIG_DEPLOY_TEST_ROOT puts every fixed path under it and skips the
 # root check. On the server it is never set.
@@ -159,6 +165,64 @@ as_postgres() {
 # backup, the drill and health never connect as a superuser.
 psql_admin() {
   as_postgres "$(pg_bin psql)" -X -q -h "$BULIG_PG_SOCKET_DIR" -p "$BULIG_PG_PORT" -U postgres -v ON_ERROR_STOP=1 "$@"
+}
+
+# host_addresses: this machine's own public addresses, one per line as /32 or /128, read from `ip -o addr` (private, tailscale and unique-local
+# ranges are left out: they are denied already). Written into a drop-in at setup time, never hard-coded.
+host_addresses() {
+  { ip -o addr show scope global 2>/dev/null || true; } | awk '
+    { a = $4; sub("/.*", "", a) }
+    a ~ /:/ { if (a ~ /^f[cd]/) next; print a "/128"; next }
+    a ~ /^(10\.|192\.168\.)/ { next }
+    a ~ /^172\.(1[6-9]|2[0-9]|3[01])\./ { next }
+    a ~ /^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\./ { next }
+    { print a "/32" }' | sort -u
+}
+
+# write_host_dropin <unit>: /etc/systemd/system/<unit>.d/10-host-addresses.conf, root-owned, with IPAddressDeny= for those addresses.
+write_host_dropin() {
+  local unit="$1" dir="$BULIG_UNIT_DIR/$1.d" addrs
+  addrs="$(host_addresses | tr '\n' ' ')"
+  addrs="${addrs% }"
+  root_dir 0755 "$dir" >/dev/null
+  {
+    echo "# Written by deploy/host-addresses.sh (root). This machine's own public addresses, so $unit cannot connect to its own public listeners."
+    echo "[Service]"
+    if [ -n "$addrs" ]; then echo "IPAddressDeny=$addrs"; fi
+  } | install_root_file "$dir/10-host-addresses.conf"
+}
+
+# build_fence_props: sets FENCE_BUILD, the properties of the transient release-build unit that decide what it can reach. A throwaway user.
+FENCE_BUILD=()
+build_fence_props() {
+  local deny="$BULIG_IP_DENY_PRIVATE" a
+  a="$(host_addresses | tr '\n' ' ')"
+  deny="$deny ${a% }"
+  FENCE_BUILD=(-p DynamicUser=yes -p "RestrictAddressFamilies=$BULIG_AF_NO_UNIX" -p "IPAddressDeny=${deny% }" \
+    -p "InaccessiblePaths=$BULIG_INACCESSIBLE" -p "BindReadOnlyPaths=$BULIG_RESOLV_BIND")
+}
+
+# cli_fence_props <kernel|worker>: sets FENCE_CLI for a one-off bulig-cli.sh command. The kernel keeps AF_UNIX (the Postgres socket), the worker does not.
+FENCE_CLI=()
+cli_fence_props() {
+  local role="$1" deny="$BULIG_IP_DENY_PRIVATE" a
+  case "$role" in
+    kernel)
+      FENCE_CLI=(-p "RestrictAddressFamilies=$BULIG_AF_WITH_UNIX" -p "IPAddressDeny=$deny" -p "IPAddressAllow=$BULIG_GATEWAY_ADDR/32"
+        -p "InaccessiblePaths=$BULIG_INACCESSIBLE" -p "BindReadOnlyPaths=$BULIG_RESOLV_BIND") ;;
+    worker)
+      a="$(host_addresses | tr '\n' ' ')"
+      deny="$deny ${a% }"
+      FENCE_CLI=(-p "RestrictAddressFamilies=$BULIG_AF_NO_UNIX" -p "IPAddressDeny=${deny% }" -p "IPAddressAllow=$BULIG_GATEWAY_ADDR/32"
+        -p "InaccessiblePaths=$BULIG_INACCESSIBLE" -p "BindReadOnlyPaths=$BULIG_RESOLV_BIND") ;;
+    *) die "role must be kernel or worker" ;;
+  esac
+}
+
+# wildcard_listeners: TCP listeners on every address (0.0.0.0, ::, *), as addr:port, one per line. An allowed address such as 127.74.3.1 reaches
+# every one of them, because the IP filter matches addresses and not ports.
+wildcard_listeners() {
+  ss -H -ltn 2>/dev/null | awk '$4 ~ /^(0\.0\.0\.0|\*|\[::\]|::):[0-9]+$/ { print $4 }' | sort -u
 }
 
 # cred_write <name>: write stdin to /etc/bulig/<name> as one secret, root-only (0600), atomically. Only the known names are accepted,

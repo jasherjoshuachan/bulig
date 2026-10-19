@@ -1,0 +1,39 @@
+# The fence probes, in ONE file. deploy/fence-check.sh runs them from inside each Bulig property set (worker, kernel, build, cli-worker,
+# cli-kernel) and fence-probe.py judges them. Columns:   expect   sets   name   kind   target
+#
+# expect  deny        must FAIL to connect (any error). If the target is not listening even without the fence the result is "inconclusive".
+#         allow       must succeed.
+#         allow-late  must succeed, but only a warning if it does not (the kernel may not be up yet).
+#         known       a documented limit: reported, never fails.
+# sets    comma list of: worker kernel build cli-worker cli-kernel
+# kind    tcp host:port | [v6]:port | unix path | abstract name (leading NUL added) | dns hostname | https hostname | http url
+#         | pwd (getpwuid of the running uid) | socketpair (AF_UNIX socketpair, what node child_process uses) | spawn (run /bin/true)
+# placeholders: @HOST@ = each of this machine's own public addresses, @TAILSCALE4@ = this machine's own tailscale address.
+# The targets are what ths-prod-01 had on 19 Oct 2026. A target that is not there any more shows as inconclusive, not as a pass.
+
+# --- other tenants' services on localhost, the docker bridge, tailscale, the machine's own addresses
+deny  worker,kernel,build,cli-worker,cli-kernel  chrome-debug-9222       tcp       127.0.0.1:9222
+deny  worker,kernel,build,cli-worker,cli-kernel  workflow-server-8233    tcp       127.0.0.1:8233
+deny  worker,kernel,build,cli-worker,cli-kernel  root-service-8000-v6    tcp       [::1]:8000
+deny  worker,kernel,build,cli-worker,cli-kernel  docker-bridge-5433      tcp       172.17.0.1:5433
+deny  worker,kernel,build,cli-worker,cli-kernel  own-tailscale-address   tcp       @TAILSCALE4@:46841
+deny  worker,kernel,build,cli-worker,cli-kernel  resolved-stub-http      tcp       127.0.0.53:80
+deny  worker,kernel,build,cli-worker,cli-kernel  resolved-stub-dns-tcp   tcp       127.0.0.53:53
+deny  worker,build,cli-worker                    own-public-ssh          tcp       @HOST@:22
+
+# --- unix sockets: a path socket, the abstract X server, tailscaled, docker, snapd
+deny  worker,build,cli-worker                    xorg-abstract-socket    abstract  /tmp/.X11-unix/X99
+deny  worker,kernel,build,cli-worker,cli-kernel  tailscaled-socket       unix      /run/tailscale/tailscaled.sock
+deny  worker,kernel,build,cli-worker,cli-kernel  snapd-socket            unix      /run/snapd.socket
+deny  worker,kernel,build,cli-worker,cli-kernel  docker-socket           unix      /run/docker.sock
+deny  worker,build,cli-worker                    postgres-socket         unix      /var/run/postgresql/.s.PGSQL.5436
+known kernel,cli-kernel                          xorg-abstract-socket    abstract  /tmp/.X11-unix/X99
+allow kernel,cli-kernel                          postgres-socket         unix      /var/run/postgresql/.s.PGSQL.5436
+
+# --- what each unit does need
+allow worker,kernel,build,cli-worker,cli-kernel  dns-lookup              dns       api.github.com
+allow worker,kernel,build,cli-worker,cli-kernel  https-github            https     api.github.com
+allow worker,kernel,build,cli-worker,cli-kernel  user-lookup             pwd       -
+allow worker,build,cli-worker                    socketpair-for-children socketpair -
+allow worker,build,cli-worker                    spawn-a-child           spawn     -
+allow-late worker,cli-worker                     kernel-gateway-healthz  http      http://127.74.3.1:7431/healthz

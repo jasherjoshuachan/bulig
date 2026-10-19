@@ -77,15 +77,18 @@ RestrictSUIDSGID=true
 RestrictRealtime=true
 LockPersonality=true
 SystemCallArchitectures=native
-# NETWORK. On this host 127.0.0.1 carries other tenants' services with no login (a browser debugging port, a workflow server, model servers,
-# ~50 more) and the docker bridges carry containers, so no Bulig unit may reach them. systemd filters every IP packet of this unit in both
-# directions (IPAddressDeny/Allow: an Allow match wins, then a Deny match, then everything else is let through, which is the public internet).
-# 127.0.0.53 is the systemd-resolved stub in /etc/resolv.conf: names cannot be looked up without it, and it answers DNS and nothing else.
-# The kernel reaches: its worker gateway address (the VPS worker connects to it; with that address on lo, both ends of the loopback
-# conversation carry it), Tailscale peers (the Mac worker, inbound and replies), DNS, and the public internet (GitHub). It reaches Postgres
-# over the unix socket, so it needs no TCP localhost at all.
-IPAddressDeny=localhost link-local multicast 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 fc00::/7
-IPAddressAllow=127.74.3.1/32 127.0.0.53/32 100.64.0.0/10
+# NETWORK. On this host 127.0.0.1 carries other tenants' services with no login and the docker bridges carry containers, so the kernel
+# reaches only what it needs: its own gateway address (the VPS worker connects to it; with 127.74.3.1 on lo, both ends of the loopback
+# conversation carry it), one Tailscale peer when the Mac worker is set up (a /32 in a root-owned drop-in, bulig.service.d/20-mac-worker.conf,
+# written by set-mac-worker.sh; none until then), and the public internet (GitHub). IPAddressDeny/Allow match ADDRESSES, NOT PORTS, so a service
+# listening on every address (22, 80, 443 here: public anyway) is also reachable at 127.74.3.1. It reaches Postgres over the unix socket.
+# KNOWN LIMIT: this unit keeps AF_UNIX (the Postgres socket), so it can still reach other tenants' ABSTRACT unix sockets (an X server here).
+# It runs no worker code (the worker is a different unit with no AF_UNIX); an AppArmor profile (deny unix addr=@**,) is the next step.
+# DNS comes from resolved's upstream list, not the 127.0.0.53 stub (see bulig-worker.service).
+IPAddressDeny=localhost link-local multicast 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7
+IPAddressAllow=127.74.3.1/32
+BindReadOnlyPaths=/run/systemd/resolve/resolv.conf:/etc/resolv.conf
+InaccessiblePaths=-/run/tailscale -/run/snapd.socket -/run/docker.sock -/var/run/docker.sock
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 # NOT set on purpose:
 #   MemoryDenyWriteExecute  node's JIT needs writable+executable memory.

@@ -38,10 +38,11 @@ RestrictRealtime=true
 LockPersonality=true
 # MemoryDenyWriteExecute is not set: the aws CLI is a frozen Python bundle and may need it off.
 SystemCallArchitectures=native
-# Postgres is reached over its unix socket. R2 and DNS only on the network: no localhost services, no docker bridges, no private ranges.
+# Postgres is reached over its unix socket. R2 only on the network: no localhost services, no docker bridges, no private ranges. DNS comes
+# from resolved's upstream list (public servers), not the 127.0.0.53 stub, so nothing local is allowed at all.
 # (With the docker fallback for the aws CLI, the container's own traffic belongs to dockerd's cgroup, not to this unit, and is not filtered here.)
 IPAddressDeny=localhost link-local multicast 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7
-IPAddressAllow=127.0.0.53/32
+BindReadOnlyPaths=/run/systemd/resolve/resolv.conf:/etc/resolv.conf
 # docker's client config lives in a root-owned folder under /var/lib/bulig-checks, never in /root (ProtectHome hides it).
 Environment=DOCKER_CONFIG=/var/lib/bulig-checks/docker
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

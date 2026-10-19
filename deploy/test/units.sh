@@ -26,7 +26,6 @@ for u in bulig.service bulig-worker.service; do
   want "$u" ProtectHome yes
   want "$u" PrivateTmp true
   want "$u" CapabilityBoundingSet ""
-  want "$u" RestrictAddressFamilies "AF_UNIX AF_INET AF_INET6"
   want "$u" KillMode control-group
   for k in ProtectKernelTunables ProtectKernelModules ProtectKernelLogs ProtectControlGroups RestrictSUIDSGID LockPersonality PrivateDevices; do
     want "$u" "$k" true
@@ -45,32 +44,54 @@ if value bulig.service LoadCredential | grep -q claude; then bad "the kernel uni
 if value bulig-worker.service LoadCredential | grep -qE 'pg-url|gh-token|config|worker-tokens'; then bad "the worker unit holds a kernel secret or the config"; else ok "the worker unit holds no kernel secret and no config"; fi
 if [ "$(value bulig.service Environment | tr '\n' ' ')" = "HOME=/var/lib/bulig PATH=/usr/local/bin:/usr/bin:/bin " ]; then ok "the kernel's environment is only HOME and PATH (no secret in it)"; else bad "kernel environment: $(value bulig.service Environment)"; fi
 
-echo "network filtering: what each unit can reach"
-DENY_PRIV="localhost link-local multicast 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7"
-DENY_KERNEL="localhost link-local multicast 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 fc00::/7"
-want bulig.service IPAddressDeny "$DENY_KERNEL"
-want bulig.service IPAddressAllow "127.74.3.1/32 127.0.0.53/32 100.64.0.0/10"
-want bulig-worker.service IPAddressDeny "$DENY_PRIV"
-want bulig-worker.service IPAddressAllow "127.74.3.1/32 127.0.0.53/32"
+echo "network and sockets: what each unit can reach"
+DENY="localhost link-local multicast 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7"
+INACC="-/run/tailscale -/run/snapd.socket -/run/docker.sock -/var/run/docker.sock"
+RES="/run/systemd/resolve/resolv.conf:/etc/resolv.conf"
+# the worker: no unix socket of any kind, the gateway address and nothing else local
+want bulig-worker.service RestrictAddressFamilies "AF_INET AF_INET6"
+want bulig-worker.service IPAddressDeny "$DENY"
+want bulig-worker.service IPAddressAllow "127.74.3.1/32"
+want bulig-worker.service InaccessiblePaths "$INACC"
+want bulig-worker.service BindReadOnlyPaths "$RES"
+# the kernel: keeps AF_UNIX for Postgres, the gateway address only; a Mac worker's /32 comes from a drop-in, none by default
+want bulig.service RestrictAddressFamilies "AF_UNIX AF_INET AF_INET6"
+want bulig.service IPAddressDeny "$DENY"
+want bulig.service IPAddressAllow "127.74.3.1/32"
+want bulig.service InaccessiblePaths "$INACC"
+want bulig.service BindReadOnlyPaths "$RES"
+# backup and drill: private ranges denied, nothing allowed, upstream resolvers, docker's config in a root-owned folder
 for u in bulig-backup.service bulig-restore-drill.service; do
-  want "$u" IPAddressDeny "$DENY_PRIV"
-  want "$u" IPAddressAllow "127.0.0.53/32"
+  want "$u" IPAddressDeny "$DENY"
+  if has "$u" IPAddressAllow; then bad "$u allows an address: $(value "$u" IPAddressAllow)"; else ok "$u allows no address at all"; fi
+  want "$u" BindReadOnlyPaths "$RES"
   want "$u" Environment "DOCKER_CONFIG=/var/lib/bulig-checks/docker"
 done
 want bulig-loopback.service IPAddressDeny any
 for u in bulig.service bulig-worker.service bulig-backup.service bulig-restore-drill.service bulig-loopback.service; do
   if [ "$(value "$u" IPAddressDeny | wc -l | tr -d ' ')" = "1" ]; then ok "$u has an IPAddressDeny line"; else bad "$u has no (or two) IPAddressDeny lines"; fi
   case " $(value "$u" IPAddressAllow) " in
-    *" 127.0.0.1/32 "* | *" 127.0.0.0/8 "* | *" localhost "* | *" any "* | *" 0.0.0.0/0 "* | *" 172.17.0.1/32 "* | *" ::1/128 "*) bad "$u lets localhost, the docker bridge or everything through: $(value "$u" IPAddressAllow)" ;;
-    *) ok "$u does not allow 127.0.0.1, localhost, the docker bridge or everything" ;;
+    *" 127.0.0.1/32 "* | *" 127.0.0.0/8 "* | *" localhost "* | *" any "* | *" 0.0.0.0/0 "* | *" 172.17.0.1/32 "* | *" ::1/128 "* | *" 127.0.0.53/32 "* | *" 100.64.0.0/10 "*) bad "$u allows localhost, the DNS stub, a whole range, the docker bridge or everything: $(value "$u" IPAddressAllow)" ;;
+    *) ok "$u does not allow 127.0.0.1, localhost, the DNS stub, Tailscale as a range, the docker bridge or everything" ;;
   esac
 done
 for u in bulig.service bulig-worker.service bulig-backup.service bulig-restore-drill.service; do
-  case " $(value "$u" IPAddressDeny) " in *" localhost "* | *" link-local "* | *" multicast "* | *" 172.16.0.0/12 "*) ok "$u denies localhost, link-local, multicast and the 172.16/12 range (docker bridges)" ;; *) bad "$u IPAddressDeny: $(value "$u" IPAddressDeny)" ;; esac
+  missing=""
+  for t in localhost link-local multicast 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7; do
+    case " $(value "$u" IPAddressDeny) " in *" $t "*) ;; *) missing="$missing $t" ;; esac
+  done
+  if [ -z "$missing" ]; then ok "$u denies localhost, link-local, multicast, 10/8, 172.16/12, 192.168/16, 100.64/10 and fc00::/7"; else bad "$u does not deny:$missing"; fi
+  if grep -qE '127\.0\.0\.53' <(grep -v '^#' "$sd/$u"); then bad "$u names the DNS stub 127.0.0.53 in a setting"; else ok "$u does not name the DNS stub (DNS goes through resolved's upstream list)"; fi
 done
-# The worker is the one that runs Claude: it must not be able to reach Tailscale peers either.
-case " $(value bulig-worker.service IPAddressDeny) " in *" 100.64.0.0/10 "*) ok "the worker also denies Tailscale (100.64.0.0/10)" ;; *) bad "worker does not deny Tailscale" ;; esac
-case " $(value bulig.service IPAddressDeny) " in *" 100.64.0.0/10 "*) bad "the kernel denies Tailscale, so the Mac worker could not reach it" ;; *) ok "the kernel does not deny Tailscale (the Mac worker comes in that way)" ;; esac
+# Only the loopback unit, which uses netlink to add an address, may have anything but IP families; neither the worker nor the build may have unix sockets.
+case " $(value bulig-worker.service RestrictAddressFamilies) " in *AF_UNIX* | *AF_NETLINK* | *AF_PACKET*) bad "the worker unit allows a non-IP socket family" ;; *) ok "the worker unit allows IP sockets only (no AF_UNIX, no AF_NETLINK)" ;; esac
+case " $(value bulig.service RestrictAddressFamilies) " in *AF_UNIX*) ok "the kernel keeps AF_UNIX (its Postgres socket): a documented limit, see the RUNBOOK" ;; *) bad "the kernel unit lost AF_UNIX, so it cannot reach Postgres" ;; esac
+if grep -q 'Known limits' "$deploy/RUNBOOK.md" && grep -q 'deny unix addr=@\*\*' "$deploy/RUNBOOK.md" && grep -qi 'abstract' <(sed -n '/Known limits/,$p' "$deploy/RUNBOOK.md"); then ok "the RUNBOOK's Known limits name the kernel's abstract-socket reach and the AppArmor next step"; else bad "RUNBOOK Known limits section is missing the abstract-socket limit"; fi
+# a wording check: no file claims the allowed addresses are limited to a port
+if grep -rniE 'only (the )?(dns|port 53)|answers dns and nothing else|dns and nothing else' "$sd" "$deploy/RUNBOOK.md" >/dev/null; then bad "a file still claims an allowed address is DNS-only: $(grep -rniE 'dns and nothing else|only dns' "$sd" "$deploy/RUNBOOK.md" | head -2)"; else ok "no file claims an allowed address reaches only DNS or only one port"; fi
+for u in bulig-worker.service bulig.service; do
+  if grep -q 'ADDRESSES, NOT PORTS' "$sd/$u"; then ok "$u says the filter matches addresses and not ports"; else bad "$u does not say the filter matches addresses, not ports"; fi
+done
 
 echo "the gateway address"
 gw="127.74.3.1"

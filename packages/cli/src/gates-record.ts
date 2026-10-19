@@ -22,6 +22,8 @@ export const isSynthetic = (job: Job | undefined): boolean => job?.title.trimSta
 
 export const SOAK_STARTED = 'gates.soak.started';
 export const WARNING_FALSE = 'gates.warning.false';
+/** Written by `bulig gates enforce` each time it switches the gates, with whether the bar was bypassed. */
+export const ENFORCED = 'gates.enforced';
 
 const DAY_MS = 86_400_000;
 
@@ -117,15 +119,19 @@ export interface Report {
   warnings: Array<Verdict & { falseReason?: string }>;
   /** Jobs left out because they are test jobs (see SYNTHETIC_PREFIX). */
   synthetic: number;
+  /** The newest `gates.enforced` in the log, whenever it was written. */
+  enforced?: { at: string; forced: boolean };
   bar: Bar;
 }
 
 /** What `events` and `jobs` say about the soak at time `now`. Only events after the newest start count. */
 export function buildReport(events: readonly BuligEvent[], jobs: readonly Job[], now: Date): Report {
   const start = soakStart(events);
+  const last = events.filter((e) => e.type === ENFORCED && e.seq !== undefined).sort((a, b) => a.seq! - b.seq!).at(-1);
+  const enforced = last && { at: last.at, forced: asRecord(last.payload).forced === true };
   if (!start) {
     const bar = checkBar(0, 0, 0);
-    return { started: false, daysElapsed: 0, jobs: [], gates: GATES.map((gate) => ({ gate, clean: 0, warned: 0 })), warnings: [], synthetic: 0, bar: { ...bar, line: `${bar.line} (the soak has not started: run bulig gates soak start)` } };
+    return { started: false, daysElapsed: 0, jobs: [], gates: GATES.map((gate) => ({ gate, clean: 0, warned: 0 })), warnings: [], synthetic: 0, ...(enforced && { enforced }), bar: { ...bar, line: `${bar.line} (the soak has not started; it starts when serve first runs with a gate on)` } };
   }
   const since = events.filter((e) => e.seq !== undefined && e.seq > start.seq!).sort((a, b) => a.seq! - b.seq!);
   const jobById = new Map(jobs.map((j) => [j.id, j]));
@@ -164,6 +170,7 @@ export function buildReport(events: readonly BuligEvent[], jobs: readonly Job[],
     }),
     warnings: [...warned.values()].map((v) => (marks.has(v.eventId) ? { ...v, falseReason: marks.get(v.eventId)! } : v)),
     synthetic,
+    ...(enforced && { enforced }),
     bar: checkBar(daysElapsed, byJob.size, marks.size),
   };
 }

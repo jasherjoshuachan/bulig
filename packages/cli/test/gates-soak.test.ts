@@ -117,7 +117,8 @@ function soakSuite(make: Make) {
     expect(r.code).toBe(0);
     expect(r.out).toContain('soak      not started');
     expect(r.out).toContain('bar not met');
-    expect(r.out).toContain('bulig gates soak start');
+    expect(r.out).toContain('it starts when serve first runs with a gate on');
+    expect(r.out).not.toContain('run bulig gates soak start');
   });
 
   it('there is no manual start: soak start alone is refused, and --restart writes a new start and drops the earlier record', async () => {
@@ -340,7 +341,7 @@ function soakSuite(make: Make) {
   describe('enforce', () => {
     /** A world whose config has a Telegram-free default `enabled`, an odd indent and extra keys that must come through untouched. */
     const configured = () => ({
-      grants: { 'channel-cli': ['approval.grant'] },
+      ...kernelConfig(),
       pluginConfig: { github: { ghBin: 'gh', allowNoChecks: true }, 'gate-evidence': { evidenceSources: ['worker-claude-code'], mode: 'warn' } },
       eventCapabilities: { 'x.y': 'z' },
     });
@@ -377,6 +378,13 @@ function soakSuite(make: Make) {
       expect(r.err).toBe('');
       expect(r.code).toBe(0);
       expect(r.out).toContain('Restart it');
+      expect(r.out).toContain('Recorded as the bar met');
+      // The record says the bar was met, with the numbers it was judged on.
+      const [rec] = await eventsOf(w, 'gates.enforced');
+      expect(await eventsOf(w, 'gates.enforced')).toHaveLength(1);
+      expect(rec).toMatchObject({ source: 'cli', payload: { forced: false, bar: { met: true, line: 'bar met', moreDays: 0, moreJobs: 0, falseWarnings: 0 }, jobs: 10 } });
+      w.clockAt(await startedAt(w), 7 * DAY);
+      expect((await w.run('gates', 'status')).out).toMatch(/^enforced  \S+$/m);
 
       const after = w.readConfig();
       const expected = structuredClone(before);
@@ -403,6 +411,11 @@ function soakSuite(make: Make) {
       const r = await w.run('gates', 'enforce', '--force');
       expect(r.code).toBe(0);
       expect(r.out).toContain('--force given');
+      expect(r.out).toContain('Recorded as FORCED');
+      const recs = await eventsOf(w, 'gates.enforced');
+      expect(recs).toHaveLength(1);
+      expect(recs[0]).toMatchObject({ source: 'cli', payload: { forced: true, bar: { met: false }, jobs: 0 } });
+      expect((recs[0]!.payload as { bar: { line: string } }).bar.line).toContain('bar not met');
       expect(w.readConfig().pluginConfig['gate-promise'].mode).toBe('enforce');
       expect(w.readConfig().pluginConfig['gate-evidence'].mode).toBe('enforce');
     });
@@ -477,7 +490,8 @@ describePg('bulig gates on Postgres', () => {
     const warn = await w.seed((s) => evidence(s, jobId, 'test', ['Unverified: a']));
     const holder = await PostgresStore.open(db.url);
     try {
-      for (const argv of [['gates', 'mark-false', warn.id, '--reason', 'x'], ['gates', 'soak', 'start', '--restart']]) {
+      const cfgBefore = readFileSync(w.cfgPath, 'utf8');
+      for (const argv of [['gates', 'mark-false', warn.id, '--reason', 'x'], ['gates', 'soak', 'start', '--restart'], ['gates', 'enforce', '--force']]) {
         const r = await w.run(...argv);
         expect(r.code).toBe(2);
         expect(r.err).toMatch(/only one kernel may do that at a time/);
@@ -485,7 +499,8 @@ describePg('bulig gates on Postgres', () => {
       }
       // Look through the holder's own connection: a second writer would be refused too.
       const log = await holder.eventsAfter(0);
-      expect(log.filter((e) => e.type === 'gates.warning.false')).toHaveLength(0);
+      expect(log.filter((e) => e.type === 'gates.warning.false' || e.type === 'gates.enforced')).toHaveLength(0);
+      expect(readFileSync(w.cfgPath, 'utf8')).toBe(cfgBefore); // a refused enforce changed nothing
       expect(log.filter((e) => e.type === 'gates.soak.started')).toHaveLength(1);
       // Reading is never refused.
       expect((await w.run('gates', 'status')).code).toBe(0);
@@ -578,6 +593,8 @@ function watched(path: string) {
   return { store, inside, outside };
 }
 
+const on = (...enabled: string[]) => ({ enabled, pluginConfig: {} as Record<string, Record<string, unknown>> });
+
 describe('the soak clock starts by itself, through the kernel', () => {
   const quiet = { debug() {}, info() {}, warn() {}, error() {} };
   const kernelOn = (store: Store, root: string) => {
@@ -592,16 +609,28 @@ describe('the soak clock starts by itself, through the kernel', () => {
     const { store, inside, outside } = watched(join(root, 'c.sqlite'));
     const k = kernelOn(store, root);
     await k.start();
-    expect(await ensureSoakStarted(k, ['worker-claude-code'])).toBeUndefined(); // no gate on: no soak
+    expect(await ensureSoakStarted(k, on('worker-claude-code'))).toBeUndefined(); // no gate on: no soak
     expect(inside).not.toContain('gates.soak.started');
-    const first = await ensureSoakStarted(k, ['gate-evidence', 'gate-promise']);
+    const first = await ensureSoakStarted(k, on('gate-evidence', 'gate-promise'));
     expect(first).toBeDefined();
-    expect(await ensureSoakStarted(k, ['gate-evidence'])).toBeUndefined();
+    expect(await ensureSoakStarted(k, on('gate-evidence'))).toBeUndefined();
     expect(inside.filter((t) => t === 'gates.soak.started')).toHaveLength(1);
     expect(outside.filter((t) => t.startsWith('gates.'))).toEqual([]);
     const starts = (await k.bus.replay(0)).filter((e) => e.type === 'gates.soak.started');
     expect(starts).toHaveLength(1);
     expect(starts[0]).toMatchObject({ source: 'cli', payload: { auto: true } });
+  });
+
+  it('a gate that is listed but switched off (enabled: false) does not start the clock; one that is really on does', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'bulig-soak-c-'));
+    dirs.push(root);
+    const k = kernelOn(new SqliteStore(join(root, 'c.sqlite')), root);
+    await k.start();
+    const off = { enabled: ['gate-evidence', 'gate-promise'], pluginConfig: { 'gate-evidence': { enabled: false }, 'gate-promise': { enabled: false } } };
+    expect(await ensureSoakStarted(k, off)).toBeUndefined();
+    expect((await k.bus.replay(0)).filter((e) => e.type === 'gates.soak.started')).toHaveLength(0);
+    const one = { enabled: ['gate-evidence', 'gate-promise'], pluginConfig: { 'gate-evidence': { enabled: false } } };
+    expect(await ensureSoakStarted(k, one)).toBeDefined();
   });
 
   it('a restarted kernel on the same record does not move the clock, even if it asks twice at once', async () => {
@@ -610,13 +639,13 @@ describe('the soak clock starts by itself, through the kernel', () => {
     const path = join(root, 'c.sqlite');
     const k1 = kernelOn(new SqliteStore(path), root);
     await k1.start();
-    const [a, b] = await Promise.all([ensureSoakStarted(k1, ['gate-evidence']), ensureSoakStarted(k1, ['gate-evidence'])]);
+    const [a, b] = await Promise.all([ensureSoakStarted(k1, on('gate-evidence')), ensureSoakStarted(k1, on('gate-evidence'))]);
     // The second one reads the record before the first has written, but the id is fixed, so it is a replay and writes nothing.
     expect([a, b].filter(Boolean).length).toBeGreaterThanOrEqual(1);
     await k1.stop();
     const k2 = kernelOn(new SqliteStore(path), root);
     await k2.start();
-    expect(await ensureSoakStarted(k2, ['gate-evidence'])).toBeUndefined();
+    expect(await ensureSoakStarted(k2, on('gate-evidence'))).toBeUndefined();
     expect((await k2.bus.replay(0)).filter((e) => e.type === 'gates.soak.started')).toHaveLength(1);
   });
 

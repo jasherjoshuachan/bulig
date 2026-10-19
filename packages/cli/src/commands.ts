@@ -377,7 +377,7 @@ async function cmdServe(args: string[], io: Io): Promise<number> {
     },
   );
   // The soak clock (step 5) starts the first time a kernel with a gate runs on a record. A failure here must not take serve down.
-  await ensureSoakStarted(session.kernel, config.enabled).catch((err: unknown) => io.err(`warn: could not record the soak start: ${err instanceof Error ? err.message : String(err)}`));
+  await ensureSoakStarted(session.kernel, config).catch((err: unknown) => io.err(`warn: could not record the soak start: ${err instanceof Error ? err.message : String(err)}`));
   const forget = io.onStop?.(stop);
   io.out(`bulig: serving with ${config.enabled.join(', ')}. Stop with Ctrl-C.`);
   try {

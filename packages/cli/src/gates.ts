@@ -4,7 +4,7 @@ import { parseArgs } from 'node:util';
 import { derivedEventId, type Kernel, type Store } from '@bulig/core';
 import { clipText } from '@bulig/text';
 import { loadConfig, GATE_PLUGINS, type BuligConfig } from './config.ts';
-import { GATES, SOAK_DAYS, SOAK_JOBS, SOAK_STARTED, WARNING_FALSE, buildReport, findWarning, soakStart, type Report } from './gates-record.ts';
+import { ENFORCED, GATES, SOAK_DAYS, SOAK_JOBS, SOAK_STARTED, WARNING_FALSE, buildReport, findWarning, soakStart, type Report } from './gates-record.ts';
 import type { Io } from './commands.ts';
 
 /** What `bulig gates` borrows from commands.ts, so that file gets one registration line and no new exports. */
@@ -57,6 +57,9 @@ async function report(io: Io, deps: GatesDeps): Promise<Report> {
   return deps.readStore(io, async (store) => buildReport(await store.eventsAfter(0), await store.listJobs(), nowOf(io)));
 }
 
+/** The gate is in `enabled` and not switched off in its own config. */
+const gateOn = (config: Pick<BuligConfig, 'enabled' | 'pluginConfig'>, g: string): boolean => config.enabled.includes(g) && config.pluginConfig[g]?.enabled !== false;
+
 /** The id of the one `gates.soak.started` a kernel writes by itself. A second try reads the same id, so it can only be written once. */
 const AUTO_START_ID = derivedEventId('gates.soak', SOURCE, 0, SOAK_STARTED);
 
@@ -64,8 +67,9 @@ const AUTO_START_ID = derivedEventId('gates.soak', SOURCE, 0, SOAK_STARTED);
  * `serve` calls this once it is up: the soak clock starts the first time a kernel with a gate runs on a record, and never again by itself.
  * The write is the kernel's own, through its fenced queue. Returns the start event if it wrote one.
  */
-export async function ensureSoakStarted(kernel: Kernel, enabled: readonly string[]): Promise<{ id: string; at: string } | undefined> {
-  if (!GATES.some((g) => enabled.includes(g))) return undefined;
+export async function ensureSoakStarted(kernel: Kernel, config: Pick<BuligConfig, 'enabled' | 'pluginConfig'>): Promise<{ id: string; at: string } | undefined> {
+  // A gate that is listed but switched off passes everything through: it says nothing, so it does not start the clock.
+  if (!GATES.some((g) => gateOn(config, g))) return undefined;
   if (soakStart(await kernel.bus.replay(0))) return undefined;
   const e = await kernel.bus.emit({ id: AUTO_START_ID, type: SOAK_STARTED, source: SOURCE, payload: { days: SOAK_DAYS, jobs: SOAK_JOBS, auto: true } });
   return { id: e.id, at: e.at };
@@ -121,6 +125,7 @@ async function status(args: string[], io: Io, deps: GatesDeps): Promise<number> 
   io.out(`elapsed   ${r.daysElapsed.toFixed(1)} of ${SOAK_DAYS} days`);
   io.out(`jobs      ${r.jobs.length} of ${SOAK_JOBS} reached a gate`);
   if (r.synthetic) io.out(`ignored   ${r.synthetic} test job${r.synthetic === 1 ? '' : 's'} (title starts with [synthetic])`);
+  if (r.enforced) io.out(`enforced  ${r.enforced.at}${r.enforced.forced ? ' (FORCED: the bar was not met)' : ''}`);
   io.out(`false     ${r.bar.falseWarnings} warning${r.bar.falseWarnings === 1 ? '' : 's'} marked false`);
   io.out('');
   io.out(`${pad('gate', 16)}${pad('clean', 8)}warned`);
@@ -188,16 +193,31 @@ async function enforce(args: string[], io: Io, deps: GatesDeps): Promise<number>
     if (!values.force) throw new deps.UserError(`not switching to enforce: ${r.bar.line}. See bulig gates status. To switch anyway: bulig gates enforce --force`);
     io.out(`bulig: --force given, going on although ${r.bar.line}`);
   }
-  const backup = setEnforce(path, io, deps);
+  const forced = !r.bar.met;
+  // The switch is written through a kernel of our own, so a running serve refuses it (it has to be restarted for the change anyway), and the record keeps
+  // whether the bar was met. The file is edited first: a record that says "enforced" over an unchanged file would be the worse mistake.
+  const backup = await withWriter(io, deps, 'enforce', async (kernel) => {
+    const done = setEnforce(path, io, deps);
+    try {
+      await kernel.bus.emit({
+        type: ENFORCED,
+        source: SOURCE,
+        payload: { forced, bar: { met: r.bar.met, line: r.bar.line, moreDays: r.bar.moreDays, moreJobs: r.bar.moreJobs, falseWarnings: r.bar.falseWarnings }, daysElapsed: r.daysElapsed, jobs: r.jobs.length },
+      });
+    } catch (err) {
+      throw new deps.UserError(`the config was changed (${path}, old file ${done}) but the record could not be written: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    return done;
+  });
   for (const note of inactive(config)) io.out(`bulig: note: ${note}`);
-  io.out(`bulig: gate-evidence and gate-promise are now "enforce" in ${path} (the old file is ${backup}).`);
+  io.out(`bulig: gate-evidence and gate-promise are now "enforce" in ${path} (the old file is ${backup}). Recorded as ${forced ? 'FORCED, the bar was not met' : 'the bar met'}.`);
   io.out('bulig: a running serve does not see this. Restart it to pick it up.');
   return 0;
 }
 
 /** A gate that is switched off or left out of `enabled` stays off whatever its mode says. Say so, so "enforce" is not taken for protection. */
 function inactive(config: BuligConfig): string[] {
-  return GATE_PLUGINS.filter((g) => !config.enabled.includes(g) || config.pluginConfig[g]?.enabled === false).map(
+  return GATE_PLUGINS.filter((g) => !gateOn(config, g)).map(
     (g) => `${g} is not enabled, so it will not run in any mode.`,
   );
 }

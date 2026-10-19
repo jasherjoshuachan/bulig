@@ -53,7 +53,7 @@ BULIG_USERS="bulig bulig-worker"
 BULIG_USER_STATE_PREFIXES="$R/var/lib/bulig $R/var/lib/bulig-worker"
 
 # One secret per root-only file in /etc/bulig, loaded by systemd LoadCredential= into the units that need it. Each unit gets only its own.
-BULIG_CREDENTIALS="pg-url gh-token worker-tokens claude-token worker-token drill-pw"
+BULIG_CREDENTIALS="pg-url gh-token worker-tokens claude-token worker-token github-read-token drill-pw"
 # R2 settings: the only names the backup file may hold.
 BULIG_BACKUP_KEYS="R2_ENDPOINT R2_BUCKET AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_DEFAULT_REGION AWS_REQUEST_CHECKSUM_CALCULATION AWS_RESPONSE_CHECKSUM_VALIDATION"
 

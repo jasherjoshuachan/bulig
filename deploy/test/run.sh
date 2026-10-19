@@ -29,7 +29,7 @@ expect_fail_msg "an absolute path as the name is refused" "unknown credential '/
 expect_fail_msg "an old-style NAME FILE call is refused" "usage: set-secret.sh" bash -c "echo v | '$ss' R2_BUCKET '$root/tmp/evil'"
 expect_fail_msg "a third argument is refused" "usage: set-secret.sh" bash -c "echo v | '$ss' --credential pg-url '$root/tmp/evil'"
 expect_fail_msg "no arguments is refused" "usage: set-secret.sh" bash -c "echo v | '$ss'"
-for n in pg-url gh-token worker-tokens claude-token worker-token drill-pw; do
+for n in pg-url gh-token worker-tokens claude-token worker-token github-read-token drill-pw; do
   expect_ok "the known credential $n is accepted" bash -c "echo v | '$ss' --credential $n"
 done
 expect_ok "backup key R2_BUCKET is written" bash -c "echo mybucket | '$ss' --backup-key R2_BUCKET"
@@ -287,7 +287,7 @@ suite_rc=$?
 # The other suites: the restore drill and backup (stubbed tools), and the server half of a release (stubbed systemd).
 # (BULIG_TEST_ONLY_THIS_FILE=1: mutations.py runs one suite at a time)
 if [ -n "${BULIG_TEST_ONLY_THIS_FILE:-}" ]; then exit "$suite_rc"; fi
-for suite in drill.sh release.sh setup.sh cluster.sh cli.sh fence.sh health.sh scan.sh units.sh invariant.sh; do
+for suite in drill.sh release.sh setup.sh cluster.sh cli.sh gitcred.sh fence.sh health.sh scan.sh units.sh invariant.sh; do
   echo
   echo "== $suite"
   bash "$here/$suite" || suite_rc=1

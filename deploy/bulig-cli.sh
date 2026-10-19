@@ -5,7 +5,7 @@
 #                     deploy/bulig-cli.sh [--as kernel|worker] --exec <program> <arguments...>
 #                     deploy/bulig-cli.sh [--as kernel|worker] --tty --exec <program> ...     (a terminal, for claude setup-token: ssh -t)
 #   --as kernel (default)  user bulig,        credentials config, pg-url, gh-token, worker-tokens   (what bulig.service has)
-#   --as worker            user bulig-worker, credentials claude-token, worker-token                (what bulig-worker.service has)
+#   --as worker            user bulig-worker, credentials claude-token, worker-token, github-read-token  (what bulig-worker.service has)
 #   --exec                 run <program> (for example git clone, for a repo the worker needs) instead of the bulig CLI
 # Same user, same credentials, same hardening, same network and socket fence (lib/common.sh: IP filter, address families, hidden sockets, resolver) and the same style of caps as the matching service (smaller numbers, so a one-off
 # command cannot take the room the services need). The kernel reads its secrets from $CREDENTIALS_DIRECTORY, as in the unit.
@@ -64,7 +64,7 @@ case "$role" in
       --setenv=HOME=/var/lib/bulig --setenv=PATH="/usr/local/bin:/usr/bin:/bin") ;;
   worker)
     cli_fence_props worker
-    add_creds claude-token:claude-token worker-token:worker-token
+    add_creds claude-token:claude-token worker-token:worker-token github-read-token:github-read-token
     spec=(--uid=bulig-worker --gid=bulig-worker --unit="bulig-cli-worker-$$" -p MemoryMax=2G -p CPUQuota=200% -p StateDirectory=bulig-worker
       --setenv=HOME=/var/lib/bulig-worker --setenv=PATH="/usr/local/bin:/usr/bin:/bin") ;;
   *) die "--as must be kernel or worker" ;;

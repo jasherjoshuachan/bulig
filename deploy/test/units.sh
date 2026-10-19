@@ -39,8 +39,10 @@ echo "credentials: each unit holds only its own"
 kernel_creds="$(value bulig.service LoadCredential | sort | tr '\n' ' ')"
 worker_creds="$(value bulig-worker.service LoadCredential | sort | tr '\n' ' ')"
 if [ "$kernel_creds" = "config:/etc/bulig/config.json gh-token:/etc/bulig/gh-token pg-url:/etc/bulig/pg-url worker-tokens:/etc/bulig/worker-tokens " ]; then ok "the kernel holds config, pg-url, gh-token and worker-tokens"; else bad "kernel credentials: $kernel_creds"; fi
-if [ "$worker_creds" = "claude-token:/etc/bulig/claude-token worker-token:/etc/bulig/worker-token " ]; then ok "the worker holds claude-token and worker-token only"; else bad "worker credentials: $worker_creds"; fi
+if [ "$worker_creds" = "claude-token:/etc/bulig/claude-token github-read-token:/etc/bulig/github-read-token worker-token:/etc/bulig/worker-token " ]; then ok "the worker holds claude-token, github-read-token and worker-token only"; else bad "worker credentials: $worker_creds"; fi
 if value bulig.service LoadCredential | grep -q claude; then bad "the kernel unit holds the Claude token"; else ok "the kernel unit never holds the Claude token"; fi
+if value bulig.service LoadCredential | grep -q 'github-read-token'; then bad "the kernel unit holds the worker's read-only GitHub token"; else ok "the kernel unit never holds the worker's read-only GitHub token"; fi
+if value bulig-worker.service LoadCredential | grep -q 'gh-token'; then bad "the worker unit holds the kernel's GitHub token (the one that can push)"; else ok "the worker unit never holds the kernel's gh-token"; fi
 if value bulig-worker.service LoadCredential | grep -qE 'pg-url|gh-token|config|worker-tokens'; then bad "the worker unit holds a kernel secret or the config"; else ok "the worker unit holds no kernel secret and no config"; fi
 if [ "$(value bulig.service Environment | tr '\n' ' ')" = "HOME=/var/lib/bulig PATH=/usr/local/bin:/usr/bin:/bin " ]; then ok "the kernel's environment is only HOME and PATH (no secret in it)"; else bad "kernel environment: $(value bulig.service Environment)"; fi
 

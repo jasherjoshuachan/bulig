@@ -19,10 +19,13 @@ Group=bulig-worker
 StateDirectory=bulig-worker
 StateDirectoryMode=0700
 WorkingDirectory=/opt/bulig/current
-# Only two credentials: the Claude token, and this worker's own token for the gateway. Not the config, not the database URL, not the
-# GitHub token: the worker reads no kernel config and gets everything it needs from its flags.
+# Three credentials: the Claude token, this worker's own token for the gateway, and a GitHub token that can only READ one repository (the
+# worker's own clone is of a private repo). Not the config, not the database URL, not the kernel's GitHub token (the one that can push):
+# the worker reads no kernel config and gets everything else it needs from its flags. The read token reaches git through a credential
+# helper in the worker's own global git config (deploy/git-credential-bulig-read, set up in the RUNBOOK), never through a URL or a file.
 LoadCredential=claude-token:/etc/bulig/claude-token
 LoadCredential=worker-token:/etc/bulig/worker-token
+LoadCredential=github-read-token:/etc/bulig/github-read-token
 # Not secret, root-owned: BULIG_WORKER_REPOS="--repo <kernelPath>=<localClone> ..." (see worker.env.example). The worker needs at least one.
 EnvironmentFile=/etc/bulig/worker.env
 Environment=HOME=/var/lib/bulig-worker

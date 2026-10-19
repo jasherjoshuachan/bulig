@@ -108,7 +108,7 @@ mkdir -m 0700 /var/tmp/home /var/tmp/build
 cd /var/tmp/build
 tar -x --no-same-owner -f -
 pnpm install --frozen-lockfile --prod=false --config.package-import-method=copy --store-dir /var/tmp/pnpm-store </dev/null >&2
-find . -name node_modules -type d -prune -print0 | tar -c --null -T - -f -'
+find . -name node_modules -type d -prune -print0 | tar -c --hard-dereference --null -T - -f -'
   build_fence_props
   local rc=0 got
   # head -c: at most one byte more than the cap is ever written to disk, whatever the build sends.

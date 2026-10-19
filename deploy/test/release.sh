@@ -193,6 +193,10 @@ mk_modules "$work/cm"; mkfifo "$work/cm/node_modules/fifo"
 expect_fail_msg "a fifo is refused" "not a file, folder or link" cm "$work/cm"
 mk_modules "$work/cm"; ln "$work/cm/node_modules/.bin/tool" "$work/cm/node_modules/tool2"
 expect_fail_msg "a hard link is refused" "hard link" cm "$work/cm"
+# A dependency's install script may make a hard link (esbuild does, found on the server 20 Oct 2026). The build archives
+# it as a separate file, so the unpack check can keep refusing hard links without refusing the release.
+if grep -q "tar -c --hard-dereference --null -T - -f -" "$deploy/release-remote.sh"; then ok "the build archives hard links as separate files (--hard-dereference)"; else bad "the build tar does not dereference hard links, so esbuild's install makes every release fail"; fi
+
 mk_modules "$work/cm"; chmod 4755 "$work/cm/node_modules/.bin/tool"
 expect_fail_msg "a set-uid file is refused" "set-uid" cm "$work/cm"
 mk_modules "$work/cm"; chmod 2755 "$work/cm/node_modules/.bin/tool"

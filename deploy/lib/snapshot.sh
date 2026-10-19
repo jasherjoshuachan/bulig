@@ -23,9 +23,9 @@ snapshot() {
     | awk -v p=":$BULIG_PG_PORT" '{ addr = $4; proc = ($NF ~ /^users:/) ? $NF : "-"; if (addr !~ p "$") print addr, proc }' \
     | sed -E 's/pid=[0-9]+,?//g; s/,?fd=[0-9]+//g' | sort -u
 
-  echo "## NanoClaw and Temporal services (all states)"
+  echo "## every service unit and its state (bulig left out). This covers the other apps on the host, whatever they are called."
   systemctl list-units --type=service --all --no-legend --plain --no-pager \
-    | awk '{print $1, $3, $4}' | grep -Ei 'nanoclaw|temporal' | sort || true
+    | awk '{print $1, $3, $4}' | grep -Ev '^(bulig|postgresql@16-bulig)' | grep -Ev "$SNAPSHOT_NOISE" | sort || true
 
   echo "## docker containers (name, image, state)"
   if command -v docker >/dev/null 2>&1; then

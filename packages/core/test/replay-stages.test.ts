@@ -9,7 +9,7 @@ import { useKernelAdapters } from './kernel-adapters.ts';
 
 const { adapters, cleanups } = useKernelAdapters();
 
-/** Make the kernel hear an event again, as if its handlers were run a second time (a standby that takes over, a worker that redelivers). */
+/** Make the kernel hear an event again, as if its handlers were run a second time, inside the same kernel (a redelivery). A standby takeover is not covered: see ADR 0010 Known limits. */
 const redeliver = (k: ReturnType<typeof createKernel>, e: BuligEvent) => (k.bus as unknown as { dispatch(e: BuligEvent): void }).dispatch(e);
 
 for (const adapter of adapters) {

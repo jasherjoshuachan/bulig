@@ -4,8 +4,8 @@ import type { BuligEvent } from '@bulig/plugin-sdk';
 import { describePg, usePgServer, type PgDatabase } from '../../../packages/core/test/pg-throwaway.ts';
 import { boot, fakeGithub, fakeHuman, fakeWorker, newDb, settle, type Sent } from './harness.ts';
 
-// ADR 0010, addendum of 19 Oct 2026: the log is delivered a second time, as a standby that takes over (or a remote worker that
-// redelivers) would do it. The pipeline must not open a second attempt of any stage, because the request for it would be dropped as
+// ADR 0010, addendum of 19 Oct 2026: the log is delivered a second time inside the same kernel, as a redelivery would do it. A standby
+// takeover is not covered here: see ADR 0010 Known limits. The pipeline must not open a second attempt of any stage, because the request for it would be dropped as
 // already done and the attempt would sit running with nobody working on it.
 
 const PASS = 'All good.\nVERDICT: PASS';

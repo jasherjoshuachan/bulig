@@ -15,9 +15,11 @@ Four things are true today and shape the choices below.
 
 ### Where it runs
 
-One kernel runs on ths-prod-01 as a systemd unit, `bulig.service`, as its own unix user `bulig`. Its record is a Postgres 16 cluster made for Bulig, on port 5436 (free when checked on 19 Oct 2026; the setup step refuses to continue if it is taken), bound to `127.0.0.1`, with its own role and database. No existing cluster, unit or file is touched. The Mac keeps its own kernel and its SQLite file until the cutover, and the two run side by side without sharing anything.
+One kernel runs on ths-prod-01 as a systemd unit, `bulig.service`, as its own unix user `bulig`. Claude workers run in a second unit, `bulig-worker.service`, as a different unix user, `bulig-worker`. The kernel unit runs with its in-process local worker disabled. The worker unit runs `bulig worker` against the kernel gateway on `127.0.0.1:7431`, exactly as the Mac worker does over Tailscale, so the VPS worker is just another worker that happens to be local. The kernel's record is a Postgres 16 cluster made for Bulig, on port 5436 (free when checked on 19 Oct 2026; the setup step refuses to continue if it is taken), bound to `127.0.0.1`, with its own role and database. No existing cluster, unit or file is touched. The Mac keeps its own kernel and its SQLite file until the cutover, and the two run side by side without sharing anything.
 
-The unit is boxed so client production cannot feel it: `MemoryMax=4G`, `CPUQuota=300%` (three of the eight CPUs), `TasksMax=512` (it counts threads, and two Claude sessions running node test workers can pass 256), and the hardening set already used by the credential broker unit (`NoNewPrivileges`, `ProtectSystem=strict` with named `ReadWritePaths`, `PrivateTmp`, `PrivateDevices`, kernel and cgroup protections, a restricted address family list). The release layout is `/opt/bulig/releases/<sha>` with a `current` symlink, and a deploy swaps the link. The `bulig` user's home is `/var/lib/bulig`. It holds the Claude login (`~/.claude*`), git config and the worktrees, and it is listed in `ReadWritePaths`. The unit does not use `ProtectHome` to hide it, because the broker has no home to protect and Bulig does. The same caps apply to everything the unit starts, including Claude sessions, because they are children of the unit.
+Both units are boxed so client production cannot feel them. The worker unit, which runs every Claude session and their children (node test workers, git, `gh`), carries `MemoryMax=3G`, `CPUQuota=250%` (two and a half of the eight CPUs) and `TasksMax=512` (it counts threads, and two Claude sessions running node test workers can pass 256). The kernel unit has its own, lower caps, which the deploy kit sets (assumed, see the list at the end), because it no longer starts Claude. Both use the hardening set already used by the credential broker unit (`NoNewPrivileges`, `ProtectSystem=strict` with named `ReadWritePaths`, `PrivateTmp`, `PrivateDevices`, kernel and cgroup protections, a restricted address family list). The release layout is `/opt/bulig/releases/<sha>` with a `current` symlink, and a deploy swaps the link. The kernel user's home is `/var/lib/bulig`. The worker user, `bulig-worker`, has its own home, which holds the Claude login (`~/.claude*`) and git config, and it is listed in that unit's `ReadWritePaths`. Neither unit uses `ProtectHome` to hide its home, because the broker has no home to protect and Bulig does.
+
+Worktrees live under `/var/lib/bulig/work`, owned by a shared group, `bulig-work`, with the setgid bit and group write, and both users run with `umask 0002`. That way the kernel's github plugin, running as `bulig`, can commit and push what the worker, running as `bulig-worker`, edited. `bulig-worker` cannot read `/etc/bulig` or the kernel's credentials, and `bulig` cannot read the worker's Claude login.
 
 ### Workers talk to the kernel over HTTP and JSON
 
@@ -27,7 +29,11 @@ The worker logic stays in `worker-claude-code`. A new `bulig worker` command run
 
 ### Auth: one bearer token per worker
 
-Each worker has its own token (long, random, made on the machine that owns it). On the Mac the token lives in the macOS Keychain and reaches the process through the wrapper script, as today. On the VPS every secret is a separate root-only file loaded with systemd `LoadCredential=` (`pg-url`, `worker-tokens`, `claude-token`), and the kernel reads each one from `$CREDENTIALS_DIRECTORY`. `EnvironmentFile` carries only non-secret settings. Secrets never reach Claude sessions through the environment (target spec section 9, rule 5: no secrets in the environment). The worker starts Claude with an explicit allowlisted environment (`PATH`, `HOME`, `LANG`, `TERM`, `TMPDIR`, the Claude auth variable and the git variables it needs), never the kernel's whole environment, so worker tokens, the Postgres URL and the Telegram and GitHub tokens never reach a Claude session. The kernel compares tokens in constant time, maps a token to a worker id, and refuses everything else with the same answer whatever was wrong. Tokens are never logged, never put in a URL, and never put in the repo. A leaked token is revoked by removing its line and restarting the kernel. Tailscale ACLs and tags come on top, but the token is the control that does not depend on them.
+Each worker has its own token (long, random, made on the machine that owns it). On the Mac the token lives in the macOS Keychain and reaches the process through the wrapper script, as today. On the VPS every secret is a separate root-only file loaded with systemd `LoadCredential=`, and each unit carries only its own. The kernel unit, `bulig.service`, carries `pg-url`, `gh-token` and `worker-tokens`. The worker unit, `bulig-worker.service`, carries `claude-token` and its own worker token, and nothing else. Each process reads its files from its own `$CREDENTIALS_DIRECTORY`. `EnvironmentFile` carries only non-secret settings. Credentials loaded this way stay out of the environment, `ps` and the journal (target spec section 9, rule 5: no secrets in the environment).
+
+What this does not do on its own is hide a secret from another process running as the same unix user. A process running as that user can read the unit's `$CREDENTIALS_DIRECTORY` files and `/proc/<pid>/environ`. A security review of the deploy kit proved this, and it is why the worker is a separate user. With two users, a Claude session (which runs as `bulig-worker`) cannot read the kernel's credentials: not the Postgres URL, the GitHub token or the other workers' tokens. It can read only what its own unit carries, which is the Claude token and its own worker token. The worker also starts Claude with an explicit allowlisted environment (`PATH`, `HOME`, `LANG`, `TERM`, `TMPDIR`, the Claude auth variable and the git variables it needs), never the whole environment of the worker process.
+
+On the Mac the worker runs as Jasher's own user. There the isolation is the allowlisted environment only, and a Claude session there can in principle read anything Jasher's user can read. This is a known limit (see below). The kernel compares tokens in constant time, maps a token to a worker id, and refuses everything else with the same answer whatever was wrong. Tokens are never logged, never put in a URL, and never put in the repo. A leaked token is revoked by removing its line from `worker-tokens` and restarting the kernel. Tailscale ACLs and tags come on top, but the token is the control that does not depend on them.
 
 ### The protocol
 
@@ -69,7 +75,7 @@ Running the VPS kernel in parallel is inside the yes Jasher gave. Moving real wo
 
 ### Backups
 
-A systemd timer runs `pg_dump` of the Bulig database every night and uploads it to R2, then checks that the object exists (a head-object check) and that its size is not zero. A restore drill restores the latest dump into a scratch cluster and checks counts, every week, so a drill always runs inside the 7-day soak, and the time it took is written down each time. The scorecard asks for exactly that number (section 13 of the target spec). A backup that was never restored is not counted as a backup.
+A systemd timer runs `pg_dump` of the Bulig database every night and uploads it to R2, then checks that the object exists (a head-object check) and that its size is not zero. At backup time it also writes the dump's sha256 to a local index. A restore drill restores the latest dump into a scratch database with `pg_restore`, as a non-superuser role, and only if the dump's sha256 is in that local index. A dump that is not in the index is refused, so a file planted in the bucket is never restored. The drill checks counts every week, so a drill always runs inside the 7-day soak, and the time it took is written down each time. The scorecard asks for exactly that number (section 13 of the target spec). A backup that was never restored is not counted as a backup.
 
 ### Step 5: eyes, then enforce
 
@@ -90,7 +96,8 @@ We are moving the household into a flat in a shared building. Other families liv
 
 ## Consequences
 
-- Bulig gets a second home with its own user, cluster and limits. If it misbehaves, it hits its own ceiling (4 GB, three CPUs) and not the neighbours.
+- Bulig gets a second home with its own users, cluster and limits. If it misbehaves, it hits its own ceiling (the worker unit, where Claude runs, is capped at 3 GB and 2.5 CPUs) and not the neighbours.
+- Two units and two users cost one more thing to deploy and a shared worktree group to keep right. In return, the process that runs Claude cannot read the kernel's credentials.
 - A worker is one more thing that can die, and that is now a normal event: the stage is resumed once on another worker, and a second failure asks a human.
 - The worker endpoint is a new door. It is closed to the public interface by binding, and closed to the tailnet by a token on top of ACLs. Anyone with the Tailscale address and no token gets a refusal.
 - The Mac keeps working as it does today until cutover. Nothing on the Mac changes in the meantime except that it can also run a worker.
@@ -103,7 +110,8 @@ We are moving the household into a flat in a shared building. Other families liv
 
 - **One kernel, no standby.** If ths-prod-01 is down, Bulig is down until systemd or Jasher brings it back. The nightly dump covers disaster recovery, and the drill says how long that takes. A standby is a later step (target spec section 6).
 - **Tailscale has no tags or ACLs for Bulig yet.** Both machines are on the tailnet with no tags. Until tags and ACLs are set in the admin console (only Jasher can), the token is the only gate on the worker endpoint.
-- **The `bulig` user has no Claude login.** Sessions on the VPS need a token made with `claude setup-token`, which is interactive and is Jasher's to do. It is stored as the `claude-token` credential file. Until then the VPS worker cannot run real stages, and the Mac worker takes everything.
+- **On the Mac, the worker runs as Jasher's own user.** Isolation there is the allowlisted environment only. A Claude session on the Mac can read what Jasher's user can read. The VPS split into two users does not apply to the Mac.
+- **The `bulig-worker` user has no Claude login.** Sessions on the VPS need a token made with `claude setup-token`, which is interactive and is Jasher's to do. It is stored as the `claude-token` credential file of the worker unit. Until then the VPS worker cannot run real stages, and the Mac worker takes everything.
 - **Claude usage is shared.** Bulig jobs and the other jobs on the server draw on the same Claude quota. The slot caps limit how much Bulig can use at once. They do not cap how much it uses over a day.
 - **A kernel crash costs up to 30 s,** as in ADR 0010, and a worker lost mid-stage costs the lease (30 s) plus the stage's work so far, because the second attempt starts the stage again.
 - **A worker that is alive but cut off from the kernel keeps running its Claude session** until its next heartbeat is refused. The fence stops its result from being written. It cannot recall a `git push` already sent, which is why the guards sit at the effect.
@@ -113,6 +121,8 @@ We are moving the household into a flat in a shared building. Other families liv
 
 - **The usage cap and the visible cost meter** (target spec section 3, row 5). The protocol carries nothing about cost today, and a cap needs the worker to report tokens. Left for a later ADR. The slot caps are the only limit for now.
 - A standby kernel.
+- **An R2 token scoped to `bulig/`.** Until Jasher issues one, the backup key is shared with other personal services.
+- **A separate user for the Mac worker.** It runs as Jasher's own user for now.
 - Wake-ups through `LISTEN/NOTIFY`. Workers poll by long poll.
 - More than two workers, or workers on other machines.
 - Moving Telegram. That is the cutover.
@@ -134,3 +144,5 @@ These were outside Jasher's four answers. Each has the cautious default and is e
 10. **`--force` on `bulig gates enforce`** exists as an escape hatch, and it is Jasher's to use. The alternative is no escape hatch at all.
 11. **Tailscale tags and ACLs** are set by Jasher in the admin console when he is ready. The design does not wait for them.
 12. **Workers are told apart by token only.** The worker id in `claim` is a label and is checked against the token's own id. A worker cannot claim as another.
+13. **Kernel unit caps after the split.** The kernel no longer starts Claude, so its `MemoryMax` and `CPUQuota` can be lower than the 4G and 300% it carries today. The number is set in the deploy kit and is not measured. The worker unit's `MemoryMax=3G`, `CPUQuota=250%` and `TasksMax=512` are this ADR's.
+14. **The R2 bucket key is shared with other personal services** until Jasher issues an R2 token scoped to `bulig/`. Until then a Bulig bug or a leaked Bulig credential can reach the other services' objects, and the sha256 index is the guard on what a drill restores. Issuing the scoped token is Jasher's, and it is not yet done.

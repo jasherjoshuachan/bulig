@@ -31,6 +31,8 @@ export interface Io {
   openStore?(dbPath: string): Store;
   /** The longest `drive` waits for the handlers of already-logged events to return before it trusts a resting status. Default 30000. */
   settleMs?: number;
+  /** Lease timings for the kernel, in ms. Tests use it to lose the lease in under a second. Default: the kernel's own (30 s lease, renewed every 10 s). */
+  lease?: { ttlMs: number; heartbeatMs: number };
   /** Replaces the plugin list `serve` loads. Tests use it to put fakes in place of the worker and GitHub. */
   servePlugins?: Plugin[];
 }
@@ -154,6 +156,7 @@ async function openSession(
   resume: 'all' | false | string[],
   onlyJob?: string,
   pluginsFor: (channel: CliChannel) => Plugin[] = terminalPlugins,
+  onLeaseLost?: (reason: string) => void,
 ): Promise<Session> {
   const channel = createCliChannel({ write: (l) => io.out(l), ...(onlyJob && { onlyJob }) });
   const plugins = pluginsFor(channel);
@@ -175,6 +178,8 @@ async function openSession(
       grants: config.grants,
       eventCapabilities: config.eventCapabilities,
       pluginConfig,
+      ...(io.lease && { leaseTtlMs: io.lease.ttlMs, leaseHeartbeatMs: io.lease.heartbeatMs }),
+      ...(onLeaseLost && { onLeaseLost }),
       logger: {
         debug() {},
         info() {},
@@ -340,21 +345,40 @@ async function cmdServe(args: string[], io: Io): Promise<number> {
   if (!config.enabled.includes('channel-telegram') && !config.enabled.includes('channel-cli')) {
     throw new UserError('serve needs a channel. Enable "channel-telegram" in the config.');
   }
-  const session = await openSession(config, io, 'all', undefined, (channel) =>
-    io.servePlugins ?? [telegram, channel.plugin, ...CORE_PLUGINS],
-  );
   let stop: () => void = () => {};
   const stopped = new Promise<void>((resolve) => (stop = resolve));
+  let leaseLost = false;
+  const session = await openSession(
+    config,
+    io,
+    'all',
+    undefined,
+    (channel) => io.servePlugins ?? [telegram, channel.plugin, ...CORE_PLUGINS],
+    (reason) => {
+      // Lost lease means stop writing at once (ADR 0010). The kernel has already stopped writing. Stop the workers too, and
+      // end non-zero so a supervisor restarts serve; the next start resumes from the record.
+      leaseLost = true;
+      io.err(`bulig: lost the executor lease (${reason}). Stopping the workers and exiting with an error so a supervisor restarts serve. The next start resumes from the record.`);
+      stop();
+    },
+  );
   const forget = io.onStop?.(stop);
   io.out(`bulig: serving with ${config.enabled.join(', ')}. Stop with Ctrl-C.`);
   try {
     await stopped;
-    io.out('bulig: stopping. Unfinished jobs pick up again on the next serve.');
+    if (!leaseLost) io.out('bulig: stopping. Unfinished jobs pick up again on the next serve.');
   } finally {
     forget?.();
-    await session.close();
+    // Closing stops every plugin, which ends the running Claude processes. After a lost lease, do not let a stuck close keep the process alive.
+    if (leaseLost) {
+      let giveUp: NodeJS.Timeout | undefined;
+      await Promise.race([session.close().catch(() => {}), new Promise<void>((r) => (giveUp = setTimeout(r, 20_000)))]);
+      clearTimeout(giveUp);
+    } else {
+      await session.close();
+    }
   }
-  return 0;
+  return leaseLost ? 1 : 0;
 }
 
 // ---------- reading ----------

@@ -46,6 +46,9 @@ export interface SeedJob {
   stages?: Array<{ name: string; status?: Stage['status']; output?: unknown }>;
 }
 
+/** The fake kernel's lease generation. A stage it starts is claimed under it; a stage seeded into the store is from the kernel before. */
+const FAKE_GENERATION = 1;
+
 /** Ids in the fake store look like the real ones (UUIDs): the first job is fakeJobId(1), the second fakeJobId(2). */
 export const fakeJobId = (n: number): string => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
 
@@ -104,7 +107,7 @@ function fakeJobs(manifest: Manifest, caps: ReadonlySet<string>, rec: Recording)
       mustGet(jobId);
       if (isApprovalStage(name)) need(`open the "${name}" stage`);
       const attempt = stages.filter((s) => s.jobId === jobId && s.name === name).length + 1;
-      const stage: Stage = { id: `00000000-0000-4000-9000-${String(stages.length + 1).padStart(12, '0')}`, jobId, name, status: 'running', attempt, startedAt: now(), endedAt: null, output: null };
+      const stage: Stage = { id: `00000000-0000-4000-9000-${String(stages.length + 1).padStart(12, '0')}`, jobId, name, status: 'running', attempt, startedAt: now(), endedAt: null, output: null, claimGeneration: FAKE_GENERATION };
       stages.push(stage);
       return { ...stage };
     },
@@ -122,7 +125,7 @@ function fakeJobs(manifest: Manifest, caps: ReadonlySet<string>, rec: Recording)
       const raw = mustGet(job.id);
       raw.status = j.status ?? 'queued';
       for (const s of j.stages ?? []) {
-        const st: Stage = { id: `00000000-0000-4000-9000-${String(stages.length + 1).padStart(12, '0')}`, jobId: job.id, name: s.name, status: s.status ?? 'passed', attempt: 1, startedAt: now(), endedAt: now(), output: s.output ?? null };
+        const st: Stage = { id: `00000000-0000-4000-9000-${String(stages.length + 1).padStart(12, '0')}`, jobId: job.id, name: s.name, status: s.status ?? 'passed', attempt: 1, startedAt: now(), endedAt: now(), output: s.output ?? null, claimGeneration: FAKE_GENERATION - 1 };
         stages.push(st);
       }
       return { ...raw };
@@ -167,6 +170,7 @@ export function createFakeKernel(manifest: Manifest, config: Record<string, unkn
   };
 
   const ctx: PluginContext = {
+    generation: FAKE_GENERATION,
     on(pattern, handler) {
       rec.subscribed.add(pattern);
       if (!patternCovered(manifest.subscribes, pattern)) {

@@ -33,6 +33,9 @@ export interface GithubConfig {
 
 class StepError extends Error {}
 
+/** The line a commit carries so a repeated request for the same stage attempt can find it. */
+const STAGE_TRAILER = 'Bulig-Stage';
+
 const str = (p: unknown, key: string): string => {
   const v = (p as Record<string, unknown> | null)?.[key];
   if (typeof v !== 'string' || v === '') throw new StepError(`payload is missing "${key}"`);
@@ -379,7 +382,30 @@ export default definePlugin({
       try {
         const cwd = str(event.payload, 'cwd');
         const message = str(event.payload, 'message');
+        // One commit per stage attempt (ADR 0010). The commit carries the attempt's id as a trailer, and a request whose attempt
+        // already has a commit gets that commit back instead of a second one. The check reads git, so it holds across a restart.
+        const stageId = (event.payload as { stageId?: unknown }).stageId;
+        if (stageId !== undefined && (typeof stageId !== 'string' || !/^[A-Za-z0-9_-]{1,64}$/.test(stageId))) throw new StepError('commit.requested has a stageId that is not a plain id');
+        const trailer = stageId === undefined ? undefined : `${STAGE_TRAILER}: ${stageId}`;
         const rules = readScopeRules(event.payload, cwd);
+        // Outside the approved scope: not a repo path, or matched by neither the scope nor the always-allowed list.
+        const isOutside = (path: string) => !isRepoPath(path) || !(matchesScope(path, rules.scope) || matchesScope(path, rules.allow));
+        if (trailer) {
+          const done = await runGit(cwd, ['log', '--fixed-strings', `--grep=${trailer}`, '--format=%H', '-n', '1']);
+          const earlier = done.code === 0 ? done.stdout.trim() : '';
+          if (earlier) {
+            ctx.log.warn(`github: stage attempt ${stageId} already has commit ${earlier.slice(0, 7)}, so no second commit was made`);
+            // Judged the way a new commit is, from the files that commit holds, so a warn-mode run that is repeated still reports them.
+            const held = await runGit(cwd, ['diff-tree', '--root', '--no-commit-id', '--name-only', '-r', '--no-renames', '-z', earlier]);
+            if (held.code !== 0) throw new StepError(`git diff-tree failed (exit ${held.code}): ${clipText((held.stderr || held.stdout).trim(), 500)}`);
+            const outside = held.stdout.split('\0').filter((x) => x && isOutside(x));
+            if (outside.length && rules.mode === 'enforce') {
+              throw Object.assign(new StepError(`commit ${earlier.slice(0, 7)} holds files outside the approved scope: ${listed(outside)}`), { outOfScope: outside });
+            }
+            ctx.emit('commit.done', { sha: earlier, base: await baseOf(cwd), ...(outside.length && { outOfScope: outside }) }, event.jobId);
+            return;
+          }
+        }
         const status = await runGit(cwd, ['status', '--porcelain=v1', '-z', '--untracked-files=all']);
         if (status.code !== 0) throw new StepError(`git status failed (exit ${status.code}): ${clipText((status.stderr || status.stdout).trim(), 500)}`);
         const changed = parseStatusZ(status.stdout);
@@ -390,7 +416,7 @@ export default definePlugin({
           // The symlink check runs at any depth; only the scope match has a depth cap.
           const link = isPlainRepoPath(path) ? symlinkOnPath(cwd, path) : undefined;
           if (link) links.push(path);
-          else if (!isRepoPath(path) || !(matchesScope(path, rules.scope) || matchesScope(path, rules.allow))) outside.push(path);
+          else if (isOutside(path)) outside.push(path);
         }
         if (links.length) {
           throw Object.assign(new StepError(`a symlink is never committed: ${listed(links)}`), { outOfScope: [...new Set([...links, ...outside])].sort() });
@@ -418,7 +444,7 @@ export default definePlugin({
             await runGit(cwd, ['reset', '-q']);
             throw new StepError(`the index held files that were never checked (${listed(extra)}), so nothing was committed`);
           }
-          must('git commit', await runGit(cwd, [...IDENTITY, 'commit', '-m', message]));
+          must('git commit', await runGit(cwd, [...IDENTITY, 'commit', '-m', trailer ? `${message}\n\n${trailer}` : message]));
         }
         const sha = must('git rev-parse', await runGit(cwd, ['rev-parse', 'HEAD']));
         ctx.emit('commit.done', { sha, base: await baseOf(cwd), ...(outside.length && { outOfScope: outside }) }, event.jobId);

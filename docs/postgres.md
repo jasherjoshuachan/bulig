@@ -34,7 +34,7 @@ On the first call Bulig connects, then runs any migrations the database has not 
 
 ## How the adapter behaves
 
-- **One connection.** A single `pg.Client`, not a pool. The kernel queue sends one task at a time and a transaction has to stay on one connection. Statements go out one at a time, in the order the calls were made.
+- **One connection, and one more for the lease.** A single `pg.Client` serves every call, not a pool. The kernel queue sends one task at a time and a transaction has to stay on one connection. Statements go out one at a time, in the order the calls were made. The executor lease (ADR 0010) has a second connection of its own, opened the first time the lease is used, that takes no advisory lock: the heartbeat that renews the lease must not wait behind a slow task. A transaction that asserts the lease reads its row `FOR KEY SHARE`, so a takeover (a new generation) waits for it to end, and a renewal (only `expires_at` changes) does not. The second connection is dropped by `abort()` and `close()` with the first.
 - **Transactions.** `BEGIN`, the task's calls, `COMMIT`. If the task fails, `ROLLBACK`. If the `COMMIT` or the `ROLLBACK` fails, the adapter throws `StoreFatalError` and the kernel stops using the store, because it can no longer say what the record holds.
 - **A database error abandons the transaction.** That is how Postgres works. The adapter checks the cases the port rejects on (a missing job or stage, a value with no JSON form) before it sends anything, so those do not abandon it. A real database error does, and if the task carries on after one, `transaction` rejects instead of reporting a commit.
 - **Give up (`abort`).** When a store call never comes back, the kernel calls `abort()`. The adapter destroys the connection. This process sends nothing more on it, every later call is refused, and the server rolls back whatever transaction was open when the connection went away. A `COMMIT` that was already on the wire cannot be recalled, and the kernel's error says so ("may or may not have been kept").
@@ -71,5 +71,5 @@ What runs on Postgres: the shared store contract suite, the Postgres-specific te
 
 - No data migration from SQLite. A Postgres record starts empty.
 - No server setup: no cluster, role, port, limits or backups on ths-prod-01. Nothing live depends on this adapter, and nothing should until a restore has been tested (ADR 0007).
-- No standby or second kernel. One kernel writes; a second is refused, not queued.
+- No standby or second kernel. One kernel writes; a second is refused, not queued. The lease and its generation number are what a standby will use (ADR 0010); the writer lock above still keeps a second one out until then.
 - No reconnect, no pool, no TLS settings beyond what the connection string carries.

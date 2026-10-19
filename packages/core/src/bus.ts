@@ -1,10 +1,50 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { createHash } from 'node:crypto';
 import { CapabilityDeniedError, matchesPattern, type BuligEvent, type EventHandler } from '@bulig/plugin-sdk';
 import type { QueueTx, StoreQueue } from './queue.ts';
+import { DuplicateEventError } from './store.ts';
 
 interface Subscription {
   plugin: string;
+  /** The plugin's name and the order of this subscription: two handlers of one plugin on one event must not share ids. */
+  key: string;
   pattern: string;
   handler: EventHandler;
+}
+
+/** One run of one handler on one event: what an event it emits is derived from (ADR 0010, addendum of 18 Oct 2026). */
+export interface Cause {
+  eventId: string;
+  handler: string;
+  /** Events this run has written so far. The next one takes this number, so two emits of one type in one run get different ids. */
+  next: number;
+}
+
+/**
+ * An event with a derived or given id was already in the log, so the whole task that met it is a replay: it was rolled back,
+ * nothing was delivered, and `existing` is what the log holds under that id.
+ */
+export class ReplayedError extends Error {
+  /** What the call that wrote the event should answer, set by the kernel for a job call: the job as the record holds it. */
+  result?: unknown;
+
+  constructor(public readonly existing: BuligEvent) {
+    super(`Event ${existing.id} (${existing.type}) was already written, so this task was a replay and wrote nothing`);
+    this.name = 'ReplayedError';
+  }
+}
+
+/**
+ * The id of an event that a handler's run caused: a hash of the event it was handling, the handler, the number of events the
+ * run had written before this one, and the type. Same inputs, same id, so a handler run twice for one event asks for the same ids.
+ * Shaped as a UUID (version 8, the custom one) so it fits wherever a random id does.
+ */
+export function derivedEventId(causeId: string, handler: string, ordinal: number, type: string): string {
+  const h = createHash('sha256').update(['bulig.event.v1', causeId, handler, String(ordinal), type].join('\0')).digest();
+  h[6] = (h[6]! & 0x0f) | 0x80;
+  h[8] = (h[8]! & 0x3f) | 0x80;
+  const x = h.subarray(0, 16).toString('hex');
+  return `${x.slice(0, 8)}-${x.slice(8, 12)}-${x.slice(12, 16)}-${x.slice(16, 20)}-${x.slice(20, 32)}`;
 }
 
 export interface EmitInput {
@@ -12,6 +52,8 @@ export interface EmitInput {
   source: string;
   payload?: unknown;
   jobId?: string | undefined;
+  /** An id the source already knows (kernel-internal; plugins cannot pass one). Without it the id is derived from the cause, or random. */
+  id?: string | undefined;
 }
 
 /**
@@ -31,6 +73,10 @@ export class Bus {
   /** Async handlers that have not finished yet, with the seq of the event each one is working on. */
   private inflight = new Map<Promise<void>, number>();
   private lastDelivered = 0;
+  /** The handler run the current code is inside, so an emit knows which event caused it. */
+  private causes = new AsyncLocalStorage<Cause | undefined>();
+  /** How many handlers each plugin has subscribed so far, so a handler's key counts within its own plugin. */
+  private perPlugin = new Map<string, number>();
 
   constructor(
     private queue: StoreQueue,
@@ -41,7 +87,16 @@ export class Bus {
   ) {}
 
   subscribe(plugin: string, pattern: string, handler: EventHandler): void {
-    this.subs.push({ plugin, pattern, handler });
+    // Numbered within the plugin, not across the bus: enabling another plugin, or a change in how many handlers another plugin
+    // has, must not move this plugin's keys, because the keys are part of event ids that outlive a restart.
+    const n = this.perPlugin.get(plugin) ?? 0;
+    this.perPlugin.set(plugin, n + 1);
+    this.subs.push({ plugin, key: `${plugin}#${n}`, pattern, handler });
+  }
+
+  /** The handler run this call is inside, if any. Taken when a write is asked for, so it is the caller's and not the queue's. */
+  currentCause(): Cause | undefined {
+    return this.causes.getStore();
   }
 
   /**
@@ -49,7 +104,12 @@ export class Bus {
    * was not written. Nobody has to wait on it: a failed write is also reported to `onError`.
    */
   emit(input: EmitInput, options: { report?: boolean } = {}): Promise<BuligEvent> {
-    const written = this.queue.run(`emit ${input.type}`, (tx) => this.record(tx, input));
+    const cause = this.currentCause();
+    const written = this.queue.run(`emit ${input.type}`, (tx) => this.record(tx, input, cause)).catch((err: unknown) => {
+      // A replay is not a failure: the event is already in the log and was delivered then.
+      if (err instanceof ReplayedError) return err.existing;
+      throw err;
+    });
     // A caller that waits for the answer (emitCommitted) hears the failure itself; no need to log it as well.
     if (options.report !== false) written.catch((err: unknown) => this.onError(err, input));
     else written.catch(() => {});
@@ -73,13 +133,25 @@ export class Bus {
    * Write an event from inside a task that is already running on the queue, and deliver it once that task commits. The
    * kernel uses this when a state change and its event must be one step: they commit together or not at all.
    */
-  async record(tx: QueueTx, input: EmitInput): Promise<BuligEvent> {
-    const event = await tx.appendEvent({
-      type: input.type,
-      source: input.source,
-      payload: input.payload ?? null,
-      ...(input.jobId !== undefined && { jobId: input.jobId }),
-    });
+  async record(tx: QueueTx, input: EmitInput, cause?: Cause): Promise<BuligEvent> {
+    // An event a handler causes gets an id derived from its cause. One with no cause (kernel.started, input from outside)
+    // gets a random one, unless its source gave a stable id.
+    const id = input.id ?? (cause ? derivedEventId(cause.eventId, cause.handler, cause.next++, input.type) : undefined);
+    let event: BuligEvent;
+    try {
+      event = await tx.appendEvent({
+        ...(id !== undefined && { id }),
+        type: input.type,
+        source: input.source,
+        payload: input.payload ?? null,
+        ...(input.jobId !== undefined && { jobId: input.jobId }),
+      });
+    } catch (err) {
+      // Already written, so this task is a replay. Throwing rolls the whole task back (a change that went with the event is
+      // undone with it) and drops the delivery, so nothing is done or announced twice.
+      if (err instanceof DuplicateEventError && err.existing) throw new ReplayedError(err.existing);
+      throw err;
+    }
     tx.afterCommit(() => this.dispatch(event));
     return event;
   }
@@ -128,28 +200,40 @@ export class Bus {
   }
 
   private dispatch(event: BuligEvent): void {
-    const seq = event.seq ?? this.lastDelivered;
-    this.lastDelivered = seq;
-    for (const sub of this.subs) {
-      if (!matchesPattern(sub.pattern, event.type)) continue;
-      try {
-        const result = sub.handler(event);
-        if (result) {
-          const tracked: Promise<void> = result.catch((err: unknown) => this.fail(sub, event, err));
-          const forget = () => void this.inflight.delete(tracked);
-          this.inflight.set(tracked, seq);
-          tracked.then(forget, forget);
+    // Dispatch runs in the async context of whoever caused the commit, which may be another handler's run. Leave that context
+    // first: the handlers each get a cause of their own below, and the failure path (and the hookup of its .catch) must have none,
+    // or a plugin.error would be recorded as an event the emitting handler caused and take one of its ordinals.
+    // This is run(undefined), not exit(): on Node 22, exit() lets the outer store come back after the first nested run(), so the
+    // .catch hookup below would still carry the emitter's cause (reproduced on 22.23.3).
+    this.causes.run(undefined, () => {
+      const seq = event.seq ?? this.lastDelivered;
+      this.lastDelivered = seq;
+      for (const sub of this.subs) {
+        if (!matchesPattern(sub.pattern, event.type)) continue;
+        try {
+          const cause: Cause = { eventId: event.id, handler: sub.key, next: 0 };
+          const result = this.causes.run(cause, () => sub.handler(event));
+          if (result) {
+            const tracked: Promise<void> = result.catch((err: unknown) => this.fail(sub, event, err));
+            const forget = () => void this.inflight.delete(tracked);
+            this.inflight.set(tracked, seq);
+            tracked.then(forget, forget);
+          }
+        } catch (err) {
+          this.fail(sub, event, err);
         }
-      } catch (err) {
-        this.fail(sub, event, err);
       }
-    }
+    });
   }
 
   private fail(sub: Subscription, event: BuligEvent, err: unknown): void {
     // A broken plugin.error handler must not loop forever.
     if (event.type === 'plugin.error') return;
+    // The id comes from the event and the subscriber, not from a random draw: if the same subscriber fails again on the same
+    // event (a redelivery), the second plugin.error is a duplicate of the first and is dropped, where a random id would log it twice.
+    // The cost is that a later failure with a different message is not recorded; the first one is.
     void this.emit({
+      id: derivedEventId(event.id, `failed:${sub.key}`, 0, 'plugin.error'),
       type: 'plugin.error',
       source: 'kernel',
       jobId: event.jobId,

@@ -46,12 +46,18 @@ export function slowStore(inner: Store, options: SlowOptions = {}): SlowStore {
         return result;
       };
     }
+    // The lease fence is not a store call the tests slow down: it passes straight through.
+    out.assertLease = (holder: string, generation: number) => target.assertLease(holder, generation);
     return out as unknown as StoreTx;
   };
   Object.assign(wrapped, delayed(inner));
   const methods = wrapped as Record<string, unknown>;
   methods.transaction = <T>(fn: (tx: StoreTx) => Promise<T>) => inner.transaction((tx) => fn(delayed(tx)));
   methods.close = () => inner.close();
+  // The lease is never slowed: it has its own path in a real adapter, and a test that wants a slow renewal says so itself.
+  methods.acquireLease = (holder: string, ttlMs: number) => inner.acquireLease(holder, ttlMs);
+  methods.renewLease = (holder: string, generation: number, ttlMs: number) => inner.renewLease(holder, generation, ttlMs);
+  methods.releaseLease = (holder: string, generation: number) => inner.releaseLease(holder, generation);
   if (inner.abort) methods.abort = () => inner.abort!();
   return wrapped;
 }

@@ -4,9 +4,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { definePlugin, type BuligEvent } from '@bulig/plugin-sdk';
 import { clipText } from '@bulig/text';
-import { readCredential } from './credentials.ts';
+import { readCredential } from '@bulig/credentials';
 
-export { CREDENTIAL_NAMES, readCredential } from './credentials.ts';
+export { CREDENTIAL_NAMES, readCredential } from '@bulig/credentials';
 
 export type StageMode = 'readonly' | 'edit';
 

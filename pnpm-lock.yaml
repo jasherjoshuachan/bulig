@@ -85,6 +85,8 @@ importers:
         specifier: 8.23.1
         version: 8.23.1
 
+  packages/credentials: {}
+
   packages/git: {}
 
   packages/plugin-sdk:
@@ -116,6 +118,9 @@ importers:
 
   plugins/channel-telegram:
     dependencies:
+      '@bulig/credentials':
+        specifier: workspace:*
+        version: link:../../packages/credentials
       '@bulig/plugin-sdk':
         specifier: workspace:*
         version: link:../../packages/plugin-sdk
@@ -155,6 +160,9 @@ importers:
 
   plugins/github:
     dependencies:
+      '@bulig/credentials':
+        specifier: workspace:*
+        version: link:../../packages/credentials
       '@bulig/git':
         specifier: workspace:*
         version: link:../../packages/git
@@ -190,6 +198,9 @@ importers:
 
   plugins/worker-claude-code:
     dependencies:
+      '@bulig/credentials':
+        specifier: workspace:*
+        version: link:../../packages/credentials
       '@bulig/plugin-sdk':
         specifier: workspace:*
         version: link:../../packages/plugin-sdk

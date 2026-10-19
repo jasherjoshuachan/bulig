@@ -1,8 +1,8 @@
 import { lstatSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
-/** Names systemd's LoadCredential= may hand the kernel: the Postgres URL, the worker tokens, and Claude's login token. */
-export const CREDENTIAL_NAMES = ['pg-url', 'worker-tokens', 'claude-token'] as const;
+/** Names systemd's LoadCredential= may hand the kernel: its config, the Postgres URL, the worker tokens, Claude's login token, the GitHub token and the Telegram bot token. */
+export const CREDENTIAL_NAMES = ['config', 'pg-url', 'worker-tokens', 'claude-token', 'gh-token', 'telegram-token'] as const;
 
 const SAFE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 

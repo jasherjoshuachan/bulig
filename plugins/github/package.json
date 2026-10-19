@@ -7,6 +7,7 @@
     ".": "./src/index.ts"
   },
   "dependencies": {
+    "@bulig/credentials": "workspace:*",
     "@bulig/git": "workspace:*",
     "@bulig/plugin-sdk": "workspace:*",
     "@bulig/scope": "workspace:*",

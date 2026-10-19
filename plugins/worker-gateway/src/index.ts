@@ -6,7 +6,7 @@ import { TokenAuth, type Compare } from './auth.ts';
 import { LOCAL_WORKER, parseGatewayConfig, type GatewayConfig } from './config.ts';
 import { ClaimRequest, CLAIM_PATH, HEARTBEAT_PATH, HeartbeatRequest, RESULT_PATH, ResultRequest, type Assignment } from './protocol.ts';
 import { Scheduler, type Active, type Pending } from './scheduler.ts';
-import { applyPatch, diffAgainst, resolveBase, WorkspaceError } from './workspace.ts';
+import { applyPatch, diffAgainst, resolveBase, revertPatch, sizeText, WorkspaceError } from './workspace.ts';
 
 export { GatewayConfigError, assertBindable, parseGatewayConfig, DEFAULT_PORT, type GatewayConfig } from './config.ts';
 export { TokenAuth } from './auth.ts';
@@ -18,6 +18,10 @@ export interface GatewayOptions {
   compare?: Compare;
   /** Environment the worker tokens are read from. Default process.env. */
   env?: Record<string, string | undefined>;
+  /** For tests: called after the record has been read in a heartbeat or result check and before the answer is used. Lets a test make the read slow. */
+  afterFenceRead?: (stageId: string) => Promise<void> | void;
+  /** For tests: called after a worker's changes were applied and before the result is written. Throwing makes the write fail. */
+  afterApply?: (stageId: string) => Promise<void> | void;
 }
 
 interface Waiter {
@@ -85,17 +89,30 @@ export function createGateway(options: GatewayOptions = {}): Plugin & { addresse
       const stillTheirs = (row: Stage | undefined, a: Active): boolean =>
         row !== undefined && row.status === 'running' && row.attempt === a.pending.attempt && row.claimGeneration === a.generation;
 
-      /** Who holds this stage, if the message is from them and matches the record. Anything else is stale. */
-      async function fence(workerId: string, body: { stageId: string; attempt: number; generation?: number | undefined }): Promise<Active | undefined> {
+      /**
+       * Who holds this stage, if the message is from them and matches the record. Anything else is stale.
+       *
+       * The record is read with an await, and the watcher can take the stage back while that read is in flight. So every check that
+       * depends on the held state is made again after the read, with no await between the last check and the return. With
+       * `finish`, the holder is also marked as finishing in that same step, so a loss cannot start between "accepted" and "finishing".
+       */
+      async function fence(workerId: string, body: { stageId: string; attempt: number; generation?: number | undefined }, opts: { finish?: boolean } = {}): Promise<Active | undefined> {
         const a = sched.held(body.stageId);
         if (!a || a.lost || a.workerId !== workerId || a.pending.attempt !== body.attempt) return undefined;
         if (body.generation !== undefined && body.generation !== a.generation) return undefined;
         if (a.generation !== ctx.generation) return undefined;
         const row = await stageRow(a.pending.jobId, a.pending.key);
+        await options.afterFenceRead?.(body.stageId);
+        // The stage may have been taken back, or handed on, while the record was being read. The row above may be from before that.
+        if (a.lost || sched.held(body.stageId) !== a) return undefined;
         if (!stillTheirs(row, a)) {
           // The record has moved on (the stage was closed, or the job ended). The worker's slot is free again.
           sched.release(a.pending.key);
           return undefined;
+        }
+        if (opts.finish) {
+          if (a.finishing) return undefined;
+          a.finishing = true;
         }
         return a;
       }
@@ -204,6 +221,7 @@ export function createGateway(options: GatewayOptions = {}): Plugin & { addresse
           attempt: p.attempt,
           generation: a.generation,
           heartbeatMs: cfg.heartbeatMs,
+          maxPatchBytes: cfg.maxPatchBytes,
           request: { stage: p.stage, prompt: String(p.payload.prompt), model: String(p.payload.model), mode: p.payload.mode === 'edit' ? 'edit' : 'readonly' },
           workspace,
         };
@@ -246,7 +264,8 @@ export function createGateway(options: GatewayOptions = {}): Plugin & { addresse
 
       /** The worker stopped heartbeating. Take the stage back: close its attempt, open the next, and offer it again once. */
       async function lose(a: Active): Promise<void> {
-        if (a.lost) return;
+        // A result being taken is not a silent worker: it will be accepted or refused on its own.
+        if (a.lost || a.finishing) return;
         a.lost = true;
         sched.release(a.pending.key);
         const p = a.pending;
@@ -262,7 +281,13 @@ export function createGateway(options: GatewayOptions = {}): Plugin & { addresse
             return;
           }
           if (!stillTheirs(await stageRow(p.jobId, p.key), a)) return;
-          // Closing the attempt lets go of its claim, so the next attempt can take one. The job folder was never touched by the worker.
+          // The job folder is only touched when a result is accepted. If a worker's changes were applied and then could not be taken
+          // back (see result), the folder holds work nobody accepted, and the next attempt must not start from it: fail the stage.
+          if (a.applied) {
+            await failStage(p, `worker "${a.workerId}" was lost after its changes were applied to the job folder and they could not be taken back, so the stage was not offered again`);
+            return;
+          }
+          // Closing the attempt lets go of its claim, so the next attempt can take one.
           await ctx.jobs.finishStage(p.key, 'failed', { interrupted: true, reason: 'worker-lost', error: `worker "${a.workerId}" stopped heartbeating`, workerId: a.workerId });
           const next = await ctx.jobs.startStage(p.jobId, p.stage);
           const ok = await say('stage.requested', { ...p.payload, stageId: next.id, reoffers: p.reoffers + 1 }, p.jobId);
@@ -422,9 +447,8 @@ export function createGateway(options: GatewayOptions = {}): Plugin & { addresse
         const r = body.data;
         // A worker that did not hear the answer sends again. If the first one went through, say so.
         if (accepted.get(r.stageId) === `${workerId}:${r.attempt}`) return send(res, 200, { ok: true, duplicate: true });
-        const a = await fence(workerId, r);
-        if (!a || a.finishing) return send(res, 409, { error: 'stale' });
-        a.finishing = true;
+        const a = await fence(workerId, r, { finish: true });
+        if (!a) return send(res, 409, { error: 'stale' });
         a.lastBeat = Date.now();
         const p = a.pending;
         try {
@@ -436,18 +460,24 @@ export function createGateway(options: GatewayOptions = {}): Plugin & { addresse
               return send(res, 400, { error: 'this stage may not send changes' });
             }
             if (r.patch && !a.applied) {
-              const patch = Buffer.from(r.patch, 'base64');
-              if (patch.length > cfg.maxPatchBytes) throw new WorkspaceError(`the changes are larger than ${Math.round(cfg.maxPatchBytes / 1024 / 1024)} MiB`);
+              let tooBig = false;
               try {
+                const patch = Buffer.from(r.patch, 'base64');
+                if (patch.length > cfg.maxPatchBytes) {
+                  tooBig = true;
+                  throw new WorkspaceError(`the changes are larger than ${sizeText(cfg.maxPatchBytes)}`);
+                }
                 await applyPatch(String(p.payload.cwd), patch);
                 a.applied = true;
+                a.appliedPatch = patch;
               } catch (err) {
                 if (!(err instanceof WorkspaceError)) throw err;
                 // The worker's work cannot be used. That is a failed stage, and the answer to the worker is that it was received.
                 if (!(await failStage(p, `the changes from worker "${workerId}" were not applied: ${err.message}`))) throw new Error('could not record the failure');
                 finish(a, workerId);
-                return send(res, 200, { ok: true });
+                return send(res, tooBig ? 413 : 200, tooBig ? { error: 'too large' } : { ok: true });
               }
+              await options.afterApply?.(r.stageId);
             }
             const o = r.output;
             await ctx.emitCommitted('stage.completed', { stage: p.stage, ok: true, result: o.result ?? '', costUsd: o.costUsd, sessionId: o.sessionId, evidence: o.evidence ?? [], workerId }, p.jobId);
@@ -457,7 +487,17 @@ export function createGateway(options: GatewayOptions = {}): Plugin & { addresse
           finish(a, workerId);
           send(res, 200, { ok: true });
         } catch (err) {
-          // Nothing was written, or it could not be confirmed. The worker sends the result again.
+          // Nothing was written, or it could not be confirmed. The worker sends the result again. Changes already applied to the job
+          // folder are taken back first: the folder must hold only what was accepted, and the retry applies them again.
+          if (a.appliedPatch) {
+            try {
+              await revertPatch(String(p.payload.cwd), a.appliedPatch);
+              a.applied = false;
+              a.appliedPatch = undefined;
+            } catch (undo) {
+              ctx.log.error(`worker-gateway: could not take back the changes of ${p.stage} (${p.key}) after the result failed: ${msg(undo)}`);
+            }
+          }
           a.finishing = false;
           ctx.log.error(`worker-gateway: could not take the result of ${p.stage} (${p.key}) from worker "${workerId}": ${msg(err)}`);
           send(res, 500, { error: 'try again' });

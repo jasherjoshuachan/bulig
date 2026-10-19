@@ -175,6 +175,39 @@ for (const adapter of ADAPTERS) {
       expect((await post(r.url, '/result', TOKENS.mac, { stageId: second, attempt: 1, generation: got2.generation, outcome: 'completed', output: { result: 'VERDICT: PASS' } })).status).toBe(200);
     });
 
+    it('if the result cannot be written after the changes were applied, they are taken back, and the retry applies them once', async () => {
+      let fail = true;
+      const r = await rig({ hooks: { afterApply: () => { if (fail) { fail = false; throw new Error('the store went away'); } } } });
+      const { job, cwd } = await r.newJob();
+      const stageId = await r.driver.ask(job, cwd, 'build', 'edit');
+      const got = (await r.claim(TOKENS.mac)).json;
+      const change = await patchOf(r.world.clone, { 'src/new.txt': 'new\n' });
+      const body = { stageId, attempt: 1, generation: got.generation, outcome: 'completed', output: { result: 'built' }, patch: change };
+      expect((await post(r.url, '/result', TOKENS.mac, body)).status).toBe(500);
+      // the job folder holds only what was accepted: nothing
+      expect(existsSync(join(cwd, 'src/new.txt'))).toBe(false);
+      expect(git(cwd, 'status', '--porcelain')).toBe('');
+      expect(r.types('stage.completed')).toHaveLength(0);
+      // the worker tries again, and this time it goes through
+      expect((await post(r.url, '/result', TOKENS.mac, body)).status).toBe(200);
+      expect(readFileSync(join(cwd, 'src/new.txt'), 'utf8')).toBe('new\n');
+      expect(r.types('stage.completed')).toHaveLength(1);
+    });
+
+    it('tells the worker how large a patch the kernel will take, and an oversized one fails the stage with that reason: no 500, no retry loop', async () => {
+      const r = await rig({ gateway: { maxPatchBytes: 1024 } });
+      const { job, cwd } = await r.newJob();
+      const stageId = await r.driver.ask(job, cwd, 'build', 'edit');
+      const got = (await r.claim(TOKENS.mac)).json;
+      expect(got.maxPatchBytes).toBe(1024);
+      const change = await patchOf(r.world.clone, { 'big.txt': 'x'.repeat(4000) + '\n' });
+      const res = await post(r.url, '/result', TOKENS.mac, { stageId, attempt: 1, generation: got.generation, outcome: 'completed', output: { result: 'built' }, patch: change });
+      expect(res.status).toBe(413);
+      expect(existsSync(join(cwd, 'big.txt'))).toBe(false);
+      expect(r.types('stage.failed')[0]!.payload).toMatchObject({ stage: 'build', error: expect.stringContaining('larger than 1 KiB') });
+      expect(r.types('stage.completed')).toHaveLength(0);
+    });
+
     it('a patch that does not apply fails the stage and leaves the folder as it was', async () => {
       const r = await rig();
       const { job, cwd } = await r.newJob();
@@ -256,6 +289,43 @@ for (const adapter of ADAPTERS) {
         // the new one reports
         expect((await post(r.url, '/result', TOKENS.pi, { stageId: second, attempt: 2, generation: fresh.generation, outcome: 'completed', output: { result: 'on time' } })).status).toBe(200);
         expect(r.types('stage.completed').map((e) => (e.payload as { result: string }).result)).toEqual(['on time']);
+      });
+
+      it('a loss that starts while a result is being checked wins: the late result gets 409, its changes are not applied, and nothing is completed twice', async () => {
+        let armed = false;
+        let release: () => void = () => {};
+        const hold = new Promise<void>((r) => (release = r));
+        // The record read for the result's check has come back (it still says "running"); the check is then held up until the stage has been taken back.
+        const r = await rig({ hooks: { afterFenceRead: () => (armed ? ((armed = false), hold) : undefined) } });
+        const { job, cwd } = await r.newJob();
+        const first = await r.driver.ask(job, cwd, 'build', 'edit');
+        const got = (await r.claim(TOKENS.mac)).json;
+        const change = await patchOf(r.world.clone, { 'late.txt': 'late\n' });
+        armed = true;
+        const late = post(r.url, '/result', TOKENS.mac, { stageId: first, attempt: 1, generation: got.generation, outcome: 'completed', output: { result: 'late' }, patch: change });
+        await waitFor(() => r.types('stage.requested').length === 2, 30_000, 'the stage to be offered again while the check waits');
+        release();
+        expect((await late).status).toBe(409);
+        expect(existsSync(join(cwd, 'late.txt'))).toBe(false);
+        expect(r.types('stage.completed')).toHaveLength(0);
+        // the new attempt is still the open one, and still unclaimed work for someone else
+        const stages = await r.k.jobs.stages(job.id);
+        expect(stages.filter((s) => s.name === 'build').map((s) => `${s.attempt}:${s.status}`)).toEqual(['1:failed', '2:running']);
+        expect((await r.claim(TOKENS.pi, 'pi', 1)).json).toMatchObject({ attempt: 2 });
+      });
+
+      it('a result that takes longer to handle than the loss timeout is not a silent worker: the stage is not taken back mid-write', async () => {
+        const r = await rig({ hooks: { afterApply: () => sleep(3500) } }); // the loss timeout is 2 s
+        const { job, cwd } = await r.newJob();
+        const stageId = await r.driver.ask(job, cwd, 'build', 'edit');
+        const got = (await r.claim(TOKENS.mac)).json;
+        const change = await patchOf(r.world.clone, { 'slow.txt': 'slow\n' });
+        const res = await post(r.url, '/result', TOKENS.mac, { stageId, attempt: 1, generation: got.generation, outcome: 'completed', output: { result: 'built' }, patch: change });
+        expect(res.status).toBe(200);
+        expect(r.types('stage.requested')).toHaveLength(1);
+        expect(r.types('stage.failed')).toHaveLength(0);
+        expect(r.types('stage.completed')).toHaveLength(1);
+        expect(readFileSync(join(cwd, 'slow.txt'), 'utf8')).toBe('slow\n');
       });
 
       it('a worker that keeps heartbeating keeps its stage past the loss timeout', async () => {

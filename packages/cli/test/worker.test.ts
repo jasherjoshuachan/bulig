@@ -73,6 +73,8 @@ describe('bulig worker, arguments', () => {
     ['a repository pair with no equals sign', good.map((a) => (a.includes('=') ? '/srv/repo' : a)), /must be <absolute path/],
     ['a relative kernel path', good.map((a) => (a.includes('=') ? 'repo=/Users/me/repo' : a)), /must be <absolute path/],
     ['slots out of range', [...good, '--slots', '99'], /--slots must be/],
+    ['a tiny patch limit', [...good, '--max-patch-bytes', '10'], /--max-patch-bytes must be/],
+    ['a patch limit that is not a number', [...good, '--max-patch-bytes', 'lots'], /--max-patch-bytes must be/],
   ])('refuses %s with exit 2', async (_name, argv, message) => {
     const w = world();
     w.io.env = { TOK: 'a-token-long-enough-0123' };

@@ -27,6 +27,8 @@ export interface Assignment {
   /** The lease generation the stage was claimed under. Sent back with every heartbeat and result. */
   generation: number;
   heartbeatMs: number;
+  /** The largest patch the kernel will take back. A bigger one fails the stage, so the worker should not build it. */
+  maxPatchBytes?: number;
   /** What to run: the same fields the in-process worker gets, minus the folder (the worker uses its own). */
   request: { stage: string; prompt: string; model: string; mode: 'readonly' | 'edit' };
   workspace: {

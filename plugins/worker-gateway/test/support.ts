@@ -166,11 +166,12 @@ export interface BootOptions {
   compare?: (a: Buffer, b: Buffer) => boolean;
   env?: Record<string, string | undefined>;
   enabled?: string[];
+  hooks?: { afterFenceRead?: (stageId: string) => Promise<void> | void; afterApply?: (stageId: string) => Promise<void> | void };
 }
 
 /** A kernel with the gateway on an OS-chosen port on 127.0.0.1, and the plugins a test adds. */
 export async function bootGateway(store: Store, o: BootOptions = {}) {
-  const gateway = createGateway({ ...(o.compare && { compare: o.compare }), env: o.env ?? { BULIG_TOKEN_MAC: TOKENS.mac, BULIG_TOKEN_PI: TOKENS.pi } });
+  const gateway = createGateway({ ...(o.compare && { compare: o.compare }), ...o.hooks, env: o.env ?? { BULIG_TOKEN_MAC: TOKENS.mac, BULIG_TOKEN_PI: TOKENS.pi } });
   const extra = o.plugins ?? [];
   const k = createKernel({
     store,

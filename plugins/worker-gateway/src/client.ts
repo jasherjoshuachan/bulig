@@ -3,6 +3,7 @@ import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { buildArgs, buildClaudeEnv, DEFAULT_TIMEOUT_MS, run, terminate, type StageRequest } from '@bulig/worker-claude-code';
 import { isLoopbackOrTailnet } from './address.ts';
+import { CLIENT_CLAIM_TIMEOUT_MS } from './config.ts';
 import { CLAIM_PATH, HEARTBEAT_PATH, RESULT_PATH, type Assignment, type ClaimRequest, type HeartbeatRequest, type ResultRequest } from './protocol.ts';
 import { collectChanges, prepareWorkspace, removeWorkspace } from './workspace.ts';
 
@@ -34,7 +35,7 @@ export interface RemoteWorkerOptions {
   env?: NodeJS.ProcessEnv | undefined;
   /** A stage is given up on (Claude is stopped, nothing is sent) when the kernel has not answered a heartbeat for this long. Default 30000. */
   lossMs?: number | undefined;
-  /** Largest patch a stage may send back. Default 8 MiB. */
+  /** Largest patch a stage may send back, if smaller than what the kernel allows (it says so with each stage). Default: the kernel's. */
   maxPatchBytes?: number | undefined;
   /** First wait after a failed call, in ms; it doubles up to 5 s. Default 1000. */
   retryMs?: number | undefined;
@@ -82,8 +83,7 @@ export function startRemoteWorker(opts: RemoteWorkerOptions): RemoteWorker {
   const doFetch = opts.fetch ?? fetch;
   const log = opts.log ?? (() => {});
   const lossMs = opts.lossMs ?? 30_000;
-  const maxPatch = opts.maxPatchBytes ?? 8 * 1024 * 1024;
-  const retryMs = opts.retryMs ?? 1000;
+    const retryMs = opts.retryMs ?? 1000;
   const children = new Set<ChildProcess>();
   const claudeEnv = (): NodeJS.ProcessEnv => {
     const env = buildClaudeEnv(opts.env ?? process.env, opts.passEnv);
@@ -113,7 +113,7 @@ export function startRemoteWorker(opts: RemoteWorkerOptions): RemoteWorker {
 
   async function claim(): Promise<Assignment | undefined> {
     const body: ClaimRequest = { workerId: opts.workerId, slots: opts.slots, projects: Object.keys(opts.repos) };
-    const r = await call(CLAIM_PATH, body, 60_000);
+    const r = await call(CLAIM_PATH, body, CLIENT_CLAIM_TIMEOUT_MS);
     if (r.status === 204) return undefined;
     if (r.status === 200) return r.json as Assignment;
     throw new Error(r.status === 401 ? 'the kernel refused the token' : `claim answered ${r.status}`);
@@ -174,6 +174,7 @@ export function startRemoteWorker(opts: RemoteWorkerOptions): RemoteWorker {
 
     const clone = opts.repos[a.workspace.repo];
     const dir = join(opts.workdir, a.stageId);
+    // Set before the folder is made: a prepare that fails half way (the worktree was added, the patch did not apply) leaves a folder to remove.
     let prepared = false;
     try {
       if (!clone || !SAFE_ID.test(a.stageId)) {
@@ -181,8 +182,8 @@ export function startRemoteWorker(opts: RemoteWorkerOptions): RemoteWorker {
         return;
       }
       try {
-        await prepareWorkspace(clone, dir, a.workspace.base, a.workspace.patch ? Buffer.from(a.workspace.patch, 'base64') : undefined);
         prepared = true;
+        await prepareWorkspace(clone, dir, a.workspace.base, a.workspace.patch ? Buffer.from(a.workspace.patch, 'base64') : undefined);
       } catch (err) {
         await post(failed(`could not prepare the workspace on worker "${opts.workerId}": ${err instanceof Error ? err.message : String(err)}`));
         return;
@@ -213,7 +214,7 @@ export function startRemoteWorker(opts: RemoteWorkerOptions): RemoteWorker {
       let patch: Buffer = Buffer.alloc(0);
       if (a.request.mode === 'edit') {
         try {
-          patch = await collectChanges(dir, maxPatch);
+          patch = await collectChanges(dir, Math.min(opts.maxPatchBytes ?? Infinity, a.maxPatchBytes ?? 8 * 1024 * 1024));
         } catch (err) {
           await post(failed(`could not collect the changes: ${err instanceof Error ? err.message : String(err)}`));
           return;

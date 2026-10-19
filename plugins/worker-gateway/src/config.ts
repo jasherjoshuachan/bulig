@@ -5,6 +5,10 @@ import { isLoopbackOrTailnet, isWildcard } from './address.ts';
 import { readCredential } from '@bulig/worker-claude-code';
 import { z } from 'zod';
 
+/** How long a worker waits for a claim to answer. A claim is held open for less than this, with room to spare. */
+export const CLIENT_CLAIM_TIMEOUT_MS = 60_000;
+export const MAX_CLAIM_WAIT_MS = CLIENT_CLAIM_TIMEOUT_MS - 15_000;
+
 /** The default port for the worker endpoint. */
 export const DEFAULT_PORT = 7431;
 /** The id the in-process worker answers to. A remote worker may not use it. */
@@ -65,7 +69,7 @@ const Schema = z.strictObject({
   /** Default most stages one remote worker may hold at once. Default 2. */
   workerSlots: z.number().int().min(1).max(16).optional(),
   /** How long one claim waits for a stage before it answers 204. Default 25000. */
-  claimWaitMs: z.number().int().min(0).max(60_000).optional(),
+  claimWaitMs: z.number().int().min(0).max(MAX_CLAIM_WAIT_MS).optional(),
   /** How often a worker should heartbeat. Default 10000. */
   heartbeatMs: z.number().int().min(20).max(60_000).optional(),
   /** A worker that has not been heard from for this long loses its stage. Default 30000. */

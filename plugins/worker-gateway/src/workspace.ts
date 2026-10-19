@@ -47,13 +47,16 @@ export async function diffAgainst(dir: string, base: string, maxBytes: number): 
     const add = await git(dir, ['add', '-A'], { env });
     if (add.code !== 0) throw new WorkspaceError(`git add failed: ${text(add)}`);
     const diff = await git(dir, ['diff', '--cached', '--binary', '--full-index', '--no-renames', '--no-ext-diff', '--no-textconv', base], { env, maxOut: maxBytes });
-    if (diff.truncated) throw new WorkspaceError(`the changes are larger than ${Math.round(maxBytes / 1024 / 1024)} MiB`);
+    if (diff.truncated) throw new WorkspaceError(`the changes are larger than ${sizeText(maxBytes)}`);
     if (diff.code !== 0) throw new WorkspaceError(`git diff failed: ${text(diff)}`);
     return diff.stdout;
   } finally {
     await rm(scratch, { recursive: true, force: true });
   }
 }
+
+/** A byte count a person can read. */
+export const sizeText = (n: number): string => (n >= 1024 * 1024 ? `${Math.round(n / 1024 / 1024)} MiB` : `${Math.max(1, Math.round(n / 1024))} KiB`);
 
 /** Paths a patch names, read by git itself (so quoting and odd names are git's problem, not a regex's). */
 async function pathsOf(dir: string, patch: Buffer): Promise<string[]> {
@@ -124,6 +127,12 @@ export async function applyPatch(dir: string, patch: Buffer): Promise<void> {
   await assertNoSpecialFiles(dir, patch);
   const r = await git(dir, ['-c', 'core.symlinks=false', 'apply', '--binary', '--whitespace=nowarn', '-'], { input: patch });
   if (r.code !== 0) throw new WorkspaceError(`the patch did not apply: ${text(r)}`);
+}
+
+/** Take back a patch that applyPatch applied (it was checked then; this only undoes it). All or nothing. */
+export async function revertPatch(dir: string, patch: Buffer): Promise<void> {
+  const r = await git(dir, ['-c', 'core.symlinks=false', 'apply', '-R', '--binary', '--whitespace=nowarn', '-'], { input: patch });
+  if (r.code !== 0) throw new WorkspaceError(`the patch could not be taken back: ${text(r)}`);
 }
 
 // ----- the worker's side -----

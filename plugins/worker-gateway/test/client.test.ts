@@ -1,9 +1,10 @@
 import { existsSync, lstatSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { assertSafeKernelUrl } from '../src/client.ts';
+import { fileURLToPath } from 'node:url';
+import { assertSafeKernelUrl, startRemoteWorker } from '../src/client.ts';
 import { applyPatch, collectChanges, prepareWorkspace, removeWorkspace, resolveBase, WorkspaceError } from '../src/workspace.ts';
-import { git as gitSync, makeWorld, tmp } from './support.ts';
+import { git as gitSync, makeWorld, sleep, tmp, waitFor } from './support.ts';
 import { git } from '@bulig/git';
 
 describe('assertSafeKernelUrl', () => {
@@ -110,5 +111,66 @@ describe('workspace transfer', () => {
     const w = makeWorld();
     gitSync(w.repo, 'remote', 'remove', 'origin');
     await expect(resolveBase(w.repo)).rejects.toThrow(/no origin/);
+  });
+});
+
+describe('the worker, against a kernel that is just a script', () => {
+  const FAKE = fileURLToPath(new URL('../../../packages/cli/test/fixtures/fake-claude-dev.mjs', import.meta.url));
+
+  /** A fetch that plays the kernel: hands out the given assignment once, then says "nothing", and records what it is sent. */
+  function fakeKernel(assignment: Record<string, unknown>) {
+    const results: Record<string, unknown>[] = [];
+    let handed = false;
+    const fetchImpl = (async (url: URL, init: { body: string }) => {
+      const path = new URL(url).pathname;
+      if (path === '/claim') {
+        if (!handed) {
+          handed = true;
+          return new Response(JSON.stringify(assignment), { status: 200 });
+        }
+        await sleep(100);
+        return new Response(null, { status: 204 });
+      }
+      if (path === '/result') results.push(JSON.parse(init.body) as Record<string, unknown>);
+      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    }) as unknown as typeof fetch;
+    return { fetchImpl, results };
+  }
+  const base = (w: ReturnType<typeof makeWorld>) => gitSync(w.clone, 'rev-parse', 'HEAD');
+  const assignment = (w: ReturnType<typeof makeWorld>, over: Record<string, unknown> = {}, request: Record<string, unknown> = {}) => ({
+    jobId: 'j', stageId: 'stage-1', attempt: 1, generation: 1, heartbeatMs: 200,
+    request: { stage: 'build', prompt: 'You are building', model: 'sonnet', mode: 'edit', ...request },
+    workspace: { repo: w.repo, base: base(w) },
+    ...over,
+  });
+
+  it('removes the folder it made when the workspace could not be prepared, and reports a failed stage', async () => {
+    const w = makeWorld();
+    // The worktree is added, then the patch is refused: the half-made folder must not be left behind.
+    const bad = Buffer.from('this is not a patch\n').toString('base64');
+    const k = fakeKernel(assignment(w, { workspace: { repo: w.repo, base: base(w), patch: bad } }));
+    const worker = startRemoteWorker({ kernelUrl: 'http://127.0.0.1:1', workerId: 'mac', token: 'mac-token-0123456789abcdef', slots: 1, repos: { [w.repo]: w.clone }, workdir: w.workdir, claudeBin: FAKE, retryMs: 50, fetch: k.fetchImpl });
+    try {
+      await waitFor(() => k.results.length === 1, 30_000, 'the failed result');
+      expect(k.results[0]).toMatchObject({ stageId: 'stage-1', outcome: 'failed', output: { error: expect.stringContaining('could not prepare the workspace') } });
+      await waitFor(() => worker.running() === 0, 30_000, 'the stage to be cleaned up');
+      expect(existsSync(join(w.workdir, 'stage-1'))).toBe(false);
+      expect(gitSync(w.clone, 'worktree', 'list').split('\n')).toHaveLength(1);
+    } finally {
+      await worker.stop();
+    }
+  });
+
+  it('does not send a patch larger than the kernel said it would take: the stage is reported failed with that reason', async () => {
+    const w = makeWorld();
+    const k = fakeKernel(assignment(w, { maxPatchBytes: 100 }));
+    const worker = startRemoteWorker({ kernelUrl: 'http://127.0.0.1:1', workerId: 'mac', token: 'mac-token-0123456789abcdef', slots: 1, repos: { [w.repo]: w.clone }, workdir: w.workdir, claudeBin: FAKE, retryMs: 50, fetch: k.fetchImpl });
+    try {
+      await waitFor(() => k.results.length === 1, 30_000, 'the result');
+      expect(k.results[0]).toMatchObject({ outcome: 'failed', output: { error: expect.stringMatching(/larger than 1 KiB/) } });
+      expect(k.results[0]).not.toHaveProperty('patch');
+    } finally {
+      await worker.stop();
+    }
   });
 });

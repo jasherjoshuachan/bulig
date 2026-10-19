@@ -39,6 +39,7 @@ export async function cmdWorker(args: string[], io: Io): Promise<number> {
       slots: { type: 'string' },
       repo: { type: 'string', multiple: true },
       'allow-http-host': { type: 'string', multiple: true },
+      'max-patch-bytes': { type: 'string' },
       'work-dir': { type: 'string' },
       workdir: { type: 'string' },
       'claude-bin': { type: 'string' },
@@ -84,6 +85,9 @@ export async function cmdWorker(args: string[], io: Io): Promise<number> {
   }
   const strs = (v: unknown): string[] | undefined => (Array.isArray(v) && v.every((x) => typeof x === 'string') ? (v as string[]) : undefined);
 
+  const maxPatch = values['max-patch-bytes'] === undefined ? undefined : Number(values['max-patch-bytes']);
+  if (maxPatch !== undefined && (!Number.isInteger(maxPatch) || maxPatch < 1024)) throw new ConfigError('--max-patch-bytes must be a whole number of bytes, at least 1024');
+
   let stop: () => void = () => {};
   const stopped = new Promise<void>((r) => (stop = r));
   const worker = startRemoteWorker({
@@ -94,6 +98,7 @@ export async function cmdWorker(args: string[], io: Io): Promise<number> {
     repos,
     workdir: workDir ? resolve(io.cwd, workDir) : join(io.home, '.bulig', 'worker', values.id),
     claudeToken,
+    maxPatchBytes: maxPatch,
     allowHttpHosts: values['allow-http-host'],
     claudeBin: values['claude-bin'] ?? (typeof claude.claudeBin === 'string' ? claude.claudeBin : undefined),
     timeoutMs: typeof claude.timeoutMs === 'number' ? claude.timeoutMs : undefined,

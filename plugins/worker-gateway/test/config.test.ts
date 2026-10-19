@@ -44,6 +44,12 @@ describe('where the endpoint may listen', () => {
     expect(() => parseGatewayConfig({ heartbeatMs: 10_000, heartbeatTimeoutMs: 15_000, workers }, env)).toThrow(/less than half/);
   });
 
+  it('a claim is held open for less than the worker waits for one, with room to spare', () => {
+    expect(parseGatewayConfig({ claimWaitMs: 45_000, workers }, env).claimWaitMs).toBe(45_000);
+    expect(() => parseGatewayConfig({ claimWaitMs: 50_000, workers }, env)).toThrow(GatewayConfigError);
+    expect(() => parseGatewayConfig({ claimWaitMs: 60_000, workers }, env)).toThrow(GatewayConfigError);
+  });
+
   it('refuses keys it does not know', () => {
     expect(() => parseGatewayConfig({ lisen: ['127.0.0.1'], workers }, env)).toThrow(GatewayConfigError);
   });

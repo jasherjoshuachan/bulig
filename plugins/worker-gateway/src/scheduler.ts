@@ -30,6 +30,8 @@ export interface Active {
   lastBeat: number;
   /** The worker's changes were applied to the job folder. A repeated result must not apply them twice. */
   applied: boolean;
+  /** The patch that was applied, kept so it can be taken back if the result cannot be recorded. */
+  appliedPatch?: Buffer | undefined;
   /** A result is being handled. The heartbeat check leaves such a stage alone. */
   finishing: boolean;
   lost: boolean;

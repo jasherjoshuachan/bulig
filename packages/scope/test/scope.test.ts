@@ -94,7 +94,9 @@ describe('matchesGlob', () => {
     expect(matchesGlob(`${deep}/end.md`, `${Array.from({ length: 28 }, () => '**').join('/')}/end.md`)).toBe(true);
     // parts that cannot be collapsed must not blow up either
     expect(matchesGlob(`${deep}/end.md`, `${Array.from({ length: 28 }, () => '**/x').join('/')}/nope.md`)).toBe(false);
-    expect(performance.now() - started).toBeLessThan(50);
+    // Measured 19 Oct 2026: about 0.2 ms (0.9 ms worst of 20). Without the memo in matchParts it runs for minutes,
+    // so 1000 ms still catches that while a loaded machine cannot trip it (50 ms did, under parallel test runs).
+    expect(performance.now() - started).toBeLessThan(1000);
   });
 
   it('is not slow on a hostile pattern', () => {

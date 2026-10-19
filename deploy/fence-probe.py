@@ -85,6 +85,12 @@ def attempt(kind, target):
             c.request("GET", u.path or "/")
             r = c.getresponse()
             return True, f"http {r.status}"
+        if kind == "node":
+            subprocess.run(["node", "-e", target], check=True, timeout=20, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            return True, "node ran it"
+        if kind == "exec":
+            subprocess.run(target.split(), check=True, timeout=20, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            return True, "exited 0"
         if kind == "pwd":
             import pwd
 
@@ -97,6 +103,8 @@ def attempt(kind, target):
         if kind == "spawn":
             subprocess.run([sys.executable, "-c", "pass"], check=True, timeout=TIMEOUT)
             return True, "child ran"
+    except subprocess.CalledProcessError as e:
+        return False, "exit " + str(e.returncode) + ": " + (e.stderr or b"").decode("utf8", "replace").strip()[:160]
     except Exception as e:  # any failure is a failure to connect
         return False, f"{type(e).__name__}: {e}"
     raise SystemExit(f"unknown probe kind {kind!r}")
@@ -162,7 +170,7 @@ def main(argv):
             else:
                 print(f"warn {set_name} {name} not reachable yet: {target} ({detail}). Check again once the kernel is up.")
         elif expect == "known":
-            print(f"info {set_name} {name} known limit: {kind} {target} is {'reachable' if ok else 'not reachable'}")
+            print(f"info {set_name} {name} known limit: {kind} {target[:60]} " + ("works" if ok else f"does not work ({detail})"))
         else:
             raise SystemExit(f"unknown expectation {expect!r}")
     return 1 if failed else 0

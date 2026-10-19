@@ -2,8 +2,8 @@
 Description=Bulig worker (bulig worker): runs Claude Code for the kernel
 Documentation=https://github.com/jasherjoshuachan/bulig
 # The worker connects to the kernel's gateway on 127.74.3.1:7431. It can start first and retry, but ordering it after the kernel is tidier.
-After=network-online.target bulig.service bulig-loopback.service
-Wants=network-online.target bulig.service bulig-loopback.service
+After=network-online.target bulig.service bulig-loopback.service systemd-resolved.service
+Wants=network-online.target bulig.service bulig-loopback.service systemd-resolved.service
 StartLimitIntervalSec=300
 StartLimitBurst=10
 

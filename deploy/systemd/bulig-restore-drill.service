@@ -1,7 +1,7 @@
 [Unit]
 Description=Restore the newest Bulig backup from R2 into a scratch database and check it
-After=postgresql@16-bulig.service network-online.target
-Wants=network-online.target
+After=postgresql@16-bulig.service network-online.target systemd-resolved.service
+Wants=network-online.target systemd-resolved.service
 AssertPathExists=/etc/bulig/backup.env
 AssertPathExists=/etc/bulig/pg-url
 AssertPathExists=/etc/bulig/drill-pw

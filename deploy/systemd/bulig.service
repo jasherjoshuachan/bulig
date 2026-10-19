@@ -3,8 +3,8 @@ Description=Bulig kernel (bulig serve)
 Documentation=https://github.com/jasherjoshuachan/bulig
 # The kernel needs its own Postgres cluster up first. Wants, not Requires: if the cluster restarts, the kernel's lease logic
 # handles the gap and a restart of this unit is not forced.
-After=network-online.target postgresql@16-bulig.service bulig-loopback.service
-Wants=network-online.target postgresql@16-bulig.service
+After=network-online.target postgresql@16-bulig.service bulig-loopback.service systemd-resolved.service
+Wants=network-online.target postgresql@16-bulig.service systemd-resolved.service
 # The gateway's own loopback address. Without it the worker's packets would carry source 127.0.0.1, which this unit must not accept.
 Requires=bulig-loopback.service
 # No config, no start, and a loud failure (Assert fails the unit; Condition would skip it silently): a missing config would otherwise

@@ -4,7 +4,8 @@
 # machine's own addresses, unix sockets including an abstract one) and CAN do what the unit needs (DNS, https, its own gateway, a child
 # process, a user lookup). Any unexpected success is a failure. The probe list is one file, fence/probes.txt.
 #   usage (root):  fence-check.sh [worker|kernel|build|cli-worker|cli-kernel|all] [--no-late | --late-only] [--late-strict]
-#   worker, kernel  properties are read from the installed unit file and its drop-ins (so a drop-in that opens a hole is tested too)
+#   worker, kernel  properties are read from what systemd has LOADED (systemctl show: drop-ins, set-property and all); BULIG_FENCE_SOURCE=files
+#                   reads the unit file and its drop-ins instead (the offline path the tests use). SupplementaryGroups= is refused.
 #   build           the transient release-build unit's properties (build_fence_props in lib/common.sh)
 #   cli-worker, cli-kernel   bulig-cli.sh's properties (cli_fence_props in lib/common.sh)
 #   --late-only     only the probes that need the kernel to be up (the gateway); --late-strict makes a miss a failure, not a warning
@@ -53,7 +54,8 @@ for s in "${sets[@]}"; do
       unit="bulig-worker.service"
       if [ "$s" = "kernel" ]; then unit="bulig.service"; fi
       [ -f "$BULIG_UNIT_DIR/$unit" ] || die "$unit is not installed in $BULIG_UNIT_DIR, so its fence cannot be tested"
-      unit_fence_props "$unit"
+      # On the server the properties come from what systemd has loaded. BULIG_FENCE_SOURCE=files|show forces one (the tests do).
+      if [ "$(fence_source)" = "show" ]; then unit_loaded_props "$unit"; else unit_fence_props "$unit"; fi
       props=("${UNIT_PROPS[@]}")
       ids=(--uid="${UNIT_USER:-bulig}")
       if [ "$s" = "worker" ]; then ids=(--uid="${UNIT_USER:-bulig-worker}"); fi
@@ -61,7 +63,8 @@ for s in "${sets[@]}"; do
       case " ${props[*]} " in *" IPAddressDeny="*) ;; *) die "$unit has no IPAddressDeny=" ;; esac
       case " ${props[*]} " in *" RestrictAddressFamilies="*) ;; *) die "$unit has no RestrictAddressFamilies=" ;; esac
       ;;
-    build) build_fence_props; props=("${FENCE_BUILD[@]}") ;;
+    # The real build sets HOME explicitly (release-remote.sh); a DynamicUser has no passwd entry to take it from.
+    build) build_fence_props; props=("${FENCE_BUILD[@]}" --setenv=HOME=/var/tmp/home) ;;
     cli-worker) cli_fence_props worker; props=("${FENCE_CLI[@]}"); ids=(--uid=bulig-worker) ;;
     cli-kernel) cli_fence_props kernel; props=("${FENCE_CLI[@]}"); ids=(--uid=bulig) ;;
   esac

@@ -86,12 +86,22 @@ done
 # Only the loopback unit, which uses netlink to add an address, may have anything but IP families; neither the worker nor the build may have unix sockets.
 case " $(value bulig-worker.service RestrictAddressFamilies) " in *AF_UNIX* | *AF_NETLINK* | *AF_PACKET*) bad "the worker unit allows a non-IP socket family" ;; *) ok "the worker unit allows IP sockets only (no AF_UNIX, no AF_NETLINK)" ;; esac
 case " $(value bulig.service RestrictAddressFamilies) " in *AF_UNIX*) ok "the kernel keeps AF_UNIX (its Postgres socket): a documented limit, see the RUNBOOK" ;; *) bad "the kernel unit lost AF_UNIX, so it cannot reach Postgres" ;; esac
-if grep -q 'Known limits' "$deploy/RUNBOOK.md" && grep -q 'deny unix addr=@\*\*' "$deploy/RUNBOOK.md" && grep -qi 'abstract' <(sed -n '/Known limits/,$p' "$deploy/RUNBOOK.md"); then ok "the RUNBOOK's Known limits name the kernel's abstract-socket reach and the AppArmor next step"; else bad "RUNBOOK Known limits section is missing the abstract-socket limit"; fi
+if grep -q '^## Known limits' "$deploy/RUNBOOK.md" && sed -n '/^## Known limits/,/^## Must be proven/p' "$deploy/RUNBOOK.md" | grep -q 'deny unix addr=@\*\*' && sed -n '/^## Known limits/,/^## Must be proven/p' "$deploy/RUNBOOK.md" | grep -qi 'abstract'; then ok "the RUNBOOK's Known limits name the kernel's abstract-socket reach and the AppArmor next step"; else bad "RUNBOOK Known limits section is missing the abstract-socket limit"; fi
 # a wording check: no file claims the allowed addresses are limited to a port
 if grep -rniE 'only (the )?(dns|port 53)|answers dns and nothing else|dns and nothing else' "$sd" "$deploy/RUNBOOK.md" >/dev/null; then bad "a file still claims an allowed address is DNS-only: $(grep -rniE 'dns and nothing else|only dns' "$sd" "$deploy/RUNBOOK.md" | head -2)"; else ok "no file claims an allowed address reaches only DNS or only one port"; fi
 for u in bulig-worker.service bulig.service; do
   if grep -q 'ADDRESSES, NOT PORTS' "$sd/$u"; then ok "$u says the filter matches addresses and not ports"; else bad "$u does not say the filter matches addresses, not ports"; fi
 done
+
+for u in bulig.service bulig-worker.service bulig-backup.service bulig-restore-drill.service; do
+  case " $(value "$u" After) " in *" systemd-resolved.service "*) ok "$u starts after systemd-resolved.service (the resolver list it binds must exist)" ;; *) bad "$u does not start After=systemd-resolved.service" ;; esac
+  case " $(value "$u" Wants) " in *" systemd-resolved.service "*) ok "$u wants systemd-resolved.service" ;; *) bad "$u does not want systemd-resolved.service" ;; esac
+done
+if grep -q 'restart the Bulig units' "$deploy/RUNBOOK.md" && grep -q 'upstream DNS servers change' "$deploy/RUNBOOK.md"; then ok "the RUNBOOK says to restart the units when the upstream DNS changes"; else bad "RUNBOOK: no restart-on-DNS-change note"; fi
+if grep -q 'user lookup' "$deploy/fence/probes.txt" || grep -q 'dynamic' "$deploy/fence/probes.txt"; then ok "the probe file explains the build's user-lookup limit"; else bad "no explanation of the build's user-lookup limit"; fi
+if grep -q 'DynamicUser' "$deploy/RUNBOOK.md" && grep -q 'io.systemd.DynamicUser' "$deploy/RUNBOOK.md" && grep -q 'node-homedir' "$deploy/RUNBOOK.md"; then ok "the RUNBOOK explains why the build's lookup fails, and that it does not need it"; else bad "RUNBOOK: build user-lookup explanation missing"; fi
+
+if grep -q '^## Must be proven on the server first' "$deploy/RUNBOOK.md" && sed -n '/^## Must be proven on the server first/,/^## Things to know/p' "$deploy/RUNBOOK.md" | grep -q 'systemctl show' && sed -n '/^## Must be proven on the server first/,/^## Things to know/p' "$deploy/RUNBOOK.md" | grep -q 'resolv.conf'; then ok "the RUNBOOK lists what must be proven on the server first"; else bad "RUNBOOK: no 'Must be proven on the server first' list"; fi
 
 echo "the gateway address"
 gw="127.74.3.1"

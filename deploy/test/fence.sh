@@ -37,6 +37,7 @@ STUB
 cat >"$stubs/systemctl" <<'STUB'
 #!/usr/bin/env bash
 echo "systemctl $*" >>"$STUB_LOG/systemctl"
+if [ "$1" = "show" ] && [ -n "${STUB_SHOW_FILE:-}" ]; then cat "$STUB_SHOW_FILE"; fi
 STUB
 cat >"$stubs/mv" <<'STUB'
 #!/usr/bin/env bash
@@ -46,6 +47,10 @@ if [ "$t" -eq 1 ] && [ -L "${args[1]}" ]; then rm -f "${args[1]}"; fi
 exec /bin/mv "${args[@]}"
 STUB
 chmod +x "$stubs"/*
+NODE_DIR=""
+for cand in "$(command -v node 2>/dev/null || true)" /opt/homebrew/bin/node /usr/local/bin/node /usr/bin/node; do
+  if [ -n "$cand" ] && [ -x "$cand" ]; then NODE_DIR="$(dirname "$cand")"; break; fi
+done
 export PATH="$stubs:/usr/bin:/bin:/usr/sbin:/sbin"
 
 new_host() {
@@ -214,9 +219,34 @@ expect_fail_msg "an unknown expectation is an error" "unknown expectation" pytho
 
 echo "the real probe list"
 P="$deploy/fence/probes.txt"
-for pat in "127\.0\.0\.1:9222( |\$)" "\[::1\]:8000( |\$)" "172\.17\.0\.1:5433( |\$)" "@TAILSCALE4@:46841( |\$)" "@HOST@:22( |\$)" "127\.0\.0\.53:80( |\$)" "abstract  /tmp/\.X11-unix/X99( |\$)" "/run/tailscale/tailscaled\.sock( |\$)" "/run/docker\.sock( |\$)" "/run/snapd\.socket( |\$)"; do
-  if grep -E "^deny" "$P" | grep -qE -- "$pat"; then ok "must-fail probe present: $pat"; else bad "no deny probe for $pat"; fi
-done
+ALL="worker,kernel,build,cli-worker,cli-kernel"
+WORKERISH="worker,build,cli-worker"
+# <target pattern> <the sets whose deny line it must be in, exactly>: a deny probe that exists for only some sets leaves the others unproven
+while IFS= read -r row; do
+  [ -n "$row" ] || continue
+  pat="${row%%@@*}"
+  want_sets="${row#*@@}"
+  got_sets="$(grep -E "^deny" "$P" | grep -E -- "$pat" | awk '{print $2}' | tr '\n' ' ' | sed 's/ $//')"
+  if [ "$got_sets" = "$want_sets" ]; then ok "must-fail probe for $pat covers exactly: $want_sets"; else bad "deny probe for $pat covers '$got_sets', wanted '$want_sets'"; fi
+done <<EOF2
+127\.0\.0\.1:9222( |\$)@@$ALL
+127\.0\.0\.1:8233( |\$)@@$ALL
+\[::1\]:8000( |\$)@@$ALL
+172\.17\.0\.1:5433( |\$)@@$ALL
+@TAILSCALE4@:46841( |\$)@@$ALL
+@HOST@:22( |\$)@@$WORKERISH
+127\.0\.0\.53:80( |\$)@@$ALL
+127\.0\.0\.53:53( |\$)@@$ALL
+abstract  /tmp/\.X11-unix/X99( |\$)@@$WORKERISH
+/run/tailscale/tailscaled\.sock( |\$)@@$ALL
+/run/snapd\.socket( |\$)@@$ALL
+/run/docker\.sock( |\$)@@$ALL
+/var/run/postgresql/\.s\.PGSQL\.5436( |\$)@@$WORKERISH
+EOF2
+# user lookup: real users resolve through files, so the lookup must work for them; for the build's DynamicUser it is a documented known limit
+if [ "$(grep -E "^allow .* pwd " "$P" | awk '{print $2}')" = "worker,kernel,cli-worker,cli-kernel" ] && [ "$(grep -E "^known .* pwd " "$P" | awk '{print $2}')" = "build" ]; then ok "user-lookup: required for the worker, kernel and CLI sets, a known limit for the build (a DynamicUser needs the varlink socket, which needs AF_UNIX)"; else bad "user-lookup lines: $(grep ' pwd ' "$P")"; fi
+if grep -E "^allow +build " "$P" | grep -q "node-homedir"; then ok "and the build is shown not to need it: node's homedir() works from the HOME the build sets"; else bad "no build node-homedir probe"; fi
+if grep -E "^allow +worker,cli-worker .* node .*api\.anthropic\.com" "$P" >/dev/null && grep -E "^known +worker,cli-worker .* node .*networkInterfaces" "$P" >/dev/null && grep -E "^allow +worker,cli-worker .* exec +claude --version" "$P" >/dev/null; then ok "worker sets run real node (https to api.anthropic.com, os.networkInterfaces as a known probe) and claude --version"; else bad "worker node/claude probes missing"; fi
 for kind in dns https pwd socketpair spawn; do
   if grep -qE "^allow +[a-z,-]+ +[a-z-]+ +$kind " "$P"; then ok "must-work probe present: $kind"; else bad "no allow probe of kind $kind"; fi
 done
@@ -226,7 +256,7 @@ if ! grep -E "^deny" "$P" | grep "abstract" | grep -q "kernel"; then ok "the ker
 for s in worker kernel build cli-worker cli-kernel; do
   if grep -vE '^#|^$' "$P" | awk -v s="$s" '{ n = split($2, a, ","); for (i = 1; i <= n; i++) if (a[i] == s) c++ } END { exit !(c >= 8) }'; then ok "$s has at least 8 probes"; else bad "$s has fewer than 8 probes"; fi
 done
-if awk '!/^#/ && NF && NF != 5 { print "line " NR ": " $0; bad = 1 } END { exit bad }' "$P" >"$work/cols" 2>&1; then ok "every probe line has five columns"; else bad "malformed probe lines: $(cat "$work/cols")"; fi
+if awk '!/^#/ && NF && NF < 5 { print "line " NR ": " $0; bad = 1 } END { exit bad }' "$P" >"$work/cols" 2>&1; then ok "every probe line has at least five columns (the last one may hold spaces)"; else bad "malformed probe lines: $(cat "$work/cols")"; fi
 
 echo "fence-check.sh"
 # stand-in for systemd-run: records the arguments, then runs what comes after "--" here (the probe, with python3 in place of /usr/bin/python3)
@@ -318,6 +348,55 @@ rc=0
 BULIG_FENCE_PROBES="$work/fc-clean.txt" bash "$deploy/fence-check.sh" worker --late-only >"$work/fc.out" 2>&1 || rc=$?
 if [ "$rc" -eq 0 ] && grep -q "^warn worker late not reachable yet" "$work/fc.out"; then ok "without --late-strict the same miss is only a warning"; else bad "late rc=$rc: $(cat "$work/fc.out")"; fi
 expect_fail_msg "an unknown set is refused" "usage: fence-check.sh" bash "$deploy/fence-check.sh" nonsense
+
+echo "the loaded properties (systemctl show)"
+fs() { ( . "$deploy/lib/common.sh"; . "$deploy/lib/fence.sh"; fence_source ); }
+if [ "$(env -u BULIG_DEPLOY_TEST_ROOT -u BULIG_FENCE_SOURCE bash -c ". '$deploy/lib/common.sh'; . '$deploy/lib/fence.sh'; fence_source")" = "show" ]; then ok "on the server (no test root) the properties come from systemctl show"; else bad "default source on the server is not show"; fi
+if [ "$(fs)" = "files" ] && [ "$(BULIG_FENCE_SOURCE=show fs)" = "show" ]; then ok "with the paths redirected for the tests they come from the files; BULIG_FENCE_SOURCE overrides"; else bad "fence_source: $(fs)"; fi
+shown="$work/show.txt"
+cat >"$shown" <<DATA
+LoadState=loaded
+User=bulig-worker
+IPAddressDeny=127.0.0.0/8 ::1/128 10.0.0.0/8
+IPAddressAllow=127.74.3.1 127.0.0.1
+RestrictAddressFamilies=AF_INET AF_INET6
+InaccessiblePaths=-/run/tailscale -/run/docker.sock
+BindPaths=
+BindReadOnlyPaths=/run/systemd/resolve/resolv.conf:/etc/resolv.conf
+SupplementaryGroups=
+ProtectSystem=strict
+PrivateTmp=yes
+ProtectHome=yes
+ProtectProc=invisible
+DATA
+: >"$log/runs"
+STUB_SHOW_FILE="$shown" BULIG_FENCE_SOURCE=show BULIG_FENCE_PROBES="$work/fc-clean.txt" bash "$deploy/fence-check.sh" worker --no-late >"$work/fc.out" 2>&1 || true
+w="$(grep -- '--unit=bulig-fence-worker-' "$log/runs" | head -1)"
+case "$w" in *"--uid=bulig-worker"*"-p IPAddressDeny=127.0.0.0/8 ::1/128 10.0.0.0/8 "*"-p IPAddressAllow=127.74.3.1 127.0.0.1 "*) ok "the probe gets the LOADED values (here a 127.0.0.1 that no file has, as set-property would leave it), so a loaded hole is tested" ;; *) bad "loaded run: $w" ;; esac
+case "$w" in *"BindPaths="*) bad "an empty loaded property was passed on: $w" ;; *) ok "an empty loaded property (BindPaths=) is not passed on" ;; esac
+case "$w" in *"-p BindReadOnlyPaths=/run/systemd/resolve/resolv.conf:/etc/resolv.conf "*"-p ProtectSystem=strict "*) ok "bind paths and the single-value settings come from the loaded unit too" ;; *) bad "loaded bind/protect: $w" ;; esac
+sed 's/^SupplementaryGroups=$/SupplementaryGroups=docker/' "$shown" >"$work/show-groups.txt"
+expect_fail_msg "a loaded worker with SupplementaryGroups is refused (it would gain docker's sockets)" "SupplementaryGroups=docker" env STUB_SHOW_FILE="$work/show-groups.txt" BULIG_FENCE_SOURCE=show BULIG_FENCE_PROBES="$work/fc-clean.txt" bash "$deploy/fence-check.sh" worker
+sed 's/^LoadState=loaded$/LoadState=not-found/' "$shown" >"$work/show-nf.txt"
+expect_fail_msg "a unit systemd has not loaded is refused" "is not loaded by systemd" env STUB_SHOW_FILE="$work/show-nf.txt" BULIG_FENCE_SOURCE=show BULIG_FENCE_PROBES="$work/fc-clean.txt" bash "$deploy/fence-check.sh" worker
+mkdir -p "$SD/bulig-worker.service.d"
+printf '[Service]\nSupplementaryGroups=docker\n' >"$SD/bulig-worker.service.d/98-groups.conf"
+expect_fail_msg "the file path refuses SupplementaryGroups in a drop-in as well" "SupplementaryGroups=docker" env BULIG_FENCE_SOURCE=files BULIG_FENCE_PROBES="$work/fc-clean.txt" bash "$deploy/fence-check.sh" worker
+rm -f "$SD/bulig-worker.service.d/98-groups.conf"
+
+echo "node and exec probes, and the build's HOME"
+if [ -n "$NODE_DIR" ]; then
+  printf 'allow worker node-ok node require("http").get("http://127.0.0.1:%s/x",r=>process.exit(r.statusCode===200?0:1)).on("error",()=>process.exit(1))\nallow worker node-bad node process.exit(3)\nknown worker node-known node process.exit(4)\nallow worker exec-ok exec python3 --version\nallow worker exec-bad exec python3 -c raise\n' "$http_port" >"$work/nodeprobes.txt"
+  res="$(PATH="$NODE_DIR:$PATH" probe fenced worker "$work/nodeprobes.txt" || true)"
+  if printf '%s\n' "$res" | grep -q "^ok worker node-ok works" && printf '%s\n' "$res" | grep -q "^FAIL worker node-bad should work" && printf '%s\n' "$res" | grep -q "^info worker node-known known limit: node .* does not work (exit 4"; then ok "a node probe works when node exits 0, fails when it does not, and a known one only reports"; else bad "node probes: $res"; fi
+  if printf '%s\n' "$res" | grep -q "^ok worker exec-ok works" && printf '%s\n' "$res" | grep -q "^FAIL worker exec-bad should work"; then ok "an exec probe (claude --version's kind) works when the command exits 0 and fails when it does not"; else bad "exec probes: $res"; fi
+else
+  ok "node probes: skipped (no node on this machine's PATH; CI has node)"
+fi
+: >"$log/runs"
+BULIG_FENCE_PROBES="$work/fc-clean.txt" bash "$deploy/fence-check.sh" build >/dev/null 2>&1 || true
+case "$(grep -- '--unit=bulig-fence-build-' "$log/runs" | head -1)" in *"--setenv=HOME=/var/tmp/home"*) ok "the build set is probed with HOME set explicitly, as the real build does (a DynamicUser has no passwd entry to take it from)" ;; *) bad "build probe has no HOME" ;; esac
+if grep -q -- '--setenv=HOME=/var/tmp/home' "$deploy/release-remote.sh"; then ok "and the real build sets that HOME"; else bad "release-remote.sh does not set HOME for the build"; fi
 
 kill "$fixture_pid" 2>/dev/null || true
 wait "$fixture_pid" 2>/dev/null || true

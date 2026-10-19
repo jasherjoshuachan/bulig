@@ -31,14 +31,16 @@ unit_last() {
   printf '%s' "$out"
 }
 
-# unit_fence_props <unit>: sets UNIT_PROPS (the -p arguments for systemd-run) and UNIT_USER from the unit as it is installed, drop-ins included.
+# unit_fence_props <unit>: sets UNIT_PROPS (the -p arguments for systemd-run) and UNIT_USER by reading the unit file and its drop-ins. This is the
+# offline path (tests, and any machine without systemd); on the server fence-check.sh uses unit_loaded_props.
 UNIT_PROPS=()
 UNIT_USER=""
 unit_fence_props() {
   local unit="$1" key v
   UNIT_PROPS=()
   UNIT_USER="$(unit_last "$unit" User)"
-  for key in IPAddressDeny IPAddressAllow RestrictAddressFamilies InaccessiblePaths BindReadOnlyPaths; do
+  [ -z "$(unit_list "$unit" SupplementaryGroups)" ] || die "$unit has SupplementaryGroups=$(unit_list "$unit" SupplementaryGroups): a Bulig user must not gain another group's files or sockets"
+  for key in IPAddressDeny IPAddressAllow RestrictAddressFamilies InaccessiblePaths BindPaths BindReadOnlyPaths; do
     v="$(unit_list "$unit" "$key")"
     if [ -n "$v" ]; then UNIT_PROPS+=(-p "$key=$v"); fi
   done
@@ -46,4 +48,30 @@ unit_fence_props() {
     v="$(unit_last "$unit" "$key")"
     if [ -n "$v" ]; then UNIT_PROPS+=(-p "$key=$v"); fi
   done
+}
+
+# unit_loaded_props <unit>: the same arrays, but from what systemd has LOADED (systemctl show), the one true source: it includes drop-ins, set-property
+# changes and a unit file edited without a daemon-reload not yet applied. Dies if the unit is not loaded or has supplementary groups.
+unit_loaded_props() {
+  local unit="$1" out key v
+  out="$(systemctl show -p LoadState,User,IPAddressDeny,IPAddressAllow,RestrictAddressFamilies,InaccessiblePaths,BindPaths,BindReadOnlyPaths,SupplementaryGroups,ProtectSystem,PrivateTmp,ProtectHome,ProtectProc "$unit")" || die "systemctl show $unit failed"
+  shown() { printf '%s\n' "$out" | awk -F= -v k="$1" '$1 == k { sub(/^[^=]*=/, ""); print; exit }'; }
+  [ "$(shown LoadState)" = "loaded" ] || die "$unit is not loaded by systemd, so its fence cannot be tested"
+  [ -z "$(shown SupplementaryGroups)" ] || die "$unit has SupplementaryGroups=$(shown SupplementaryGroups): a Bulig user must not gain another group's files or sockets"
+  UNIT_PROPS=()
+  UNIT_USER="$(shown User)"
+  for key in IPAddressDeny IPAddressAllow RestrictAddressFamilies InaccessiblePaths BindPaths BindReadOnlyPaths; do
+    v="$(shown "$key")"
+    if [ -n "$v" ]; then UNIT_PROPS+=(-p "$key=$v"); fi
+  done
+  for key in ProtectSystem PrivateTmp ProtectHome ProtectProc; do
+    v="$(shown "$key")"
+    if [ -n "$v" ]; then UNIT_PROPS+=(-p "$key=$v"); fi
+  done
+}
+
+# fence_source: where the worker and kernel properties come from. "show" (systemctl show: what systemd has loaded) on the server; "files" when the
+# paths are redirected for the tests (BULIG_DEPLOY_TEST_ROOT set). BULIG_FENCE_SOURCE=files|show forces one.
+fence_source() {
+  if [ -n "${BULIG_FENCE_SOURCE:-}" ]; then printf '%s' "$BULIG_FENCE_SOURCE"; elif [ -z "$R" ]; then printf show; else printf files; fi
 }

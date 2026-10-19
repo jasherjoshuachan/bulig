@@ -7,7 +7,11 @@
 #         known       a documented limit: reported, never fails.
 # sets    comma list of: worker kernel build cli-worker cli-kernel
 # kind    tcp host:port | [v6]:port | unix path | abstract name (leading NUL added) | dns hostname | https hostname | http url
-#         | pwd (getpwuid of the running uid) | socketpair (AF_UNIX socketpair, what node child_process uses) | spawn (run /bin/true)
+#         | pwd (getpwuid of the running uid) | socketpair (AF_UNIX socketpair, what node child_process uses) | spawn (run a child)
+#         | node (run `node -e <target>`; works when it exits 0) | exec (run the command in <target>; works when it exits 0)
+# The build's user-lookup is a KNOWN limit: it runs as a DynamicUser, which has no /etc/passwd entry, and libnss_systemd resolves dynamic users
+# only over the varlink socket /run/systemd/userdb/io.systemd.DynamicUser, which needs AF_UNIX, which the build does not have (on purpose).
+# The build does not need the lookup (HOME is set explicitly; node's os.homedir() reads $HOME), and node-homedir proves that.
 # placeholders: @HOST@ = each of this machine's own public addresses, @TAILSCALE4@ = this machine's own tailscale address.
 # The targets are what ths-prod-01 had on 19 Oct 2026. A target that is not there any more shows as inconclusive, not as a pass.
 
@@ -33,7 +37,12 @@ allow kernel,cli-kernel                          postgres-socket         unix   
 # --- what each unit does need
 allow worker,kernel,build,cli-worker,cli-kernel  dns-lookup              dns       api.github.com
 allow worker,kernel,build,cli-worker,cli-kernel  https-github            https     api.github.com
-allow worker,kernel,build,cli-worker,cli-kernel  user-lookup             pwd       -
+allow worker,kernel,cli-worker,cli-kernel        user-lookup             pwd       -
+known build                                      user-lookup-dynamic     pwd       -
+allow build                                      node-homedir            node      console.log(require('os').homedir())
 allow worker,build,cli-worker                    socketpair-for-children socketpair -
 allow worker,build,cli-worker                    spawn-a-child           spawn     -
+allow worker,cli-worker                          node-https-anthropic    node      fetch('https://api.anthropic.com/',{signal:AbortSignal.timeout(8000)}).then(()=>process.exit(0),e=>{console.error(String(e&&e.cause||e));process.exit(1)})
+known worker,cli-worker                          node-network-interfaces node      require('os').networkInterfaces()
+allow worker,cli-worker                          claude-version          exec      claude --version
 allow-late worker,cli-worker                     kernel-gateway-healthz  http      http://127.74.3.1:7431/healthz

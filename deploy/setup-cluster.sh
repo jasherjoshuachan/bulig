@@ -10,7 +10,7 @@ need_root
 refuse_if_users_running
 
 command -v pg_createcluster >/dev/null 2>&1 || die "pg_createcluster not found (postgresql-common is not installed)"
-[ -d "/usr/lib/postgresql/$BULIG_PG_VERSION/bin" ] || die "postgresql-$BULIG_PG_VERSION is not installed"
+[ -d "$R/usr/lib/postgresql/$BULIG_PG_VERSION/bin" ] || die "postgresql-$BULIG_PG_VERSION is not installed"
 need_dir "$BULIG_CRED_DIR"
 
 # 1. Is port 5436 free, or already ours? Check what listens, and what any cluster (running or not) is configured for.
@@ -31,7 +31,7 @@ if [ -n "$listening" ] && ! printf '%s\n' "$listening" | grep -Eq 'users:\(\("(p
   die "port $BULIG_PG_PORT has a listener that is not postgres: $listening"
 fi
 
-# 2. The cluster. scram-sha-256 for TCP, peer for the local socket (so root and postgres need no password locally).
+# 2. The cluster (the logins are set in step 3).
 if [ "$ours_exists" -eq 0 ]; then
   pg_createcluster "$BULIG_PG_VERSION" "$BULIG_PG_CLUSTER" --port "$BULIG_PG_PORT" -- --auth-local=peer --auth-host=scram-sha-256
   echo "cluster: created"
@@ -39,19 +39,33 @@ else
   echo "cluster: already there"
 fi
 
-# 3. Listen on localhost only. conf.d is included by the Debian postgresql.conf. Written only for this cluster.
-conf_d="/etc/postgresql/$BULIG_PG_VERSION/$BULIG_PG_CLUSTER/conf.d"
-install -d -m 0755 "$conf_d"
-want_conf="listen_addresses = 'localhost'
+# 3. No TCP listener at all: every client (the kernel, the backup, the drill, health) uses the unix socket, so nothing on the host can reach the
+# cluster over 127.0.0.1 and no Bulig unit needs 127.0.0.1. Logins are scram-sha-256 on the socket for the two Bulig roles and peer for the
+# postgres OS user (setup only), and nothing else matches (so everything else is rejected). The config goes in conf.d, which the Debian
+# postgresql.conf includes, and the rules in a file of their own that conf.d points to (hba_file). Both are written as root-owned files
+# (install_root_file); the folder belongs to postgres, the files do not.
+cluster_dir="$R/etc/postgresql/$BULIG_PG_VERSION/$BULIG_PG_CLUSTER"
+conf_d="$cluster_dir/conf.d"
+hba_file="$cluster_dir/bulig_hba.conf"
+[ -d "$conf_d" ] && [ ! -L "$conf_d" ] || die "$conf_d is missing (or is a link). pg_createcluster should have made it."
+want_conf="listen_addresses = ''
 port = $BULIG_PG_PORT
 password_encryption = 'scram-sha-256'
+hba_file = '/etc/postgresql/$BULIG_PG_VERSION/$BULIG_PG_CLUSTER/bulig_hba.conf'
 "
+want_hba="# Written by deploy/setup-cluster.sh. Unix socket only. No TCP rule, so no TCP login exists even if listen_addresses is changed.
+local   all       postgres                  peer
+local   bulig     bulig                     scram-sha-256
+local   all       bulig_drill               scram-sha-256
+"
+restart_needed=0
 if [ "$(cat "$conf_d/bulig.conf" 2>/dev/null || true)" != "${want_conf%$'\n'}" ]; then
-  printf '%s' "$want_conf" >"$conf_d/bulig.conf"
-  chown -h postgres:postgres "$conf_d/bulig.conf"
+  printf '%s' "$want_conf" | install_root_file "$conf_d/bulig.conf"
   restart_needed=1
-else
-  restart_needed=0
+fi
+if [ "$(cat "$hba_file" 2>/dev/null || true)" != "${want_hba%$'\n'}" ]; then
+  printf '%s' "$want_hba" | install_root_file "$hba_file"
+  restart_needed=1
 fi
 
 # 4. Start (or restart if the config just changed). Only this cluster.
@@ -72,7 +86,7 @@ url="$(cat "$BULIG_CRED_DIR/pg-url" 2>/dev/null || true)"
 if [ -n "$url" ]; then
   pw="${url#postgres://bulig:}"
   pw="${pw%%@*}"
-  [ -n "$pw" ] && [ "$pw" != "$url" ] || die "$BULIG_CRED_DIR/pg-url is not in the form postgres://bulig:<password>@127.0.0.1:$BULIG_PG_PORT/bulig. Fix or remove that file and run again."
+  [ -n "$pw" ] && [ "$pw" != "$url" ] || die "$BULIG_CRED_DIR/pg-url is not in the form postgres://bulig:<password>@%2Fvar%2Frun%2Fpostgresql:$BULIG_PG_PORT/bulig. Fix or remove that file and run again."
 else
   pw="$(openssl rand -hex 24)"
 fi
@@ -107,15 +121,16 @@ printf "ALTER ROLE bulig_drill PASSWORD '%s';\n" "$drill_pw" | psql_admin -f - >
 printf '%s' "$drill_pw" | cred_write drill-pw >/dev/null
 echo "credential: $BULIG_CRED_DIR/drill-pw written (mode 600, root)"
 
-# 6. The URL, with an explicit host (a URL without one would fall back to the default socket and port, which may be another cluster).
+# 6. The URL, with an explicit host: the socket folder, percent-encoded as the driver reads it (a URL without a host would fall back to the
+# default socket and port, which may be another cluster).
 # It goes into a root-only credential file, loaded by systemd LoadCredential= into the kernel unit and the backup units only.
-printf 'postgres://bulig:%s@127.0.0.1:%s/bulig' "$pw" "$BULIG_PG_PORT" | cred_write pg-url >/dev/null
+printf 'postgres://bulig:%s@%%2Fvar%%2Frun%%2Fpostgresql:%s/bulig' "$pw" "$BULIG_PG_PORT" | cred_write pg-url >/dev/null
 echo "credential: $BULIG_CRED_DIR/pg-url written (mode 600, root)"
 
-# 7. Prove the password works over TCP, the way the service will connect.
-if PGPASSWORD="$pw" "$(pg_bin psql)" -X -q -h 127.0.0.1 -p "$BULIG_PG_PORT" -U bulig -d bulig -tA -c "SELECT 1" >/dev/null; then
-  echo "login: bulig@127.0.0.1:$BULIG_PG_PORT ok"
+# 7. Prove the password works over the socket, the way the service will connect.
+if PGPASSWORD="$pw" "$(pg_bin psql)" -X -q -h "$BULIG_PG_HOST" -p "$BULIG_PG_PORT" -U bulig -d bulig -tA -c "SELECT 1" >/dev/null; then
+  echo "login: bulig@$BULIG_PG_HOST:$BULIG_PG_PORT ok"
 else
-  die "bulig could not log in over TCP on 127.0.0.1:$BULIG_PG_PORT"
+  die "bulig could not log in over the socket $BULIG_PG_HOST, port $BULIG_PG_PORT"
 fi
 echo "setup-cluster: done"

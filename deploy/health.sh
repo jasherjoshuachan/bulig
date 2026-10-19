@@ -34,6 +34,12 @@ else
   exit 1
 fi
 
+if systemctl is-active --quiet bulig-loopback.service; then
+  ok "bulig-loopback.service active ($BULIG_GATEWAY_ADDR on lo)"
+else
+  bad "bulig-loopback.service is $(systemctl is-active bulig-loopback.service 2>&1 || true): the worker cannot reach the kernel"
+fi
+
 # The worker is a separate unit under a separate user. It must be up, but a worker problem does not hide the kernel checks below.
 if systemctl is-active --quiet bulig-worker.service; then
   ok "bulig-worker.service active"
@@ -41,13 +47,13 @@ else
   bad "bulig-worker.service is $(systemctl is-active bulig-worker.service 2>&1 || true)"
 fi
 
-# 2. Read the lease row twice, as the bulig role over 127.0.0.1:5436 (password through a private PGPASSFILE, never a command line).
+# 2. Read the lease row twice, as the bulig role over the unix socket, port 5436 (password through a private PGPASSFILE, never a command line).
 work="$(private_tmpdir)"
 trap 'rm -rf "$work"' EXIT
 PGPASSFILE="$(pg_passfile "$(cred_path pg-url)" "$work")"
 export PGPASSFILE
 lease_row() {
-  "$(pg_bin psql)" -X -q -w -h 127.0.0.1 -p "$BULIG_PG_PORT" -U bulig -d bulig -tA -F '|' \
+  "$(pg_bin psql)" -X -q -w -h "$BULIG_PG_HOST" -p "$BULIG_PG_PORT" -U bulig -d bulig -tA -F '|' \
     -c "SELECT holder, generation, expires_at > clock_timestamp(), to_char(expires_at, 'YYYY-MM-DD HH24:MI:SS.US') FROM executor_lease" 2>&1 || true
 }
 row1=""

@@ -45,6 +45,46 @@ if value bulig.service LoadCredential | grep -q claude; then bad "the kernel uni
 if value bulig-worker.service LoadCredential | grep -qE 'pg-url|gh-token|config|worker-tokens'; then bad "the worker unit holds a kernel secret or the config"; else ok "the worker unit holds no kernel secret and no config"; fi
 if [ "$(value bulig.service Environment | tr '\n' ' ')" = "HOME=/var/lib/bulig PATH=/usr/local/bin:/usr/bin:/bin " ]; then ok "the kernel's environment is only HOME and PATH (no secret in it)"; else bad "kernel environment: $(value bulig.service Environment)"; fi
 
+echo "network filtering: what each unit can reach"
+DENY_PRIV="localhost link-local multicast 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7"
+DENY_KERNEL="localhost link-local multicast 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 fc00::/7"
+want bulig.service IPAddressDeny "$DENY_KERNEL"
+want bulig.service IPAddressAllow "127.74.3.1/32 127.0.0.53/32 100.64.0.0/10"
+want bulig-worker.service IPAddressDeny "$DENY_PRIV"
+want bulig-worker.service IPAddressAllow "127.74.3.1/32 127.0.0.53/32"
+for u in bulig-backup.service bulig-restore-drill.service; do
+  want "$u" IPAddressDeny "$DENY_PRIV"
+  want "$u" IPAddressAllow "127.0.0.53/32"
+  want "$u" Environment "DOCKER_CONFIG=/var/lib/bulig-checks/docker"
+done
+want bulig-loopback.service IPAddressDeny any
+for u in bulig.service bulig-worker.service bulig-backup.service bulig-restore-drill.service bulig-loopback.service; do
+  if [ "$(value "$u" IPAddressDeny | wc -l | tr -d ' ')" = "1" ]; then ok "$u has an IPAddressDeny line"; else bad "$u has no (or two) IPAddressDeny lines"; fi
+  case " $(value "$u" IPAddressAllow) " in
+    *" 127.0.0.1/32 "* | *" 127.0.0.0/8 "* | *" localhost "* | *" any "* | *" 0.0.0.0/0 "* | *" 172.17.0.1/32 "* | *" ::1/128 "*) bad "$u lets localhost, the docker bridge or everything through: $(value "$u" IPAddressAllow)" ;;
+    *) ok "$u does not allow 127.0.0.1, localhost, the docker bridge or everything" ;;
+  esac
+done
+for u in bulig.service bulig-worker.service bulig-backup.service bulig-restore-drill.service; do
+  case " $(value "$u" IPAddressDeny) " in *" localhost "* | *" link-local "* | *" multicast "* | *" 172.16.0.0/12 "*) ok "$u denies localhost, link-local, multicast and the 172.16/12 range (docker bridges)" ;; *) bad "$u IPAddressDeny: $(value "$u" IPAddressDeny)" ;; esac
+done
+# The worker is the one that runs Claude: it must not be able to reach Tailscale peers either.
+case " $(value bulig-worker.service IPAddressDeny) " in *" 100.64.0.0/10 "*) ok "the worker also denies Tailscale (100.64.0.0/10)" ;; *) bad "worker does not deny Tailscale" ;; esac
+case " $(value bulig.service IPAddressDeny) " in *" 100.64.0.0/10 "*) bad "the kernel denies Tailscale, so the Mac worker could not reach it" ;; *) ok "the kernel does not deny Tailscale (the Mac worker comes in that way)" ;; esac
+
+echo "the gateway address"
+gw="127.74.3.1"
+case "$(value bulig-worker.service ExecStart)" in *"--kernel http://$gw:7431 "*) ok "the worker connects to http://$gw:7431" ;; *) bad "worker URL: $(value bulig-worker.service ExecStart)" ;; esac
+if [ "$(value bulig-loopback.service ExecStart)" = "/usr/bin/ip address replace $gw/32 dev lo" ] && [ "$(value bulig-loopback.service ExecStop)" = "/usr/bin/ip address del $gw/32 dev lo" ]; then ok "bulig-loopback.service puts $gw/32 on lo and takes it off again"; else bad "loopback exec: $(value bulig-loopback.service ExecStart) / $(value bulig-loopback.service ExecStop)"; fi
+want bulig-loopback.service Type oneshot
+want bulig-loopback.service RemainAfterExit yes
+want bulig-loopback.service Before "bulig.service bulig-worker.service"
+want bulig-loopback.service CapabilityBoundingSet CAP_NET_ADMIN
+want bulig-loopback.service RestrictAddressFamilies "AF_NETLINK AF_UNIX"
+want bulig.service Requires bulig-loopback.service
+if value bulig-worker.service Wants | grep -q bulig-loopback.service && value bulig-worker.service After | grep -q bulig-loopback.service; then ok "the worker wants and starts after the gateway address"; else bad "worker ordering"; fi
+if value bulig.service After | grep -q bulig-loopback.service; then ok "the kernel starts after the gateway address"; else bad "kernel ordering"; fi
+
 echo "caps (ADR 0011)"
 want bulig.service MemoryMax 1G
 want bulig.service CPUQuota 100%
@@ -82,9 +122,9 @@ assert 'channel-telegram' not in c['enabled'], 'telegram must stay off until cut
 assert 'worker-claude-code' not in c['enabled'], 'the kernel runs no Claude'
 assert 'worker-gateway' in c['enabled']
 w=c['pluginConfig']['worker-gateway']
-assert w['listen']==['127.0.0.1'] and w['port']==7431 and w['workers']['vps']['credential']=='worker-tokens'
+assert w['listen']==['127.74.3.1'] and w['port']==7431 and w['workers']['vps']['credential']=='worker-tokens'
 assert c['pluginConfig']['gate-evidence']['mode']=='warn' and c['pluginConfig']['gate-promise']['mode']=='warn'
 assert c['dbPath'].startswith('/var/lib/bulig/'), 'dbPath'
-" "$cfg" 2>"$work/err"; then ok "the template: Postgres from the pg-url credential, gateway on 127.0.0.1:7431 for worker vps, gates in warn, Telegram and the local worker off"; else bad "config template: $(cat "$work/err")"; fi
+" "$cfg" 2>"$work/err"; then ok "the template: Postgres from the pg-url credential, gateway on 127.74.3.1:7431 for worker vps, gates in warn, Telegram and the local worker off"; else bad "config template: $(cat "$work/err")"; fi
 
 finish

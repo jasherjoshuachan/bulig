@@ -38,6 +38,8 @@ absent "no Claude token" "claude-token"
 absent "no ReadWritePaths (StateDirectory is the writable place)" "ReadWritePaths"
 check "capped memory" "MemoryMax=1G"
 check "home hidden" "ProtectHome=yes"
+check "the kernel's one-off commands cannot reach localhost, private ranges or the docker bridges" "IPAddressDeny=localhost link-local multicast 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 fc00::/7"
+check "only the gateway address, DNS and Tailscale are let through" "IPAddressAllow=127.74.3.1/32 127.0.0.53/32 100.64.0.0/10"
 check "the CLI is run from the root-owned release" "/opt/bulig/current/packages/cli/bin/bulig.mjs"
 if [ "$(tail -1 "$work/argv")" = "status" ]; then ok "the arguments reach the CLI"; else bad "last arg: $(tail -1 "$work/argv")"; fi
 check "a pipe for stdin and stdout" "--pipe"
@@ -50,6 +52,8 @@ check "with the Claude token" "LoadCredential=claude-token:$work/root/etc/bulig/
 check "and its own worker token" "LoadCredential=worker-token:$work/root/etc/bulig/worker-token"
 absent "none of the kernel's secrets or its config" "pg-url|gh-token|worker-tokens|config.json"
 absent "no ReadWritePaths" "ReadWritePaths"
+check "the worker's one-off commands also cannot reach Tailscale" "IPAddressDeny=localhost link-local multicast 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7"
+check "only the gateway address and DNS are let through" "IPAddressAllow=127.74.3.1/32 127.0.0.53/32"
 if [ "$(tail -4 "$work/argv" | tr '\n' ' ')" = "git clone https://example.invalid/r /var/lib/bulig-worker/work/r " ]; then ok "--exec runs the program as given"; else bad "tail: $(tail -4 "$work/argv" | tr '\n' ' ')"; fi
 absent "--exec does not run the bulig CLI" "bulig.mjs"
 

@@ -13,8 +13,18 @@ BULIG_PG_VERSION=16
 BULIG_PG_CLUSTER=bulig
 BULIG_PG_PORT=5436
 BULIG_PG_SOCKET_DIR=/var/run/postgresql
-# The kernel's worker gateway (ADR 0011): 127.0.0.1, plus the Tailscale address for the Mac worker.
+# Every client reaches this cluster over the unix socket in that folder, by its full path and port. The cluster has no TCP listener at all, so
+# no unit needs to reach 127.0.0.1 (other tenants' services listen there).
+BULIG_PG_HOST=/var/run/postgresql
+# The kernel's worker gateway (ADR 0011): its own loopback address, plus the Tailscale address for the Mac worker.
+BULIG_GATEWAY_ADDR=127.74.3.1
 BULIG_GATEWAY_PORT=7431
+# IP filtering (systemd IPAddressDeny=/IPAddressAllow=) for units that run code Bulig does not control: everything local or private is denied,
+# so the public internet is what is left. DNS needs the systemd-resolved stub that /etc/resolv.conf points to. The unit files carry the same
+# lists as text and deploy/test/units.sh checks them; the transient units (release build, bulig-cli.sh) take them from here.
+BULIG_IP_DENY_PRIVATE="localhost link-local multicast 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7"
+BULIG_IP_DENY_KERNEL="localhost link-local multicast 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 fc00::/7"
+BULIG_IP_ALLOW_DNS="127.0.0.53/32"
 
 # The tests run the scripts against a throwaway folder: BULIG_DEPLOY_TEST_ROOT puts every fixed path under it and skips the
 # root check. On the server it is never set.
@@ -209,6 +219,29 @@ worker_env_write() {
   echo "wrote $file"
 }
 
+# install_root_file <dest>: stdin becomes <dest>, root-owned, 0644, in a folder root does not own (Postgres's config folders belong to
+# postgres). Written to a root-owned temp file in /var/lib/bulig-checks first, copied beside the target with install -o root, then renamed
+# over it with mv -T. A link at the target is refused (and checked again just before the rename).
+install_root_file() {
+  local dest="$1" dir tmp new
+  dir="$(dirname "$dest")"
+  [ -d "$dir" ] && [ ! -L "$dir" ] || die "$dir is missing (or is a link)"
+  under_user_state "$dir" && die "$dir is inside a Bulig user's folder. Root never works there."
+  [ ! -L "$dest" ] || die "$dest is a link. Not touching it."
+  ensure_checks_dir
+  tmp="$(mktemp -p "$BULIG_CHECKS_DIR" "conf.XXXXXX")"
+  cat >"$tmp"
+  chmod 0644 "$tmp"
+  new="$dest.new.$$"
+  if is_root; then install -o root -g root -m 0644 "$tmp" "$new"; else install -m 0644 "$tmp" "$new"; fi
+  rm -f "$tmp"
+  if [ -L "$dest" ]; then
+    rm -f "$new"
+    die "$dest became a link. Not touching it."
+  fi
+  mv -T "$new" "$dest"
+}
+
 # backup_key_write <NAME>: set one R2 setting in /etc/bulig/backup.env from stdin, keeping every other line. Known names only.
 backup_key_write() {
   local name="$1" tmp value known=0 n file="$BULIG_BACKUP_ENV_FILE"
@@ -253,8 +286,11 @@ pg_passfile() {
   rest="${rest#*@}"
   hostport="${rest%%/*}"
   db="${rest#*/}"
-  host="${hostport%%:*}"
+  host="${hostport%:*}"
   port="${hostport##*:}"
+  # A socket folder is written %2Fvar%2Frun%2Fpostgresql (or /var/run/postgresql) in the URL. libpq looks a socket connection up in the
+  # passfile under the host name "localhost".
+  case "$host" in %2[Ff]* | /*) host=localhost ;; esac
   [ -n "$user" ] && [ -n "$pw" ] && [ -n "$host" ] && [ -n "$port" ] && [ -n "$db" ] || die "$url_file is not postgres://user:password@host:port/db"
   out="$dir/pgpass"
   (umask 077 && printf '%s:%s:%s:%s:%s\n' "$(pgpass_escape "$host")" "$(pgpass_escape "$port")" "$(pgpass_escape "$db")" "$(pgpass_escape "$user")" "$(pgpass_escape "$pw")" >"$out")

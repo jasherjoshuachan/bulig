@@ -3,8 +3,10 @@ Description=Bulig kernel (bulig serve)
 Documentation=https://github.com/jasherjoshuachan/bulig
 # The kernel needs its own Postgres cluster up first. Wants, not Requires: if the cluster restarts, the kernel's lease logic
 # handles the gap and a restart of this unit is not forced.
-After=network-online.target postgresql@16-bulig.service
+After=network-online.target postgresql@16-bulig.service bulig-loopback.service
 Wants=network-online.target postgresql@16-bulig.service
+# The gateway's own loopback address. Without it the worker's packets would carry source 127.0.0.1, which this unit must not accept.
+Requires=bulig-loopback.service
 # No config, no start, and a loud failure (Assert fails the unit; Condition would skip it silently): a missing config would otherwise
 # fall back to a SQLite file and run a second, empty record.
 AssertPathExists=/etc/bulig/config.json
@@ -75,6 +77,15 @@ RestrictSUIDSGID=true
 RestrictRealtime=true
 LockPersonality=true
 SystemCallArchitectures=native
+# NETWORK. On this host 127.0.0.1 carries other tenants' services with no login (a browser debugging port, a workflow server, model servers,
+# ~50 more) and the docker bridges carry containers, so no Bulig unit may reach them. systemd filters every IP packet of this unit in both
+# directions (IPAddressDeny/Allow: an Allow match wins, then a Deny match, then everything else is let through, which is the public internet).
+# 127.0.0.53 is the systemd-resolved stub in /etc/resolv.conf: names cannot be looked up without it, and it answers DNS and nothing else.
+# The kernel reaches: its worker gateway address (the VPS worker connects to it; with that address on lo, both ends of the loopback
+# conversation carry it), Tailscale peers (the Mac worker, inbound and replies), DNS, and the public internet (GitHub). It reaches Postgres
+# over the unix socket, so it needs no TCP localhost at all.
+IPAddressDeny=localhost link-local multicast 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 fc00::/7
+IPAddressAllow=127.74.3.1/32 127.0.0.53/32 100.64.0.0/10
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 # NOT set on purpose:
 #   MemoryDenyWriteExecute  node's JIT needs writable+executable memory.

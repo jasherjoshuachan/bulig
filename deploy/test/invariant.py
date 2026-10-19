@@ -30,11 +30,6 @@ FORBIDDEN = re.compile(r"(?:/var/lib/bulig(?:-worker)?(?![A-Za-z0-9_.\-])|/home/
 FORBIDDEN_VARS = re.compile(r"\$\{?(BULIG_HOME|BULIG_WORKER_HOME|BULIG_REPOS_DIR|BULIG_WORKER_WORK_DIR|BULIG_STATE_DIR|BULIG_WORKER_STATE_DIR)\b")
 ANCESTORS = {"/", "/var", "/var/lib"}
 
-WRITE_VERBS = {
-    "install", "mkdir", "rmdir", "rm", "mv", "cp", "ln", "chmod", "chown", "chgrp", "touch", "tee", "truncate", "dd", "rsync", "mktemp",
-    "unlink", "shred", "setfacl", "chattr", "mkfifo", "mknod", "unzip", "systemd-tmpfiles", "git", "gh", "node", "pnpm", "npm", "claude",
-    "useradd", "usermod", "userdel", "groupadd", "chsh", "cat_into", "patch",
-}
 # Commands that hand the rest of the line to another user: what follows is not a root write.
 USER_WRAPPERS = {"runuser", "setpriv", "su"}
 PREFIX_WORDS = {"if", "then", "else", "elif", "do", "while", "until", "!", "{", "}", "time", "fi", "done", "esac"}
@@ -42,7 +37,7 @@ PREFIX_CMDS = {"env", "command", "exec", "sudo", "nice", "ionice", "nohup", "bui
 DECL = {"local", "export", "readonly", "declare", "typeset"}
 SEPARATORS = re.compile(r"^[;&|()]+$")
 REDIRECT = re.compile(r"^(?:[0-9]*|&)>{1,2}[&|]?$")
-RECURSIVE_FLAGS = re.compile(r"^-[A-Za-z]*[Rr][A-Za-z]*$|^--recursive$|^-delete$")
+RECURSIVE_FLAGS = re.compile(r"^-[A-Za-z]*[Rr][A-Za-z]*$|^--recursive$")
 
 
 class Report:
@@ -237,42 +232,65 @@ def functions(files):
     return funcs
 
 
-def analyse_line(path, lineno, line, env, writer_funcs, rep, count_only=False):
-    toks = tokens(line)
+READ_ONLY = {
+    "echo", "printf", "die", "ok", "bad", "test", "[", "[[", "ls", "cat", "stat", "readlink", "realpath", "grep", "egrep", "fgrep", "head", "tail",
+    "wc", "id", "pgrep", "diff", "cmp", "sort", "uniq", "cut", "tr", "basename", "dirname", "date", "sleep", "seq", "true", "false", "exit",
+    "return", "cd", "pwd", "read", "shift", "set", "unset", "export", "local", "declare", "trap", "type", "hash", "wait", "sha256sum", "shasum",
+    "cksum", "du", "df", ".", "source", ":", "break", "continue", "ss", "pg_lsclusters", "pg_isready", "command",
+}
+FIND_WRITES = {"-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprint0", "-fprintf", "-fls"}
+DOCKER = {"docker", "podman"}
+
+
+def mount_sources(args):
+    """The host side of every docker -v / --volume / --mount argument."""
+    out, i = [], 0
+    while i < len(args):
+        a = args[i]
+        val = None
+        if a in ("-v", "--volume", "--mount") and i + 1 < len(args):
+            val = args[i + 1]
+            i += 1
+        elif a.startswith("--volume=") or a.startswith("--mount="):
+            val = a.split("=", 1)[1]
+        elif re.match(r"^-v.+", a):
+            val = a[2:]
+        if val is not None:
+            m = re.search(r"(?:source|src)=([^,]+)", val)
+            out.append(m.group(1) if m else val.split(":")[0])
+        i += 1
+    return out
+
+
+def analyse_line(path, lineno, line, env, writer_funcs, rep, known_funcs=frozenset()):
+    """Every command that is not on the short read-only list is treated as able to write: if any of its arguments names a Bulig user's
+    folder (after variables are expanded), that is a violation. Redirect targets are checked the same way."""
+    toks = list(tokens(line))
+    if toks and toks[0] == "case" and ")" in toks:
+        toks = toks[toks.index(")") + 1:]  # the header and the first pattern are not commands
     segs, redirects = segments(toks)
-    root_segs = []
-    has_writer = False
+    checked = []  # (command, args) of every segment that is not read-only and not run as another user
     for seg in segs:
+        if seg and seg[0] in DECL:
+            continue  # only declarations (local, export, ...); a command in a value is its own segment
         cmd, args = command_of(seg)
-        if cmd is None:
+        if cmd is None or cmd in USER_WRAPPERS or cmd in ("for", "case", "select", "in", "function"):
             continue
-        if cmd in USER_WRAPPERS:
-            continue
+        if not re.match(r"^(\[\[?|[A-Za-z0-9_./:+@%~${}-]+)$", cmd):
+            continue  # a case pattern or a fragment of a nested quote, not a command
         if cmd == "systemd-run":
             joined = " ".join(args)
             if re.search(r"--uid=bulig(?:-worker)?\b", joined) or "DynamicUser=yes" in joined:
-                continue
-            has_writer = True  # runs as root
-            root_segs.append((cmd, args))
+                continue  # runs as another user: that user writes, not root
+            checked.append((cmd, args))
             continue
-        if cmd in ("find",):
-            if any(a in ("-delete", "-exec", "-execdir", "-fprint") for a in args):
-                has_writer = True
-            root_segs.append((cmd, args))
+        if cmd == "find":
+            if any(a in FIND_WRITES for a in args):
+                checked.append((cmd, args))
             continue
-        if cmd == "xargs":
-            has_writer = True
-            root_segs.append((cmd, args))
-            continue
-        if cmd == "tar":
-            if any(re.match(r"^-[A-Za-z]*x", a) or a in ("--extract", "--get") for a in args):
-                has_writer = True
-            root_segs.append((cmd, args))
-            continue
-        if cmd in ("sed", "perl"):
+        if cmd == "sed":
             if any(re.match(r"^-[A-Za-z]*i", a) or a.startswith("--in-place") for a in args):
-                has_writer = True
-            root_segs.append((cmd, args))
+                checked.append((cmd, args))
             continue
         if cmd in ("useradd", "usermod"):
             # --home-dir only records the path in /etc/passwd; --create-home is a separate rule below.
@@ -287,38 +305,44 @@ def analyse_line(path, lineno, line, env, writer_funcs, rep, count_only=False):
                 if a.startswith("--home-dir=") or a.startswith("--home="):
                     continue
                 kept.append(a)
-            args = kept
-        if cmd in WRITE_VERBS or cmd in writer_funcs:
-            has_writer = True
-        root_segs.append((cmd, args))
-    if has_writer or redirects:
+            checked.append((cmd, kept))
+            continue
+        if cmd in writer_funcs:
+            checked.append((cmd, args))
+            continue
+        if cmd in known_funcs or cmd in READ_ONLY:
+            continue
+        checked.append((cmd, args))
+    if checked or redirects:
         rep.writers += 1
-    # redirect targets
     for r in redirects:
         if r in ("/dev/null", "/dev/stderr", "/dev/stdout"):
             continue
         if hits(r, env):
             rep.add(path, lineno, "redirect", f"writes into a Bulig user's folder: {r} :: {line}")
-    # root_segs may be checked for forbidden tokens only when the line writes
-    if has_writer:
-        for cmd, args in root_segs:
-            if cmd in ("echo", "printf", "die", "ok", "bad"):
-                continue
+    if any(c == "xargs" for c, _ in checked):
+        # what xargs is fed comes from the other side of the pipe, so every word on the line counts
+        for seg in segs:
+            c, args = command_of(seg)
+            if c is not None and c != "xargs" and any(hits(a, env) for a in args):
+                rep.add(path, lineno, "write", f"xargs acts on a list built from a Bulig user's folder :: {line}")
+                break
+    for cmd, args in checked:
+        for a in args:
+            if hits(a, env):
+                rep.add(path, lineno, "write", f"{cmd} names a Bulig user's folder: {a} :: {line}")
+                break
+        # a recursive or find-exec command on a parent of the folders
+        recursive = any(RECURSIVE_FLAGS.match(a) or a in FIND_WRITES for a in args)
+        if recursive:
             for a in args:
-                if hits(a, env):
-                    rep.add(path, lineno, "write", f"{cmd} names a Bulig user's folder: {a} :: {line}")
+                if not a.startswith("-") and is_ancestor(a, env):
+                    rep.add(path, lineno, "recursive", f"{cmd} writes recursively under {a}, a parent of the users' folders :: {line}")
                     break
-        # recursive write on a parent
-        flags = [a for _, args in root_segs for a in args if RECURSIVE_FLAGS.match(a)]
-        if flags:
-            for cmd, args in root_segs:
-                if cmd in ("echo", "printf", "die"):
-                    continue
-                for a in args:
-                    if not a.startswith("-") and is_ancestor(a, env):
-                        rep.add(path, lineno, "recursive", f"recursive write on {a}, a parent of the users' folders :: {line}")
-                        break
-    for cmd, args in root_segs:
+        if cmd in DOCKER:
+            for src in mount_sources(args):
+                if hits(src, env) or is_ancestor(src, env):
+                    rep.add(path, lineno, "docker-mount", f"{cmd} mounts {src}, which is or contains a Bulig user's folder :: {line}")
         if cmd in ("chown", "chgrp"):
             flat = [a for a in args if a.startswith("-")]
             if not any(re.match(r"^-[A-Za-z]*h", a) or a == "--no-dereference" for a in flat):
@@ -330,6 +354,13 @@ def analyse_line(path, lineno, line, env, writer_funcs, rep, count_only=False):
                 rep.add(path, lineno, "create-home", f"useradd must not create a home; systemd does :: {line}")
         if cmd == "usermod" and any(a in ("-m", "--move-home") for a in args):
             rep.add(path, lineno, "move-home", f"usermod must not move a home :: {line}")
+    # Paths worked out at run time from a lookup of the Bulig users are not visible to a text check, so a root script may not make the lookup.
+    for seg in segs:
+        cmd, args = command_of(seg)
+        if cmd == "getent" and len([a for a in args if not a.startswith("-")]) >= 2:
+            rep.add(path, lineno, "home-lookup", f"getent looks up a single user or group (the Bulig users' homes must not be looked up by a root script) :: {line}")
+        if cmd == "eval":
+            rep.add(path, lineno, "eval", f"eval builds a command at run time, which this check cannot read :: {line}")
 
 
 def check_unit(path, text, rep):
@@ -392,13 +423,13 @@ def analyse(scripts, units):
         for name, body in funcs.items():
             probe = Report()
             for n, line in logical_lines("\n".join(body)):
-                analyse_line("<fn>", n, line, env, writer_funcs, probe)
+                analyse_line("<fn>", n, line, env, writer_funcs, probe, frozenset(funcs) - writer_funcs)
             if probe.writers:
                 writer_funcs.add(name)
     for path, text in scripts:
         rep.files += 1
         for n, line in logical_lines(text):
-            analyse_line(path, n, line, env, writer_funcs, rep)
+            analyse_line(path, n, line, env, writer_funcs, rep, frozenset(funcs) - writer_funcs)
     for path, text in units:
         rep.files += 1
         check_unit(path, text, rep)
@@ -414,7 +445,7 @@ def main(argv):
     rep = analyse(scripts, units)
     for v in rep.violations:
         print("VIOLATION", v)
-    print(f"invariant: checked {len(scripts)} scripts and {len(units)} units, {rep.writers} writing statements, {rep.writer_funcs} writing helpers, {len(rep.violations)} violations")
+    print(f"invariant: checked {len(scripts)} scripts and {len(units)} units, {rep.writers} statements that can write, {rep.writer_funcs} writing helpers, {len(rep.violations)} violations")
     return 1 if rep.violations else 0
 
 

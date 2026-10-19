@@ -53,6 +53,9 @@ mkdir -p "$work/pw"
 printf 'postgres://bulig:ab:c\\d@127.0.0.1:5436/bulig' >"$work/pw/url"
 pf="$(. "$deploy/lib/common.sh"; pg_passfile "$work/pw/url" "$work/pw")"
 if [ "$(cat "$pf")" = '127.0.0.1:5436:bulig:bulig:ab\:c\\d' ]; then ok "the password line has the host, port, db and user, with : and backslash escaped"; else bad "passfile content: $(cat "$pf")"; fi
+printf 'postgres://bulig:pw1@%%2Fvar%%2Frun%%2Fpostgresql:5436/bulig' >"$work/pw/sock"
+pf2="$(. "$deploy/lib/common.sh"; pg_passfile "$work/pw/sock" "$work/pw")"
+if [ "$(cat "$pf2")" = 'localhost:5436:bulig:bulig:pw1' ]; then ok "a socket-folder URL gives the host localhost, which is what libpq looks up for a unix socket"; else bad "socket passfile: $(cat "$pf2")"; fi
 if [ "$(mode "$pf")" = "600" ]; then ok "the passfile is mode 600"; else bad "passfile mode $(mode "$pf")"; fi
 printf 'mysql://x:y@h:1/d' >"$work/pw/bad"
 expect_fail "a URL that is not postgres:// is refused" bash -c ". '$deploy/lib/common.sh'; pg_passfile '$work/pw/bad' '$work/pw'"
@@ -284,7 +287,7 @@ suite_rc=$?
 # The other suites: the restore drill and backup (stubbed tools), and the server half of a release (stubbed systemd).
 # (BULIG_TEST_ONLY_THIS_FILE=1: mutations.py runs one suite at a time)
 if [ -n "${BULIG_TEST_ONLY_THIS_FILE:-}" ]; then exit "$suite_rc"; fi
-for suite in drill.sh release.sh setup.sh cli.sh units.sh invariant.sh; do
+for suite in drill.sh release.sh setup.sh cluster.sh cli.sh units.sh invariant.sh; do
   echo
   echo "== $suite"
   bash "$here/$suite" || suite_rc=1

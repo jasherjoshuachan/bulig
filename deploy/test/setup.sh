@@ -34,6 +34,7 @@ echo "$last" >>"$STUB_LOG/created-users"
 STUB
 cat >"$stubs/getent" <<'STUB'
 #!/usr/bin/env bash
+echo "getent $*" >>"$STUB_LOG/getent"
 name="$2"
 var="STUB_HOME_${name//-/_}"
 echo "$name:x:999:999::${!var:-/var/lib/$name}:/usr/sbin/nologin"
@@ -94,7 +95,7 @@ echo "setup-user.sh"
 new_root "$root"
 unset STUB_USERS STUB_RUNNING
 expect_ok "setup runs when no Bulig process exists" bash "$su"
-for pair in "opt/bulig 755" "opt/bulig/releases 755" "usr/local/lib/bulig 755" "etc/bulig 700" "var/backups/bulig 700" "var/lib/bulig-checks 700"; do
+for pair in "opt/bulig 755" "opt/bulig/releases 755" "usr/local/lib/bulig 755" "etc/bulig 700" "var/backups/bulig 700" "var/lib/bulig-checks 700" "var/lib/bulig-checks/docker 700"; do
   read -r dir_ want_ <<<"$pair"
   if [ -d "$root/$dir_" ] && [ "$(mode "$root/$dir_")" = "$want_" ]; then ok "/$dir_ exists with mode $want_"; else bad "/$dir_: $(mode "$root/$dir_" 2>&1)"; fi
 done
@@ -113,7 +114,9 @@ if [ "$(listing "$root")" = "$after1" ] && ! grep -q '^useradd' "$log/calls"; th
 chmod 755 "$root/etc/bulig"
 bash "$su" >/dev/null 2>&1
 if [ "$(mode "$root/etc/bulig")" = "700" ]; then ok "a loosened root folder is put back to 0700"; else bad "etc/bulig mode $(mode "$root/etc/bulig")"; fi
-expect_fail_msg "a user that exists with another home is refused" "exists with home /home/bulig" env STUB_HOME_bulig=/home/bulig bash "$su"
+rm -f "$log/calls" "$log/getent"
+expect_ok "a user that exists with another home is left alone (the units set HOME and StateDirectory themselves)" env STUB_HOME_bulig=/home/bulig bash "$su"
+if ! grep -q '^useradd' "$log/calls" && [ ! -e "$log/getent" ]; then ok "no useradd, and the home is never looked up (no getent)"; else bad "calls: $(cat "$log/calls" "$log/getent" 2>/dev/null)"; fi
 
 # --- 4. links where a root folder belongs ---
 echo "links"

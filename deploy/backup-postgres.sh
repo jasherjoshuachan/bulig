@@ -2,7 +2,7 @@
 # Dump the bulig database (custom format, already compressed), send it to R2 under bulig/postgres/, check the object is there, and
 # record its sha256 in the root-owned local index. The restore drill trusts that index, never R2.
 # Runs from bulig-backup.service (root; credentials pg-url and backup-env come from LoadCredential=). Exit non-zero on any failure.
-# The database is read as the bulig role over 127.0.0.1:5436. The password goes in through a PGPASSFILE in a 0700 folder of /var/lib/bulig-checks (root's),
+# The database is read as the bulig role over the unix socket (port 5436). The password goes in through a PGPASSFILE in a 0700 folder of /var/lib/bulig-checks (root's),
 # never on a command line (any user on this host can read other processes' arguments).
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -27,8 +27,8 @@ PGPASSFILE="$(pg_passfile "$(cred_path pg-url)" "$work")"
 export PGPASSFILE
 export PGCONNECT_TIMEOUT=15
 
-# -w: never ask for a password. A password file that does not match 127.0.0.1:5436 / bulig fails here, loudly.
-"$(pg_bin pg_dump)" -Fc -Z 6 --no-owner --no-privileges -w -h 127.0.0.1 -p "$BULIG_PG_PORT" -U bulig -d bulig -f "$archive.partial"
+# -w: never ask for a password. A password file that does not match localhost:5436 / bulig fails here, loudly.
+"$(pg_bin pg_dump)" -Fc -Z 6 --no-owner --no-privileges -w -h "$BULIG_PG_HOST" -p "$BULIG_PG_PORT" -U bulig -d bulig -f "$archive.partial"
 "$(pg_bin pg_restore)" --list "$archive.partial" >/dev/null || die "the dump is not a readable archive"
 bytes="$(wc -c <"$archive.partial" | tr -d ' ')"
 [ "$bytes" -gt 1024 ] || die "the dump is only $bytes bytes: refusing to upload something that looks empty"

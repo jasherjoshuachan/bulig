@@ -17,7 +17,7 @@ r2="$work/r2"
 stubs="$work/stubs"
 mkdir -p "$r/etc/bulig" "$r/var/backups/bulig" "$r/var/lib/bulig-checks" "$log" "$r2" "$stubs"
 chmod 700 "$r/var/lib/bulig-checks"
-printf 'postgres://bulig:%s@127.0.0.1:5436/bulig' "$SECRET_PG" >"$r/etc/bulig/pg-url"
+printf 'postgres://bulig:%s@%%2Fvar%%2Frun%%2Fpostgresql:5436/bulig' "$SECRET_PG" >"$r/etc/bulig/pg-url"
 printf '%s' "$SECRET_DRILL" >"$r/etc/bulig/drill-pw"
 printf 'R2_ENDPOINT=https://example.invalid\nR2_BUCKET=b\nAWS_ACCESS_KEY_ID=AKIAFAKE\nAWS_SECRET_ACCESS_KEY=%s\nAWS_DEFAULT_REGION=auto\n' "$SECRET_R2" >"$r/etc/bulig/backup.env"
 
@@ -58,7 +58,8 @@ echo "psql PGPASSFILE=$(cat "$PGPASSFILE")" >>"$STUB_LOG/passfile"
 sql=""; while [ "$#" -gt 0 ]; do [ "$1" = "-c" ] && sql="$2"; shift; done
 case "$sql" in
   *"FROM pg_database"*) ;;
-  *information_schema.tables*) echo jobs ;;
+  *cntrl*) echo 0 ;;
+  *information_schema.tables*) printf 'public.jobs\npublic."a b"\npublic."x*"\n' ;;
   *"SELECT count(*)"*) echo 3 ;;
 esac
 exit 0
@@ -88,7 +89,7 @@ if [ "$(wc -l <"$idx" | tr -d ' ')" = "1" ]; then ok "it recorded one line in th
 key="$(cut -d' ' -f3 "$idx")"
 sum="$(cut -d' ' -f1 "$idx")"
 if [ -f "$r2/$key" ] && [ "$(shasum -a 256 <"$r2/$key" | cut -d' ' -f1)" = "$sum" ]; then ok "the index sha256 is the sha256 of the object in R2"; else bad "index and R2 object disagree"; fi
-if grep -q "127.0.0.1:5436:bulig:bulig:$SECRET_PG" "$log/passfile"; then ok "pg_dump got its password through a PGPASSFILE"; else bad "no passfile line seen by pg_dump"; fi
+if grep -q "localhost:5436:bulig:bulig:$SECRET_PG" "$log/passfile"; then ok "pg_dump got its password through a PGPASSFILE"; else bad "no passfile line seen by pg_dump"; fi
 
 # --- drill ---
 echo "restore-drill.sh"
@@ -114,13 +115,20 @@ cp "$idx" "$work/index.keep" && : >"$idx"
 expect_fail_msg "an empty index is refused" "no backup recorded" bash "$deploy/restore-drill.sh"
 cp "$work/index.keep" "$idx"
 
+# the tables are compared and counted by their quoted names, one per line
+if grep -qF 'FROM public."a b"' "$log/argv"; then ok "a table whose name has a space is counted whole, by its quoted name (no word splitting)"; else bad "count queries: $(grep 'count(' "$log/argv" | head -4)"; fi
+if grep -qF 'FROM public."x*"' "$log/argv" && grep -qF 'FROM public.jobs' "$log/argv"; then ok "and so are a name with a glob character and a plain one"; else bad "count queries: $(grep 'count(' "$log/argv" | head -4)"; fi
+if grep -qF 'FROM public."a ' "$log/argv" && ! grep -qF 'FROM public."a b"' "$log/argv"; then bad "the name was split"; else ok "no query was made for half a name"; fi
+if grep -q "format('%I.%I', table_schema, table_name)" "$log/argv" && grep -q "format('%I', d.datname)" "$log/argv"; then ok "table and database names come back quoted by Postgres (format %I)"; else bad "names are not quoted by the server"; fi
+if grep -q "table_name ~ '\[\[:cntrl:\]\]'" "$log/argv"; then ok "a table name with a control character is looked for (and refused)"; else bad "no control-character check"; fi
+
 # --- no secret on any command line ---
 echo "arguments"
 for secret in "$SECRET_PG" "$SECRET_DRILL" "$SECRET_R2" "postgres://"; do
   if grep -qF -- "$secret" "$log/argv"; then bad "'$secret' appears in the arguments of a tool: $(grep -F -- "$secret" "$log/argv" | head -2)"; else ok "'$secret' is not in any tool's arguments"; fi
 done
-if grep -q "^pg_dump .*-h 127.0.0.1 -p 5436 -U bulig" "$log/argv" && grep -q "^psql .*-h 127.0.0.1 -p 5436 -U bulig_drill" "$log/argv"; then ok "the tools were called with an explicit host, port and user"; else bad "tool calls: $(head -5 "$log/argv")"; fi
-if grep -q "bulig_drill:$SECRET_DRILL" "$log/passfile"; then ok "the drill role's password reached psql through the passfile"; else bad "no drill passfile line"; fi
+if grep -q "^pg_dump .*-h /var/run/postgresql -p 5436 -U bulig" "$log/argv" && grep -q "^psql .*-h /var/run/postgresql -p 5436 -U bulig_drill" "$log/argv"; then ok "the tools were called with an explicit host, port and user"; else bad "tool calls: $(head -5 "$log/argv")"; fi
+if grep -q "^psql PGPASSFILE=.*" "$log/passfile" && grep -q "localhost:5436:\*:bulig_drill:$SECRET_DRILL" "$log/passfile"; then ok "the drill role's password reached psql through the passfile, for host localhost (a unix socket)"; else bad "no drill passfile line"; fi
 if [ -z "$(find "$r/var/lib/bulig-checks" -mindepth 1 | head -1)" ]; then ok "no passfile or download is left behind"; else bad "left behind: $(find "$r/var/lib/bulig-checks")"; fi
 
 # --- docker: the R2 key goes in on stdin ---

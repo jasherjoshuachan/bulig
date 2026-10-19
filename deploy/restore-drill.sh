@@ -36,15 +36,15 @@ work="$(private_tmpdir)"
 scratch="bulig_drill_$(date -u +%Y%m%d%H%M%S)"
 started=$SECONDS
 
-# One passfile, two logins: bulig (read the live counts) and bulig_drill (own the scratch database). Both only on 127.0.0.1:5436.
+# One passfile, two logins: bulig (read the live counts) and bulig_drill (own the scratch database). Both only over the unix socket, port 5436.
 PGPASSFILE="$(pg_passfile "$(cred_path pg-url)" "$work")"
 export PGPASSFILE
 drill_pw="$(cat "$(cred_path drill-pw)")"
 [ -n "$drill_pw" ] || die "the drill-pw credential is empty. Run setup-cluster.sh."
-printf '127.0.0.1:%s:*:bulig_drill:%s\n' "$BULIG_PG_PORT" "$(pgpass_escape "$drill_pw")" >>"$PGPASSFILE"
+printf 'localhost:%s:*:bulig_drill:%s\n' "$BULIG_PG_PORT" "$(pgpass_escape "$drill_pw")" >>"$PGPASSFILE"
 export PGCONNECT_TIMEOUT=15
 
-pg_args=(-w -h 127.0.0.1 -p "$BULIG_PG_PORT")
+pg_args=(-w -h "$BULIG_PG_HOST" -p "$BULIG_PG_PORT")
 psql_drill() { "$(pg_bin psql)" -X -q "${pg_args[@]}" -U bulig_drill -v ON_ERROR_STOP=1 "$@"; }
 psql_live() { "$(pg_bin psql)" -X -q "${pg_args[@]}" -U bulig -d bulig -v ON_ERROR_STOP=1 -tA "$@"; }
 
@@ -55,9 +55,11 @@ cleanup() {
 trap cleanup EXIT
 
 # Leftovers from a drill that was killed: only databases this role owns, with this drill's name prefix.
-for old in $(psql_drill -d postgres -tA -c "SELECT d.datname FROM pg_database d JOIN pg_roles r ON r.oid = d.datdba WHERE r.rolname = 'bulig_drill' AND d.datname LIKE 'bulig\_drill\_%'"); do
-  psql_drill -d postgres -c "DROP DATABASE IF EXISTS \"$old\" WITH (FORCE)" >/dev/null
-done
+# The names come back already quoted for SQL (format %I) and are read one per line, so nothing is split on spaces or expanded as a pattern.
+while IFS= read -r old; do
+  [ -n "$old" ] || continue
+  psql_drill -d postgres -c "DROP DATABASE IF EXISTS $old WITH (FORCE)" >/dev/null
+done < <(psql_drill -d postgres -tA -c "SELECT format('%I', d.datname) FROM pg_database d JOIN pg_roles r ON r.oid = d.datdba WHERE r.rolname = 'bulig_drill' AND d.datname LIKE 'bulig\_drill\_%'")
 
 dump="$work/dump"
 r2_get "$key" "$dump"
@@ -72,7 +74,11 @@ psql_drill -d postgres -c "CREATE DATABASE \"$scratch\"" >/dev/null
 restore_seconds=$((SECONDS - restore_started))
 
 # Same tables, and rows where the live database has rows. Counts differ a little by design: the live database moved on since the dump.
-tables_sql="SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE' ORDER BY 1"
+# Names come back as format('%I.%I') so each one is already safe to put in SQL, and are read one per line (no word splitting, no globbing).
+# A table name with a control character (a newline would split it) is refused outright.
+tables_sql="SELECT format('%I.%I', table_schema, table_name) FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE' ORDER BY 1"
+odd_sql="SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_name ~ '[[:cntrl:]]'"
+[ "$(psql_live -c "$odd_sql")" = "0" ] || die "the live database has a table name with a control character. Not comparing it."
 live_tables="$(psql_live -c "$tables_sql")"
 scratch_tables="$(psql_drill -d "$scratch" -tA -c "$tables_sql")"
 [ -n "$scratch_tables" ] || die "the restored database has no tables"
@@ -80,15 +86,16 @@ scratch_tables="$(psql_drill -d "$scratch" -tA -c "$tables_sql")"
 
 summary=""
 problems=0
-for t in $scratch_tables; do
-  live_n="$(psql_live -c "SELECT count(*) FROM \"$t\"")"
-  scratch_n="$(psql_drill -d "$scratch" -tA -c "SELECT count(*) FROM \"$t\"")"
+while IFS= read -r t; do
+  [ -n "$t" ] || continue
+  live_n="$(psql_live -c "SELECT count(*) FROM $t")"
+  scratch_n="$(psql_drill -d "$scratch" -tA -c "SELECT count(*) FROM $t")"
   summary="$summary $t=$scratch_n/$live_n"
   if [ "$live_n" -gt 0 ] && [ "$scratch_n" -eq 0 ]; then
     echo "bulig-restore-drill: table $t has $live_n rows live and 0 restored" >&2
     problems=1
   fi
-done
+done <<<"$scratch_tables"
 [ "$problems" -eq 0 ] || die "restored database is missing rows (restored/live:$summary)"
 
 echo "bulig-restore-drill: ok dump=$key sha256=$actual restore_seconds=$restore_seconds total_seconds=$((SECONDS - started)) rows(restored/live):$summary"

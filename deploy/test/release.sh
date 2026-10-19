@@ -23,7 +23,7 @@ mkdir -m 0700 "$r/var/lib/bulig-checks"
 export BULIG_DEPLOY_TEST_ROOT="$r"
 export STUB_LOG="$work/log"
 mkdir -p "$STUB_LOG"
-UNITS="bulig.service bulig-worker.service bulig-backup.service bulig-backup.timer bulig-restore-drill.service bulig-restore-drill.timer"
+UNITS="bulig-loopback.service bulig.service bulig-worker.service bulig-backup.service bulig-backup.timer bulig-restore-drill.service bulig-restore-drill.timer"
 
 # The two users' folders, as systemd leaves them. They are given an old date so any later touch shows up.
 mkdir -p "$r/var/lib/bulig/state" "$r/var/lib/bulig/repos/sandbox" "$r/var/lib/bulig-worker/work/sandbox" "$r/var/lib/bulig-worker/.claude"
@@ -206,8 +206,12 @@ extract_call="$(grep -- '--unit=bulig-extract-' "$STUB_LOG/calls" | head -1)"
 for p in DynamicUser=yes PrivateTmp=yes KillMode=control-group ProtectSystem=strict NoNewPrivileges=yes MemoryMax= TasksMax=; do
   case "$build_call" in *"$p"*) ok "the build unit has $p" ;; *) bad "the build unit lacks $p: $build_call" ;; esac
 done
+case "$build_call" in *"-p IPAddressDeny=localhost link-local multicast 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7 "*) ok "the build cannot reach localhost, link-local, multicast, private ranges, Tailscale or the docker bridges (IPAddressDeny)" ;; *) bad "the build's IPAddressDeny: $build_call" ;; esac
+case "$build_call" in *"-p IPAddressAllow=127.0.0.53/32 "*) ok "the build may reach the DNS stub, and nothing else local (IPAddressAllow)" ;; *) bad "the build's IPAddressAllow: $build_call" ;; esac
+case "$build_call" in *"-p IPAddressAllow=127.0.0.53/32 -p "*) ok "and that is the whole Allow list (nothing after it)" ;; *) bad "the build's Allow list is longer than the DNS stub: $build_call" ;; esac
 case "$build_call" in *"--uid="* | *" -p User="*) bad "the build is tied to a named user: $build_call" ;; *) ok "the build runs as a throwaway user, not as bulig or bulig-worker" ;; esac
 case "$build_call" in *"$r"* | *"/var/lib/bulig-checks"* | *"/usr/local/lib/bulig"*) bad "a path of root's trees reached the build's arguments: $build_call" ;; *) ok "no path of root's trees is in the build's arguments (the source goes in on stdin)" ;; esac
+if grep -q "^systemctl enable bulig-loopback.service bulig.service bulig-worker.service" "$STUB_LOG/calls" && grep -q "^systemctl start bulig-loopback.service" "$STUB_LOG/calls"; then ok "the gateway address unit is enabled and started before the services restart"; else bad "systemctl calls: $(grep systemctl "$STUB_LOG/calls" | head -5)"; fi
 for p in "ReadWritePaths=$r/var/lib/bulig-checks/rel." ProtectSystem=strict PrivateNetwork=yes CapabilityBoundingSet= NoNewPrivileges=yes; do
   case "$extract_call" in *"$p"*) ok "the unpack unit has $p" ;; *) bad "the unpack unit lacks $p: $extract_call" ;; esac
 done

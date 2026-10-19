@@ -27,7 +27,7 @@ while IFS= read -r line; do
     *) bad "${line#FAIL }" ;;
   esac
 done <"$work/cases"
-if [ "$total" -ge 45 ]; then ok "the case driver ran $total cases"; else bad "the case driver ran only $total cases: $(head -c 300 "$work/cases")"; fi
+if [ "$total" -ge 80 ]; then ok "the case driver ran $total cases"; else bad "the case driver ran only $total cases: $(head -c 300 "$work/cases")"; fi
 
 echo "through the command line"
 cp -R "$deploy/." "$work/k"

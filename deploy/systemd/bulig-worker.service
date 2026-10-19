@@ -1,9 +1,9 @@
 [Unit]
 Description=Bulig worker (bulig worker): runs Claude Code for the kernel
 Documentation=https://github.com/jasherjoshuachan/bulig
-# The worker connects to the kernel's gateway on 127.0.0.1:7431. It can start first and retry, but ordering it after the kernel is tidier.
-After=network-online.target bulig.service
-Wants=network-online.target bulig.service
+# The worker connects to the kernel's gateway on 127.74.3.1:7431. It can start first and retry, but ordering it after the kernel is tidier.
+After=network-online.target bulig.service bulig-loopback.service
+Wants=network-online.target bulig.service bulig-loopback.service
 StartLimitIntervalSec=300
 StartLimitBurst=10
 
@@ -29,7 +29,7 @@ Environment=HOME=/var/lib/bulig-worker
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
 # %d is this unit's credentials directory, %S is /var/lib. --slots 2: at most two jobs at once on this machine. $BULIG_WORKER_REPOS is
 # split into words on purpose (one --repo per repository).
-ExecStart=/usr/bin/node /opt/bulig/current/packages/cli/bin/bulig.mjs worker --kernel http://127.0.0.1:7431 --id vps --token-file %d/worker-token --claude-token-file %d/claude-token --work-dir %S/bulig-worker/work --slots 2 $BULIG_WORKER_REPOS
+ExecStart=/usr/bin/node /opt/bulig/current/packages/cli/bin/bulig.mjs worker --kernel http://127.74.3.1:7431 --id vps --token-file %d/worker-token --claude-token-file %d/claude-token --work-dir %S/bulig-worker/work --slots 2 $BULIG_WORKER_REPOS
 Restart=always
 RestartSec=5
 TimeoutStopSec=60
@@ -64,6 +64,14 @@ RestrictSUIDSGID=true
 RestrictRealtime=true
 LockPersonality=true
 SystemCallArchitectures=native
+# NETWORK. On this host 127.0.0.1 carries other tenants' services with no login (a browser debugging port, a workflow server, model servers,
+# ~50 more) and the docker bridges carry containers, so no Bulig unit may reach them. systemd filters every IP packet of this unit in both
+# directions (IPAddressDeny/Allow: an Allow match wins, then a Deny match, then everything else is let through, which is the public internet).
+# 127.0.0.53 is the systemd-resolved stub in /etc/resolv.conf: names cannot be looked up without it, and it answers DNS and nothing else.
+# This unit runs Claude (a prompt can steer it) and the commands Claude runs, so it gets the narrowest reach: the kernel gateway's address,
+# DNS, and the public internet (the Claude API, GitHub). Not 127.0.0.1, not the docker bridges, not other private ranges, not Tailscale.
+IPAddressDeny=localhost link-local multicast 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7
+IPAddressAllow=127.74.3.1/32 127.0.0.53/32
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 # NOT set on purpose:
 #   MemoryDenyWriteExecute  node's JIT needs writable+executable memory.

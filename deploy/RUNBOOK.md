@@ -14,7 +14,8 @@ How it is kept:
 - The kernel's config is a root-owned file, `/etc/bulig/config.json`, handed to the kernel with `LoadCredential=config:` (the kernel reads `$CREDENTIALS_DIRECTORY/config` first, PR #50). Nothing is written into a home.
 - Dependency installs run as a throwaway user (`DynamicUser=yes`) in a transient unit whose private `/var/tmp` systemd deletes. The source goes in on stdin and a tar of `node_modules` comes out on stdout. Root never enters a folder that user wrote to.
 - Setup scripts refuse to run while any process of either user exists (`pgrep -u`), refuse a link where a root folder belongs, and use `chown -h`. `need_dir` refuses any path inside a user's folder and, as real root, any path whose parents are not root's or are writable by group or others.
-- `deploy/test/invariant.sh` parses every script root runs and every unit file and fails the build if one writes, chmods, chowns, removes, installs, copies, moves, links or redirects into either folder (after expanding variables), or runs a recursive write on a parent, or uses `chown` without `-h`, or makes a home, or has a root-privileged `ExecStartPre=`. It runs in `scripts/verify.sh`. It reads text, so `release.sh` and `setup.sh` in the same folder also run the real scripts against fake user folders and check that nothing in them changes.
+- `deploy/test/invariant.sh` is a text check, and this is exactly what it checks. It reads every script root runs and every unit file. In a script, any command that is not on a short read-only list (`echo`, `test`, `ls`, `cat`, `grep`, `stat`, `id`, `wc`, `sort`, a `find` with no `-exec`/`-delete`, a `sed` without `-i`, and the kit's own helper functions that do not write) counts as able to write. It fails the build if such a command has an argument, or a redirect has a target, that after variables are expanded names `/var/lib/bulig`, `/var/lib/bulig-worker` or `~bulig`; if a recursive command or a `find ... -exec/-delete` names `/`, `/var` or `/var/lib`; if `docker` mounts one of them or a parent; if a script calls `getent` for one user or group, or `eval`; if `chown` has no `-h` or has `-R`; if `useradd` makes a home; if a root unit names one of the folders; or if a Bulig unit has no `StateDirectory=` or has a root-privileged `ExecStartPre=`. Commands run as another user (`systemd-run --uid=bulig*` or `DynamicUser=yes`, `runuser`, `setpriv`) are not root writes and are skipped.
+  It does **not** see a path that exists only at run time (built from a file's contents or from command output other than the ones it bans), or a write done by a program it has no rule for, if no argument names the folder. For those, `release.sh` and `setup.sh` in the same folder run the real scripts against fake user folders and check that nothing in them is created, changed or deleted. It runs in `scripts/verify.sh`.
 
 ## What runs where
 
@@ -45,8 +46,9 @@ Stop at the first failure and read the message: every script says what it refuse
 
 1. **Precheck.** The "before" picture. Read-only. The release is not on the server yet, so copy the kit into the root-owned checks folder first (delete `kit/` after step 5, when the release carries the same files):
    ```bash
-   ssh ths-prod-01 'mkdir -p -m 0700 /var/lib/bulig-checks' && rsync -az deploy/ ths-prod-01:/var/lib/bulig-checks/kit/ && ssh ths-prod-01 'bash /var/lib/bulig-checks/kit/precheck.sh'
+   ssh ths-prod-01 'mkdir -p -m 0700 /var/lib/bulig-checks' && rsync -rlz deploy/ ths-prod-01:/var/lib/bulig-checks/kit/ && ssh ths-prod-01 'test -z "$(find /var/lib/bulig-checks/kit ! -user root)" && bash /var/lib/bulig-checks/kit/precheck.sh'
    ```
+   `-rlz`, not `-az`: `-a` includes `-o`, and rsync running as root on the server would keep the Mac user's id as the owner. Without it every file is created by root. (`--chown=root:root` would say it outright, but the Mac's `rsync` is openrsync and does not have it; the `find` above fails the command if anything on the server is not root's.)
 
 2. **Users and root folders.** Makes the two users with no home, and `/opt/bulig`, `/usr/local/lib/bulig`, `/etc/bulig`, `/var/backups/bulig`, `/var/lib/bulig-checks`. It makes nothing for the users: systemd does that at the first start. It refuses while any process of either user exists, so on a rerun stop the services first (`systemctl stop bulig-worker bulig`).
    ```bash
@@ -54,7 +56,7 @@ Stop at the first failure and read the message: every script says what it refuse
    ```
    Read its tool lists. If `node`, `pnpm`, `git`, `gh` (bulig) or `node`, `git`, `claude` (bulig-worker) shows MISSING, install it under `/usr/local` or `/usr`.
 
-3. **Postgres cluster.** Creates `16 bulig` on 5436, the role `bulig` and database `bulig`, a second role `bulig_drill` (can create databases and nothing else; used only by the restore drill), and writes the connection URL (explicit host and port) into `/etc/bulig/pg-url`. It refuses if 5436 is used by anything else, or by something that is not Postgres, and (like step 2) while a Bulig process exists.
+3. **Postgres cluster.** Creates `16 bulig` on 5436 with **no TCP listener** (`listen_addresses = ''`), the role `bulig` and database `bulig`, a second role `bulig_drill` (can create databases and nothing else; used only by the restore drill), and writes the connection URL into `/etc/bulig/pg-url`: `postgres://bulig:<password>@%2Fvar%2Frun%2Fpostgresql:5436/bulig`, which the driver reads as the unix socket folder `/var/run/postgresql`, port 5436. The cluster's logins are three unix-socket rules in `bulig_hba.conf` (postgres by peer, `bulig` and `bulig_drill` by password), and there is no rule for TCP. The two config files are written as root-owned files (`install -o root`, then `mv -T`; a link at the target is refused). It refuses if 5436 is used by anything else, or by something that is not Postgres, and (like step 2) while a Bulig process exists.
    ```bash
    ssh ths-prod-01 'bash /var/lib/bulig-checks/kit/setup-cluster.sh'
    ```
@@ -88,7 +90,7 @@ Stop at the first failure and read the message: every script says what it refuse
    3. refuses it if it holds anything but files, folders and links, a hard link, a set-id file, a file outside `node_modules`, a `node_modules` where the release has no folder, or a link that leaves the release (absolute, or climbing past the root, or with `..` after a name);
    4. builds the final tree from a fresh copy of the delivered code plus those `node_modules` folders (nothing else from the build is kept, so a build script cannot change a delivered file) and installs it as `/opt/bulig/releases/<sha>`;
    5. installs `deploy/` as `/usr/local/lib/bulig/<sha>` (the scripts root runs and the unit files, root-owned);
-   6. swaps both `current` links, installs the unit files, creates `/etc/bulig/config.json` from the template **only if it is missing** (root, 0600; never overwritten), restarts both services, and runs `health.sh`. Any failure puts back both links and the unit files. It refuses a sha that is already live (exit 3).
+   6. swaps both `current` links, installs the unit files, creates `/etc/bulig/config.json` from the template **only if it is missing** (root, 0600; never overwritten), enables and starts `bulig-loopback.service` (the gateway address), restarts both services, and runs `health.sh`. Any failure puts back both links and the unit files. It refuses a sha that is already live (exit 3).
 
 6. **Health.** Run it any time. It checks both services, and reads the lease twice, 11 seconds apart.
    ```bash
@@ -110,7 +112,7 @@ Stop at the first failure and read the message: every script says what it refuse
    ```
    (How PR-E names the target is its own detail. `bulig-cli.sh` runs as user `bulig` with the kernel's credentials.)
 
-9. **Synthetic jobs.** One on the VPS worker, one on the Mac worker over Tailscale. Exactly one PR each, on the sandbox repo. Jobs run through the two services; one-off commands go through `bulig-cli.sh`. For the Mac worker, add its token (`set-secret.sh --worker-token mac`), add the Tailscale address to `listen` in `/etc/bulig/config.json` (root edit), and restart `bulig.service`.
+9. **Synthetic jobs.** One on the VPS worker, one on the Mac worker over Tailscale. Exactly one PR each, on the sandbox repo. Jobs run through the two services; one-off commands go through `bulig-cli.sh`. For the Mac worker, add its token (`set-secret.sh --worker-token mac`), add the VPS's Tailscale address (100.85.168.22 when checked on 19 Oct 2026) next to `127.74.3.1` in `listen` in `/etc/bulig/config.json` (root edit), and restart `bulig.service`. The kernel unit already lets Tailscale peers in (`IPAddressAllow=100.64.0.0/10`).
 
 10. **Backup.** Fill the R2 settings, one name at a time, then run one backup by hand and look for the `bulig-backup: ok` line:
     ```bash
@@ -134,15 +136,35 @@ Stop at the first failure and read the message: every script says what it refuse
     ```
     A diff of unrelated services that started or stopped on their own (a nightly job) needs a human read: check it is not Bulig's doing before calling it noise, and add the pattern to `SNAPSHOT_NOISE` in `lib/snapshot.sh` if it is.
 
+## What each unit can reach (network)
+
+On this host `127.0.0.1` carries other tenants' services with no login (a browser debugging port with a live client session, a workflow server, model servers, about fifty more) and `172.17.0.1` and the other bridges carry containers. Claude (the worker, steered by prompts) and dependency scripts (the build) run code Bulig does not control, so systemd filters every IP packet of each unit in both directions (`IPAddressDeny=`, `IPAddressAllow=`: an Allow match wins, then a Deny match, then the packet is let through, which leaves the public internet):
+
+| Unit | Denied | Let through (Allow) |
+|---|---|---|
+| `bulig-worker.service` and the worker's `bulig-cli.sh` commands | localhost, link-local, multicast, `10/8`, `172.16/12`, `192.168/16`, `100.64/10`, `fc00::/7` | `127.74.3.1/32` (the kernel gateway), `127.0.0.53/32` (DNS) |
+| the release build (transient `bulig-build-*`) | the same | `127.0.0.53/32` |
+| `bulig.service` and the kernel's `bulig-cli.sh` commands | localhost, link-local, multicast, `10/8`, `172.16/12`, `192.168/16`, `fc00::/7` | `127.74.3.1/32`, `127.0.0.53/32`, `100.64.0.0/10` (Tailscale peers: the Mac worker, inbound and replies) |
+| `bulig-backup.service`, `bulig-restore-drill.service` | the worker's list | `127.0.0.53/32` |
+| `bulig-loopback.service` | everything (`any`) | nothing |
+
+- **Postgres needs no TCP at all.** The kernel, backup, drill and health reach it over the unix socket, which IP filtering does not touch.
+- **Why `127.74.3.1` is put on `lo`.** `ip route get 127.74.3.1` on this host says `src 127.0.0.1`: a connection to a loopback address that is not assigned as its own address carries source `127.0.0.1`. Then the kernel unit would have to let `127.0.0.1` in and out (the filter checks the peer address: destination on the way out, source on the way in), which is exactly where the other tenants are. With `127.74.3.1/32` on `lo` the route says `src 127.74.3.1`, both ends of the conversation carry it, and each side allows that one address. (For a Tailscale peer the source is the peer's own `100.x` address.)
+- **`127.0.0.53` is allowed for DNS.** `/etc/resolv.conf` points at the `systemd-resolved` stub there. It answers DNS and nothing else. Without it no unit can look up a name.
+- **What stays reachable:** the public internet, and services bound to `0.0.0.0` on the host's own address (22, 80, 443: public anyway).
+- **Docker.** With no `aws` CLI the backup runs the pinned image through `docker run`. That container's traffic belongs to dockerd's cgroup, not to the backup unit, so the unit's filter does not cover it. The container gets the R2 key on stdin and the dump, nothing else. The docker client's config folder is `DOCKER_CONFIG=/var/lib/bulig-checks/docker` (root-owned, made by `setup-user.sh`), because `ProtectHome=yes` hides `/root`.
+- **The gateway bind.** `bulig serve` binds the gateway to `127.74.3.1` (config `listen`). PR #50 accepts any address in `127.0.0.0/8`, `::1` and the Tailscale ranges and refuses wildcards; `bulig worker` accepts plain `http` to the same set.
+
 ## Footprint on ths-prod-01
 
 Everything this kit adds or changes (nothing else is touched):
 
 - Users and groups: `bulig`, `bulig-worker` (system users, `--no-create-home`, nologin).
-- Units: `bulig.service`, `bulig-worker.service`, `bulig-backup.service` and `.timer`, `bulig-restore-drill.service` and `.timer` in `/etc/systemd/system`. Short-lived transient units `bulig-build-*`, `bulig-extract-*`, `bulig-cli-*` while a release or a command runs.
-- Folders: `/opt/bulig`, `/usr/local/lib/bulig`, `/etc/bulig`, `/var/backups/bulig`, `/var/lib/bulig-checks` (all root), and `/var/lib/bulig`, `/var/lib/bulig-worker` (made by systemd).
-- Postgres: cluster `16 bulig` on 127.0.0.1:5436, roles `bulig` and `bulig_drill`, database `bulig`. The existing clusters (5432 and the others) are not touched.
-- Ports: 5436 (Postgres) and 7431 (the worker gateway) on 127.0.0.1; the Tailscale address is added at the Mac-worker step. Nothing on a public interface.
+- Units: `bulig-loopback.service`, `bulig.service`, `bulig-worker.service`, `bulig-backup.service` and `.timer`, `bulig-restore-drill.service` and `.timer` in `/etc/systemd/system`. Short-lived transient units `bulig-build-*`, `bulig-extract-*`, `bulig-cli-*` while a release or a command runs.
+- Folders: `/opt/bulig`, `/usr/local/lib/bulig`, `/etc/bulig`, `/var/backups/bulig`, `/var/lib/bulig-checks` and `/var/lib/bulig-checks/docker` (all root), and `/var/lib/bulig`, `/var/lib/bulig-worker` (made by systemd).
+- Postgres: cluster `16 bulig`, port 5436, unix socket only (`listen_addresses = ''`), roles `bulig` and `bulig_drill`, database `bulig`. The existing clusters (5432 and the others) are not touched.
+- Network: Postgres has no TCP listener (socket `/var/run/postgresql/.s.PGSQL.5436`). The worker gateway listens on `127.74.3.1:7431`, an address that `bulig-loopback.service` puts on `lo` (`ip address replace 127.74.3.1/32 dev lo`, removed when the unit stops); the Tailscale address is added at the Mac-worker step. Nothing on a public interface.
+- The one thing added outside the units, users and folders above is that address alias on `lo`. It is a host network change, so it needs Jasher's yes before the server phase.
 
 ## Cutover (Jasher only)
 
@@ -165,7 +187,7 @@ To undo: remove `channel-telegram` from `enabled`, restart, then start the Mac s
   ```
 - **Stop Bulig, leave everything else alone.** `systemctl stop bulig-worker bulig`. The cluster keeps running. Jobs resume on the next start.
 - **Remove Bulig completely.** Only with Jasher's yes, and in this order: `systemctl disable --now bulig-worker bulig bulig-backup.timer bulig-restore-drill.timer`, remove `/etc/systemd/system/bulig*`, `systemctl daemon-reload`, `pg_dropcluster 16 bulig --stop`, then `userdel bulig`, `userdel bulig-worker`, then `/opt/bulig`, `/etc/bulig`, `/usr/local/lib/bulig`, `/var/lib/bulig`, `/var/lib/bulig-worker`, `/var/backups/bulig`, `/var/lib/bulig-checks` (after the last `postcheck.sh`). Run `postcheck.sh`; it should show nothing changed from the precheck.
-- **Restore the database from R2.** The restore drill is the rehearsal. For a real restore: `systemctl stop bulig-worker bulig`, take the newest dump (a custom-format `.dump` under `bulig/postgres/`; check its sha256 against `/var/backups/bulig/index`), create an empty database as `bulig`, `pg_restore --no-owner --role=bulig -h 127.0.0.1 -p 5436 -U bulig -d <db> <dump>`, point the config at it, start the services.
+- **Restore the database from R2.** The restore drill is the rehearsal. For a real restore: `systemctl stop bulig-worker bulig`, take the newest dump (a custom-format `.dump` under `bulig/postgres/`; check its sha256 against `/var/backups/bulig/index`), create an empty database as `bulig`, `pg_restore --no-owner --role=bulig -h /var/run/postgresql -p 5436 -U bulig -d <db> <dump>`, point the config at it, start the services.
 
 ## Things to know
 
@@ -176,4 +198,4 @@ To undo: remove `channel-telegram` from `enabled`, restart, then start the Mac s
 - The kernel unit's caps (1G, 100%, 256 tasks) are assumed in ADR 0011 (item 13), not measured. The worker's (3G, 250%, 512) are the ADR's.
 - With no `aws` CLI the R2 calls go through a docker container (image pinned by digest) fed by stdin and stdout: no host mount, and the R2 key travels on stdin, never in docker's arguments or environment.
 - Passfiles and downloads live in a 0700 folder under `/var/lib/bulig-checks` (root's), never in the host's `/tmp`, also when you run a script by hand.
-- Everything uses a Postgres connection with an explicit host (`127.0.0.1`) and port, and passwords travel in a private PGPASSFILE, never on a command line (any user on this host can read other processes' arguments).
+- Everything uses a Postgres connection with an explicit host (the socket folder `/var/run/postgresql`) and port, and passwords travel in a private PGPASSFILE (host field `localhost`, which is how libpq looks up a socket), never on a command line (any user on this host can read other processes' arguments).

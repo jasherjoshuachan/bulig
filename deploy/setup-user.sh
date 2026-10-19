@@ -16,18 +16,17 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 need_root
 refuse_if_users_running
 
-# make_user <name>: the home is only RECORDED (useradd --home-dir, in /etc/passwd). No folder is created: systemd does that.
+# make_user <name>: an existing user is left alone. Its passwd home does not matter (the units set HOME and StateDirectory= themselves),
+# and a root script does not look the home up. A new user is made with the home only RECORDED (--home-dir, in /etc/passwd); no folder is
+# created: systemd does that when the unit starts.
 make_user() {
-  local name="$1" home="/var/lib/$1" have
+  local name="$1"
   if id "$name" >/dev/null 2>&1; then
-    have="$(getent passwd "$name" | cut -d: -f6)"
-    [ "$have" = "$home" ] || die "user $name exists with home $have, not $home. Not touching it."
     echo "user $name: already there"
   else
-    # No home is created: systemd makes it (StateDirectory=) when the unit starts. nologin on purpose: neither service needs a shell.
-    # One-off commands go through bulig-cli.sh, which runs them as a capped transient unit.
-    useradd --system --no-create-home --home-dir "$home" --shell /usr/sbin/nologin --user-group "$name"
-    echo "user $name: created (no home yet: systemd makes $home when the unit first starts)"
+    # nologin on purpose: neither service needs a shell. One-off commands go through bulig-cli.sh (a capped transient unit).
+    useradd --system --no-create-home --home-dir "/var/lib/$name" --shell /usr/sbin/nologin --user-group "$name"
+    echo "user $name: created (no home yet: systemd makes /var/lib/$name when the unit first starts)"
   fi
 }
 
@@ -44,8 +43,10 @@ root_dir 0755 "$BULIG_TOOLS_DIR"
 root_dir 0700 "$BULIG_CRED_DIR"
 # Backups wait here before and after R2, and the index of what was backed up lives here. Root only.
 root_dir 0700 "$BULIG_BACKUP_DIR"
-# Work areas for releases and the before/after snapshots. Root only.
+# Work areas for releases and the before/after snapshots. Root only. docker/ is the docker client's config folder for the backup units
+# (DOCKER_CONFIG), so docker never looks in /root, which those units cannot see.
 ensure_checks_dir
+root_dir 0700 "$BULIG_CHECKS_DIR/docker"
 
 # Tools must be in system folders: neither user has a home with a ~/.local, and the dependency build runs as a throwaway user.
 check_tools() {

@@ -7,7 +7,7 @@
 #   --as kernel (default)  user bulig,        credentials config, pg-url, gh-token, worker-tokens   (what bulig.service has)
 #   --as worker            user bulig-worker, credentials claude-token, worker-token                (what bulig-worker.service has)
 #   --exec                 run <program> (for example git clone, for a repo the worker needs) instead of the bulig CLI
-# Same user, same credentials, same hardening and the same style of caps as the matching service (smaller numbers, so a one-off
+# Same user, same credentials, same hardening, same network filter (IPAddressDeny/Allow) and the same style of caps as the matching service (smaller numbers, so a one-off
 # command cannot take the room the services need). The kernel reads its secrets from $CREDENTIALS_DIRECTORY, as in the unit.
 # Only one writer may hold the database: stop bulig.service first for commands that write (run, resume, migrate), start it after.
 # Read-only commands (status, history) can run while the service is up.
@@ -61,10 +61,12 @@ case "$role" in
   kernel)
     add_creds config:config.json pg-url:pg-url gh-token:gh-token worker-tokens:worker-tokens
     spec=(--uid=bulig --gid=bulig --unit="bulig-cli-kernel-$$" -p MemoryMax=1G -p CPUQuota=100% -p StateDirectory=bulig
+      -p "IPAddressDeny=$BULIG_IP_DENY_KERNEL" -p "IPAddressAllow=$BULIG_GATEWAY_ADDR/32 $BULIG_IP_ALLOW_DNS 100.64.0.0/10"
       --setenv=HOME=/var/lib/bulig --setenv=PATH="/usr/local/bin:/usr/bin:/bin") ;;
   worker)
     add_creds claude-token:claude-token worker-token:worker-token
     spec=(--uid=bulig-worker --gid=bulig-worker --unit="bulig-cli-worker-$$" -p MemoryMax=2G -p CPUQuota=200% -p StateDirectory=bulig-worker
+      -p "IPAddressDeny=$BULIG_IP_DENY_PRIVATE" -p "IPAddressAllow=$BULIG_GATEWAY_ADDR/32 $BULIG_IP_ALLOW_DNS"
       --setenv=HOME=/var/lib/bulig-worker --setenv=PATH="/usr/local/bin:/usr/bin:/bin") ;;
   *) die "--as must be kernel or worker" ;;
 esac

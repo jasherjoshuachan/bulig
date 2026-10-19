@@ -173,4 +173,71 @@ describe('the worker, against a kernel that is just a script', () => {
       await worker.stop();
     }
   });
+
+  describe('heartbeats the kernel does not answer with 200', () => {
+    const SLOW = fileURLToPath(new URL('./fixtures/fake-claude-slow.mjs', import.meta.url));
+
+    /** A kernel whose heartbeat answer is whatever `heartbeat()` says. */
+    function kernel(assignmentBody: Record<string, unknown>, heartbeat: () => number) {
+      const results: unknown[] = [];
+      let handed = false;
+      const fetchImpl = (async (url: URL, init: { body: string }) => {
+        const path = new URL(url).pathname;
+        if (path === '/claim') {
+          if (!handed) {
+            handed = true;
+            return new Response(JSON.stringify(assignmentBody), { status: 200 });
+          }
+          await sleep(100);
+          return new Response(null, { status: 204 });
+        }
+        if (path === '/heartbeat') return new Response(JSON.stringify({}), { status: heartbeat() });
+        results.push(JSON.parse(init.body));
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      }) as unknown as typeof fetch;
+      return { fetchImpl, results };
+    }
+    const make = (w: ReturnType<typeof makeWorld>, k: ReturnType<typeof kernel>, delay: string, marks: string) =>
+      startRemoteWorker({
+        kernelUrl: 'http://127.0.0.1:1', workerId: 'mac', token: 'mac-token-0123456789abcdef', slots: 1, repos: { [w.repo]: w.clone }, workdir: w.workdir,
+        claudeBin: SLOW, passEnv: ['FAKE_BUILD_DELAY_MS', 'FAKE_MARK'], env: { ...process.env, FAKE_BUILD_DELAY_MS: delay, FAKE_MARK: marks },
+        lossMs: 1000, retryMs: 50, fetch: k.fetchImpl,
+      });
+    const stage = (w: ReturnType<typeof makeWorld>) => ({
+      jobId: 'j', stageId: 'stage-1', attempt: 1, generation: 1, heartbeatMs: 200,
+      request: { stage: 'build', prompt: 'You are building', model: 'sonnet', mode: 'edit' },
+      workspace: { repo: w.repo, base: gitSync(w.clone, 'rev-parse', 'HEAD') },
+    });
+
+    it.each([500, 404, 502])('answers of %i, heartbeat after heartbeat, make the worker stop its Claude and send nothing', async (status) => {
+      const w = makeWorld();
+      const marks = join(tmp(), 'marks');
+      writeFileSync(marks, '');
+      const k = kernel(stage(w), () => status);
+      const worker = make(w, k, '600000', marks);
+      try {
+        await waitFor(() => readFileSync(marks, 'utf8').includes('build'), 60_000, 'Claude to start');
+        await waitFor(() => worker.running() === 0, 30_000, 'the worker to give the stage up');
+        expect(k.results).toEqual([]);
+        expect(existsSync(join(w.workdir, 'stage-1'))).toBe(false);
+      } finally {
+        await worker.stop();
+      }
+    });
+
+    it('control: 200 answers keep the run going and its result is sent', async () => {
+      const w = makeWorld();
+      const marks = join(tmp(), 'marks');
+      writeFileSync(marks, '');
+      const k = kernel(stage(w), () => 200);
+      const worker = make(w, k, '2500', marks); // longer than lossMs
+      try {
+        await waitFor(() => k.results.length === 1, 60_000, 'the result');
+        expect(k.results[0]).toMatchObject({ outcome: 'completed' });
+      } finally {
+        await worker.stop();
+      }
+    });
+  });
 });
+

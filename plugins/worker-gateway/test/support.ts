@@ -191,8 +191,8 @@ export async function bootGateway(store: Store, o: BootOptions = {}) {
       ...o.pluginConfig,
     },
     logger: process.env.GW_DEBUG ? { debug() {}, info() {}, warn: (m: string) => console.log('WARN', m), error: (m: string) => console.log('ERROR', m) } : { debug() {}, info() {}, warn() {}, error: () => {} },
-    leaseHeartbeatMs: 300,
-    leaseTtlMs: 1500,
+    leaseHeartbeatMs: 1000,
+    leaseTtlMs: 9000,
     ...o.kernel,
   });
   kernels.push(k);
@@ -281,7 +281,7 @@ export async function bootPipeline(store: Store, o: { local?: boolean; gateway?:
       'pipeline-dev': { resume: 'all' },
     },
     gateway: { claimWaitMs: 1000, heartbeatMs: 300, heartbeatTimeoutMs: 3000, ...o.gateway },
-    kernel: { leaseHeartbeatMs: 500, leaseTtlMs: 3000, ...o.kernel },
+    kernel: { leaseHeartbeatMs: 1000, leaseTtlMs: 9000, ...o.kernel },
   });
   process.env.FAKE_GH_STATE = world.ghState;
   const remote = (id: 'mac' | 'pi', extra: Partial<RemoteWorkerOptions> = {}) => {

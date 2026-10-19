@@ -79,7 +79,7 @@ export async function cmdWorker(args: string[], io: Io): Promise<number> {
   // Claude's own settings come from the same config file the in-process worker reads, when there is one.
   let claude: Record<string, unknown> = {};
   try {
-    claude = loadConfig(io.cwd, io.home).config.pluginConfig['worker-claude-code'] ?? {};
+    claude = loadConfig(io.cwd, io.home, io.env).config.pluginConfig['worker-claude-code'] ?? {};
   } catch (err) {
     if (!(err instanceof ConfigError && err.message.startsWith('No config found'))) throw err;
   }

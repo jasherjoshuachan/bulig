@@ -143,6 +143,9 @@ export function startRemoteWorker(opts: RemoteWorkerOptions): RemoteWorker {
           if (r.status === 200) lastOk = Date.now();
           else if (r.status === 409) abort('the kernel no longer has this stage with us');
           else if (r.status === 401) abort('the kernel refused the token');
+          // Any other answer (a 500, a 404 from an old kernel, a proxy's 502) is not "alive": it counts toward losing contact, so a
+          // worker attached to a broken kernel stops its Claude run instead of burning quota.
+          else if (Date.now() - lastOk > lossMs) abort(`the kernel keeps answering ${r.status} to heartbeats`);
         })
         .catch(() => {
           if (Date.now() - lastOk > lossMs) abort('lost contact with the kernel');

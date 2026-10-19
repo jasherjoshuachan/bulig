@@ -52,7 +52,7 @@ Usage:
   bulig worker --kernel <url> --id <workerId> (--token-env <VAR> | --token-file <path>) [--slots 2] --repo <kernelPath>=<localClone> ...
 
 A job id can be shortened to any unique start of it.
-Config: bulig.config.json in the current folder, or ~/.bulig/config.json.`;
+Config, first found wins: $CREDENTIALS_DIRECTORY/config, the file $BULIG_CONFIG names, bulig.config.json in the current folder, ~/.bulig/config.json.`;
 
 /** Where a driven job comes to rest. */
 const RESTING: JobStatus[] = ['awaiting_approval', 'done', 'failed', 'cancelled'];
@@ -276,7 +276,7 @@ async function cmdRun(args: string[], io: Io): Promise<number> {
   if (!values.repo || !values.title) throw new UserError('run needs --repo <path> and --title <text>');
   const repo = resolve(io.cwd, values.repo);
   if (!existsSync(resolve(repo, '.git'))) throw new UserError(`${repo} is not a git repository`);
-  const { config } = loadConfig(io.cwd, io.home);
+  const { config } = loadConfig(io.cwd, io.home, io.env);
 
   const session = await openSession(config, io, false);
   try {
@@ -291,7 +291,7 @@ async function cmdRun(args: string[], io: Io): Promise<number> {
 async function cmdApprove(args: string[], io: Io): Promise<number> {
   const [idArg, kind, stageArg, ...extra] = args;
   if (!idArg || (kind !== 'plan' && kind !== 'merge') || extra.length) throw new UserError('usage: bulig approve <jobId> <plan|merge> <stageId>');
-  const { config } = loadConfig(io.cwd, io.home);
+  const { config } = loadConfig(io.cwd, io.home, io.env);
   const { job, stages } = await lookup(config, io, idArg);
   const waiting = stages.find((s) => s.name.startsWith('approve-') && s.status === 'running');
   if (job.status !== 'awaiting_approval' || !waiting) {
@@ -314,7 +314,7 @@ async function cmdApprove(args: string[], io: Io): Promise<number> {
 async function cmdDeny(args: string[], io: Io): Promise<number> {
   const [idArg, stageArg, ...extra] = args;
   if (!idArg || extra.length) throw new UserError('usage: bulig deny <jobId> <stageId>');
-  const { config } = loadConfig(io.cwd, io.home);
+  const { config } = loadConfig(io.cwd, io.home, io.env);
   const { job, stages } = await lookup(config, io, idArg);
   const waiting = stages.find((s) => s.name.startsWith('approve-') && s.status === 'running');
   if (job.status !== 'awaiting_approval' || !waiting) throw new UserError(`job ${job.id} is ${job.status.replace('_', ' ')}, not waiting for an approval`);
@@ -343,7 +343,7 @@ function checkStage(jobId: string, waiting: { id: string; name: string }, stageA
 async function cmdResume(args: string[], io: Io): Promise<number> {
   const [idArg, ...extra] = args;
   if (!idArg || extra.length) throw new UserError('usage: bulig resume <jobId>');
-  const { config } = loadConfig(io.cwd, io.home);
+  const { config } = loadConfig(io.cwd, io.home, io.env);
   const { job } = await lookup(config, io, idArg);
   if (job.status !== 'running' && job.status !== 'queued') throw new UserError(`job ${job.id} is ${job.status.replace('_', ' ')}; only running jobs resume`);
   const session = await openSession(config, io, [job.id], job.id);
@@ -360,7 +360,7 @@ async function cmdResume(args: string[], io: Io): Promise<number> {
  */
 async function cmdServe(args: string[], io: Io): Promise<number> {
   if (args.length) throw new UserError('usage: bulig serve');
-  const { config } = loadConfig(io.cwd, io.home);
+  const { config } = loadConfig(io.cwd, io.home, io.env);
   if (!config.enabled.includes('channel-telegram') && !config.enabled.includes('channel-cli')) {
     throw new UserError('serve needs a channel. Enable "channel-telegram" in the config.');
   }
@@ -405,7 +405,7 @@ async function cmdServe(args: string[], io: Io): Promise<number> {
 /** The config the read commands need: the store only. With no config file at all they look at the default SQLite file. */
 function storeConfigFor(io: Io): Pick<BuligConfig, 'store' | 'dbPath'> {
   try {
-    const { config } = loadConfig(io.cwd, io.home);
+    const { config } = loadConfig(io.cwd, io.home, io.env);
     return { store: config.store, dbPath: config.dbPath };
   } catch (err) {
     if (err instanceof ConfigError && err.message.startsWith('No config found')) return { store: { kind: 'sqlite' }, dbPath: defaultDbPath(io.home) };

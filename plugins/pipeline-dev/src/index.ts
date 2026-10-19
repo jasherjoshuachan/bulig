@@ -185,9 +185,8 @@ export default definePlugin({
      * Write an event and wait until it is committed. A state change is saved first and the event that tells someone to
      * act on it second; if the second write is lost, nobody is told, and the job would wait for ever. So a lost event
      * is an error here, and the handler's guard turns it into a failed job with this reason. If failing the job cannot be
-     * written either, the job stays as it is until the next start, where resume handles a running job. A job that is
-     * waiting for an approval nobody was asked for is not picked up again. Approvals are now bound to the exact stage
-     * they were asked for (ADR 0008), so asking again on start would be safe, but it is not done yet.
+     * written either, the job stays as it is until the next start, where resume handles it: a running job runs its next
+     * step again, and a job waiting for an approval nobody was asked for is asked again (ADR 0009).
      */
     async function announce(type: string, payload: unknown, jobId: string): Promise<void> {
       try {
@@ -205,6 +204,47 @@ export default definePlugin({
         await abandon(stage, err);
         throw err;
       }
+    }
+
+    /** The plugin-state key that holds the id of the last approval stage whose question went out for a job. */
+    const askedKey = (jobId: string) => `asked:${jobId}`;
+
+    /**
+     * Note that the question for this approval stage was written, so a restart knows not to ask it again. The question
+     * is already out, so a lost note does not fail the job. The next start asks again with a new stage, and the card
+     * already sent expires (ADR 0009).
+     */
+    async function markAsked(jobId: string, stageId: string): Promise<void> {
+      try {
+        await ctx.state.set(askedKey(jobId), stageId);
+      } catch (err) {
+        ctx.log.warn(`pipeline-dev: the question for stage ${stageId} of job ${jobId} went out, but that could not be noted: ${err instanceof Error ? err.message : String(err)}. A restart will ask it again with a new stage.`);
+      }
+    }
+
+    /**
+     * On start, for a job waiting on a person. If the question for its open approval stage was never noted as sent,
+     * close that stage as interrupted and let decide() open a new one, which asks the question again under a new id.
+     * A card for the closed stage, if one ever went out, then names a stage that is not open, and is refused (ADR 0008).
+     * A job marked waiting with no approval stage open lost its status write after the answer was saved; decide()
+     * carries on from the answer on record.
+     */
+    async function reaskIfLost(job: Job): Promise<void> {
+      let open: Stage[];
+      let asked: string | undefined;
+      try {
+        open = (await ctx.jobs.stages(job.id)).filter((s) => s.status === 'running' && s.name.startsWith('approve-'));
+        asked = open.length ? await ctx.state.get<string>(askedKey(job.id)) : undefined;
+      } catch (err) {
+        // Not knowing is no reason to fail a job that may well be waiting on a card someone can see. Leave it for the next start.
+        ctx.log.warn(`pipeline-dev: could not tell whether job ${job.id} was asked its question, so it was left waiting: ${err instanceof Error ? err.message : String(err)}`);
+        return;
+      }
+      if (open.length === 1 && open[0]!.id === asked) return;
+      for (const s of open) await finish(s, 'failed', { interrupted: true, reason: 'not asked', error: 'the question for this stage was never sent' });
+      if (open.length) ctx.log.info(`pipeline-dev: job ${job.id} was waiting on a question that was never sent. Asking it again.`);
+      await ctx.jobs.setStatus(job.id, 'running');
+      await advance(job.id);
     }
 
     async function fail(jobId: string, reason: string, extra: Record<string, unknown> = {}): Promise<void> {
@@ -338,6 +378,7 @@ export default definePlugin({
           if (action.which === 'plan') {
             const summary = withEvidence(evidenceBlock(stages, ['plan', 'critique']), `PLAN\n${textOf(stages, 'plan')}\n\nCRITIQUE\n${textOf(stages, 'critique')}`);
             await announce('approval.requested', { jobId: job.id, kind: 'plan', stageId: asked.id, summary: clip(summary, 4000), scope: scopeOf(stages) ?? [] }, job.id);
+            await markAsked(job.id, asked.id);
           } else {
             const pr = outputOf(lastOf(stages, 'pr')!);
             const review = textOf(stages, 'review');
@@ -356,6 +397,7 @@ export default definePlugin({
               },
               job.id,
             );
+            await markAsked(job.id, asked.id);
           }
           return;
         }
@@ -407,6 +449,10 @@ export default definePlugin({
               // Only a job whose cleanup was asked for: a worktree kept on purpose, or one from before these records, is left alone.
               if (!(await ctx.state.get(`cleaned:${job.id}`)) && !(await ctx.state.get(`kept:${job.id}`)) && (await ctx.state.get(`cleanup-asked:${job.id}`))) await cleanupIfIdle(job.id);
             });
+            continue;
+          }
+          if (job.status === 'awaiting_approval') {
+            await attempt(job.id, () => reaskIfLost(job));
             continue;
           }
           if (job.status !== 'queued' && job.status !== 'running') continue;

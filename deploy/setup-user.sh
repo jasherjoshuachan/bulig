@@ -30,16 +30,8 @@ make_user() {
 make_user bulig "$BULIG_HOME"
 make_user bulig-worker "$BULIG_WORKER_HOME"
 
-# /var/lib/bulig: the kernel's space (state, ~/.bulig config, ~/.config/gh, repos). Private to bulig.
-install -d -m 0750 -o bulig -g bulig "$BULIG_HOME"
-install -d -m 0750 -o bulig -g bulig "$BULIG_HOME/state"
-# Where the kernel looks for its config: $HOME/.bulig/config.json. Root owns the folder and the file, bulig can read but not edit them.
-install -d -m 0750 -o root -g bulig "$BULIG_HOME/.bulig"
-# The kernel's repo clones and worktrees. Its git runs with hooks and fsmonitor off (PR #50 and PR-G).
-install -d -m 0750 -o bulig -g bulig "$BULIG_REPOS_DIR"
-# /var/lib/bulig-worker: the worker's home (Claude's sign-in and settings), and work/ for its own clones. Private to bulig-worker.
-install -d -m 0750 -o bulig-worker -g bulig-worker "$BULIG_WORKER_HOME"
-install -d -m 0700 -o bulig-worker -g bulig-worker "$BULIG_WORKER_WORK_DIR"
+# /var/lib/bulig (the kernel's space) and /var/lib/bulig-worker (the worker's) are each 0700 and owned by their own user. See setup_folders in lib/common.sh.
+setup_folders
 # git's "dubious ownership" check does not fire: each user only opens repos it created itself, so no safe.directory entry is added.
 # If one is ever needed, add that exact path for that user only, never '*'.
 

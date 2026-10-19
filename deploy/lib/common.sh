@@ -13,12 +13,12 @@ BULIG_GATEWAY_PORT=7431
 # The tests run the scripts against a throwaway folder: BULIG_DEPLOY_TEST_ROOT puts every fixed path under it and skips the
 # root check. On the server it is never set.
 R="${BULIG_DEPLOY_TEST_ROOT:-}"
-BULIG_HOME="/var/lib/bulig"
-BULIG_WORKER_HOME="/var/lib/bulig-worker"
+BULIG_HOME="$R/var/lib/bulig"
+BULIG_WORKER_HOME="$R/var/lib/bulig-worker"
 # Where the kernel keeps repo clones and its own worktrees (user bulig only), and where the worker keeps its own clones (user bulig-worker
 # only). Nothing is shared: the worker sends the kernel a patch, and the kernel applies it in its own worktree (ADR 0011, PR #50).
-BULIG_REPOS_DIR="/var/lib/bulig/repos"
-BULIG_WORKER_WORK_DIR="/var/lib/bulig-worker/work"
+BULIG_REPOS_DIR="$BULIG_HOME/repos"
+BULIG_WORKER_WORK_DIR="$BULIG_WORKER_HOME/work"
 BULIG_CRED_DIR="$R/etc/bulig"
 BULIG_BACKUP_ENV_FILE="$R/etc/bulig/backup.env"
 BULIG_CHECKS_DIR="$R/var/lib/bulig-checks"
@@ -55,6 +55,29 @@ ensure_checks_dir() {
     (umask 077 && mkdir "$BULIG_CHECKS_DIR") || die "cannot create $BULIG_CHECKS_DIR"
   fi
   if is_root && [ "$(stat -c %u "$BULIG_CHECKS_DIR")" != "0" ]; then die "$BULIG_CHECKS_DIR is not owned by root. Not touching it."; fi
+}
+
+# make_dir <mode> <owner> <group> <path>: create a folder Bulig owns, set its mode, and (as root) its owner. Prints what it did, so the
+# tests can read the plan. Only used on the fixed Bulig paths below.
+make_dir() {
+  local mode="$1" owner="$2" group="$3" path="$4"
+  [ ! -L "$path" ] || die "$path is a link. Not touching it."
+  install -d -m "$mode" "$path"
+  if is_root; then chown "$owner:$group" "$path"; fi
+  echo "dir $mode $owner:$group $path"
+}
+
+# The folders of the two Bulig users. Each home is private to its user, so neither can read the other's Claude login, caches or clones.
+setup_folders() {
+  make_dir 0700 bulig bulig "$BULIG_HOME"
+  make_dir 0750 bulig bulig "$BULIG_HOME/state"
+  # Where the kernel looks for its config: $HOME/.bulig/config.json. Root owns the folder and the file, bulig can read but not edit them.
+  make_dir 0750 root bulig "$BULIG_HOME/.bulig"
+  # The kernel's repo clones and worktrees. Its git runs with hooks and fsmonitor off (PR #50 and PR-G).
+  make_dir 0750 bulig bulig "$BULIG_REPOS_DIR"
+  # The worker's home (Claude's sign-in and settings, caches) and work/ for its own clones.
+  make_dir 0700 bulig-worker bulig-worker "$BULIG_WORKER_HOME"
+  make_dir 0700 bulig-worker bulig-worker "$BULIG_WORKER_WORK_DIR"
 }
 
 # Prefer the Postgres 16 client tools by path, so a newer client on PATH never talks to this cluster by accident.

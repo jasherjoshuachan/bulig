@@ -10,7 +10,7 @@ The two users, and why:
 - `bulig-worker` runs the worker (`bulig-worker.service`), which runs Claude Code and the commands Claude runs. It holds the Claude token
   and its own worker token, and nothing else. It cannot read `/etc/bulig` or the kernel's credentials, because it is a different user.
 - The two users share no folder and no group. The worker has its own clone of a repo and sends the kernel a patch; the kernel applies it in its
-  own worktree (ADR 0011, PR #50). Neither user can read the other's tree. The kernel's git runs with hooks and fsmonitor off (PR #50 and PR-G).
+  own worktree (ADR 0011, PR #50). Both homes are 0700 and owned by their own user (`setup-user.sh` sets them, `deploy/test/run.sh` checks the modes), so neither user can read the other's Claude login, caches or clones. The kernel's git runs with hooks and fsmonitor off (PR #50 and PR-G).
 
 | What | Path |
 |---|---|
@@ -18,8 +18,9 @@ The two users, and why:
 | Secrets, one file each | `/etc/bulig/pg-url`, `gh-token`, `worker-tokens`, `claude-token`, `worker-token`, `drill-pw` (root, 0600). systemd hands each unit only its own through `LoadCredential=` (`credentials.example`) |
 | R2 settings | `/etc/bulig/backup.env` (root, 0600), loaded by the backup units only |
 | Kernel config | `/var/lib/bulig/.bulig/config.json` (root owns it, `bulig` can read it) |
+| The kernel's home | `/var/lib/bulig` (`bulig:bulig`, 0700). Holds `.bulig/config.json`, `state/`, the gh sign-in |
 | The kernel's repos and worktrees | `/var/lib/bulig/repos` (`bulig:bulig`, 0750, kernel umask 0077) |
-| The worker's home (Claude sign-in) and its own clones | `/var/lib/bulig-worker`, clones in `/var/lib/bulig-worker/work` (`bulig-worker`, 0700, worker umask 0077) |
+| The worker's home (Claude sign-in, caches) and its own clones | `/var/lib/bulig-worker` (`bulig-worker:bulig-worker`, 0700), clones in `/var/lib/bulig-worker/work` (0700, worker umask 0077) |
 | Dumps waiting for R2, and the index of checksums | `/var/backups/bulig` (root). The index (`/var/backups/bulig/index`) lists every dump this host made with its sha256 |
 | Before and after snapshots | `/var/lib/bulig-checks` (root) |
 

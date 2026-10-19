@@ -84,6 +84,28 @@ printf 'mysql://x:y@h:1/d' >"$work/pw/bad"
 expect_fail "a URL that is not postgres:// is refused" bash -c ". '$deploy/lib/common.sh'; pg_passfile '$work/pw/bad' '$work/pw'"
 if grep -nE 'pg_dump|pg_restore|psql' "$deploy"/backup-postgres.sh "$deploy"/restore-drill.sh "$deploy"/health.sh | grep -E 'postgres(ql)?://|pg_url|BULIG_PG_URL'; then bad "a script puts the database URL on a command line"; else ok "no script passes the database URL to a postgres tool"; fi
 
+# ---------- 1c. folders ----------
+echo "setup_folders"
+froot="$work/root-folders"
+mkdir -p "$froot/var/lib"
+plan="$(BULIG_DEPLOY_TEST_ROOT="$froot" bash -c ". '$deploy/lib/common.sh'; setup_folders")"
+echo "$plan" >"$work/plan"
+# Each home is private to its own user: a different owner than the other, and 0700, so neither can read the other's Claude login or clones.
+if grep -qxF "dir 0700 bulig:bulig $froot/var/lib/bulig" "$work/plan"; then ok "the kernel home is 0700 and owned by bulig:bulig"; else bad "kernel home line missing: $(cat "$work/plan")"; fi
+if grep -qxF "dir 0700 bulig-worker:bulig-worker $froot/var/lib/bulig-worker" "$work/plan"; then ok "the worker home is 0700 and owned by bulig-worker:bulig-worker"; else bad "worker home line missing: $(cat "$work/plan")"; fi
+if grep -qxF "dir 0700 bulig-worker:bulig-worker $froot/var/lib/bulig-worker/work" "$work/plan"; then ok "the worker clones folder is 0700 and owned by bulig-worker"; else bad "worker work line missing"; fi
+if [ "$(mode "$froot/var/lib/bulig")" = "700" ] && [ "$(mode "$froot/var/lib/bulig-worker")" = "700" ] && [ "$(mode "$froot/var/lib/bulig-worker/work")" = "700" ]; then ok "the folders on disk have those modes"; else bad "on-disk modes: $(mode "$froot/var/lib/bulig") $(mode "$froot/var/lib/bulig-worker")"; fi
+# Nothing under the worker's home is owned by the kernel side, and nothing under the kernel's home (except the root-owned config folder) by the worker.
+if grep -F "$froot/var/lib/bulig-worker" "$work/plan" | grep -Ev "^dir [0-7]+ bulig-worker:bulig-worker " >/dev/null; then bad "a worker folder has the wrong owner"; else ok "every worker folder is owned by bulig-worker"; fi
+if grep -F "$froot/var/lib/bulig/" "$work/plan" | grep -E "bulig-worker:" >/dev/null; then bad "a kernel folder is owned by the worker"; else ok "no kernel folder is owned by the worker"; fi
+# A re-run changes nothing (idempotent) and a pre-existing wrong mode is corrected.
+chmod 755 "$froot/var/lib/bulig-worker"
+BULIG_DEPLOY_TEST_ROOT="$froot" bash -c ". '$deploy/lib/common.sh'; setup_folders" >/dev/null
+if [ "$(mode "$froot/var/lib/bulig-worker")" = "700" ]; then ok "a second run puts a loosened home back to 0700"; else bad "home mode after re-run is $(mode "$froot/var/lib/bulig-worker")"; fi
+# A link in place of a folder is refused.
+rm -rf "$froot/var/lib/bulig-worker/work" && ln -s "$work" "$froot/var/lib/bulig-worker/work"
+expect_fail_msg "a link where a folder belongs is refused" "is a link" env BULIG_DEPLOY_TEST_ROOT="$froot" bash -c ". '$deploy/lib/common.sh'; setup_folders"
+
 # ---------- 2. snapshot ----------
 echo "snapshot, precheck and postcheck"
 stubs="$work/stubs"

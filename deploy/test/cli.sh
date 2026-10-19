@@ -44,6 +44,7 @@ expect_ok "a kernel command runs" bash "$cli" status
 check "as user bulig" "--uid=bulig"
 check "its folder is made by systemd" "StateDirectory=bulig"
 check "private to the user" "StateDirectoryMode=0700"
+check "no core dump from a kernel command" "LimitCORE=0"
 check "with the kernel's config" "LoadCredential=config:$work/root/etc/bulig/config.json"
 check "and database URL" "LoadCredential=pg-url:$work/root/etc/bulig/pg-url"
 check "and GitHub token" "LoadCredential=gh-token:$work/root/etc/bulig/gh-token"
@@ -64,6 +65,7 @@ check "a pipe for stdin and stdout" "--pipe"
 
 echo "worker command"
 expect_ok "a worker command runs" bash "$cli" --as worker --exec git clone https://example.invalid/r /var/lib/bulig-worker/work/r
+check "no core dump from a worker command" "LimitCORE=0"
 check "as user bulig-worker" "--uid=bulig-worker"
 check "its folder is made by systemd" "StateDirectory=bulig-worker"
 check "with the Claude token" "LoadCredential=claude-token:$work/root/etc/bulig/claude-token"
@@ -98,3 +100,4 @@ expect_fail_msg "an unknown role is refused" "--as must be kernel or worker" bas
 expect_fail_msg "no command is refused" "usage: bulig-cli.sh" bash "$cli"
 
 finish
+

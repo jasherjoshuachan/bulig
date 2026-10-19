@@ -81,6 +81,9 @@ done
 # unit values into systemd-run, so no IP list anywhere in the kit may use one (found on the server, 20 Oct 2026).
 sym_hits="$(grep -nE '^(IPAddressDeny|IPAddressAllow)=.*\b(localhost|link-local|multicast)\b' "$sd"/*.service 2>/dev/null; grep -nE 'BULIG_IP_DENY_PRIVATE=.*\b(localhost|link-local|multicast)\b' "$deploy/lib/common.sh")"
 if [ -z "$sym_hits" ]; then ok "no IP list in the units or lib/common.sh uses a symbolic name (systemd-run cannot parse one in a list)"; else bad "a symbolic name in an IP list: $sym_hits"; fi
+for u in bulig.service bulig-worker.service; do
+  if [ "$(value "$u" LimitCORE)" = "0" ]; then ok "$u writes no core dump (LimitCORE=0)"; else bad "$u can write a core dump holding a credential"; fi
+done
 for u in bulig.service bulig-worker.service bulig-backup.service bulig-restore-drill.service; do
   missing=""
   for t in 127.0.0.0/8 ::1/128 169.254.0.0/16 fe80::/10 224.0.0.0/4 ff00::/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7; do

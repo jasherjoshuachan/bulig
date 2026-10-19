@@ -39,6 +39,14 @@ host=example.invalid
 
 '
 if [ "$rc" = "0" ] && [ ! -s "$work/hout" ]; then ok "another host gets nothing"; else bad "other host (rc $rc): $(cat "$work/hout")"; fi
+# Lookalike hosts must get nothing either: an exact match, never a substring or suffix match (review of #53).
+for h in github.com.evil.example evil.github.com github.com:443 GitHub.com xgithub.com; do
+  run_helper github-read-token get "protocol=https
+host=$h
+
+"
+  if [ "$rc" = "0" ] && [ ! -s "$work/hout" ]; then ok "a lookalike host gets nothing: $h"; else bad "lookalike host $h got: $(cat "$work/hout")"; fi
+done
 run_helper github-read-token get 'protocol=http
 host=github.com
 

@@ -57,6 +57,8 @@ LimitNOFILE=65536
 
 # Hardening (same set as personal-credential-broker, minus what node and git need).
 NoNewPrivileges=true
+# No core dumps: a crashing process could otherwise leave a credential in /var/crash.
+LimitCORE=0
 CapabilityBoundingSet=
 AmbientCapabilities=
 PrivateTmp=true

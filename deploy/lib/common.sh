@@ -221,6 +221,7 @@ cli_fence_props() {
         -p "InaccessiblePaths=$BULIG_INACCESSIBLE" -p "BindReadOnlyPaths=$BULIG_RESOLV_BIND") ;;
     *) die "role must be kernel or worker" ;;
   esac
+  FENCE_CLI+=(-p LimitCORE=0) # no core dumps: a crash could leave a credential in /var/crash
 }
 
 # wildcard_listeners: TCP listeners on every address (0.0.0.0, ::, *), as addr:port, one per line. An allowed address such as 127.74.3.1 reaches

@@ -26,7 +26,9 @@ BULIG_GATEWAY_PORT=7431
 #  - RestrictAddressFamilies without AF_UNIX: no unix socket at all, abstract ones included. socketpair() is not affected by it.
 #  - InaccessiblePaths: the other unix sockets that could be reached if AF_UNIX were ever allowed ("-" = ignore a missing path).
 #  - BindReadOnlyPaths: resolved's upstream resolver list instead of the 127.0.0.53 stub, so no localhost address has to be allowed for DNS.
-BULIG_IP_DENY_PRIVATE="localhost link-local multicast 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7"
+# Numeric prefixes only: systemd-run (systemd 255) refuses a symbolic name such as localhost inside a list
+# ("Failed to parse IP address prefix"), and these go into transient units. Unit files share the same rule.
+BULIG_IP_DENY_PRIVATE="127.0.0.0/8 ::1/128 169.254.0.0/16 fe80::/10 224.0.0.0/4 ff00::/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7"
 BULIG_AF_NO_UNIX="AF_INET AF_INET6"
 BULIG_AF_WITH_UNIX="AF_UNIX AF_INET AF_INET6"
 BULIG_INACCESSIBLE="-/run/tailscale -/run/snapd.socket -/run/docker.sock -/var/run/docker.sock"

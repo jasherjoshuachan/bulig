@@ -119,7 +119,7 @@ echo "the properties of each set"
 props() { # props <function call...>: print the array the function fills, one -p value per line
   bash -c ". '$deploy/lib/common.sh'; . '$deploy/lib/fence.sh'; $1" | tr '\n' ' '
 }
-DENY="localhost link-local multicast 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7"
+DENY="127.0.0.0/8 ::1/128 169.254.0.0/16 fe80::/10 224.0.0.0/4 ff00::/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7"
 HOSTS="2001:db8::10/128 203.0.113.10/32"
 INACC="-/run/tailscale -/run/snapd.socket -/run/docker.sock -/var/run/docker.sock"
 RES="/run/systemd/resolve/resolv.conf:/etc/resolv.conf"

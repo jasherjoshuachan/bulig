@@ -47,7 +47,11 @@ for f in files:
         # skips only the address rules, never the port or display words.
         addresses_ok = "scan-forbidden: allow-addresses" in line
         for m in ([] if addresses_ok else v4.finditer(line)):
-            if not allowed4([int(x) for x in m.groups()]):
+            o = [int(x) for x in m.groups()]
+            # The base of a well-known range written as a prefix (link-local 169.254.0.0/16, multicast 224.0.0.0/4)
+            # names no host; a host inside it is still caught.
+            if o in ([169, 254, 0, 0], [224, 0, 0, 0]) and line[m.end():m.end() + 1] == "/": continue
+            if not allowed4(o):
                 print(path + ":" + str(n) + " (ipv4-outside-allowed-ranges)")
         for m in ([] if addresses_ok else v6.finditer(line)):
             if not m.group(1).lower().replace("0db8", "db8").startswith("2001:db8"):
@@ -55,7 +59,7 @@ for f in files:
         for name, rx in words:
             if rx.search(line):
                 print(path + ":" + str(n) + " (" + name + ")")
-')"
+')" || { echo "verify: the built-in host-detail check did not run (its checker failed), so the tree is not known to be clean" >&2; exit 1; }
 if [ -n "$builtin_hits" ]; then
   echo "verify: real host details found at (file:line, rule):" >&2
   echo "$builtin_hits" >&2

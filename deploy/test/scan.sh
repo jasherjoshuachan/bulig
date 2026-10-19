@@ -39,6 +39,12 @@ offends "a public IPv4 address" ipv4-outside-allowed-ranges "ssh $pub4" "$pub4"
 offends "an address just below the Tailscale range" ipv4-outside-allowed-ranges "peer 100.$((64 - 1)).0.1" "100.63"
 offends "an address just above the Tailscale range" ipv4-outside-allowed-ranges "peer 100.$((127 + 1)).0.1" "100.128"
 offends "172.32 (just outside 172.16/12)" ipv4-outside-allowed-ranges "bridge 172.$((31 + 1)).0.1" "172.32"
+mkrepo "$repo"
+printf 'deny 169.254.0.0/16 224.0.0.0/4\n' >"$repo/ranges.txt"
+git -C "$repo" add ranges.txt
+expect_ok "the link-local and multicast range bases written as prefixes pass" run_scan "$repo"
+llb="169.$((250 + 4)).0.0"
+offends "the link-local base without a prefix is still an address" ipv4-outside-allowed-ranges "x $llb y" "$llb"
 offends "a link-local IPv4 address" ipv4-outside-allowed-ranges "x 169.$((250 + 4)).1.1" "169.254"
 g6="26""06:47""00::11""11"
 offends "a global IPv6 address" ipv6-global-address "v6 $g6" "$g6"
@@ -72,6 +78,12 @@ mkrepo "$repo"
 printf 'tar -xzf x; has-ac-in-a-word; 22922 is fine; 1.2.3.4.5; 300.1.1.1\n' >"$repo/ok2.txt"
 git -C "$repo" add ok2.txt
 expect_ok "near misses pass (a word with ac in it, a longer number, a five-part version, an octet over 255)" run_scan "$repo"
+
+# A checker that crashes must fail the scan, never pass it (found 20 Oct 2026: a quoting slip crashed it and it said clean).
+broken="$work/scan-broken.sh"
+sed 's/^import re, sys$/import re, sys; raise SystemExit(3)/' "$scan" >"$broken"
+mkrepo "$repo"
+if env -u BULIG_FORBIDDEN_TERMS XDG_CONFIG_HOME="$work/none" SCAN_ROOT="$repo" bash "$broken" >"$work/scan.out" 2>&1; then bad "a scan whose checker crashes passed"; elif grep -q "did not run" "$work/scan.out"; then ok "a scan whose checker crashes fails, and says so"; else bad "a crashed checker failed without saying why: $(cat "$work/scan.out")"; fi
 
 echo "the old text, put back into the real tree"
 real="$work/real-copy"

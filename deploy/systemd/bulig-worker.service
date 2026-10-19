@@ -76,7 +76,7 @@ SystemCallArchitectures=native
 # - DNS: /etc/resolv.conf is the systemd-resolved stub on 127.0.0.53, which would have to be allowed, and an allowed address reaches every
 #   listener on it. So the unit gets resolved's upstream list in its place (public servers, which the deny list does not touch).
 # - InaccessiblePaths hides the other sockets a unix connection could have reached (tailscaled, snapd, docker) if AF_UNIX were ever allowed.
-IPAddressDeny=localhost link-local multicast 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7
+IPAddressDeny=127.0.0.0/8 ::1/128 169.254.0.0/16 fe80::/10 224.0.0.0/4 ff00::/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7
 IPAddressAllow=127.74.3.1/32
 BindReadOnlyPaths=/run/systemd/resolve/resolv.conf:/etc/resolv.conf
 InaccessiblePaths=-/run/tailscale -/run/snapd.socket -/run/docker.sock -/var/run/docker.sock

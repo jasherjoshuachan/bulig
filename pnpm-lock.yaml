@@ -53,6 +53,9 @@ importers:
       '@bulig/worker-claude-code':
         specifier: workspace:*
         version: link:../../plugins/worker-claude-code
+      '@bulig/worker-gateway':
+        specifier: workspace:*
+        version: link:../../plugins/worker-gateway
       tsx:
         specifier: ^4.20.0
         version: 4.23.15
@@ -188,6 +191,25 @@ importers:
       '@bulig/text':
         specifier: workspace:*
         version: link:../../packages/text
+    devDependencies:
+      '@bulig/core':
+        specifier: workspace:*
+        version: link:../../packages/core
+
+  plugins/worker-gateway:
+    dependencies:
+      '@bulig/plugin-sdk':
+        specifier: workspace:*
+        version: link:../../packages/plugin-sdk
+      '@bulig/text':
+        specifier: workspace:*
+        version: link:../../packages/text
+      '@bulig/worker-claude-code':
+        specifier: workspace:*
+        version: link:../worker-claude-code
+      zod:
+        specifier: ^4.1.0
+        version: 4.6.5
     devDependencies:
       '@bulig/core':
         specifier: workspace:*

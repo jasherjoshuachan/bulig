@@ -223,7 +223,7 @@ describe('the worker, against a kernel that is just a script', () => {
       } finally {
         await worker.stop();
       }
-    });
+    }, 120_000); // its own waits add up to 90 s (Claude start, then give up), past the 60 s default
 
     it('control: 200 answers keep the run going and its result is sent', async () => {
       const w = makeWorld();
@@ -237,7 +237,7 @@ describe('the worker, against a kernel that is just a script', () => {
       } finally {
         await worker.stop();
       }
-    });
+    }, 120_000);
   });
 });
 

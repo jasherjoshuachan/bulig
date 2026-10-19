@@ -1,0 +1,89 @@
+[Unit]
+Description=Bulig worker (bulig worker): runs Claude Code for the kernel
+Documentation=https://github.com/jasherjoshuachan/bulig
+# The worker connects to the kernel's gateway on 127.74.3.1:7431. It can start first and retry, but ordering it after the kernel is tidier.
+After=network-online.target bulig.service bulig-loopback.service systemd-resolved.service
+Wants=network-online.target bulig.service bulig-loopback.service systemd-resolved.service
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+# Its own user, apart from the kernel's. This is the user that runs Claude Code and the commands Claude runs, so it must not be able to
+# read the kernel's secrets: /etc/bulig is root-only, and the kernel's $CREDENTIALS_DIRECTORY belongs to the other user.
+User=bulig-worker
+Group=bulig-worker
+# THE INVARIANT: systemd makes /var/lib/bulig-worker and owns it (bulig-worker:bulig-worker, 0700). Root never creates, writes or chowns
+# anything inside it. The worker's clones and stage folders (work/) are made by the worker itself. ProtectSystem=strict below makes this
+# folder (and only this one) writable.
+StateDirectory=bulig-worker
+StateDirectoryMode=0700
+WorkingDirectory=/opt/bulig/current
+# Only two credentials: the Claude token, and this worker's own token for the gateway. Not the config, not the database URL, not the
+# GitHub token: the worker reads no kernel config and gets everything it needs from its flags.
+LoadCredential=claude-token:/etc/bulig/claude-token
+LoadCredential=worker-token:/etc/bulig/worker-token
+# Not secret, root-owned: BULIG_WORKER_REPOS="--repo <kernelPath>=<localClone> ..." (see worker.env.example). The worker needs at least one.
+EnvironmentFile=/etc/bulig/worker.env
+Environment=HOME=/var/lib/bulig-worker
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# %d is this unit's credentials directory, %S is /var/lib. --slots 2: at most two jobs at once on this machine. $BULIG_WORKER_REPOS is
+# split into words on purpose (one --repo per repository).
+ExecStart=/usr/bin/node /opt/bulig/current/packages/cli/bin/bulig.mjs worker --kernel http://127.74.3.1:7431 --id vps --token-file %d/worker-token --claude-token-file %d/claude-token --work-dir %S/bulig-worker/work --slots 2 $BULIG_WORKER_REPOS
+Restart=always
+RestartSec=5
+TimeoutStopSec=60
+KillMode=control-group
+# Private to bulig-worker.
+UMask=0077
+
+# Caps (ADR 0011). With the kernel's, this leaves the rest of the 8 CPUs and 15 GB to client production.
+MemoryMax=3G
+CPUQuota=250%
+TasksMax=512
+CPUWeight=50
+Nice=10
+LimitNOFILE=65536
+
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=true
+PrivateDevices=true
+# Read-only everywhere except this user's own StateDirectory (Claude's sign-in and settings, and its clones under work/).
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+SystemCallArchitectures=native
+# NETWORK AND SOCKETS. This unit runs Claude (a prompt can steer it) and the commands Claude runs, so it gets the narrowest reach.
+# Other services on this host listen on loopback and on the container bridges with no login of their own, and another tenant's program can
+# listen on an abstract unix socket that no file permission or PrivateTmp hides. So:
+# - RestrictAddressFamilies has no AF_UNIX (and no AF_NETLINK): the unit cannot open a unix socket at all, abstract ones included. Pipes and
+#   socketpair() are not affected (systemd.exec: "sockets created with socketpair() are unaffected"), which is what node's child_process uses.
+# - IPAddressDeny/Allow filter every IP packet in both directions (an Allow match wins, then a Deny match, then the packet is let through,
+#   which is the public internet). They match ADDRESSES, NOT PORTS: 127.74.3.1 is allowed for the kernel gateway, so a service listening on
+#   every address is also reachable at 127.74.3.1, with a loopback source (it may treat that as trusted). The host's own public addresses are denied as well; they
+#   are read from the machine at setup time into a drop-in (bulig-worker.service.d/10-host-addresses.conf, root-owned), not written here.
+# - DNS: /etc/resolv.conf is the systemd-resolved stub on 127.0.0.53, which would have to be allowed, and an allowed address reaches every
+#   listener on it. So the unit gets resolved's upstream list in its place (public servers, which the deny list does not touch).
+# - InaccessiblePaths hides the other sockets a unix connection could have reached (tailscaled, snapd, docker) if AF_UNIX were ever allowed.
+IPAddressDeny=localhost link-local multicast 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7
+IPAddressAllow=127.74.3.1/32
+BindReadOnlyPaths=/run/systemd/resolve/resolv.conf:/etc/resolv.conf
+InaccessiblePaths=-/run/tailscale -/run/snapd.socket -/run/docker.sock -/var/run/docker.sock
+RestrictAddressFamilies=AF_INET AF_INET6
+# NOT set on purpose:
+#   MemoryDenyWriteExecute  node's JIT needs writable+executable memory.
+#   RestrictNamespaces      Claude Code's own sandbox uses namespaces if it is switched on.
+
+[Install]
+WantedBy=multi-user.target

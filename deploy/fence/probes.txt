@@ -1,0 +1,46 @@
+# The fence probes that are safe to publish: generic, with nothing about this machine or its other tenants in them. deploy/fence-check.sh
+# runs them from inside each Bulig property set (worker, kernel, build, cli-worker, cli-kernel) and fence-probe.py judges them. It adds more
+# probes at run time, none of them in git:
+#   1. derived: fence-probe.py derive reads this machine's listeners (ss), its own addresses (ip) and its abstract unix sockets, and makes a deny
+#      probe for every loopback, private-range and tailscale listener, for every wildcard listener port on the loopback, private and own
+#      addresses, and for every abstract socket. So whatever else runs here is probed without being named.
+#   2. /etc/bulig/fence-extra-probes.txt: root-owned, 0600, written on the server (RUNBOOK, "The extra probes"). fence-check.sh FAILS if it is
+#      missing or has no probe in it, so the machine-specific probes cannot be silently skipped.
+# Columns:   expect   sets   name   kind   target
+#
+# expect  deny        must FAIL to connect (any error). A failed connection only counts as blocked when the control run outside the fence
+#                     reached the same target; otherwise it is "inconclusive" (a warning).
+#         allow       must succeed.
+#         allow-late  must succeed, but only a warning if it does not (the kernel may not be up yet).
+#         known       a documented limit: reported, never fails.
+# sets    comma list of: worker kernel build cli-worker cli-kernel
+# kind    tcp host:port | [v6]:port | unix path | abstract name (leading NUL added) | dns hostname | https hostname | http url
+#         | pwd (getpwuid of the running uid) | socketpair (AF_UNIX socketpair, what node child_process uses) | spawn (run a child)
+#         | node (run `node -e <target>`; works when it exits 0) | exec (run the command in <target>; works when it exits 0)
+#
+# The build's user lookup is a KNOWN limit: it runs as a DynamicUser, which has no /etc/passwd entry, and libnss_systemd resolves dynamic users
+# only over a varlink unix socket, which needs AF_UNIX, which the build does not have (on purpose). The build does not need the lookup (HOME is
+# set explicitly; node's os.homedir() reads $HOME), and node-homedir proves that.
+
+# --- the systemd-resolved stub: reachable only through resolved's upstream list, never directly
+deny  worker,kernel,build,cli-worker,cli-kernel  resolver-stub-dns-tcp   tcp       127.0.0.53:53
+# --- well-known unix sockets that a Bulig unit has no business with
+deny  worker,kernel,build,cli-worker,cli-kernel  tailscaled-socket       unix      /run/tailscale/tailscaled.sock
+deny  worker,kernel,build,cli-worker,cli-kernel  snapd-socket            unix      /run/snapd.socket
+deny  worker,kernel,build,cli-worker,cli-kernel  docker-socket           unix      /run/docker.sock
+# --- Bulig's own Postgres socket: the kernel needs it, the worker and the build must not have it
+deny  worker,build,cli-worker                    postgres-socket         unix      /var/run/postgresql/.s.PGSQL.5436
+allow kernel,cli-kernel                          postgres-socket         unix      /var/run/postgresql/.s.PGSQL.5436
+
+# --- what each unit does need
+allow worker,kernel,build,cli-worker,cli-kernel  dns-lookup              dns       api.github.com
+allow worker,kernel,build,cli-worker,cli-kernel  https-github            https     api.github.com
+allow worker,kernel,cli-worker,cli-kernel        user-lookup             pwd       -
+known build                                      user-lookup-dynamic     pwd       -
+allow build                                      node-homedir            node      console.log(require('os').homedir())
+allow worker,build,cli-worker                    socketpair-for-children socketpair -
+allow worker,build,cli-worker                    spawn-a-child           spawn     -
+allow worker,cli-worker                          node-https-anthropic    node      fetch('https://api.anthropic.com/',{signal:AbortSignal.timeout(8000)}).then(()=>process.exit(0),e=>{console.error(String(e&&e.cause||e));process.exit(1)})
+known worker,cli-worker                          node-network-interfaces node      require('os').networkInterfaces()
+allow worker,cli-worker                          claude-version          exec      claude --version
+allow-late worker,cli-worker                     kernel-gateway-healthz  http      http://127.74.3.1:7431/healthz

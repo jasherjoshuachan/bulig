@@ -44,7 +44,7 @@ const USAGE = `bulig: a small kernel for Claude Code agent work
 
 Usage:
   bulig serve
-  bulig run --repo <path> --title <text> [--issue <text>]
+  bulig run --repo <path> --title <text> [--issue <text>]   (one-off; needs "worker-claude-code" in the config, else use serve)
   bulig approve <jobId> <plan|merge> <stageId>
   bulig deny <jobId> <stageId>
   bulig resume <jobId>
@@ -171,6 +171,19 @@ export function assertWiring(plugins: readonly Plugin[], enabled: readonly strin
 /** The plugins `run`, `approve`, `deny` and `resume` load: the terminal channel and the core. Telegram belongs to `serve`. */
 const terminalPlugins = (channel: CliChannel): Plugin[] => [channel.plugin, ...CORE_PLUGINS];
 
+/**
+ * A one-off command (run, approve, resume) loads the in-process worker and never the gateway, so a config without
+ * `worker-claude-code` leaves the first stage with nobody to take it: the job would sit queued with no error. Refuse before anything is written.
+ */
+function assertOneOffHasWorker(config: BuligConfig, command: string): void {
+  if (config.enabled.includes('worker-claude-code')) return;
+  throw new UserError(
+    `bulig ${command} cannot run here: the config has no worker for one-off commands ("worker-claude-code" is not enabled, and a one-off command never starts the worker gateway). ` +
+      'Jobs on this machine go through "bulig serve". On a gateway-only server, submit through the channel serve listens on. ' +
+      'To run one-off, stop serve first and add "worker-claude-code" to "enabled".',
+  );
+}
+
 async function openSession(
   config: BuligConfig,
   io: Io,
@@ -281,6 +294,7 @@ async function cmdRun(args: string[], io: Io): Promise<number> {
   const repo = resolve(io.cwd, values.repo);
   if (!existsSync(resolve(repo, '.git'))) throw new UserError(`${repo} is not a git repository`);
   const { config } = loadConfig(io.cwd, io.home, io.env);
+  assertOneOffHasWorker(config, 'run');
 
   const session = await openSession(config, io, false);
   try {
@@ -296,6 +310,7 @@ async function cmdApprove(args: string[], io: Io): Promise<number> {
   const [idArg, kind, stageArg, ...extra] = args;
   if (!idArg || (kind !== 'plan' && kind !== 'merge') || extra.length) throw new UserError('usage: bulig approve <jobId> <plan|merge> <stageId>');
   const { config } = loadConfig(io.cwd, io.home, io.env);
+  assertOneOffHasWorker(config, 'approve');
   const { job, stages } = await lookup(config, io, idArg);
   const waiting = stages.find((s) => s.name.startsWith('approve-') && s.status === 'running');
   if (job.status !== 'awaiting_approval' || !waiting) {
@@ -348,6 +363,7 @@ async function cmdResume(args: string[], io: Io): Promise<number> {
   const [idArg, ...extra] = args;
   if (!idArg || extra.length) throw new UserError('usage: bulig resume <jobId>');
   const { config } = loadConfig(io.cwd, io.home, io.env);
+  assertOneOffHasWorker(config, 'resume');
   const { job } = await lookup(config, io, idArg);
   if (job.status !== 'running' && job.status !== 'queued') throw new UserError(`job ${job.id} is ${job.status.replace('_', ' ')}; only running jobs resume`);
   const session = await openSession(config, io, [job.id], job.id);

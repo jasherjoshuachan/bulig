@@ -548,3 +548,35 @@ describePg('the CLI on Postgres', () => {
     expect(existsSync(w.config.dbPath)).toBe(false);
   });
 });
+
+describe('a one-off command with no worker to take its stages', () => {
+  const gatewayOnly = { enabled: ['channel-cli', 'worker-gateway', 'github', 'pipeline-dev'] };
+
+  it('run refuses at once, says why, and leaves no record: no database, no job', async () => {
+    const w = world(gatewayOnly);
+    const run = await w.run('run', '--repo', w.repo, '--title', 'T');
+    expect(run.code).toBe(2);
+    expect(run.err).toContain('the config has no worker for one-off commands');
+    expect(run.err).toContain('bulig serve');
+    expect(run.out).toBe('');
+    expect(existsSync(join(w.root, 'db'))).toBe(false);
+  });
+
+  it('approve and resume refuse the same way, before they open the record', async () => {
+    const w = world(gatewayOnly);
+    const approve = await w.run('approve', 'abc', 'plan', 'stage');
+    expect(approve.code).toBe(2);
+    expect(approve.err).toContain('no worker for one-off commands');
+    const resume = await w.run('resume', 'abc');
+    expect(resume.code).toBe(2);
+    expect(resume.err).toContain('no worker for one-off commands');
+    expect(existsSync(join(w.root, 'db'))).toBe(false);
+  });
+
+  it('the default config still runs a job to its first approval', async () => {
+    const w = world();
+    const run = await w.run('run', '--repo', w.repo, '--title', 'Add multiply function', '--issue', 'Add src/multiply.js');
+    expect(run.err).toBe('');
+    expect(run.out).toContain('approval needed: plan');
+  });
+});

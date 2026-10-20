@@ -1,18 +1,30 @@
 """One fence probe run, from inside a Bulig unit (or, in "control" mode, from outside every fence). Used by fence-check.sh; tested offline in
-deploy/test/fence.sh against local listeners.
+deploy/test/fence.sh against local listeners that count the connections they accept.
 
-    python3 fence-probe.py control <set> <probes.txt|-> [--host-addrs "a/32 b/128"]
-        As root, outside any fence: print "<name>=open|closed" for every deny and known probe of that set. "-" reads the probes from stdin.
-    python3 fence-probe.py fenced  <set> <probes.txt|-> [--host-addrs ...] [--control "name=open,..."] [--late-only | --no-late]
+THE RULE: this kit never completes a connection to anything that is not Bulig's, from any context, and never wakes a socket-activated unit
+that is not Bulig's. The only probes that connect are the "allow" ones (Bulig's own gateway, its Postgres socket, DNS, github, anthropic) and
+the "deny" ones, which run inside the fence and must fail before they reach anything. A deny probe that SUCCEEDS is a real connection to
+another service: that is exactly why it is a failure, and why the other modes never connect at all.
+
+    python3 fence-probe.py control <set> <probes.txt|-> --ss-tcp <ss -Hltn output> --ss-unix <ss -Hxl output> --activation <systemctl list-sockets output>
+                           [--host-addrs "a/32 b/128"]
+        As root, outside any fence, WITHOUT CONNECTING to anything: print "<name>=open|closed|activation" for every deny and known probe of that set.
+        open = ss lists a listener at that address. closed = ss does not list one (inconclusive). activation = the target is a socket that systemd
+        listens on for another unit (systemctl list-sockets), so nothing may connect to it. "-" reads the probes from stdin.
+    python3 fence-probe.py fenced  <set> <probes.txt|-> --control "name=open,..." --af "<RestrictAddressFamilies>" [--ip-deny "..."]
+                           [--ip-allow "..."] [--inaccessible "..."] [--host-addrs ...] [--late-only | --no-late]
         Inside the unit: run the probes of that set and print "ok|FAIL|warn|info <set> <name> <detail>". Exit 1 if anything FAILed.
+        The unit's own properties are passed in, because known limits and activation sockets are judged from them, not by connecting.
     python3 fence-probe.py derive <ss -ltn output> <ss -xl output> <ip -o addr output>
         Print deny probes for what is listening on THIS machine (loopback, private-range and tailscale listeners, every wildcard listener port on
         the loopback, private and own addresses, every abstract unix socket), so the list needs no names of other services.
 
-A "deny" probe passes when the connection fails AND the control run found the target open (so the failure is the fence's doing). It FAILs when
-the connection works (the fence leaks). If the control found the target closed, or there is no control result, a failure proves nothing, so
-it is only a warning ("inconclusive").
+A "deny" probe passes when the connection fails AND the control run found the target listed by ss (so the failure is the fence's doing). It FAILs
+when the connection works (the fence leaks). If ss did not list the target, a failure proves nothing, so it is only a warning ("inconclusive").
+A "known" probe (a documented limit) never connects: it reports the limit from the unit's properties and ss. A target that is socket-activated
+is never connected to by any mode: it is judged from the unit's properties only.
 """
+import ipaddress
 import os
 import socket
 import ssl
@@ -34,6 +46,8 @@ def parse_probes(path, set_name, host_addrs):
         if len(parts) != 5:
             raise SystemExit(f"bad probe line: {line!r}")
         expect, sets, name, kind, target = parts
+        if expect not in ("deny", "known", "allow", "allow-late"):
+            raise SystemExit(f"unknown expectation {expect!r}")
         if set_name not in sets.split(","):
             continue
         if "@HOST@" in target:
@@ -222,6 +236,174 @@ def derive(ss_tcp, ss_unix, ip_addr):
     return lines[:MAX_DERIVED]
 
 
+# ---- reading the host without connecting to it -------------------------------------------------------------------------------------------------
+
+# Kinds that open a connection to something. A known probe of one of these is never run; a deny probe of one is never run against an
+# activation socket.
+CONNECT_KINDS = ("tcp", "unix", "abstract", "http", "https", "dns")
+
+
+def norm_path(p):
+    """/var/run is /run; ss and systemd may print either."""
+    return "/run/" + p[len("/var/run/"):] if p.startswith("/var/run/") else p
+
+
+def read_tcp_listeners(path):
+    """Listening (host, port) pairs from `ss -H -ltn` output."""
+    out = []
+    for line in open(path):
+        f = line.split()
+        if len(f) >= 4 and f[0] == "LISTEN":
+            host, port = split_listener(f[3])
+            if port.isdigit():
+                out.append((host, int(port)))
+    return out
+
+
+def read_unix_listeners(path):
+    """Names of listening unix sockets from `ss -H -xl` output: a path, or '@name' for an abstract socket."""
+    out = set()
+    for line in open(path):
+        f = line.split()
+        if len(f) >= 5 and f[1] == "LISTEN":
+            out.add(f[4] if f[4].startswith("@") else norm_path(f[4]))
+    return out
+
+
+def read_activation(path):
+    """The listen addresses that systemd holds for a socket unit, from `systemctl list-sockets` output: (tcp host, port) pairs, paths, and
+    '@name' abstract names. Other lines (netlink and kernel sockets, headers) have none of these forms and are ignored."""
+    tcp, unix = [], set()
+    for line in open(path):
+        f = line.split()
+        if not f:
+            continue
+        listen = f[0]
+        if listen.startswith("@"):
+            unix.add(listen)
+        elif listen.startswith("/"):
+            unix.add(norm_path(listen))
+        else:
+            host, port = split_listener(listen)
+            if port.isdigit() and host:
+                tcp.append((host, int(port)))
+    return tcp, unix
+
+
+def _ip(host):
+    try:
+        return ipaddress.ip_address(host.split("%")[0].strip("[]"))
+    except ValueError:
+        return None
+
+
+def tcp_host_matches(listen_host, host, wildcard_any_family):
+    """Does a listener bound to listen_host take connections to host? A wildcard takes any address of its family (any family, when
+    wildcard_any_family: used for activation sockets, where a miss would wake a service, so the match is as wide as it can be)."""
+    a, b = _ip(listen_host), _ip(host)
+    if listen_host in ("*", "0.0.0.0", "::"):
+        if wildcard_any_family or listen_host == "*" or b is None:
+            return True
+        return a is not None and b is not None and a.version == b.version
+    if a is None or b is None:
+        return listen_host == host
+    return a == b
+
+
+def tcp_listed(host, port, listeners, wildcard_any_family=False):
+    return any(lp == port and tcp_host_matches(lh, host, wildcard_any_family) for lh, lp in listeners)
+
+
+def is_activation(kind, target, activation):
+    act_tcp, act_unix = activation
+    if kind == "tcp":
+        host, port = split_hostport(target)
+        return tcp_listed(host, port, act_tcp, wildcard_any_family=True)
+    if kind == "unix":
+        return norm_path(target) in act_unix
+    if kind == "abstract":
+        return "@" + target in act_unix
+    return False
+
+
+def control_state(kind, target, tcp_listeners, unix_listeners, activation):
+    """open | closed | activation, from text only. This never opens a socket."""
+    if is_activation(kind, target, activation):
+        return "activation"
+    if kind == "tcp":
+        host, port = split_hostport(target)
+        return "open" if tcp_listed(host, port, tcp_listeners) else "closed"
+    if kind == "unix":
+        return "open" if norm_path(target) in unix_listeners else "closed"
+    if kind == "abstract":
+        return "open" if "@" + target in unix_listeners else "closed"
+    return "closed"
+
+
+class UnitProps:
+    """What the unit being probed is allowed to do, as systemd reports it. Known limits and activation sockets are judged from this."""
+
+    def __init__(self, af, ip_deny, ip_allow, inaccessible):
+        self.af = af.split()
+        self.deny = self._nets(ip_deny)
+        self.allow = self._nets(ip_allow)
+        self.inaccessible = [norm_path(x.lstrip("-+!~")) for x in inaccessible.split()]
+
+    @staticmethod
+    def _nets(text):
+        named = {
+            "any": ["0.0.0.0/0", "::/0"],
+            "localhost": ["127.0.0.0/8", "::1/128"],
+            "link-local": ["169.254.0.0/16", "fe80::/10"],
+            "multicast": ["224.0.0.0/4", "ff00::/8"],
+        }
+        out = []
+        for tok in text.split():
+            for item in named.get(tok, [tok]):
+                try:
+                    out.append(ipaddress.ip_network(item, strict=False))
+                except ValueError:
+                    pass
+        return out
+
+    def has_af_unix(self):
+        if self.af and self.af[0].startswith("~"):  # a deny list: ~AF_UNIX AF_NETLINK
+            return "AF_UNIX" not in [x.lstrip("~") for x in self.af]
+        return "AF_UNIX" in self.af or not self.af  # no list at all means no restriction
+
+    def address_denied(self, host):
+        a = _ip(host)
+        if a is None:
+            return False
+        if any(a in n for n in self.allow if n.version == a.version):
+            return False
+        return any(a in n for n in self.deny if n.version == a.version)
+
+    def path_hidden(self, path):
+        p = norm_path(path)
+        return any(p == h or p.startswith(h.rstrip("/") + "/") for h in self.inaccessible)
+
+
+def ss_note(state):
+    return {"activation": "an activation socket", "open": "listed by ss", "closed": "not listed by ss"}.get(state, "no ss result")
+
+
+def properties_verdict(kind, target, props):
+    """(ok, text): is the target out of reach of this unit, judged only from the unit's properties?"""
+    if kind == "tcp":
+        host, _ = split_hostport(target)
+        if props.address_denied(host):
+            return True, f"{host} is denied by IPAddressDeny"
+        return False, f"{host} is NOT denied by the unit's IP filter"
+    if kind in ("unix", "abstract"):
+        if not props.has_af_unix():
+            return True, "the unit has no AF_UNIX, so it cannot open a unix socket"
+        if kind == "unix" and props.path_hidden(target):
+            return True, "the path is hidden by InaccessiblePaths"
+        return False, "the unit has AF_UNIX and nothing hides this socket, so it could connect if it listens"
+    return False, "cannot be judged from properties"
+
+
 def main(argv):
     if len(argv) == 5 and argv[1] == "derive":
         for line in derive(argv[2], argv[3], argv[4]):
@@ -231,15 +413,16 @@ def main(argv):
         print(__doc__)
         return 2
     mode, set_name, probes_file = argv[1], argv[2], argv[3]
-    host_addrs, control, late = [], {}, "both"
+    opts = {"--host-addrs": "", "--control": None, "--af": None, "--ip-deny": "", "--ip-allow": "", "--inaccessible": "",
+            "--ss-tcp": None, "--ss-unix": None, "--activation": None}
+    late = "both"
     i = 4
     while i < len(argv):
         a = argv[i]
-        if a == "--host-addrs":
-            host_addrs = argv[i + 1].split()
-            i += 2
-        elif a == "--control":
-            control = dict(kv.split("=", 1) for kv in argv[i + 1].split(",") if "=" in kv)
+        if a in opts:
+            if i + 1 >= len(argv):
+                raise SystemExit(f"{a} needs a value")
+            opts[a] = argv[i + 1]
             i += 2
         elif a == "--late-only":
             late = "only"
@@ -249,26 +432,64 @@ def main(argv):
             i += 1
         else:
             raise SystemExit(f"unknown argument {a}")
+    host_addrs = opts["--host-addrs"].split()
     probes = parse_probes(probes_file, set_name, host_addrs)
+    if mode == "control":
+        # Text only: ss and systemctl output that root read before. Nothing here may open a socket. All three are required, so that a missing
+        # one cannot turn into "nothing is socket-activated".
+        for flag in ("--ss-tcp", "--ss-unix", "--activation"):
+            if opts[flag] is None:
+                raise SystemExit(f"control needs {flag}: it reads the host from ss and systemctl, it never connects")
+        tcp_l, unix_l = read_tcp_listeners(opts["--ss-tcp"]), read_unix_listeners(opts["--ss-unix"])
+        activation = read_activation(opts["--activation"])
+        for expect, name, kind, target in probes:
+            if expect in ("deny", "known"):
+                print(f"{name}={control_state(kind, target, tcp_l, unix_l, activation)}")
+        return 0
+    # fenced: --control and --af are required, so that a caller that forgot them cannot make a deny probe connect to an activation socket or
+    # an abstract socket it could reach.
+    if opts["--control"] is None or opts["--af"] is None:
+        raise SystemExit("fenced needs --control (what the control run found) and --af (the unit's RestrictAddressFamilies)")
+    control = dict(kv.split("=", 1) for kv in opts["--control"].split(",") if "=" in kv)
+    props = UnitProps(opts["--af"], opts["--ip-deny"], opts["--ip-allow"], opts["--inaccessible"])
     failed = 0
     for expect, name, kind, target in probes:
-        if mode == "control":
-            if expect in ("deny", "known"):
-                ok, _ = attempt(kind, target)
-                print(f"{name}={'open' if ok else 'closed'}")
-            continue
         is_late = expect == "allow-late"
         if late == "only" and not is_late:
             continue
         if late == "no" and is_late:
             continue
+        state = control.get(name)
+        if expect == "known" and kind in CONNECT_KINDS:
+            # A documented limit is reported from the unit's properties and ss. Connecting to prove it would be a real connection to
+            # another service (and could start it), so it is never tested that way.
+            _, why = properties_verdict(kind, target, props)
+            print(f"info {set_name} {name} known limit, not tested by connecting: {kind} {target[:60]} ({ss_note(state)}; {why})")
+            continue
+        if expect == "deny" and kind in ("tcp", "unix", "abstract"):
+            if state == "activation":
+                # Systemd listens on this socket for another unit: a connection would start it. Judged from properties only.
+                good, why = properties_verdict(kind, target, props)
+                if good:
+                    print(f"ok {set_name} {name} activation socket: checked by properties only ({why})")
+                elif kind == "tcp":
+                    print(f"FAIL {set_name} {name} activation socket: checked by properties only, and {kind} {target} is reachable: {why}")
+                    failed += 1
+                else:
+                    print(f"info {set_name} {name} activation socket: checked by properties only; known limit, not tested by connecting ({why})")
+                continue
+            if kind != "tcp" and props.has_af_unix() and not (kind == "unix" and props.path_hidden(target)):
+                # Nothing fences this: the unit may open a unix socket and the path is not hidden, so a connection would simply succeed.
+                good, why = properties_verdict(kind, target, props)
+                print(f"info {set_name} {name} known limit, not tested by connecting: {kind} {target[:60]} ({ss_note(state)}; {why})")
+                continue
         ok, detail = attempt(kind, target)
         if expect == "deny":
             if ok:
                 print(f"FAIL {set_name} {name} UNEXPECTED SUCCESS: {kind} {target} was reachable ({detail})")
                 failed += 1
-            elif control.get(name) != "open":
-                print(f"warn {set_name} {name} inconclusive: {target} was not shown to be listening without the fence ({detail})")
+            elif state not in ("open", "activation"):
+                print(f"warn {set_name} {name} inconclusive: {target} was not shown to be listening by ss ({detail})")
             else:
                 print(f"ok {set_name} {name} blocked ({detail})")
         elif expect == "allow":
@@ -283,6 +504,7 @@ def main(argv):
             else:
                 print(f"warn {set_name} {name} not reachable yet: {target} ({detail}). Check again once the kernel is up.")
         elif expect == "known":
+            # (kinds that open no connection to another service: a user lookup, node's interface list, a child process)
             print(f"info {set_name} {name} known limit: {kind} {target[:60]} " + ("works" if ok else f"does not work ({detail})"))
         else:
             raise SystemExit(f"unknown expectation {expect!r}")

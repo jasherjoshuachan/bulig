@@ -12,7 +12,12 @@ another service: that is exactly why it is a failure, and why the other modes ne
         (Socket activation is not decided here: the fenced run decides it from each target.)
     python3 fence-probe.py fenced  <set> <probes.txt|-> --control "name=open,..." --af "<RestrictAddressFamilies>"
                            --activation-text "<systemctl list-sockets output>" [--ip-deny "..."] [--ip-allow "..."] [--inaccessible "..."] [--host-addrs ...] [--late-only | --no-late]
+                           [--deny-timeout 1.5] [--jobs 32]
         Inside the unit: run the probes of that set and print "ok|FAIL|warn|info <set> <name> <detail>". Exit 1 if anything FAILed.
+        Speed (neither changes a verdict): a deny probe is dropped by the IP filter, so a blocked one ends in a timeout, and that wait used to be
+        the whole run (about 180 probes x 5 sets x 3 s, one after another). Deny probes now wait --deny-timeout seconds (default 1.5; allow probes keep
+        3 s and a timeout is still a FAIL for them) and run --jobs at a time (default 32; --jobs 1 is the plain one-after-another order). Results
+        are always printed in the probe file's order.
         The unit's own properties are passed in, because known limits and activation sockets are judged from them, not by connecting.
         Whether a target is socket-activated is decided from the target itself (against --activation-text), never from its probe name.
         A tcp deny target that the unit's own IPAddressDeny/IPAddressAllow leave open is a FAIL from the properties, without connecting.
@@ -26,6 +31,7 @@ when the connection works (the fence leaks). If ss did not list the target, a fa
 A "known" probe (a documented limit) never connects: it reports the limit from the unit's properties and ss. A target that is socket-activated
 is never connected to by any mode: it is judged from the unit's properties only.
 """
+import concurrent.futures
 import ipaddress
 import os
 import re
@@ -36,7 +42,13 @@ import sys
 import http.client
 import urllib.parse
 
-TIMEOUT = 3.0
+TIMEOUT = 3.0  # allow probes (Bulig's own targets): a slow answer is still an answer, a timeout is a FAIL
+# A deny probe that is working is DROPPED by the IP filter (the SYN is discarded silently), so it always ends in a timeout. That wait is the whole
+# cost of the check, and it buys nothing: a connection that would LEAK completes in milliseconds (loopback, the bridges and the host's own
+# addresses are all local), so a short wait tells a drop from a leak just as well. Configurable: --deny-timeout.
+DENY_TIMEOUT = 1.5
+# Deny probes are independent of each other, so they run this many at a time inside the one fenced unit. --jobs 1 runs everything in order.
+JOBS = 32
 
 
 NAME_OK = re.compile(r"[A-Za-z0-9._-]{1,64}\Z")
@@ -87,33 +99,33 @@ def split_hostport(target):
     return host, int(port)
 
 
-def attempt(kind, target):
-    """Return (ok, detail). ok means the thing worked."""
+def attempt(kind, target, timeout=TIMEOUT):
+    """Return (ok, detail). ok means the thing worked. A timeout is a failure (ok False), for every kind: it never counts as a pass."""
     try:
         if kind == "tcp":
             host, port = split_hostport(target)
-            s = socket.create_connection((host, port), timeout=TIMEOUT)
+            s = socket.create_connection((host, port), timeout=timeout)
             s.close()
             return True, "connected"
         if kind in ("unix", "abstract"):
             s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            s.settimeout(TIMEOUT)
+            s.settimeout(timeout)
             s.connect(("\0" + target) if kind == "abstract" else target)  # abstract: the name starts with a NUL byte, then "/tmp/..." as written
             s.close()
             return True, "connected"
         if kind == "dns":
-            socket.setdefaulttimeout(TIMEOUT)
+            socket.setdefaulttimeout(timeout)
             socket.getaddrinfo(target, 443, type=socket.SOCK_STREAM)
             return True, "resolved"
         if kind == "https":
             ctx = ssl.create_default_context()
-            s = socket.create_connection((target, 443), timeout=TIMEOUT)
+            s = socket.create_connection((target, 443), timeout=timeout)
             t = ctx.wrap_socket(s, server_hostname=target)
             t.close()
             return True, "tls handshake"
         if kind == "http":
             u = urllib.parse.urlparse(target)
-            c = http.client.HTTPConnection(u.hostname, u.port or 80, timeout=TIMEOUT)
+            c = http.client.HTTPConnection(u.hostname, u.port or 80, timeout=timeout)
             c.request("GET", u.path or "/")
             r = c.getresponse()
             return True, f"http {r.status}"
@@ -133,7 +145,7 @@ def attempt(kind, target):
             b.close()
             return True, "socketpair works"
         if kind == "spawn":
-            subprocess.run([sys.executable, "-c", "pass"], check=True, timeout=TIMEOUT)
+            subprocess.run([sys.executable, "-c", "pass"], check=True, timeout=timeout)
             return True, "child ran"
     except subprocess.CalledProcessError as e:
         return False, "exit " + str(e.returncode) + ": " + (e.stderr or b"").decode("utf8", "replace").strip()[:160]
@@ -431,6 +443,54 @@ def properties_verdict(kind, target, props):
     return False, "cannot be judged from properties"
 
 
+def make_job(set_name, expect, name, kind, target, state, deny_timeout):
+    """The probe that really attempts something: returns (line, failed). Deny probes get the short timeout, everything else the full one."""
+    def job():
+        ok, detail = attempt(kind, target, deny_timeout if expect == "deny" else TIMEOUT)
+        if expect == "deny":
+            if ok:
+                return f"FAIL {set_name} {name} UNEXPECTED SUCCESS: {kind} {target} was reachable ({detail})", True
+            if state != "open":
+                return f"warn {set_name} {name} inconclusive: {target} was not shown to be listening by ss ({detail})", False
+            return f"ok {set_name} {name} blocked ({detail})", False
+        if expect == "allow":
+            if ok:
+                return f"ok {set_name} {name} works ({detail})", False
+            return f"FAIL {set_name} {name} should work but did not: {kind} {target} ({detail})", True
+        if expect == "allow-late":
+            if ok:
+                return f"ok {set_name} {name} works ({detail})", False
+            return f"warn {set_name} {name} not reachable yet: {target} ({detail}). Check again once the kernel is up.", False
+        if expect == "known":
+            # (kinds that open no connection to another service: a user lookup, node's interface list, a child process)
+            return f"info {set_name} {name} known limit: {kind} {target[:60]} " + ("works" if ok else f"does not work ({detail})"), False
+        raise SystemExit(f"unknown expectation {expect!r}")
+    job.is_deny = expect == "deny"
+    return job
+
+
+def emit(todo, jobs):
+    """Run the jobs and print every result line in the order of the probe file. Returns the exit code (1 if anything FAILed).
+    jobs == 1: one after another, in order. Otherwise the deny probes (which just wait out a drop) run jobs at a time, and the allow and other
+    probes, which talk to Bulig's own things and may start processes, run one at a time beside them. Either way the lines come out the same."""
+    failed = 0
+    if jobs <= 1:
+        for job, line, bad in todo:
+            if job is not None:
+                line, bad = job()
+            print(line, flush=True)
+            failed += 1 if bad else 0
+        return 1 if failed else 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as deny_pool, concurrent.futures.ThreadPoolExecutor(max_workers=1) as one_by_one:
+        waiting = [(None if job is None else (deny_pool if job.is_deny else one_by_one).submit(job), line, bad) for job, line, bad in todo]
+        for fut, line, bad in waiting:  # in probe order: a slow probe holds up the printing, never the running
+            if fut is not None:
+                line, bad = fut.result()
+            print(line, flush=True)
+            failed += 1 if bad else 0
+    return 1 if failed else 0
+
+
 def main(argv):
     if len(argv) == 5 and argv[1] == "derive":
         for line in derive(argv[2], argv[3], argv[4]):
@@ -441,7 +501,8 @@ def main(argv):
         return 2
     mode, set_name, probes_file = argv[1], argv[2], argv[3]
     opts = {"--host-addrs": "", "--control": None, "--af": None, "--ip-deny": "", "--ip-allow": "", "--inaccessible": "",
-            "--ss-tcp": None, "--ss-unix": None, "--activation-text": None}
+            "--ss-tcp": None, "--ss-unix": None, "--activation-text": None,
+            "--deny-timeout": str(DENY_TIMEOUT), "--jobs": str(JOBS)}
     late = "both"
     i = 4
     while i < len(argv):
@@ -459,6 +520,13 @@ def main(argv):
             i += 1
         else:
             raise SystemExit(f"unknown argument {a}")
+    try:
+        deny_timeout, jobs = float(opts["--deny-timeout"]), int(opts["--jobs"])
+    except ValueError:
+        raise SystemExit("--deny-timeout is a number of seconds and --jobs a whole number")
+    # (a timeout of nothing would make every blocked probe look instant; one of minutes would bring the 40-minute check back)
+    if not 0.05 <= deny_timeout <= 10 or not 1 <= jobs <= 256:
+        raise SystemExit("--deny-timeout must be between 0.05 and 10 seconds and --jobs between 1 and 256")
     host_addrs = opts["--host-addrs"].split()
     probes = parse_probes(probes_file, set_name, host_addrs)
     if mode == "control":
@@ -479,7 +547,10 @@ def main(argv):
     activation = parse_activation(opts["--activation-text"])
     control = dict(kv.split("=", 1) for kv in opts["--control"].split(",") if "=" in kv)
     props = UnitProps(opts["--af"], opts["--ip-deny"], opts["--ip-allow"], opts["--inaccessible"])
-    failed = 0
+    # Every probe gives exactly one result: (line, failed). Judging a probe from text (properties, ss, activation) is instant and never connects;
+    # only the probes that really have to attempt something become a job. The results are printed in the probe file's order, whatever order
+    # the jobs finish in, so a run reads the same every time and two modes can be compared line by line.
+    todo = []  # (job, line, failed): a job is a function returning (line, failed); without one the result is already known
     for expect, name, kind, target in probes:
         is_late = expect == "allow-late"
         if late == "only" and not is_late:
@@ -493,58 +564,32 @@ def main(argv):
             # A documented limit is reported from the unit's properties and ss. Connecting to prove it would be a real connection to
             # another service (and could start it), so it is never tested that way.
             _, why = properties_verdict(kind, target, props)
-            print(f"info {set_name} {name} known limit, not tested by connecting: {kind} {target[:60]} ({ss_note('activation' if activated else state)}; {why})")
+            todo.append((None, f"info {set_name} {name} known limit, not tested by connecting: {kind} {target[:60]} ({ss_note('activation' if activated else state)}; {why})", False))
             continue
         if expect == "deny" and kind in ("tcp", "unix", "abstract"):
             if activated:
                 # Systemd listens on this socket for another unit: a connection would start it. Judged from properties only.
                 good, why = properties_verdict(kind, target, props)
                 if good:
-                    print(f"ok {set_name} {name} activation socket: checked by properties only ({why})")
+                    todo.append((None, f"ok {set_name} {name} activation socket: checked by properties only ({why})", False))
                 elif kind == "tcp":
-                    print(f"FAIL {set_name} {name} activation socket: checked by properties only, and {kind} {target} is reachable: {why}")
-                    failed += 1
+                    todo.append((None, f"FAIL {set_name} {name} activation socket: checked by properties only, and {kind} {target} is reachable: {why}", True))
                 else:
-                    print(f"info {set_name} {name} activation socket: checked by properties only; known limit, not tested by connecting ({why})")
+                    todo.append((None, f"info {set_name} {name} activation socket: checked by properties only; known limit, not tested by connecting ({why})", False))
                 continue
             if kind == "tcp":
                 good, why = properties_verdict(kind, target, props)
                 if not good:
                     # The unit's own properties already leave this address open: a connection would simply go through to another service.
-                    print(f"FAIL {set_name} {name} {kind} {target} is open by the unit's own properties ({why}); not connected to")
-                    failed += 1
+                    todo.append((None, f"FAIL {set_name} {name} {kind} {target} is open by the unit's own properties ({why}); not connected to", True))
                     continue
             if kind != "tcp" and props.has_af_unix() and not (kind == "unix" and props.path_hidden(target)):
                 # Nothing fences this: the unit may open a unix socket and the path is not hidden, so a connection would simply succeed.
                 good, why = properties_verdict(kind, target, props)
-                print(f"info {set_name} {name} known limit, not tested by connecting: {kind} {target[:60]} ({ss_note(state)}; {why})")
+                todo.append((None, f"info {set_name} {name} known limit, not tested by connecting: {kind} {target[:60]} ({ss_note(state)}; {why})", False))
                 continue
-        ok, detail = attempt(kind, target)
-        if expect == "deny":
-            if ok:
-                print(f"FAIL {set_name} {name} UNEXPECTED SUCCESS: {kind} {target} was reachable ({detail})")
-                failed += 1
-            elif state != "open":
-                print(f"warn {set_name} {name} inconclusive: {target} was not shown to be listening by ss ({detail})")
-            else:
-                print(f"ok {set_name} {name} blocked ({detail})")
-        elif expect == "allow":
-            if ok:
-                print(f"ok {set_name} {name} works ({detail})")
-            else:
-                print(f"FAIL {set_name} {name} should work but did not: {kind} {target} ({detail})")
-                failed += 1
-        elif expect == "allow-late":
-            if ok:
-                print(f"ok {set_name} {name} works ({detail})")
-            else:
-                print(f"warn {set_name} {name} not reachable yet: {target} ({detail}). Check again once the kernel is up.")
-        elif expect == "known":
-            # (kinds that open no connection to another service: a user lookup, node's interface list, a child process)
-            print(f"info {set_name} {name} known limit: {kind} {target[:60]} " + ("works" if ok else f"does not work ({detail})"))
-        else:
-            raise SystemExit(f"unknown expectation {expect!r}")
-    return 1 if failed else 0
+        todo.append((make_job(set_name, expect, name, kind, target, state, deny_timeout), "", False))
+    return emit(todo, jobs)
 
 
 if __name__ == "__main__":

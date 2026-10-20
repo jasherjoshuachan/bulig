@@ -53,7 +53,7 @@ BULIG_USERS="bulig bulig-worker"
 BULIG_USER_STATE_PREFIXES="$R/var/lib/bulig $R/var/lib/bulig-worker"
 
 # One secret per root-only file in /etc/bulig, loaded by systemd LoadCredential= into the units that need it. Each unit gets only its own.
-BULIG_CREDENTIALS="pg-url gh-token worker-tokens claude-token worker-token drill-pw"
+BULIG_CREDENTIALS="pg-url gh-token worker-tokens claude-token worker-token github-read-token drill-pw"
 # R2 settings: the only names the backup file may hold.
 BULIG_BACKUP_KEYS="R2_ENDPOINT R2_BUCKET AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_DEFAULT_REGION AWS_REQUEST_CHECKSUM_CALCULATION AWS_RESPONSE_CHECKSUM_VALIDATION"
 
@@ -221,6 +221,7 @@ cli_fence_props() {
         -p "InaccessiblePaths=$BULIG_INACCESSIBLE" -p "BindReadOnlyPaths=$BULIG_RESOLV_BIND") ;;
     *) die "role must be kernel or worker" ;;
   esac
+  FENCE_CLI+=(-p LimitCORE=0) # no core dumps: a crash could leave a credential in /var/crash
 }
 
 # wildcard_listeners: TCP listeners on every address (0.0.0.0, ::, *), as addr:port, one per line. An allowed address such as 127.74.3.1 reaches

@@ -29,7 +29,7 @@ chmod +x "$stubs/systemd-run" "$stubs/ip"
 export PATH="$stubs:/usr/bin:/bin:/usr/sbin:/sbin"
 export BULIG_DEPLOY_TEST_ROOT="$work/root" STUB_OUT="$work/argv"
 mkdir -p "$work/root/etc/bulig"
-for f in config.json pg-url gh-token worker-tokens claude-token worker-token; do : >"$work/root/etc/bulig/$f"; done
+for f in config.json pg-url gh-token worker-tokens claude-token worker-token github-read-token; do : >"$work/root/etc/bulig/$f"; done
 cli="$deploy/bulig-cli.sh"
 has() { grep -qxF -- "$1" "$work/argv"; }
 check() { # check <label> <exact line expected in the systemd-run arguments>
@@ -44,11 +44,13 @@ expect_ok "a kernel command runs" bash "$cli" status
 check "as user bulig" "--uid=bulig"
 check "its folder is made by systemd" "StateDirectory=bulig"
 check "private to the user" "StateDirectoryMode=0700"
+check "no core dump from a kernel command" "LimitCORE=0"
 check "with the kernel's config" "LoadCredential=config:$work/root/etc/bulig/config.json"
 check "and database URL" "LoadCredential=pg-url:$work/root/etc/bulig/pg-url"
 check "and GitHub token" "LoadCredential=gh-token:$work/root/etc/bulig/gh-token"
 check "and worker tokens" "LoadCredential=worker-tokens:$work/root/etc/bulig/worker-tokens"
 absent "no Claude token" "claude-token"
+absent "and no read-only token for the worker's clone (that is the worker's own)" "github-read-token"
 absent "no ReadWritePaths (StateDirectory is the writable place)" "ReadWritePaths"
 check "capped memory" "MemoryMax=1G"
 check "home hidden" "ProtectHome=yes"
@@ -63,10 +65,12 @@ check "a pipe for stdin and stdout" "--pipe"
 
 echo "worker command"
 expect_ok "a worker command runs" bash "$cli" --as worker --exec git clone https://example.invalid/r /var/lib/bulig-worker/work/r
+check "no core dump from a worker command" "LimitCORE=0"
 check "as user bulig-worker" "--uid=bulig-worker"
 check "its folder is made by systemd" "StateDirectory=bulig-worker"
 check "with the Claude token" "LoadCredential=claude-token:$work/root/etc/bulig/claude-token"
 check "and its own worker token" "LoadCredential=worker-token:$work/root/etc/bulig/worker-token"
+check "and the read-only GitHub token for its own clone" "LoadCredential=github-read-token:$work/root/etc/bulig/github-read-token"
 absent "none of the kernel's secrets or its config" "pg-url|gh-token|worker-tokens|config.json"
 absent "no ReadWritePaths" "ReadWritePaths"
 check "the worker's one-off commands cannot reach Tailscale or this machine's own public addresses" "IPAddressDeny=127.0.0.0/8 ::1/128 169.254.0.0/16 fe80::/10 224.0.0.0/4 ff00::/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7 2001:db8::10/128 203.0.113.10/32"
@@ -75,6 +79,7 @@ check "the worker's one-off commands have no unix sockets at all" "RestrictAddre
 if [ "$(grep -c '^RestrictAddressFamilies=' "$work/argv")" = "1" ] && ! grep -q 'RestrictAddressFamilies=.*AF_UNIX' "$work/argv"; then ok "and nothing else in the command line gives AF_UNIX back"; else bad "address-family lines: $(grep Restrict "$work/argv")"; fi
 check "and cannot see the tailscale, snapd or docker sockets" "InaccessiblePaths=-/run/tailscale -/run/snapd.socket -/run/docker.sock -/var/run/docker.sock"
 check "and resolve names through resolved's upstream list" "BindReadOnlyPaths=/run/systemd/resolve/resolv.conf:/etc/resolv.conf"
+if [ "$(grep -c '^LoadCredential=' "$work/argv")" = "3" ]; then ok "and exactly three credentials, no more"; else bad "worker credentials: $(grep '^LoadCredential=' "$work/argv" | tr '\n' ' ')"; fi
 if [ "$(tail -4 "$work/argv" | tr '\n' ' ')" = "git clone https://example.invalid/r /var/lib/bulig-worker/work/r " ]; then ok "--exec runs the program as given"; else bad "tail: $(tail -4 "$work/argv" | tr '\n' ' ')"; fi
 absent "--exec does not run the bulig CLI" "bulig.mjs"
 
@@ -95,3 +100,4 @@ expect_fail_msg "an unknown role is refused" "--as must be kernel or worker" bas
 expect_fail_msg "no command is refused" "usage: bulig-cli.sh" bash "$cli"
 
 finish
+

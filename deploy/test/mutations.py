@@ -125,6 +125,8 @@ M = [
     ("read token: the worker CLI set loads the kernel's gh-token", "cli.sh", "bulig-cli.sh", "add_creds claude-token:claude-token worker-token:worker-token github-read-token:github-read-token", "add_creds claude-token:claude-token worker-token:worker-token github-read-token:github-read-token gh-token:gh-token"),
     ("read token: set-secret does not know the name", "run.sh", "lib/common.sh", "worker-token github-read-token drill-pw", "worker-token drill-pw"),
     ("read token helper: the password line prints the username", "gitcred.sh", "git-credential-bulig-read", "password=%s\\n' \"$token\"", "password=%s\\n' \"x-access-token\""),
+    ("read token: the worker unit has no default for a missing token", "units.sh", "systemd/bulig-worker.service", "SetCredential=github-read-token:none\n", ""),
+    ("read token helper: the default none is sent as a password", "gitcred.sh", "git-credential-bulig-read", 'if [ "$token" = "none" ]; then', 'if false; then'),
     ("read token helper: the host check matches a substring", "gitcred.sh", "git-credential-bulig-read", '[ "$host" = "github.com" ]', '[[ "$host" == *github.com* ]]'),
     ("read token helper: the username changed", "gitcred.sh", "git-credential-bulig-read", "printf 'username=x-access-token\\npassword", "printf 'username=oauth\\npassword"),
     ("read token helper: a third line is printed", "gitcred.sh", "git-credential-bulig-read", "printf 'username=x-access-token\\npassword=%s\\n' \"$token\"", "printf 'username=x-access-token\\npassword=%s\\nquit=1\\n' \"$token\""),

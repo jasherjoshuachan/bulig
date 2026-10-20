@@ -26,6 +26,9 @@ WorkingDirectory=/opt/bulig/current
 LoadCredential=claude-token:/etc/bulig/claude-token
 LoadCredential=worker-token:/etc/bulig/worker-token
 LoadCredential=github-read-token:/etc/bulig/github-read-token
+# The read token is optional (a public repository needs none). systemd refuses to start a unit whose LoadCredential= file
+# is missing; SetCredential= with the same ID is the default it falls back to, and the helper treats "none" as "no token".
+SetCredential=github-read-token:none
 # Not secret, root-owned: BULIG_WORKER_REPOS="--repo <kernelPath>=<localClone> ..." (see worker.env.example). The worker needs at least one.
 EnvironmentFile=/etc/bulig/worker.env
 Environment=HOME=/var/lib/bulig-worker

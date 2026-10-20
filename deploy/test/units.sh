@@ -81,6 +81,7 @@ done
 # unit values into systemd-run, so no IP list anywhere in the kit may use one (found on the server, 20 Oct 2026).
 sym_hits="$(grep -nE '^(IPAddressDeny|IPAddressAllow)=.*\b(localhost|link-local|multicast)\b' "$sd"/*.service 2>/dev/null; grep -nE 'BULIG_IP_DENY_PRIVATE=.*\b(localhost|link-local|multicast)\b' "$deploy/lib/common.sh")"
 if [ -z "$sym_hits" ]; then ok "no IP list in the units or lib/common.sh uses a symbolic name (systemd-run cannot parse one in a list)"; else bad "a symbolic name in an IP list: $sym_hits"; fi
+if [ "$(value bulig-worker.service SetCredential)" = "github-read-token:none" ]; then ok "the worker starts without a read token (SetCredential default none)"; else bad "bulig-worker.service has no SetCredential=github-read-token:none, so a missing token file stops the unit"; fi
 for u in bulig.service bulig-worker.service; do
   if [ "$(value "$u" LimitCORE)" = "0" ]; then ok "$u writes no core dump (LimitCORE=0)"; else bad "$u can write a core dump holding a credential"; fi
 done

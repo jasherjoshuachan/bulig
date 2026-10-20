@@ -33,6 +33,15 @@ run_helper gh-token get "$ask"
 if [ "$(cat "$work/hout")" = "username=x-access-token
 password=ghs_KERNELONLY0123456789" ]; then ok "the kernel's helper reads gh-token the same way"; else bad "gh-token output: $(cat "$work/hout")"; fi
 
+echo "the unit's default when no token file is installed"
+printf 'none' >"$creds/github-read-token"
+run_helper github-read-token get 'protocol=https
+host=github.com
+
+'
+if [ "$rc" = "0" ] && [ ! -s "$work/hout" ] && grep -q "not set on this server" "$work/herr"; then ok "the default value none answers nothing and says why"; else bad "none (rc $rc): out=$(cat "$work/hout") err=$(cat "$work/herr")"; fi
+printf '%s' "$tok" >"$creds/github-read-token"
+
 echo "it answers only when it should"
 run_helper github-read-token get 'protocol=https
 host=example.invalid

@@ -313,7 +313,7 @@ install_root_file() {
 # fence_extra_check <file>: dies unless the file holds at least one probe and every probe line is complete: expect (deny|known), sets (known
 # names), a name, a kind (tcp|unix|abstract) and a target, with no <placeholder> left.
 fence_extra_check() {
-  local f="$1" line trimmed n=0 expect sets name kind target s
+  local f="$1" line trimmed n=0 expect sets name kind target s seen=" "
   while IFS= read -r line || [ -n "$line" ]; do
     trimmed="${line#"${line%%[![:space:]]*}"}"
     case "$trimmed" in '' | '#'*) continue ;; esac
@@ -325,6 +325,12 @@ fence_extra_check() {
     case "$kind" in tcp | unix | abstract) ;; *) die "fence-extra-probes: kind must be tcp, unix or abstract: $line" ;; esac
     [ -n "$name" ] && [ -n "$target" ] || die "fence-extra-probes: a probe needs five fields: $line"
     case "$line" in *'<'* | *'>'*) die "fence-extra-probes: a <placeholder> is still in: $line" ;; esac
+    # A name is how the control result finds its probe, so it is plain and unique per set (a comma or a repeat would hide an activation flag).
+    [[ "$name" =~ ^[A-Za-z0-9._-]{1,64}$ ]] || die "fence-extra-probes: a name may only hold letters, digits, dot, underscore and dash (1 to 64): $line"
+    for s in ${sets//,/ }; do
+      case "$seen" in *" $s/$name "*) die "fence-extra-probes: the name '$name' is used twice for the set $s: $line" ;; esac
+      seen="$seen$s/$name "
+    done
     n=$((n + 1))
   done <"$f"
   [ "$n" -gt 0 ] || die "fence-extra-probes: the file holds no probe"

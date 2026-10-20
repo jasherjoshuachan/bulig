@@ -70,8 +70,8 @@ cat "$static_probes" "$work/derived" "$BULIG_FENCE_EXTRA" >"$work/all-probes"
 fail=0
 for s in "${sets[@]}"; do
   # 1. Which deny targets are really listening? From ss, without connecting. (A target that is not there proves nothing when it cannot be reached.)
-  #    Sockets that systemd holds for another unit come back as "activation" and are never connected to.
-  control="$(python3 -I "$probe" control "$s" - --ss-tcp "$work/ss-tcp" --ss-unix "$work/ss-unix" --activation "$work/sockets" "${common_args[@]}" <"$work/all-probes" | paste -sd, -)"
+  #    (Whether a target is socket-activated is decided inside the fenced run, from the target and the systemctl list-sockets text it is given.)
+  control="$(python3 -I "$probe" control "$s" - --ss-tcp "$work/ss-tcp" --ss-unix "$work/ss-unix" "${common_args[@]}" <"$work/all-probes" | paste -sd, -)"
   # 2. The set's properties.
   ids=()
   case "$s" in
@@ -104,7 +104,7 @@ for s in "${sets[@]}"; do
   rc=0
   out="$(systemd-run --quiet --pipe --wait --collect --unit="bulig-fence-$s-$$" ${ids[@]+"${ids[@]}"} "${props[@]}" \
     -- /usr/bin/python3 -I "$probe" fenced "$s" - "${common_args[@]}" --control "$control" \
-    --af "$(prop_value RestrictAddressFamilies)" --ip-deny "$(prop_value IPAddressDeny)" --ip-allow "$(prop_value IPAddressAllow)" \
+    --activation-text "$(cat "$work/sockets")" --af "$(prop_value RestrictAddressFamilies)" --ip-deny "$(prop_value IPAddressDeny)" --ip-allow "$(prop_value IPAddressAllow)" \
     --inaccessible "$(prop_value InaccessiblePaths)" ${late_flag[@]+"${late_flag[@]}"} <"$work/all-probes" 2>&1)" || rc=$?
   printf '%s\n' "$out"
   # (here-strings, not printf | grep -q: under pipefail grep -q can close the pipe early and make printf fail)

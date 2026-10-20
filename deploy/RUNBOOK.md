@@ -22,7 +22,7 @@ How it is kept:
 Bulig runs on the same host as client production. It gets its own two users, its own Postgres cluster (`16 bulig`, port 5436), two systemd units with CPU and memory caps, and its own folders. The snapshot taken by `precheck.sh` and compared by `postcheck.sh` shows that nothing else it lists has changed (clusters, services, timers, unit files, ports, containers, users and groups, cron, and the mode of a few top folders; it says nothing about what it does not list).
 
 - `bulig` runs the kernel (`bulig.service`). Credentials: `config`, `pg-url`, `gh-token`, `worker-tokens`. No Claude token.
-- `bulig-worker` runs the worker (`bulig-worker.service`), which runs Claude Code. Credentials: `claude-token`, `worker-token`. No config, no database URL, no GitHub token.
+- `bulig-worker` runs the worker (`bulig-worker.service`), which runs Claude Code. Credentials: `claude-token`, `worker-token`, `github-read-token` (a fine-grained GitHub token with read-only Contents on the one sandbox repo, for the worker's own clone). No config, no database URL, no token that can push.
 - The two share no folder and no group. The worker has its own clone of a repo and sends the kernel a patch; the kernel applies it in its own worktree (ADR 0011, PR #50). Both homes are 0700.
 
 | What | Path | Made by |
@@ -31,7 +31,7 @@ Bulig runs on the same host as client production. It gets its own two users, its
 | Worker home, Claude settings, clones, stage folders | `/var/lib/bulig-worker` | systemd (`StateDirectory=bulig-worker`), then the worker |
 | Node code, one folder per release | `/opt/bulig/releases/<sha>`, `/opt/bulig/current` | `release-remote.sh` (root) |
 | Root scripts and unit files, one folder per release | `/usr/local/lib/bulig/<sha>`, `/usr/local/lib/bulig/current` | `release-remote.sh` (root) |
-| Secrets and the kernel config | `/etc/bulig/` (pg-url, gh-token, worker-tokens, claude-token, worker-token, drill-pw, backup.env, config.json, worker.env) | `set-secret.sh`, `setup-cluster.sh`, `release-remote.sh` (root) |
+| Secrets and the kernel config | `/etc/bulig/` (pg-url, gh-token, worker-tokens, claude-token, worker-token, github-read-token, drill-pw, backup.env, config.json, worker.env) | `set-secret.sh`, `setup-cluster.sh`, `release-remote.sh` (root) |
 | Dumps before and after R2, and the index of what was backed up | `/var/backups/bulig` | the backup (root) |
 | Snapshots and release work areas | `/var/lib/bulig-checks` | root |
 | Units | `/etc/systemd/system/bulig*` | `release-remote.sh` |
@@ -66,6 +66,10 @@ Stop at the first failure and read the message: every script says what it refuse
      ```bash
      security find-generic-password -s bulig-github-bot -w | ssh ths-prod-01 'bash /var/lib/bulig-checks/kit/set-secret.sh --credential gh-token'
      ```
+   - The worker's read-only GitHub token (from the Mac Keychain; fine-grained, read-only Contents on the one sandbox repo). The worker unit loads it, so it must be there before the release in step 5:
+     ```bash
+     security find-generic-password -s bulig-worker-read-token -w | ssh ths-prod-01 'bash /var/lib/bulig-checks/kit/set-secret.sh --credential github-read-token'
+     ```
    - The VPS worker's token. One command writes the worker's own `worker-token` and its `vps=` line in the kernel's `worker-tokens`:
      ```bash
      openssl rand -hex 32 | ssh ths-prod-01 'bash /var/lib/bulig-checks/kit/set-secret.sh --worker-token vps'
@@ -99,13 +103,15 @@ Stop at the first failure and read the message: every script says what it refuse
    ssh ths-prod-01 'systemctl show bulig.service bulig-worker.service -p Id -p User -p MemoryMax -p CPUQuotaPerSecUSec -p TasksMax -p StateDirectory'
    ```
 
-7. **Repos.** The kernel and the worker each make their own clone, as their own user, inside their own folder (`git clone` makes the missing parent folders as that user; root makes none). For a public sandbox repo:
+7. **Repos.** The kernel and the worker each make their own clone, as their own user, inside their own folder (`git clone` makes the missing parent folders as that user; root makes none). The sandbox repo is private, so each user first gets a git credential helper in its own global git config, written by that user (`git config --global` runs as the user in a transient unit, so the file lands in the user's own folder; root writes nothing there). The helper is `git-credential-bulig-read`, a root-owned script in the release. On every `git clone` and `git fetch` to `https://github.com` it reads the token from the unit's `$CREDENTIALS_DIRECTORY` at that moment and hands it to git. The token is never written into a git config, a remote URL, an argument, the environment or a log. The worker's helper reads `github-read-token`, the kernel's reads `gh-token`, and each is only ever in its own unit:
    ```bash
+   ssh ths-prod-01 '/usr/local/lib/bulig/current/bulig-cli.sh --as worker --exec git config --global credential.https://github.com.helper "/usr/local/lib/bulig/current/git-credential-bulig-read github-read-token"'
+   ssh ths-prod-01 '/usr/local/lib/bulig/current/bulig-cli.sh --as kernel --exec git config --global credential.https://github.com.helper "/usr/local/lib/bulig/current/git-credential-bulig-read gh-token"'
    ssh ths-prod-01 '/usr/local/lib/bulig/current/bulig-cli.sh --as kernel --exec git clone https://github.com/<owner>/sandbox /var/lib/bulig/repos/sandbox'
    ssh ths-prod-01 '/usr/local/lib/bulig/current/bulig-cli.sh --as worker --exec git clone https://github.com/<owner>/sandbox /var/lib/bulig-worker/work/sandbox'
    ssh ths-prod-01 'systemctl restart bulig-worker'
    ```
-   Assumed (to confirm in the server phase): a private repo needs a credential helper for the clone; that is a kernel-side detail, not a root write.
+   The worker's own `git fetch origin` (it runs with the worker's global git config) then works the same way. A public repo needs no helper.
 
 8. **Copy over the old record** (PR-E, `bulig migrate sqlite-to-postgres`). Dry run first, then the real copy. The SQLite file goes in through `bulig-cli.sh --exec`, as the `bulig` user, into the kernel's own state folder, over a pipe. **Never `scp` or `rsync` it into `/var/lib/bulig`**: root would be writing inside the user's folder, which is the one thing this kit does not do. Stop the kernel first (only one writer), run the command in a capped transient unit, start the kernel again, run `health.sh`:
    ```bash
@@ -234,6 +240,7 @@ To undo: remove `channel-telegram` from `enabled`, restart, then start the Mac s
 - **The kernel can reach other tenants' abstract unix sockets.** `bulig.service` keeps `AF_UNIX` because it talks to Postgres over a unix socket, and an abstract socket has no file permission to stop it. It runs no worker code (the worker is a separate unit with no `AF_UNIX`), and the fence check lists this as a known limit (from the properties and ss, without connecting). The next hardening is an AppArmor profile for the kernel with `deny unix addr=@**,`; that is a change to the host's security setup and needs Jasher's yes before it is made.
 - **`127.74.3.1` reaches every listener on all addresses, with a loopback source** (see above). The filter matches addresses, not ports; a listener on every address that trusts loopback callers trusts the worker.
 - **The backup's docker container is outside the unit's IP filter** (see above).
+- **The worker's Claude sessions can read the worker's own read-only token.** `github-read-token` is in the worker's `$CREDENTIALS_DIRECTORY`, and Claude runs as the worker with that environment. It grants read on the one sandbox repo and nothing else (no write, no other repo), so this is accepted. The kernel's `gh-token`, which can push, is never in the worker's unit.
 - **The fence is untested on a real machine until the server phase.** Everything about it was checked as text and with stand-ins; `fence-check.sh` is the first real test, and `systemd-analyze verify` only checks syntax.
 
 ## Must be proven on the server first
@@ -252,6 +259,7 @@ Everything above was checked as text, with `systemd-analyze verify` (which reads
 10. A release rolls back cleanly on a failed health check, a failed FIRST release leaves nothing running or enabled, and a second release succeeds.
 11. `/etc/bulig/fence-extra-probes.txt` is filled in from the template ("The extra probes") and `fence-check.sh` runs with it; the check refuses to run without it.
 12. PR #50's `github` plugin starts from the `gh-token` credential (no `BULIG_GH_TOKEN` in any environment).
+13. Both helpers work inside their units: the worker's clone of the private sandbox repo succeeds with `github-read-token`, a push from the worker is refused by GitHub (the token is read-only), and the kernel's clone and push work with `gh-token`.
 
 ## Things to know
 

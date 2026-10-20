@@ -335,6 +335,21 @@ if [ "$dc" -ge 10 ]; then ok "derived: the probe reads the lines it was given ($
 : >"$work/e-empty"
 if [ -z "$(python3 -I "$deploy/fence-probe.py" derive "$work/e-empty" "$work/e-empty" "$work/e-empty")" ]; then ok "derived: a machine with nothing listening gives no probes (and no error)"; else bad "derived output from nothing"; fi
 
+printf 'LISTEN 0 4096 [::ffff:127.0.0.1]:41009 *:*\nLISTEN 0 4096 [::ffff:10.1.2.3]:41010 *:*\nLISTEN 0 4096 [::ffff:127.74.3.1]:7431 *:*\nLISTEN 0 4096 [::ffff:203.0.113.10]:41011 *:*\n' >"$work/d-tcp-mapped"
+python3 -I "$deploy/fence-probe.py" derive "$work/d-tcp-mapped" "$work/e-empty" "$work/d-ip" >"$work/derived-mapped.txt"
+if grep -q "^deny worker,kernel,build,cli-worker,cli-kernel listener-127.0.0.1-41009 tcp 127.0.0.1:41009\$" "$work/derived-mapped.txt" && grep -q " listener-10.1.2.3-41010 tcp 10.1.2.3:41010\$" "$work/derived-mapped.txt" && ! grep -q "7431" "$work/derived-mapped.txt" && ! grep -q "41011" "$work/derived-mapped.txt"; then ok "derived: an IPv4-mapped loopback or private listener (::ffff:a.b.c.d) is probed as the IPv4 address, the mapped gateway is left out, and a mapped public address is not a deny target"; else bad "mapped listeners: $(cat "$work/derived-mapped.txt")"; fi
+
+python3 -I - "$deploy/fence-probe.py" >"$work/classify.out" 2>&1 <<'PY'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("fp", sys.argv[1])
+fp = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(fp)
+want = {"::ffff:127.0.0.1": "loopback", "::ffff:10.1.2.3": "private", "::ffff:100.64.0.10": "tailscale", "::ffff:203.0.113.10": "public", "::ffff:0.0.0.0": "wildcard", "::1": "loopback", "2001:db8::1": "public"}
+got = {k: fp.classify(k) for k in want}
+assert got == want, got
+print("classify ok")
+PY
+if grep -q "classify ok" "$work/classify.out"; then ok "classify: an IPv4-mapped IPv6 address is classified as the IPv4 address it wraps"; else bad "classify: $(cat "$work/classify.out")"; fi
 echo "the extra probes (set-secret.sh --fence-extra-probes)"
 xroot="$work/xroot"
 mkdir -p "$xroot/etc/bulig"
@@ -598,6 +613,19 @@ rc=$?
 if [ "$rc" -eq 1 ] && grep -q "^FAIL worker d-tcp activation socket: checked by properties only, and tcp 127.0.0.1:$tcp_port is reachable" "$work/nc-act2.out"; then ok "an activation socket whose address the IP filter does not deny is a FAIL, judged from the properties and still not connected to"; else bad "unfiltered activation target: rc=$rc $(cat "$work/nc-act2.out")"; fi
 zero_accepts "  and still nothing connected"
 
+# a deny probe of kind http, https, dns (or anything but tcp, unix, abstract) would skip the activation check: refused, and nothing connects
+reset_accepts
+for dk in http https dns pwd; do
+  case "$dk" in http) dt="http://127.0.0.1:$http_port/x" ;; https) dt="127.0.0.1" ;; dns) dt="localhost" ;; *) dt="-" ;; esac
+  printf 'deny worker bad-kind %s %s\n' "$dk" "$dt" >"$work/bad-kind.txt"
+  expect_fail_msg "a deny probe of kind $dk is refused by control" "a deny probe must be kind tcp, unix or abstract" python3 -I "$deploy/fence-probe.py" control worker "$work/bad-kind.txt" "${CA[@]}"
+  expect_fail_msg "  and by fenced" "a deny probe must be kind tcp, unix or abstract" python3 -I "$deploy/fence-probe.py" fenced worker "$work/bad-kind.txt" --control "" --af "$NOUNIX" --activation-text "127.0.0.1:$http_port  other.socket  other.service"
+done
+zero_accepts "deny probes of kind http, https, dns, pwd (refused before anything runs, even at an activation socket)"
+for dk in http https dns; do
+  expect_fail_msg "set-secret refuses a deny probe of kind $dk in the extra file" "kind must be" bash -c "printf 'deny worker xk $dk example.test\n' | bash '$deploy/set-secret.sh' --fence-extra-probes"
+done
+
 # the activation flag is found from the TARGET, not from the probe's name: a control result that lost it (here: says "open", as when two
 # probes share a name and the later result wins) must not make a deny probe connect to an activation socket
 reset_accepts
@@ -651,7 +679,7 @@ if [ "$(accepts tcp)" = "1" ] && grep -q "^FAIL worker open-a UNEXPECTED SUCCESS
 # reading the host as text: the forms ss and systemctl really print
 printf 'LISTEN 0 4096 127.0.0.53%%lo:53 0.0.0.0:*\nLISTEN 0 128 *:8081 *:*\nLISTEN 0 128 0.0.0.0:8082 0.0.0.0:*\nLISTEN 0 128 [::]:8083 [::]:*\nLISTEN 0 128 [::1]:8084 [::]:*\n' >"$work/t-ss-tcp"
 printf 'u_str LISTEN 0 200 /var/run/postgresql/.s.PGSQL.5436 11 * 0\nu_dgr UNCONN 0 0 /run/dgram.sock 12 * 0\nu_str LISTEN 0 4096 @/tmp/abs-name 13 * 0\n' >"$work/t-ss-unix"
-printf '[::]:8090  wide.socket  wide.service\n127.0.0.1:8091  one.socket  one.service\n/run/act.sock  act.socket  act.service\n@/tmp/act-abs  actabs.socket  actabs.service\nroute 1361  systemd-networkd.socket  systemd-networkd.service\nkobject-uevent 1  systemd-udevd-kernel.socket  systemd-udevd.service\n' >"$work/t-sockets"
+printf '[::]:18090  wide.socket  wide.service\n127.0.0.1:18091  one.socket  one.service\n/run/act.sock  act.socket  act.service\n@/tmp/act-abs  actabs.socket  actabs.service\nroute 1361  systemd-networkd.socket  systemd-networkd.service\nkobject-uevent 1  systemd-udevd-kernel.socket  systemd-udevd.service\n' >"$work/t-sockets"
 printf '%s\n' \
   'deny worker t-stub-v4 tcp 127.0.0.53:53' \
   'deny worker t-star-v4 tcp 127.0.0.1:8081' \
@@ -672,15 +700,15 @@ python3 -I "$deploy/fence-probe.py" control worker "$work/t-probes.txt" --ss-tcp
 want="t-stub-v4=open t-star-v4=open t-star-v6=open t-wild4-v4=open t-wild4-v6=closed t-wild6-v6=open t-wild6-v4=closed t-v6-exact=open t-v6-other=closed t-pg-varrun=open t-pg-run=open t-dgram=closed t-abs=open t-abs-none=closed"
 if [ "$(tr '\n' ' ' <"$work/t-out" | sed 's/ $//')" = "$want" ]; then ok "ss and systemctl text is read as printed: %lo suffixes, wildcards by family (ss), any-family wildcards for activation, /var/run is /run, datagram sockets are not listeners, kernel sockets are ignored"; else bad "control reading: got '$(tr '\n' ' ' <"$work/t-out")' want '$want'"; fi
 printf '%s\n' \
-  'deny worker t-act-wide-v4 tcp 127.0.0.1:8090' \
-  'deny worker t-act-one tcp 127.0.0.1:8091' \
+  'deny worker t-act-wide-v4 tcp 127.0.0.1:18090' \
+  'deny worker t-act-one tcp 127.0.0.1:18091' \
   'deny worker t-act-path unix /var/run/act.sock' \
   'deny worker t-act-abs abstract /tmp/act-abs' >"$work/t-act-probes.txt"
 fres="$(python3 -I "$deploy/fence-probe.py" fenced worker "$work/t-act-probes.txt" --control "" --af "$NOUNIX" --activation-text "$(cat "$work/t-sockets")" --ip-deny "127.0.0.0/8")"
 if [ "$(grep -c '^ok worker t-act-.* activation socket: checked by properties only' <<<"$fres")" = "4" ]; then ok "activation targets are matched as systemctl prints them: a wildcard of either family covers every address on its port, a /var/run path is the /run socket, an abstract name has its @; kernel sockets (route, kobject-uevent) are ignored"; else bad "activation matching: $fres"; fi
-printf 'deny worker t-act-one-other tcp 127.0.0.2:8091\n' >"$work/t-act-other.txt"
+printf 'deny worker t-act-one-other tcp 127.0.0.2:18091\n' >"$work/t-act-other.txt"
 fres="$(python3 -I "$deploy/fence-probe.py" fenced worker "$work/t-act-other.txt" --control "" --af "$NOUNIX" --activation-text "$(cat "$work/t-sockets")")"
-if grep -q "t-act-one-other tcp 127.0.0.2:8091 is open by the unit's own properties" <<<"$fres"; then ok "an address that only shares the port of a one-address activation socket is not taken for it"; else bad "non-matching activation: $fres"; fi
+if grep -q "t-act-one-other tcp 127.0.0.2:18091 is open by the unit's own properties" <<<"$fres"; then ok "an address that only shares the port of a one-address activation socket is not taken for it"; else bad "non-matching activation: $fres"; fi
 expect_fail_msg "fenced without --control is refused" "fenced needs --control" python3 -I "$deploy/fence-probe.py" fenced worker "$work/t-probes.txt" --af "$NOUNIX"
 expect_fail_msg "fenced without --af is refused" "fenced needs --control" python3 -I "$deploy/fence-probe.py" fenced worker "$work/t-probes.txt" --control ""
 
@@ -716,6 +744,7 @@ if [ "$rc" -ne 0 ] && grep -q "systemctl list-sockets failed" "$work/fc.out" && 
 # the RUNBOOK states the rule, and no longer says the control run connects
 RB="$deploy/RUNBOOK.md"
 if grep -q "never completes a connection to anything that is not Bulig's" "$RB" && grep -q "never triggers socket activation of a non-Bulig unit" "$RB" && grep -q "Socket-activated targets are never connected to by anything" "$RB" && grep -q "A known limit is never tested by connecting" "$RB"; then ok "the RUNBOOK states the rule, the activation skip and the known-limit rule"; else bad "the RUNBOOK lacks the never-connect rule"; fi
+if grep -q "A per-user unit could still listen on a TCP port or an abstract name" "$RB" && grep -q "http.*https.*dns.*deny lines are refused" "$RB"; then ok "the RUNBOOK says per-user units could listen on TCP or abstract names and why the deny probes are still safe, and that only tcp, unix and abstract deny probes are accepted"; else bad "the RUNBOOK lacks the per-user note"; fi
 if grep -q "Activation detection reads the system manager only" "$RB" && grep -q "/run/user/<uid>" "$RB"; then ok "the RUNBOOK says activation detection reads the system manager only (per-user sockets are not probe targets)"; else bad "the RUNBOOK lacks the system-manager-only line"; fi
 if ! grep -qi "tried as root, outside every fence\|control run.*connect\|first tried as root" "$RB"; then ok "and no text says the control run connects"; else bad "the RUNBOOK still says the control run connects: $(grep -ni 'tried as root\|control run' "$RB")"; fi
 if grep -q "THE RULE" "$deploy/fence-check.sh" && grep -q "THE RULE" "$deploy/fence-probe.py" && grep -q "THE RULE" "$deploy/fence/probes.txt"; then ok "the rule is at the top of fence-check.sh, fence-probe.py and the probe list"; else bad "THE RULE is missing from a fence file"; fi

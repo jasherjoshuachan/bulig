@@ -55,6 +55,10 @@ def parse_probes(path, set_name, host_addrs):
         expect, sets, name, kind, target = parts
         if expect not in ("deny", "known", "allow", "allow-late"):
             raise SystemExit(f"unknown expectation {expect!r}")
+        # A deny probe is only ever a tcp address, a unix socket or an abstract socket: those are the kinds whose activation can be checked
+        # against systemctl list-sockets, and whose fence (IP filter, no AF_UNIX) stops them first. http, https or dns would connect without that.
+        if expect == "deny" and kind not in ("tcp", "unix", "abstract"):
+            raise SystemExit(f"a deny probe must be kind tcp, unix or abstract, not {kind!r}: {line!r}")
         # The control result is found by name, so a name is plain (no comma, no equals sign) and used once per set. Two probes with one name
         # would let the later one's result stand in for the earlier one's.
         if not NAME_OK.match(name):
@@ -144,9 +148,18 @@ GATEWAY = ("127.74.3.1", "7431")  # the kernel's own gateway: the worker is mean
 MAX_DERIVED = 400
 
 
+def unmap(a):
+    """An IPv4-mapped IPv6 address (::ffff:127.0.0.1) is the IPv4 address it wraps; the kernel and the IP filter treat it as that."""
+    try:
+        v = ipaddress.ip_address(a)
+    except ValueError:
+        return a
+    return str(v.ipv4_mapped) if v.version == 6 and v.ipv4_mapped is not None else a
+
+
 def classify(addr):
     """loopback | private | tailscale | linklocal | public | wildcard, for an IPv4 or IPv6 address."""
-    a = addr.split("%")[0].strip("[]")
+    a = unmap(addr.split("%")[0].strip("[]"))
     if a in ("0.0.0.0", "*", "::"):
         return "wildcard"
     if ":" in a:
@@ -190,7 +203,7 @@ def derive(ss_tcp, ss_unix, ip_addr):
         if len(f) >= 4 and f[0] == "LISTEN":
             host, port = split_listener(f[3])
             if port.isdigit():
-                listeners.append((host, port))
+                listeners.append((unmap(host), port))
     own_public, own_local = [], []
     for line in open(ip_addr):
         f = line.split()
@@ -308,7 +321,7 @@ def parse_activation(text):
 
 def _ip(host):
     try:
-        return ipaddress.ip_address(host.split("%")[0].strip("[]"))
+        return ipaddress.ip_address(unmap(host.split("%")[0].strip("[]")))
     except ValueError:
         return None
 

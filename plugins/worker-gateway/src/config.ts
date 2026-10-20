@@ -1,6 +1,6 @@
-import { lstatSync, readFileSync } from 'node:fs';
+import { lstatSync, readFileSync, realpathSync } from 'node:fs';
 import { isIP } from 'node:net';
-import { isAbsolute } from 'node:path';
+import { dirname, isAbsolute } from 'node:path';
 import { isLoopbackOrTailnet, isWildcard } from './address.ts';
 import { readCredential } from '@bulig/worker-claude-code';
 import { z } from 'zod';
@@ -80,7 +80,22 @@ const Schema = z.strictObject({
   baseBranch: z.string().min(1).optional(),
 });
 
-function readTokenFile(path: string): string | undefined {
+/**
+ * True when the file sits directly in the unit's systemd credentials folder ($CREDENTIALS_DIRECTORY, set by LoadCredential=).
+ * systemd makes those files 0440 root:root on a private mount only that unit sees, and lets the unit's user read them, so the
+ * group bit is set by design and says nothing about who else can read it. Anywhere else the owner-only rule stands.
+ */
+function inCredentialsDirectory(file: string, env: Record<string, string | undefined> = process.env): boolean {
+  const dir = env.CREDENTIALS_DIRECTORY;
+  if (!dir) return false;
+  try {
+    return realpathSync(dirname(file)) === realpathSync(dir);
+  } catch {
+    return false;
+  }
+}
+
+function readTokenFile(path: string, env: Record<string, string | undefined>): string | undefined {
   if (!isAbsolute(path)) throw new GatewayConfigError(`tokenFile ${JSON.stringify(path)} must be an absolute path`);
   let st;
   try {
@@ -89,7 +104,7 @@ function readTokenFile(path: string): string | undefined {
     return undefined;
   }
   if (!st.isFile()) throw new GatewayConfigError(`tokenFile ${JSON.stringify(path)} is not a regular file`);
-  if (st.mode & 0o077) throw new GatewayConfigError(`tokenFile ${JSON.stringify(path)} can be read or written by its group or by anyone. Make it readable by its owner only (chmod 600).`);
+  if (st.mode & 0o077 && !inCredentialsDirectory(path, env)) throw new GatewayConfigError(`tokenFile ${JSON.stringify(path)} can be read or written by its group or by anyone. Make it readable by its owner only (chmod 600).`);
   return readFileSync(path, 'utf8').replace(/\r?\n$/, '') || undefined;
 }
 
@@ -111,7 +126,7 @@ function resolveToken(id: string, w: z.infer<typeof Worker>, env: Record<string,
     if (t) return t;
   }
   if (w.tokenFile) {
-    const t = readTokenFile(w.tokenFile);
+    const t = readTokenFile(w.tokenFile, env);
     if (t) return t;
   }
   return w.tokenEnv ? env[w.tokenEnv] : undefined;

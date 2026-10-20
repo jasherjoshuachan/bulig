@@ -124,6 +124,30 @@ describe('worker tokens', () => {
       expect(() => parseGatewayConfig({ workers: { mac: { tokenFile: f } } }, env)).toThrow(/readable by its owner only/);
     });
 
+    it('a 0440 file directly in the unit\'s credentials folder is accepted: systemd makes LoadCredential files that way', () => {
+      const d = credDir();
+      const f = join(d, 'worker-token');
+      writeFileSync(f, 'file-token-0123456789abc\n');
+      chmodSync(f, 0o440);
+      expect(parseGatewayConfig({ workers: { mac: { tokenFile: f } } }, { ...env, CREDENTIALS_DIRECTORY: d }).workers[0]!.token).toBe('file-token-0123456789abc');
+    });
+
+    it('the same 0440 file outside the credentials folder, or in a folder below it, is still refused', () => {
+      const d = credDir();
+      const f = join(d, 'worker-token');
+      writeFileSync(f, 'file-token-0123456789abc\n');
+      chmodSync(f, 0o440);
+      expect(() => parseGatewayConfig({ workers: { mac: { tokenFile: f } } }, env)).toThrow(/readable by its owner only/);
+      const other = credDir();
+      expect(() => parseGatewayConfig({ workers: { mac: { tokenFile: f } } }, { ...env, CREDENTIALS_DIRECTORY: other })).toThrow(/readable by its owner only/);
+      const sub = join(d, 'below');
+      mkdirSync(sub);
+      const g = join(sub, 'worker-token');
+      writeFileSync(g, 'file-token-0123456789abc\n');
+      chmodSync(g, 0o440);
+      expect(() => parseGatewayConfig({ workers: { mac: { tokenFile: g } } }, { ...env, CREDENTIALS_DIRECTORY: d })).toThrow(/readable by its owner only/);
+    });
+
     it.each([0o600, 0o400])('a token file with mode %o is accepted', (mode) => {
       const d = credDir();
       const f = join(d, 'mac.token');

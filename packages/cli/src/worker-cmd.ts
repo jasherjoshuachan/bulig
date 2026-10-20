@@ -1,5 +1,5 @@
-import { lstatSync, readFileSync } from 'node:fs';
-import { isAbsolute, join, resolve } from 'node:path';
+import { lstatSync, readFileSync, realpathSync } from 'node:fs';
+import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import { startRemoteWorker } from '@bulig/worker-gateway/client';
 import { ConfigError, loadConfig } from './config.ts';
@@ -8,6 +8,21 @@ import type { Io } from './commands.ts';
 const ID = /^[a-z0-9][a-z0-9_-]{0,31}$/;
 
 /** A secret kept in a file (a systemd credential on the server). Errors name the flag and the path, never the value. */
+/**
+ * True when the file sits directly in the unit's systemd credentials folder ($CREDENTIALS_DIRECTORY, set by LoadCredential=).
+ * systemd makes those files 0440 root:root on a private mount only that unit sees, and lets the unit's user read them, so the
+ * group bit is set by design and says nothing about who else can read it. Anywhere else the owner-only rule stands.
+ */
+function inCredentialsDirectory(file: string, env: Record<string, string | undefined> = process.env): boolean {
+  const dir = env.CREDENTIALS_DIRECTORY;
+  if (!dir) return false;
+  try {
+    return realpathSync(dirname(file)) === realpathSync(dir);
+  } catch {
+    return false;
+  }
+}
+
 function readSecretFile(flag: string, path: string, cwd: string): string {
   const file = resolve(cwd, path);
   let st;
@@ -17,7 +32,7 @@ function readSecretFile(flag: string, path: string, cwd: string): string {
     throw new ConfigError(`${flag} ${file} does not exist`);
   }
   if (!st.isFile()) throw new ConfigError(`${flag} ${file} is not a regular file`);
-  if (st.mode & 0o077) throw new ConfigError(`${flag} ${file} can be read or written by its group or by anyone. Make it readable by its owner only (chmod 600).`);
+  if (st.mode & 0o077 && !inCredentialsDirectory(file)) throw new ConfigError(`${flag} ${file} can be read or written by its group or by anyone. Make it readable by its owner only (chmod 600).`);
   const value = readFileSync(file, 'utf8').replace(/\r?\n$/, '');
   if (!value) throw new ConfigError(`${flag} ${file} is empty`);
   return value;

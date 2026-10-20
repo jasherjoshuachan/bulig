@@ -4,7 +4,8 @@ import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 
 // Whole jobs on a loaded machine: give each test room.
-vi.setConfig({ testTimeout: 240_000 });
+// Two full jobs through two workers wait twice for up to 200 s; the cap must hold both waits with room (a loaded Mac hit 240 s, 20 Oct 2026).
+vi.setConfig({ testTimeout: 480_000 });
 import { ADAPTERS, bootPipeline, finishJob, git, prCreates, waitFor } from './support.ts';
 
 // A whole job through the real pipeline and the real github plugin (over a local origin and a fake gh), with Claude run by a worker
@@ -82,12 +83,12 @@ for (const adapter of ADAPTERS) {
       const b = await rig.startJob('Second');
       rig.human.grant(a.id, 'plan');
       rig.human.grant(b.id, 'plan');
-      await waitFor(() => rig.human.asking(a.id, 'merge') && rig.human.asking(b.id, 'merge'), 120_000, 'both merge questions');
+      await waitFor(() => rig.human.asking(a.id, 'merge') && rig.human.asking(b.id, 'merge'), 200_000, 'both merge questions');
       const sources = new Set(rig.events.filter((e) => e.type === 'stage.completed').map((e) => e.source));
       expect(sources).toEqual(new Set(['worker-claude-code', 'worker-gateway']));
       rig.human.grant(a.id, 'merge');
       rig.human.grant(b.id, 'merge');
-      await waitFor(async () => (await rig.k.jobs.get(a.id))!.status === 'done' && (await rig.k.jobs.get(b.id))!.status === 'done', 120_000, 'both jobs done');
+      await waitFor(async () => (await rig.k.jobs.get(a.id))!.status === 'done' && (await rig.k.jobs.get(b.id))!.status === 'done', 200_000, 'both jobs done');
       expect(prCreates(rig.world.ghLog)).toBe(2);
     });
   });

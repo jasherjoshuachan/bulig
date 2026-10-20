@@ -83,6 +83,31 @@ describe('bulig worker, arguments', () => {
     expect(w.err.join('\n')).toMatch(message);
   });
 
+  it('accepts a 0440 token file directly in the unit\'s credentials folder (systemd LoadCredential), and refuses it anywhere else', async () => {
+    const w = world();
+    const creds = join(w.root, 'creds');
+    mkdirSync(creds);
+    const f = join(creds, 'worker-token');
+    writeFileSync(f, 'file-token-0123456789abc\n');
+    chmodSync(f, 0o440);
+    const viaFile = good.filter((a) => a !== '--token-env' && a !== 'TOK');
+    const saved = process.env.CREDENTIALS_DIRECTORY;
+    try {
+      delete process.env.CREDENTIALS_DIRECTORY;
+      expect(await runCli([...viaFile, '--token-file', f, '--slots', '99'], w.io)).toBe(2);
+      expect(w.err.join('\n')).toMatch(/group or by anyone/);
+      w.err.length = 0;
+      process.env.CREDENTIALS_DIRECTORY = creds;
+      // --slots 99 is checked right after the token, so a slots error means the token file was accepted
+      expect(await runCli([...viaFile, '--token-file', f, '--slots', '99'], w.io)).toBe(2);
+      expect(w.err.join('\n')).toMatch(/--slots must be/);
+      expect(w.err.join('\n')).not.toMatch(/group or by anyone/);
+    } finally {
+      if (saved === undefined) delete process.env.CREDENTIALS_DIRECTORY;
+      else process.env.CREDENTIALS_DIRECTORY = saved;
+    }
+  });
+
   it('takes the token from a file, from exactly one of --token-env and --token-file, and refuses a file anyone can read', async () => {
     const w = world();
     const f = join(w.root, 'worker-token');

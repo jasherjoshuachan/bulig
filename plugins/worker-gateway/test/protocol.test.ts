@@ -409,7 +409,8 @@ for (const adapter of ADAPTERS) {
         for (const m of made) asked.push(await r.driver.ask(m.job, m.cwd, 'plan'));
         const order: string[] = [];
         for (let i = 0; i < 3; i++) {
-          const got = (await post(r.url, '/claim', TOKENS.pi, { workerId: 'pi', slots: 1 })).json;
+          // take() asks again on a 204 (a claim window that ended under load) and returns the first real assignment, so the order is unchanged
+          const got = (await r.take(TOKENS.pi, 'pi', 1)).json;
           order.push(got.stageId);
           await post(r.url, '/result', TOKENS.pi, { stageId: got.stageId, attempt: 1, generation: got.generation, outcome: 'completed', output: { result: 'x' } });
         }

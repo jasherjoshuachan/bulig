@@ -133,9 +133,19 @@ d="$STUB_DATA"
 case "$1" in
   list-units) if printf '%s ' "$@" | grep -q -- '--state=running'; then awk '$4 == "running"' "$d/units.txt"; else cat "$d/units.txt"; fi ;;
   list-timers) cat "$d/timers.txt" ;;
-  list-unit-files) cat "$d/unitfiles.txt" ;;
+  list-unit-files)
+    # A name after the flags lists only that unit file (any type); --type=service lists only the services.
+    pat=""; for a in "${@:2}"; do case "$a" in -*) ;; *) pat="$a" ;; esac; done
+    if [ -n "$pat" ]; then awk -v p="$pat" '$1 == p' "$d/unitfiles.txt"
+    elif printf '%s ' "$@" | grep -q -- '--type=service'; then awk '$1 ~ /\.service$/' "$d/unitfiles.txt"
+    else cat "$d/unitfiles.txt"; fi ;;
+  show) if [ -f "$d/show/${!#}" ]; then cat "$d/show/${!#}"; fi ;;
   *) exit 0 ;;
 esac
+STUB
+cat >"$stubs/docker" <<'STUB'
+#!/usr/bin/env bash
+cat "$STUB_DATA/docker.txt"
 STUB
 cat >"$stubs/ss" <<'STUB'
 #!/usr/bin/env bash
@@ -191,6 +201,7 @@ DATA
 LISTEN 0 511 0.0.0.0:80 0.0.0.0:* users:(("nginx",pid=812,fd=6))
 LISTEN 0 200 127.0.0.1:5432 0.0.0.0:* users:(("postgres",pid=900,fd=5))
 DATA
+  printf 'clientweb ghcr.io/client/web:1.4 running\nncl-a1-sess-1-k3j agent-session:latest running\nold-migrate client/migrate:2 exited\n' >"$w/data/docker.txt"
   printf '16 main 5432 online postgres /var/lib/postgresql/16/main /var/log/postgresql/postgresql-16-main.log\n' >"$w/data/clusters.txt"
   printf 'root:x:0:0:root:/root:/bin/bash\nclient:x:1000:1000::/home/client:/bin/bash\n' >"$w/data/passwd.txt"
   printf 'root:x:0:\nclient:x:1000:\n' >"$w/data/group.txt"
@@ -288,6 +299,54 @@ if [ ! -e "$w/root/tmp-elsewhere" ]; then ok "neither script touched the path it
 echo 'LISTEN 0 1 0.0.0.0:8080 0.0.0.0:* users:(("python3",pid=7,fd=3))' >>"$w/data/ss.txt"
 expect_fail_msg "postcheck.sh fails after a change, and shows it" "8080" bash "$deploy/postcheck.sh"
 if [ "$(find "$checks" -type f | wc -l | tr -d ' ')" = "1" ]; then ok "postcheck left no temp files"; else bad "postcheck left extra files in $checks"; fi
+
+# Churn Bulig cannot cause: a service a timer starts changes run state on its own schedule, and an agent starts a container per session.
+# postcheck reports those and does not compare them; everything else about them still is. One case per fresh world.
+post_case() { # post_case <label> <pass|fail> <text the output must contain> <command run inside the world folder after the precheck>
+  local label="$1" want="$2" text="$3" cmd="$4" pw="$work/pw" rc=0
+  new_world "$pw"
+  # clientjob: a oneshot its timer (in the timers list) starts. reportjob: systemd says a timer triggers it, but no timer is listed.
+  # digestjob: a oneshot with a .timer of the same name among the unit files. plainjob: a oneshot with no timer at all.
+  printf 'clientjob.service loaded inactive dead Client job\nreportjob.service loaded inactive dead Report\ndigestjob.service loaded inactive dead Digest\nplainjob.service loaded inactive dead Plain\n' >>"$pw/data/units.txt"
+  printf 'clientjob.service static\nreportjob.service static\ndigestjob.service static\nplainjob.service static\ndigestjob.timer disabled\n' >>"$pw/data/unitfiles.txt"
+  mkdir -p "$pw/data/show"
+  printf 'Type=simple\nTriggeredBy=reportjob-nightly.timer\n' >"$pw/data/show/reportjob.service"
+  printf 'Type=oneshot\nTriggeredBy=\n' >"$pw/data/show/digestjob.service"
+  printf 'Type=oneshot\nTriggeredBy=plainjob.socket\n' >"$pw/data/show/plainjob.service"
+  (
+    export STUB_DATA="$pw/data" BULIG_DEPLOY_TEST_ROOT="$pw/root"
+    bash "$deploy/precheck.sh" >/dev/null 2>&1 || exit 9
+    cd "$pw" && eval "$cmd"
+    bash "$deploy/postcheck.sh"
+  ) >"$work/out" 2>&1 || rc=$?
+  if [ "$rc" -eq 9 ]; then bad "$label: precheck did not run"; return; fi
+  if [ "$want" = pass ] && [ "$rc" -ne 0 ]; then bad "$label (postcheck failed): $(head -c 400 "$work/out")"; return; fi
+  if [ "$want" = fail ] && [ "$rc" -eq 0 ]; then bad "$label (postcheck passed): $(head -c 400 "$work/out")"; return; fi
+  if grep -qF -- "$text" "$work/out"; then ok "$label"; else bad "$label (no '$text'): $(head -c 400 "$work/out")"; fi
+}
+st() { echo "sed -i.bak 's/^$1 loaded inactive dead/$1 loaded $2/' data/units.txt"; } # st <unit> <new active and sub state>
+post_case "a timer's oneshot mid-run is info, not a failure" pass "info  clientjob.service: inactive dead -> activating start" "$(st clientjob.service 'activating start')"
+post_case "a timer's oneshot whose run failed is a warn that names it, not a failure" pass "warn  clientjob.service is failed now" "$(st clientjob.service 'failed failed')"
+post_case "a timer's service running at the postcheck is info" pass "info  clientjob.service: inactive dead -> active running" "$(st clientjob.service 'active running')"
+post_case "a service systemd says a timer triggers is info" pass "info  reportjob.service: inactive dead -> activating start" "$(st reportjob.service 'activating start')"
+post_case "a oneshot with a .timer of the same name is info" pass "info  digestjob.service: inactive dead -> activating start" "$(st digestjob.service 'activating start')"
+post_case "a oneshot with no timer that changed state still fails" fail "+plainjob.service failed failed" "$(st plainjob.service 'failed failed')"
+post_case "a service with no timer that stopped still fails" fail "+clientapp.service inactive dead" "sed -i.bak 's/^clientapp.service loaded active running/clientapp.service loaded inactive dead/' data/units.txt"
+post_case "a timer's service: its timer is still compared" fail "-clientjob.timer clientjob.service" "$(st clientjob.service 'activating start'); sed -i.bak '/clientjob.timer/d' data/timers.txt"
+post_case "a timer's service: its unit file state is still compared" fail "+clientjob.service masked" "$(st clientjob.service 'failed failed'); sed -i.bak 's/^clientjob.service static/clientjob.service masked/' data/unitfiles.txt"
+post_case "a timer's service whose unit file vanished still fails" fail "-clientjob.service static" "sed -i.bak '/^clientjob.service/d' data/units.txt data/unitfiles.txt"
+post_case "a new container from an image already running is info" pass "info  new container ncl-a1-sess-2-q9z from agent-session:latest" "echo 'ncl-a1-sess-2-q9z agent-session:latest running' >>data/docker.txt"
+post_case "a new container from a new image still fails" fail "+evil evil/image:1 running" "echo 'evil evil/image:1 running' >>data/docker.txt"
+post_case "a new container from an image that was only stopped at the precheck still fails" fail "+again client/migrate:2 running" "echo 'again client/migrate:2 running' >>data/docker.txt"
+post_case "a session container gone while its image still runs in another is info" pass "info  container ncl-a1-sess-1-k3j from agent-session:latest is gone now" "sed -i.bak '/^ncl-a1-sess-1-k3j /d' data/docker.txt; echo 'ncl-a1-sess-3-p0w agent-session:latest running' >>data/docker.txt"
+post_case "a session container stopped while its image still runs in another is info" pass "info  container ncl-a1-sess-1-k3j from agent-session:latest is stopped now" "sed -i.bak 's/^ncl-a1-sess-1-k3j agent-session:latest running/ncl-a1-sess-1-k3j agent-session:latest exited/' data/docker.txt; echo 'ncl-a1-sess-3-p0w agent-session:latest running' >>data/docker.txt"
+post_case "a container gone with no running container left on its image still fails" fail "-ncl-a1-sess-1-k3j agent-session:latest running" "sed -i.bak '/^ncl-a1-sess-1-k3j /d' data/docker.txt; echo 'ncl-a1-sess-3-p0w agent-session:latest exited' >>data/docker.txt"
+post_case "a container stopped with no running container left on its image still fails" fail "+ncl-a1-sess-1-k3j agent-session:latest exited" "sed -i.bak 's/^ncl-a1-sess-1-k3j agent-session:latest running/ncl-a1-sess-1-k3j agent-session:latest exited/' data/docker.txt"
+post_case "a session container moved to a new image, while its old image still runs, still fails" fail "+ncl-a1-sess-1-k3j evil/image:1 running" "sed -i.bak 's/^ncl-a1-sess-1-k3j agent-session:latest running/ncl-a1-sess-1-k3j evil\\/image:1 running/' data/docker.txt; echo 'ncl-a1-sess-3-p0w agent-session:latest running' >>data/docker.txt"
+post_case "a removed container still fails" fail "-clientweb ghcr.io/client/web:1.4 running" "sed -i.bak '/^clientweb /d' data/docker.txt"
+post_case "a stopped container still fails" fail "+clientweb ghcr.io/client/web:1.4 exited" "sed -i.bak 's/^clientweb ghcr.io\/client\/web:1.4 running/clientweb ghcr.io\/client\/web:1.4 exited/' data/docker.txt"
+post_case "a known container under a new image still fails" fail "+clientweb agent-session:latest running" "sed -i.bak 's/^clientweb ghcr.io\/client\/web:1.4 running/clientweb agent-session:latest running/' data/docker.txt"
+post_case "info lines do not hide a real change elsewhere" fail "8080" "$(st clientjob.service 'failed failed'); echo 'ncl-a1-sess-2-q9z agent-session:latest running' >>data/docker.txt; echo 'LISTEN 0 1 0.0.0.0:8080 0.0.0.0:* users:((\"python3\",pid=7,fd=3))' >>data/ss.txt"
 
 
 finish

@@ -120,6 +120,8 @@ if grep -q 'every item in "Must be proven on the server first"' <<<"$CUT" && gre
 STEP8="$(sed -n '/^8\. \*\*Copy over the old record/,/^9\. \*\*Synthetic/p' "$deploy/RUNBOOK.md")"
 # shellcheck disable=SC2016
 if grep -q 'bulig-cli.sh --as kernel --exec' <<<"$STEP8" && grep -q 'Never `scp`' <<<"$STEP8"; then ok "step 8 pipes the SQLite file in through bulig-cli.sh --exec and says never to scp it into a user's folder"; else bad "step 8 does not use bulig-cli.sh --exec"; fi
+PC="$(sed -n '/^12\. \*\*Postcheck/,/^## /p' "$deploy/RUNBOOK.md")"
+if grep -q 'the run state of a service a timer starts' <<<"$PC" && grep -q 'a `failed` one is a `warn` line that names the unit' <<<"$PC" && grep -q 'a container whose image no longer runs in any container, or a known container on a new image still fails' <<<"$PC"; then ok "the RUNBOOK's postcheck step says what is reported and not compared, and what still fails"; else bad "RUNBOOK postcheck step does not describe the timer and container rules"; fi
 UNINST="$(grep -- '- \*\*Remove Bulig completely' "$deploy/RUNBOOK.md")"
 if [ "${UNINST%%postcheck.sh*}" != "$UNINST" ] && [ "${UNINST%%postcheck.sh*}" != "${UNINST%%/var/lib/bulig-checks*}" ] && [ "${#UNINST}" -gt 0 ]; then
   before_pc="${UNINST%%\`postcheck.sh\`*}"

@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # Does the fence hold on this machine? For each Bulig property set, run a short probe INSIDE a transient unit that has exactly that set's
 # network, socket and path properties, and require that it CANNOT reach other tenants' services (localhost, the docker bridge, tailscale, the
-# machine's own addresses, unix sockets including an abstract one) and CAN do what the unit needs (DNS, https, its own gateway, a child
-# process, a user lookup). Any unexpected success is a failure. The probe list is one file, fence/probes.txt.
+# machine's own addresses, unix sockets including an abstract one where the set has no AF_UNIX) and CAN do what the unit needs (DNS, https, its
+# own gateway, a child process, a user lookup, and for the worker sets Claude Code's Bash sandbox: a unix socket of its own and bwrap). Any
+# unexpected success is a failure. The probe list is one file, fence/probes.txt.
+# The worker sets have AF_UNIX, so every listening path socket ss lists is also judged for them from the file alone (stat and access inside the
+# unit, never a connection): the connectable ones are listed as known limits in every run, and a connectable Bulig socket is a failure.
 #   Probes: fence/probes.txt (published, generic) + ones derived from what this machine listens on + /etc/bulig/fence-extra-probes.txt (root, 0600,
 #   required: this script fails without it).
 #   usage (root):  fence-check.sh [worker|kernel|build|cli-worker|cli-kernel|all] [--no-late | --late-only] [--late-strict]
@@ -24,7 +27,8 @@
 #   - A target that systemd holds as a socket for another unit (systemctl list-sockets) is never connected to by anything. It is judged from the
 #     unit's properties only, and reported as "activation socket: checked by properties only".
 #   - Known limits are reported from the unit's properties and ss, labelled "known limit, not tested by connecting".
-#   - What does connect: the allow probes (Bulig's own gateway and Postgres socket, DNS, github, anthropic) and the deny probes inside the fence,
+#   - What does connect: the allow probes (Bulig's own gateway and Postgres socket, DNS, github, anthropic, a unix socket the probe makes for
+#     itself) and the deny probes inside the fence,
 #     which must fail before they reach anything. A deny probe that succeeds IS a real connection to another service; that is why it is a failure.
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -58,6 +62,9 @@ probe="$here/fence-probe.py"
 [ -s "$BULIG_FENCE_EXTRA" ] || die "$BULIG_FENCE_EXTRA is missing or empty. Fill in fence/extra-probes.template and install it with set-secret.sh --fence-extra-probes (RUNBOOK, 'The extra probes')."
 (fence_extra_check "$BULIG_FENCE_EXTRA") || die "$BULIG_FENCE_EXTRA is not usable (see above)"
 host_addrs="$(host_addresses | tr '\n' ' ')"
+# The kernel user's uid: a path socket it owns that the worker sets could connect to is a FAIL (the probe judges that from the file, never by
+# connecting). -1 when the user does not exist yet.
+bulig_uid="$(id -u bulig 2>/dev/null || echo -1)"
 common_args=(--host-addrs "$host_addrs")
 
 # One probe stream for all sets: the published probes, the ones derived from what this machine is listening on right now, and the extra file.
@@ -119,8 +126,9 @@ for s in "${sets[@]}"; do
       ;;
     # The real build sets HOME explicitly (release-remote.sh); a DynamicUser has no passwd entry to take it from.
     build) build_fence_props; props=("${FENCE_BUILD[@]}" --setenv=HOME=/var/tmp/home) ;;
-    cli-worker) cli_fence_props worker; props=("${FENCE_CLI[@]}"); ids=(--uid=bulig-worker) ;;
-    cli-kernel) cli_fence_props kernel; props=("${FENCE_CLI[@]}"); ids=(--uid=bulig) ;;
+    # (with bulig-cli.sh's own hardening, so the sandbox probe sees the /proc a real one-off command has)
+    cli-worker) cli_fence_props worker; cli_harden_props worker; props=("${FENCE_CLI[@]}" "${CLI_HARDEN[@]}"); ids=(--uid=bulig-worker) ;;
+    cli-kernel) cli_fence_props kernel; cli_harden_props kernel; props=("${FENCE_CLI[@]}" "${CLI_HARDEN[@]}"); ids=(--uid=bulig) ;;
   esac
   [ "${#props[@]}" -gt 0 ] || die "no fence properties found for $s (is the unit installed?)"
   # The unit's properties, handed to the probe as plain values: known limits and activation sockets are judged from them.
@@ -135,7 +143,7 @@ for s in "${sets[@]}"; do
   systemd-run --quiet --pipe --wait --collect --unit="$unit_name" ${ids[@]+"${ids[@]}"} "${props[@]}" -p "RuntimeMaxSec=$((set_cap + 15))" \
     -- /usr/bin/python3 -I "$probe" fenced "$s" - "${common_args[@]}" --control "$control" \
     --activation-text "$(cat "$work/sockets")" --af "$(prop_value RestrictAddressFamilies)" --ip-deny "$(prop_value IPAddressDeny)" --ip-allow "$(prop_value IPAddressAllow)" \
-    --inaccessible "$(prop_value InaccessiblePaths)" --deny-timeout "$deny_timeout" --jobs "$par" ${late_flag[@]+"${late_flag[@]}"} <"$work/all-probes" >"$work/out-$s" 2>&1 &
+    --inaccessible "$(prop_value InaccessiblePaths)" --bulig-uid "$bulig_uid" --deny-timeout "$deny_timeout" --jobs "$par" ${late_flag[@]+"${late_flag[@]}"} <"$work/all-probes" >"$work/out-$s" 2>&1 &
   pids+=("$!")
   names+=("$unit_name")
 done

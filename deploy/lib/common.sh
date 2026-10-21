@@ -23,15 +23,23 @@ BULIG_GATEWAY_PORT=7431
 # the same values as text and deploy/test/units.sh checks them; the transient units (release build, bulig-cli.sh) take them from here, and
 # fence-check.sh tests the result against the real machine.
 #  - IPAddressDeny: everything local or private (the public internet is what is left), plus the host's own public addresses (host_addresses).
-#  - RestrictAddressFamilies without AF_UNIX: no unix socket at all, abstract ones included. socketpair() is not affected by it.
-#  - InaccessiblePaths: the other unix sockets that could be reached if AF_UNIX were ever allowed ("-" = ignore a missing path).
+#  - RestrictAddressFamilies: the build has no AF_UNIX (no unix socket at all, abstract ones included; socketpair() is not affected by it).
+#    The worker and its one-off commands have AF_UNIX and AF_NETLINK (Jasher, 21 Oct 2026): Claude Code runs every Bash command in bubblewrap,
+#    which needs a unix socket of its own (the sandbox's proxy, in the unit's private /tmp) and netlink (to bring up loopback in its own network
+#    namespace). So the worker sets can reach other tenants' ABSTRACT unix sockets, as the kernel can: a known limit, reported by fence-check.sh.
+#  - InaccessiblePaths: named unix sockets and folders, hidden from the file view ("-" = ignore a missing path). Only these are hidden; it is not
+#    every socket. The worker, which has AF_UNIX, also loses the Postgres socket folder, the system D-Bus folder, snapd's second socket, systemd's
+#    userdb folder, resolved's varlink sockets and /run/user, none of which it needs. Any other path socket whose permissions let the worker's user
+#    in stays connectable: a known limit, listed from the files (never by connecting) by fence-check.sh in every run.
 #  - BindReadOnlyPaths: resolved's upstream resolver list instead of the 127.0.0.53 stub, so no localhost address has to be allowed for DNS.
 # Numeric prefixes only: systemd-run (systemd 255) refuses a symbolic name such as localhost inside a list
 # ("Failed to parse IP address prefix"), and these go into transient units. Unit files share the same rule.
 BULIG_IP_DENY_PRIVATE="127.0.0.0/8 ::1/128 169.254.0.0/16 fe80::/10 224.0.0.0/4 ff00::/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7"
 BULIG_AF_NO_UNIX="AF_INET AF_INET6"
 BULIG_AF_WITH_UNIX="AF_UNIX AF_INET AF_INET6"
+BULIG_AF_WORKER="AF_UNIX AF_INET AF_INET6 AF_NETLINK"
 BULIG_INACCESSIBLE="-/run/tailscale -/run/snapd.socket -/run/docker.sock -/var/run/docker.sock"
+BULIG_INACCESSIBLE_WORKER="-/run/tailscale -/run/snapd.socket -/run/docker.sock -/var/run/docker.sock -/run/postgresql -/var/run/postgresql -/run/dbus -/run/snapd-snap.socket -/run/systemd/userdb -/run/systemd/resolve/io.systemd.Resolve -/run/systemd/resolve/io.systemd.Resolve.Monitor -/run/user"
 BULIG_RESOLV_BIND="/run/systemd/resolve/resolv.conf:/etc/resolv.conf"
 
 # The tests run the scripts against a throwaway folder: BULIG_DEPLOY_TEST_ROOT puts every fixed path under it and skips the
@@ -51,6 +59,12 @@ BULIG_BACKUP_INDEX="$R/var/backups/bulig/index"
 # The two users, and the paths NOT to touch (named here only so need_dir can refuse them; nothing is ever written to them).
 BULIG_USERS="bulig bulig-worker"
 BULIG_USER_STATE_PREFIXES="$R/var/lib/bulig $R/var/lib/bulig-worker"
+# The AppArmor profile that lets /usr/bin/bwrap make user namespaces (Ubuntu 24.04 sets kernel.apparmor_restrict_unprivileged_userns=1).
+# release-remote.sh installs deploy/apparmor/bulig-bwrap here and loads it; nothing else in /etc/apparmor.d is touched.
+BULIG_APPARMOR_DIR="$R/etc/apparmor.d"
+BULIG_APPARMOR_PROFILE="bulig-bwrap"
+BULIG_APPARMOR_ENABLED="$R/sys/module/apparmor/parameters/enabled"
+BULIG_APPARMOR_LOADED="$R/sys/kernel/security/apparmor/profiles"
 
 # One secret per root-only file in /etc/bulig, loaded by systemd LoadCredential= into the units that need it. Each unit gets only its own.
 BULIG_CREDENTIALS="pg-url gh-token worker-tokens claude-token worker-token github-read-token drill-pw telegram-token"
@@ -206,7 +220,8 @@ build_fence_props() {
     -p "InaccessiblePaths=$BULIG_INACCESSIBLE" -p "BindReadOnlyPaths=$BULIG_RESOLV_BIND")
 }
 
-# cli_fence_props <kernel|worker>: sets FENCE_CLI for a one-off bulig-cli.sh command. The kernel keeps AF_UNIX (the Postgres socket), the worker does not.
+# cli_fence_props <kernel|worker>: sets FENCE_CLI for a one-off bulig-cli.sh command. The kernel keeps AF_UNIX (the Postgres socket). The worker gets
+# exactly bulig-worker.service's fence (AF_UNIX and AF_NETLINK for Claude Code's sandbox, the same hidden paths); deploy/test/fence.sh compares them.
 FENCE_CLI=()
 cli_fence_props() {
   local role="$1" deny="$BULIG_IP_DENY_PRIVATE" a
@@ -217,11 +232,33 @@ cli_fence_props() {
     worker)
       a="$(host_addresses | tr '\n' ' ')"
       deny="$deny ${a% }"
-      FENCE_CLI=(-p "RestrictAddressFamilies=$BULIG_AF_NO_UNIX" -p "IPAddressDeny=${deny% }" -p "IPAddressAllow=$BULIG_GATEWAY_ADDR/32"
-        -p "InaccessiblePaths=$BULIG_INACCESSIBLE" -p "BindReadOnlyPaths=$BULIG_RESOLV_BIND") ;;
+      FENCE_CLI=(-p "RestrictAddressFamilies=$BULIG_AF_WORKER" -p "IPAddressDeny=${deny% }" -p "IPAddressAllow=$BULIG_GATEWAY_ADDR/32"
+        -p "InaccessiblePaths=$BULIG_INACCESSIBLE_WORKER" -p "BindReadOnlyPaths=$BULIG_RESOLV_BIND") ;;
     *) die "role must be kernel or worker" ;;
   esac
   FENCE_CLI+=(-p LimitCORE=0) # no core dumps: a crash could leave a credential in /var/crash
+}
+
+# cli_harden_props <kernel|worker>: sets CLI_HARDEN, the hardening of a one-off bulig-cli.sh command (the same as the matching service). fence-check.sh
+# runs its cli sets with it too, so the sandbox probe sees the real /proc. The worker has no ProtectKernelTunables, ProtectKernelLogs or
+# ProtectHostname (each mounts over part of /proc, and then bwrap cannot mount a fresh one for Claude Code's sandbox; 21 Oct 2026): ReadOnlyPaths=/sys
+# and a SystemCallFilter for syslog, sethostname and setdomainname stand in, as in bulig-worker.service.
+CLI_HARDEN=()
+cli_harden_props() {
+  CLI_HARDEN=(
+    -p NoNewPrivileges=yes -p CapabilityBoundingSet= -p PrivateTmp=yes -p PrivateDevices=yes
+    -p ProtectSystem=strict -p ProtectHome=yes -p ProtectKernelModules=yes
+    -p ProtectControlGroups=yes -p ProtectClock=yes -p ProtectProc=invisible
+    -p RestrictSUIDSGID=yes -p RestrictRealtime=yes -p LockPersonality=yes -p SystemCallArchitectures=native
+    -p UMask=0077 -p StateDirectoryMode=0700
+    -p KillMode=control-group
+    -p TasksMax=256 -p CPUWeight=50 -p Nice=10
+  )
+  case "$1" in
+    kernel) CLI_HARDEN+=(-p ProtectKernelTunables=yes -p ProtectKernelLogs=yes -p ProtectHostname=yes) ;;
+    worker) CLI_HARDEN+=(-p ReadOnlyPaths=/sys -p "SystemCallFilter=~syslog sethostname setdomainname") ;;
+    *) die "role must be kernel or worker" ;;
+  esac
 }
 
 # wildcard_listeners: TCP listeners on every address (0.0.0.0, ::, *), as addr:port, one per line. An allowed address such as 127.74.3.1 reaches

@@ -91,7 +91,8 @@ SystemCallArchitectures=native
 # written by set-mac-worker.sh; none until then), and the public internet (GitHub). IPAddressDeny/Allow match ADDRESSES, NOT PORTS, so a service
 # listening on every address is also reachable at 127.74.3.1, with a loopback source (it may treat that as trusted). It reaches Postgres over the unix socket.
 # KNOWN LIMIT: this unit keeps AF_UNIX (the Postgres socket), so it can still reach other tenants' ABSTRACT unix sockets.
-# It runs no worker code (the worker is a different unit with no AF_UNIX); an AppArmor profile (deny unix addr=@**,) is the next step.
+# It runs no worker code (the worker is a different unit; it has AF_UNIX too, for Claude Code's sandbox, with the same known limit); an AppArmor
+# profile (deny unix addr=@**,) is the next step.
 # DNS comes from resolved's upstream list, not the 127.0.0.53 stub (see bulig-worker.service).
 IPAddressDeny=127.0.0.0/8 ::1/128 169.254.0.0/16 fe80::/10 224.0.0.0/4 ff00::/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7
 IPAddressAllow=127.74.3.1/32

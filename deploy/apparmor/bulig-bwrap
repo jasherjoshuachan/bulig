@@ -1,0 +1,8 @@
+# Added for Bulig (Jasher, 21 Oct 2026): lets bubblewrap create user namespaces, so Claude Code's Bash sandbox runs in bulig-worker.
+abi <abi/4.0>,
+include <tunables/global>
+
+profile bulig-bwrap /usr/bin/bwrap flags=(unconfined) {
+  userns,
+  include if exists <local/bulig-bwrap>
+}

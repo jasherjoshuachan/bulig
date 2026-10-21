@@ -134,8 +134,20 @@ want="-p DynamicUser=yes -p RestrictAddressFamilies=AF_INET AF_INET6 -p IPAddres
 if [ "$got" = "$want" ]; then ok "build: throwaway user, no AF_UNIX, private ranges and the host's addresses denied, nothing allowed, sockets hidden, upstream resolvers"; else bad "build props: $got"; fi
 # shellcheck disable=SC2016
 got="$(props 'cli_fence_props worker; printf "%s\n" "${FENCE_CLI[@]}"')"
-want="-p RestrictAddressFamilies=AF_INET AF_INET6 -p IPAddressDeny=$DENY $HOSTS -p IPAddressAllow=127.74.3.1/32 -p InaccessiblePaths=$INACC -p BindReadOnlyPaths=$RES -p LimitCORE=0 "
-if [ "$got" = "$want" ]; then ok "cli worker: no AF_UNIX, denies like the build, allows the gateway address only"; else bad "cli worker props: $got"; fi
+INACC_W="$INACC -/run/postgresql -/var/run/postgresql -/run/dbus -/run/snapd-snap.socket -/run/systemd/userdb -/run/systemd/resolve/io.systemd.Resolve -/run/systemd/resolve/io.systemd.Resolve.Monitor -/run/user"
+want="-p RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK -p IPAddressDeny=$DENY $HOSTS -p IPAddressAllow=127.74.3.1/32 -p InaccessiblePaths=$INACC_W -p BindReadOnlyPaths=$RES -p LimitCORE=0 "
+if [ "$got" = "$want" ]; then ok "cli worker: AF_UNIX and AF_NETLINK for Claude Code's sandbox, denies like the build, allows the gateway address only, hides the Postgres folder and the system bus too"; else bad "cli worker props: $got"; fi
+# The worker's one-off commands are meant to have the same fence as bulig-worker.service: compare them key by key (the unit's deny list plus
+# the host addresses its drop-in adds).
+uv() { grep -E "^$1=" "$deploy/systemd/bulig-worker.service" | sed -E "s/^$1=//"; }
+# shellcheck disable=SC2016
+cli_v() { bash -c ". '$deploy/lib/common.sh'; cli_fence_props worker; for e in \"\${FENCE_CLI[@]}\"; do case \"\$e\" in $1=*) printf '%s' \"\${e#*=}\" ;; esac; done"; }
+same=1
+for key in RestrictAddressFamilies IPAddressAllow InaccessiblePaths BindReadOnlyPaths; do
+  if [ "$(cli_v "$key")" != "$(uv "$key")" ]; then same=0; echo "    $key: unit '$(uv "$key")', cli '$(cli_v "$key")'" >&2; fi
+done
+if [ "$(cli_v IPAddressDeny)" != "$(uv IPAddressDeny) $HOSTS" ]; then same=0; echo "    IPAddressDeny: unit '$(uv IPAddressDeny)' + host, cli '$(cli_v IPAddressDeny)'" >&2; fi
+if [ "$same" -eq 1 ]; then ok "cli worker: the same families, allow list, hidden paths, resolver and (with the host drop-in) deny list as bulig-worker.service"; else bad "cli worker and bulig-worker.service have different fences"; fi
 # shellcheck disable=SC2016
 got="$(props 'cli_fence_props kernel; printf "%s\n" "${FENCE_CLI[@]}"')"
 want="-p RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 -p IPAddressDeny=$DENY -p IPAddressAllow=127.74.3.1/32 -p InaccessiblePaths=$INACC -p BindReadOnlyPaths=$RES -p LimitCORE=0 "
@@ -320,7 +332,7 @@ if ! grep -qE ' 127\.74\.3\.1:' "$work/derived.txt"; then ok "derived: the kerne
 chk 203.0.113.10:41007 ""
 chk 172.20.0.1:41008 "$ALL"
 chk 172.20.0.1:41005 "$ALL"
-if [ "$(awk '$1 == "deny" && $4 == "abstract" { print $2 " " $5 }' "$work/derived.txt" | sort | tr '\n' '|')" = "worker,build,cli-worker /tmp/example-abstract|worker,build,cli-worker second|" ] && [ "$(awk '$1 == "known" && $4 == "abstract" { print $2 " " $5 }' "$work/derived.txt" | sort | tr '\n' '|')" = "kernel,cli-kernel /tmp/example-abstract|kernel,cli-kernel second|" ]; then ok "derived: every abstract socket is denied for the worker, build and worker CLI and a known limit for the kernel sets; a path socket is not an abstract one"; else bad "abstract lines: $(grep abstract "$work/derived.txt")"; fi
+if [ "$(awk '$1 == "deny" && $4 == "abstract" { print $2 " " $5 }' "$work/derived.txt" | sort | tr '\n' '|')" = "build /tmp/example-abstract|build second|" ] && [ "$(awk '$1 == "known" && $4 == "abstract" { print $2 " " $5 }' "$work/derived.txt" | sort | tr '\n' '|')" = "worker,kernel,cli-worker,cli-kernel /tmp/example-abstract|worker,kernel,cli-worker,cli-kernel second|" ]; then ok "derived: every abstract socket is denied for the build (no AF_UNIX) and a known limit for the kernel and worker sets (AF_UNIX); a path socket is not an abstract one"; else bad "abstract lines: $(grep abstract "$work/derived.txt")"; fi
 python3 -I "$deploy/fence-probe.py" derive "$work/d-tcp" "$work/d-unix" "$work/d-ip" >"$work/derived2.txt"
 if cmp -s "$work/derived.txt" "$work/derived2.txt"; then ok "derived: the same machine gives the same list"; else bad "derived list is not stable"; fi
 # the order ss prints in does not matter
@@ -328,7 +340,8 @@ sed '1!G;h;$!d' "$work/d-tcp" >"$work/d-tcp-rev"
 sed '1!G;h;$!d' "$work/d-unix" >"$work/d-unix-rev"
 python3 -I "$deploy/fence-probe.py" derive "$work/d-tcp-rev" "$work/d-unix-rev" "$work/d-ip" >"$work/derived3.txt"
 if cmp -s "$work/derived.txt" "$work/derived3.txt"; then ok "derived: listeners in the reverse order give the same, sorted list"; else bad "derived list depends on the order ss printed in"; fi
-if ! grep -qvE '^(deny|known) ' "$work/derived.txt"; then ok "derived: every line is a probe line"; else bad "odd derived output"; fi
+if ! grep -qvE '^(deny|known|reach) ' "$work/derived.txt"; then ok "derived: every line is a probe line"; else bad "odd derived output"; fi
+if [ "$(grep '^reach ' "$work/derived.txt")" = "reach worker,cli-worker path-1 unix-path /run/example.sock" ]; then ok "derived: the listening path socket becomes one reach line for the worker sets (an abstract one does not)"; else bad "reach lines: $(grep '^reach ' "$work/derived.txt")"; fi
 # the derived lines are valid probe lines: the probe reads them
 dc="$(python3 -I "$deploy/fence-probe.py" control worker - "${CA[@]}" --host-addrs "203.0.113.10/32" <"$work/derived.txt" | wc -l | tr -d ' ')"
 if [ "$dc" -ge 10 ]; then ok "derived: the probe reads the lines it was given ($dc probes in the worker set)"; else bad "derived lines not read ($dc)"; fi
@@ -425,22 +438,31 @@ if [ "$rc" -eq 0 ] && grep -q "fence-check: ok" "$work/fc.out"; then ok "no leak
 if [ "$(grep -c '^warn .* gone inconclusive' "$work/fc.out")" = "5" ]; then ok "a target that is not listening shows as inconclusive, per set, and does not pass silently"; else bad "inconclusive count: $(grep -c inconclusive "$work/fc.out")"; fi
 run_for() { grep -- "--unit=bulig-fence-$1-" "$log/runs" | head -1; }
 w="$(run_for worker)"
-case "$w" in *"--uid=bulig-worker"*"-p IPAddressDeny=$DENY $HOSTS "*"-p IPAddressAllow=127.74.3.1/32 "*"-p RestrictAddressFamilies=AF_INET AF_INET6 "*"-p InaccessiblePaths=$INACC "*"-p BindReadOnlyPaths=$RES "*) ok "worker set: read from the installed unit and its drop-in (uid, deny with the host addresses, the gateway allow, no AF_UNIX, hidden sockets, upstream resolvers)" ;; *) bad "worker run: $w" ;; esac
+case "$w" in *"--uid=bulig-worker"*"-p IPAddressDeny=$DENY $HOSTS "*"-p IPAddressAllow=127.74.3.1/32 "*"-p RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK "*"-p InaccessiblePaths=$INACC_W "*"-p BindReadOnlyPaths=$RES "*) ok "worker set: read from the installed unit and its drop-in (uid, deny with the host addresses, the gateway allow, AF_UNIX and AF_NETLINK, hidden sockets, upstream resolvers)" ;; *) bad "worker run: $w" ;; esac
+# the bwrap probe has to see the unit's real /proc, system call filter and capabilities, so those are passed on too
+case "$w" in *"-p ReadOnlyPaths=/sys "*"-p SystemCallFilter=~syslog sethostname setdomainname "*"-p ProtectKernelModules=true "*"-p NoNewPrivileges=true "*"-p CapabilityBoundingSet= "*) ok "worker set: the sandbox-relevant settings (ReadOnlyPaths, SystemCallFilter, the Protect* kept, NoNewPrivileges, the empty capability set) are passed on, so the bwrap probe runs as the worker would" ;; *) bad "worker run lacks the sandbox settings: $w" ;; esac
+case "$w" in *ProtectKernelTunables* | *ProtectKernelLogs* | *ProtectHostname* | *ProcSubset*) bad "the worker set has a /proc protection the worker unit does not: $w" ;; *) ok "and none of the /proc protections the worker unit leaves out" ;; esac
 k="$(run_for kernel)"
+case "$k" in *"-p ProtectKernelTunables=true "*"-p ProtectKernelLogs=true "*"-p ProtectHostname=true "*) ok "kernel set: its /proc protections are passed on as the unit has them" ;; *) bad "kernel run lacks its /proc protections: $k" ;; esac
 case "$k" in *"--uid=bulig "*"-p IPAddressDeny=$DENY "*"-p IPAddressAllow=127.74.3.1/32 100.101.102.103/32 "*"-p RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 "*) ok "kernel set: keeps AF_UNIX, allows its gateway and exactly the Mac worker's /32 from the drop-in" ;; *) bad "kernel run: $k" ;; esac  # scan-forbidden: allow-addresses (a Tailscale test address)
 b="$(run_for build)"
 case "$b" in *"-p DynamicUser=yes"*"-p RestrictAddressFamilies=AF_INET AF_INET6"*"-p IPAddressDeny=$DENY $HOSTS "*) ok "build set: DynamicUser, no AF_UNIX, the deny list with the host addresses" ;; *) bad "build run: $b" ;; esac
 case "$b" in *"--uid="* | *"IPAddressAllow"*) bad "the build set has a named user or an Allow: $b" ;; *) ok "and no named user and no Allow" ;; esac
 cw="$(run_for cli-worker)"; ck="$(run_for cli-kernel)"
-case "$cw" in *"--uid=bulig-worker"*"RestrictAddressFamilies=AF_INET AF_INET6"*) ok "cli-worker set: no AF_UNIX" ;; *) bad "cli-worker run: $cw" ;; esac
+case "$cw" in *"--uid=bulig-worker"*"RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK "*"InaccessiblePaths=$INACC_W "*) ok "cli-worker set: the worker unit's families and hidden paths" ;; *) bad "cli-worker run: $cw" ;; esac
 case "$ck" in *"--uid=bulig "*"RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6"*) ok "cli-kernel set: keeps AF_UNIX" ;; *) bad "cli-kernel run: $ck" ;; esac
+# the cli sets are probed with bulig-cli.sh's own hardening, so the bwrap probe sees the /proc a real one-off command has
+case "$cw" in *"-p ReadOnlyPaths=/sys "*"-p SystemCallFilter=~syslog sethostname setdomainname "*) ok "cli-worker set: probed with the worker's hardening (ReadOnlyPaths=/sys, the system call filter)" ;; *) bad "cli-worker run lacks the hardening: $cw" ;; esac
+case "$cw" in *ProtectKernelTunables* | *ProtectKernelLogs* | *ProtectHostname*) bad "cli-worker set has a /proc protection: $cw" ;; *) ok "and none of the /proc protections bwrap cannot live with" ;; esac
+case "$ck" in *"-p ProtectKernelTunables=yes "*"-p ProtectKernelLogs=yes "*"-p ProtectHostname=yes "*) ok "cli-kernel set: probed with the kernel's /proc protections" ;; *) bad "cli-kernel run lacks its hardening: $ck" ;; esac
 # a target that ss lists and the fenced run cannot reach is the one case that is a real pass
-printf 'deny worker hidden-sock unix %s\n' "$unix_path" >"$work/fc-hidden.txt"
+# (the build set: the worker sets have AF_UNIX, so there a unix path that InaccessiblePaths does not hide is a known limit and is not run)
+printf 'deny build hidden-sock unix %s\n' "$unix_path" >"$work/fc-hidden.txt"
 rc=0
 printf 'u_str LISTEN 0 5 %s 1 * 0\n' "$unix_path" >"$log/ss-unix"
-STUB_HIDE="$unix_path" BULIG_FENCE_PROBES="$work/fc-hidden.txt" bash "$deploy/fence-check.sh" worker >"$work/fc.out" 2>&1 || rc=$?
+STUB_HIDE="$unix_path" BULIG_FENCE_PROBES="$work/fc-hidden.txt" bash "$deploy/fence-check.sh" build >"$work/fc.out" 2>&1 || rc=$?
 : >"$log/ss-unix"
-if [ "$rc" -eq 0 ] && grep -q "^ok worker hidden-sock blocked" "$work/fc.out" && ! grep -q "^warn" "$work/fc.out"; then ok "a target that ss lists and the fenced run cannot reach is a pass: blocked (so the ss listing is what makes a pass mean something)"; else bad "hidden-target rc=$rc: $(cat "$work/fc.out")"; fi
+if [ "$rc" -eq 0 ] && grep -q "^ok build hidden-sock blocked" "$work/fc.out" && ! grep -q "^warn" "$work/fc.out"; then ok "a target that ss lists and the fenced run cannot reach is a pass: blocked (so the ss listing is what makes a pass mean something)"; else bad "hidden-target rc=$rc: $(cat "$work/fc.out")"; fi
 # the machine-specific probes are required, and are part of the run
 EX="$root/etc/bulig/fence-extra-probes.txt"
 cp "$EX" "$work/ex.keep"
@@ -464,17 +486,17 @@ BULIG_FENCE_PROBES="$work/fc-clean.txt" bash "$deploy/fence-check.sh" worker >"$
 if [ "$rc" -eq 1 ] && grep -q "^FAIL worker listener-127.0.0.1-$tcp_port UNEXPECTED SUCCESS" "$work/fc.out"; then ok "a loopback listener found with ss becomes a deny probe without being named anywhere, and a leak to it fails the check"; else bad "derived probe not run: rc=$rc $(cat "$work/fc.out")"; fi
 printf 'u_str LISTEN 0 4096 @example-abstract-name 1 * 0\n' >"$log/ss-unix"
 : >"$log/ss-tcp"
-BULIG_FENCE_PROBES="$work/fc-clean.txt" bash "$deploy/fence-check.sh" worker kernel >"$work/fc.out" 2>&1 || true
-if grep -q "worker abstract-1 " "$work/fc.out" && grep -q "^info kernel abstract-1 known limit" "$work/fc.out"; then ok "an abstract socket found with ss is probed: denied for the worker, a known limit for the kernel"; else bad "derived abstract probes: $(grep abstract "$work/fc.out")"; fi
+BULIG_FENCE_PROBES="$work/fc-clean.txt" bash "$deploy/fence-check.sh" worker kernel build >"$work/fc.out" 2>&1 || true
+if grep -q "^info worker abstract-1 known limit, not tested by connecting" "$work/fc.out" && grep -q "^info kernel abstract-1 known limit, not tested by connecting" "$work/fc.out" && grep -qE "^(ok|warn|FAIL) build abstract-1 " "$work/fc.out"; then ok "an abstract socket found with ss is probed: denied for the build, a known limit (never connected to) for the worker and the kernel"; else bad "derived abstract probes: $(grep abstract "$work/fc.out")"; fi
 : >"$log/ss-unix"
 if ! grep -q "work\." <(ls "$root/var/lib/bulig-checks" 2>/dev/null); then ok "the probe stream is removed afterwards"; else bad "work folder left in $(ls "$root/var/lib/bulig-checks")"; fi
 
 # a drop-in that opens a hole is part of what is tested
 mkdir -p "$SD/bulig-worker.service.d"
-printf '[Service]\nIPAddressAllow=127.0.0.1/32\nRestrictAddressFamilies=AF_UNIX\n' >"$SD/bulig-worker.service.d/99-hole.conf"
+printf '[Service]\nIPAddressAllow=127.0.0.1/32\nRestrictAddressFamilies=AF_PACKET\n' >"$SD/bulig-worker.service.d/99-hole.conf"
 : >"$log/runs"
 BULIG_FENCE_PROBES="$work/fc-clean.txt" bash "$deploy/fence-check.sh" worker >/dev/null 2>&1 || true
-case "$(run_for worker)" in *"IPAddressAllow=127.74.3.1/32 127.0.0.1/32"*"RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX"*) ok "a drop-in that adds 127.0.0.1 and AF_UNIX is passed to the probe, so the probe would catch it" ;; *) bad "drop-in not merged: $(run_for worker)" ;; esac
+case "$(run_for worker)" in *"IPAddressAllow=127.74.3.1/32 127.0.0.1/32"*"RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_PACKET"*) ok "a drop-in that adds 127.0.0.1 and a socket family is passed to the probe, so the probe would catch it" ;; *) bad "drop-in not merged: $(run_for worker)" ;; esac
 printf '[Service]\nIPAddressAllow=\nIPAddressAllow=100.64.1.1/32\n' >"$SD/bulig-worker.service.d/99-hole.conf"  # scan-forbidden: allow-addresses (a Tailscale test address)
 : >"$log/runs"
 BULIG_FENCE_PROBES="$work/fc-clean.txt" bash "$deploy/fence-check.sh" worker >/dev/null 2>&1 || true
@@ -526,6 +548,10 @@ ProtectSystem=strict
 PrivateTmp=yes
 ProtectHome=yes
 ProtectProc=invisible
+ProtectKernelTunables=no
+ReadOnlyPaths=/sys
+SystemCallFilter=~sethostname setdomainname syslog
+CapabilityBoundingSet=
 DATA
 : >"$log/runs"
 STUB_SHOW_FILE="$shown" BULIG_FENCE_SOURCE=show BULIG_FENCE_PROBES="$work/fc-clean.txt" bash "$deploy/fence-check.sh" worker --no-late >"$work/fc.out" 2>&1 || true
@@ -533,6 +559,7 @@ w="$(grep -- '--unit=bulig-fence-worker-' "$log/runs" | head -1)"
 case "$w" in *"--uid=bulig-worker"*"-p IPAddressDeny=127.0.0.0/8 ::1/128 10.0.0.0/8 "*"-p IPAddressAllow=127.74.3.1 127.0.0.1 "*) ok "the probe gets the LOADED values (here a 127.0.0.1 that no file has, as set-property would leave it), so a loaded hole is tested" ;; *) bad "loaded run: $w" ;; esac
 case "$w" in *"BindPaths="*) bad "an empty loaded property was passed on: $w" ;; *) ok "an empty loaded property (BindPaths=) is not passed on" ;; esac
 case "$w" in *"-p BindReadOnlyPaths=/run/systemd/resolve/resolv.conf:/etc/resolv.conf "*"-p ProtectSystem=strict "*) ok "bind paths and the single-value settings come from the loaded unit too" ;; *) bad "loaded bind/protect: $w" ;; esac
+case "$w" in *"-p ReadOnlyPaths=/sys "*"-p SystemCallFilter=~sethostname setdomainname syslog "*"-p ProtectKernelTunables=no "*"-p CapabilityBoundingSet= "*) ok "and the sandbox-relevant settings, the empty capability set included, come from the loaded unit" ;; *) bad "loaded sandbox settings: $w" ;; esac
 sed 's/^SupplementaryGroups=$/SupplementaryGroups=docker/' "$shown" >"$work/show-groups.txt"
 expect_fail_msg "a loaded worker with SupplementaryGroups is refused (it would gain docker's sockets)" "SupplementaryGroups=docker" env STUB_SHOW_FILE="$work/show-groups.txt" BULIG_FENCE_SOURCE=show BULIG_FENCE_PROBES="$work/fc-clean.txt" bash "$deploy/fence-check.sh" worker
 sed 's/^LoadState=loaded$/LoadState=not-found/' "$shown" >"$work/show-nf.txt"
@@ -555,6 +582,81 @@ fi
 BULIG_FENCE_PROBES="$work/fc-clean.txt" bash "$deploy/fence-check.sh" build >/dev/null 2>&1 || true
 case "$(grep -- '--unit=bulig-fence-build-' "$log/runs" | head -1)" in *"--setenv=HOME=/var/tmp/home"*) ok "the build set is probed with HOME set explicitly, as the real build does (a DynamicUser has no passwd entry to take it from)" ;; *) bad "build probe has no HOME" ;; esac
 if grep -q -- '--setenv=HOME=/var/tmp/home' "$deploy/release-remote.sh"; then ok "and the real build sets that HOME"; else bad "release-remote.sh does not set HOME for the build"; fi
+
+echo "Claude Code's sandbox probes (worker sets)"
+if grep -qE "^allow +worker,cli-worker +bwrap-sandbox +sandbox +/usr/bin/bwrap --unshare-all --ro-bind / / --dev /dev --proc /proc /bin/true\$" "$P"; then ok "the worker sets run bwrap --unshare-all --ro-bind / / --dev /dev --proc /proc /bin/true (the sandbox without Claude)"; else bad "no bwrap probe for exactly the worker sets: $(grep bwrap "$P")"; fi
+if grep -qE "^allow +worker,cli-worker +unix-socket-of-its-own +unix-self +-\$" "$P"; then ok "and listen on a unix socket of their own (what the sandbox's proxy does)"; else bad "no unix-self probe for the worker sets"; fi
+printf 'allow worker sb-ok sandbox python3 -c pass\nallow worker sb-bad sandbox python3 -c raise\nallow worker sb-missing sandbox /nonexistent/bwrap --unshare-all /bin/true\nallow worker us-self unix-self -\n' >"$work/sbprobes.txt"
+res="$(probe fenced worker "$work/sbprobes.txt" --control "" --af "$WITHUNIX" --activation-text "" --ip-deny "127.0.0.0/8 ::1/128" || true)"
+if grep -q "^ok worker sb-ok works (bwrap made its namespaces" <<<"$res"; then ok "a sandbox probe whose command exits 0 works"; else bad "sandbox ok: $res"; fi
+for n in sb-bad sb-missing; do
+  if grep "^FAIL worker $n should work but did not" <<<"$res" | grep -q "the AppArmor profile bulig-bwrap is not loaded" && grep "^FAIL worker $n " <<<"$res" | grep -q "AF_NETLINK or AF_UNIX"; then ok "a sandbox probe that fails ($n) is a FAIL that names AppArmor and the address families as the likely causes"; else bad "sandbox $n: $(grep "$n" <<<"$res")"; fi
+done
+if grep -q "^ok worker us-self works (listened on and connected to a unix socket of its own)" <<<"$res"; then ok "the unix-self probe listens on and connects to its own socket"; else bad "unix-self: $(grep us-self <<<"$res")"; fi
+printf 'allow worker us-self unix-self -\n' >"$work/us.txt"
+res="$(python3 -I "$deploy/test/fenced-standin.py" "$deploy/fence-probe.py" fenced worker "$work/us.txt" --control "" --af "$NOUNIX" --activation-text "" || true)"
+if grep -q "^FAIL worker us-self should work but did not" <<<"$res" && grep -q "EAFNOSUPPORT" <<<"$res" && grep -q "Claude Code's sandbox listens on a unix socket of its own" <<<"$res"; then ok "in a set with no AF_UNIX the unix-self probe FAILs and says why (the error seen on the server)"; else bad "unix-self without AF_UNIX: $res"; fi
+if [ -z "$(find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'bulig-fence-*' -newer "$work/probes.txt" 2>/dev/null | head -1)" ]; then ok "and it leaves no temporary folder behind"; else bad "a bulig-fence-* folder was left in ${TMPDIR:-/tmp}"; fi
+# The worker sets have AF_UNIX: a unix deny probe runs there only when InaccessiblePaths hides its path, and an abstract one never does.
+# (Never against the machine's real sockets: here nothing fences the probe, so a run against /run/docker.sock and the like would really
+# connect to them, as it did on a CI runner. The paths below are in a fresh folder; nothing listens there.)
+WAF="AF_UNIX AF_INET AF_INET6 AF_NETLINK"
+wd="$(mktemp -d /tmp/bfw-XXXXXX)"
+printf 'deny worker hidden-one unix %s/hidden/a.sock\ndeny worker open-one unix %s/open/b.sock\ndeny worker an-abstract abstract example-name\n' "$wd" "$wd" >"$work/w-unix.txt"
+res="$(probe fenced worker "$work/w-unix.txt" --control "" --af "$WAF" --inaccessible "-$wd/hidden" --activation-text "" || true)"
+if grep -q "^warn worker hidden-one inconclusive" <<<"$res" && grep -q "^info worker open-one known limit, not tested by connecting" <<<"$res" && grep -q "^info worker an-abstract known limit, not tested by connecting" <<<"$res"; then ok "with AF_UNIX, a deny probe whose path is hidden is run (it cannot reach anything), one whose path is not hidden and an abstract one are known limits, never connected to"; else bad "worker unix probes: $res"; fi
+rm -rf "$wd"
+# and every published unix deny probe for the worker sets is under one of the worker's hidden paths, so on the server each one is a real test
+# (checked as text: the paths are never opened here)
+unhidden=""
+while read -r _ sets name _ target; do
+  case ",$sets," in *,worker,* | *,cli-worker,*) ;; *) continue ;; esac
+  t="${target/#\/var\/run\//\/run\/}"
+  hit=0
+  for h in $INACC_W; do h="${h#-}"; h="${h/#\/var\/run\//\/run\/}"; case "$t" in "$h" | "$h"/*) hit=1 ;; esac; done
+  [ "$hit" -eq 1 ] || unhidden="$unhidden $name"
+done < <(grep -E '^deny +[^ ]+ +[^ ]+ +unix ' "$P")
+if [ -z "$unhidden" ] && [ "$(grep -cE '^deny +[^ ]*worker[^ ]* +[^ ]+ +unix ' "$P")" -ge 7 ]; then ok "every published unix deny probe for the worker sets (tailscaled, snapd x2, docker, Postgres, userdb, resolved) is under the worker's hidden paths"; else bad "published worker unix probes not hidden:$unhidden"; fi
+
+echo "path sockets the worker sets could connect to (judged from the file, never connected to)"
+sk="$(mktemp -d /tmp/bf-XXXXXX)"
+mkdir -p "$sk/open" "$sk/shut"
+python3 -I - "$sk" <<'PYS'
+import os, socket, sys
+d = sys.argv[1]
+for name, mode in (("open/other.sock", 0o666), ("open/closed.sock", 0o000), ("shut/inside.sock", 0o666)):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.bind(os.path.join(d, name))
+    s.close()
+    os.chmod(os.path.join(d, name), mode)
+open(os.path.join(d, "open/plain-file"), "w").close()
+PYS
+chmod 000 "$sk/shut"
+{ for f in open/other.sock open/closed.sock shut/inside.sock open/plain-file open/missing.sock; do printf 'u_str LISTEN 0 5 %s 1 * 0\n' "$sk/$f"; done; } >"$work/r-unix"
+: >"$work/r-tcp"; : >"$work/r-ip"
+probe derive "$work/r-tcp" "$work/r-unix" "$work/r-ip" | grep '^reach ' >"$work/reach.txt"
+if [ "$(wc -l <"$work/reach.txt" | tr -d ' ')" = "5" ]; then ok "every listening path socket from ss gets a reach line"; else bad "reach lines: $(cat "$work/reach.txt")"; fi
+me="$(id -u)"
+res="$(probe fenced worker "$work/reach.txt" --control "" --af "$WAF" --activation-text "" --self-uid 99999 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && grep -q "^info worker path-[0-9]* known limit, not tested by connecting: unix path $sk/open/other.sock is connectable from this set" <<<"$res"; then ok "a world-connectable socket of someone else is listed as a known limit, and nothing fails"; else bad "other socket rc=$rc: $res"; fi
+if [ "$me" != "0" ]; then
+  if ! grep -q "closed.sock\|inside.sock\|plain-file\|missing.sock" <<<"$res"; then ok "a socket with no permission, one behind a closed folder, a plain file and a missing path are not listed"; else bad "unreachable ones listed: $res"; fi
+  if grep -q "^info worker path-sockets 5 listening path sockets: 1 connectable from this set (known limit, listed above), 0 its own, 0 Bulig's own (must be 0), 4 not reachable" <<<"$res"; then ok "and one summary line counts them"; else bad "summary: $(grep path-sockets <<<"$res")"; fi
+fi
+res="$(probe fenced worker "$work/reach.txt" --control "" --af "$WAF" --activation-text "" --self-uid 99999 --bulig-uid "$me" 2>&1)"; rc=$?
+if [ "$rc" -eq 1 ] && grep -q "^FAIL worker path-[0-9]* a Bulig socket is connectable from this set: $sk/open/other.sock" <<<"$res"; then ok "a connectable socket owned by the kernel's user is a FAIL (exit 1)"; else bad "bulig-owned socket rc=$rc: $res"; fi
+res="$(probe fenced worker "$work/reach.txt" --control "" --af "$WAF" --activation-text "" 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && grep -q "^info worker path-[0-9]* this set's own socket: $sk/open/other.sock" <<<"$res"; then ok "the set's own socket is listed as its own"; else bad "own socket rc=$rc: $res"; fi
+if python3 -I -c 'import importlib.util,sys; s=importlib.util.spec_from_file_location("fp", sys.argv[1]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); sys.exit(0 if m.BULIG_OWN_PATHS == ("/run/postgresql/.s.PGSQL.5436",) and "/var/lib/bulig/" in m.BULIG_OWN_PREFIXES else 1)' "$deploy/fence-probe.py"; then ok "the Bulig Postgres socket and the kernel's folders count as Bulig's own"; else bad "Bulig's own paths"; fi
+printf "%s * 0\n" "$sk/open/other.sock" >"$work/r-act"
+res="$(probe fenced worker "$work/reach.txt" --control "" --af "$WAF" --activation-text "$(cat "$work/r-act")" --self-uid 99999 2>&1)"
+if grep -q "other.sock is connectable from this set (.*; an activation socket)" <<<"$res"; then ok "an activation socket is named as one (and still never connected to)"; else bad "activation note: $(grep other.sock <<<"$res")"; fi
+printf 'reach worker x unix /run/x.sock\n' >"$work/reach-bad.txt"
+expect_fail_msg "a reach line of another kind is refused" "a reach line is kind unix-path" python3 -I "$deploy/fence-probe.py" fenced worker "$work/reach-bad.txt" --control "" --af "$WAF" --activation-text ""
+printf 'known worker x unix-path /run/x.sock\n' >"$work/reach-bad.txt"
+expect_fail_msg "and a unix-path line that is not a reach line" "a reach line is kind unix-path" python3 -I "$deploy/fence-probe.py" fenced worker "$work/reach-bad.txt" --control "" --af "$WAF" --activation-text ""
+if grep -q -- '--bulig-uid "$bulig_uid"' "$deploy/fence-check.sh" && grep -q 'bulig_uid="$(id -u bulig' "$deploy/fence-check.sh"; then ok "fence-check hands the kernel user's uid to every set"; else bad "fence-check does not pass --bulig-uid"; fi
+chmod 755 "$sk/shut"; rm -rf "$sk"
 
 echo "the kit never connects to another service, and never wakes one"
 # Listeners that count the connections they accept: tcp_port, the unix socket and (Linux) the abstract one stand for ANOTHER service;

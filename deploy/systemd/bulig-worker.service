@@ -61,37 +61,62 @@ PrivateDevices=true
 # Read-only everywhere except this user's own StateDirectory (Claude's sign-in and settings, and its clones under work/).
 ProtectSystem=strict
 ProtectHome=yes
-ProtectKernelTunables=true
 ProtectKernelModules=true
-ProtectKernelLogs=true
 ProtectControlGroups=true
 ProtectClock=true
-ProtectHostname=true
 ProtectProc=invisible
+# CLAUDE CODE'S SANDBOX NEEDS A FRESH /proc (found on the server, 21 Oct 2026). bwrap mounts a new proc for every sandboxed command, and the kernel
+# refuses that ("Can't mount proc on /newroot/proc: Operation not permitted") when this unit's /proc has parts mounted over. ProtectKernelTunables,
+# ProtectKernelLogs and ProtectHostname each do that, and ProcSubset=pid hides most of /proc, so none of the four is set here. What stands in:
+# - ProtectKernelTunables -> ReadOnlyPaths=/sys. sysfs stays read-only (ProtectSystem=strict leaves /sys writable). /proc/sys and the other
+#   /proc tunables are no longer mounted read-only; they belong to root and this unit has no capabilities, so it still cannot change the host's.
+#   Inside bwrap's own namespaces a command can change that namespace's own settings, which reach nothing outside it.
+# - ProtectKernelLogs -> SystemCallFilter=~syslog (no reading or clearing the kernel log through syslog(2)). /dev/kmsg is gone with PrivateDevices;
+#   /proc/kmsg is root-only.
+# - ProtectHostname -> SystemCallFilter=~sethostname setdomainname. The unit no longer gets its own UTS namespace, but it cannot rename the host.
+ReadOnlyPaths=/sys
+SystemCallFilter=~syslog sethostname setdomainname
 RestrictSUIDSGID=true
 RestrictRealtime=true
 LockPersonality=true
 SystemCallArchitectures=native
-# NETWORK AND SOCKETS. This unit runs Claude (a prompt can steer it) and the commands Claude runs, so it gets the narrowest reach.
-# Other services on this host listen on loopback and on the container bridges with no login of their own, and another tenant's program can
-# listen on an abstract unix socket that no file permission or PrivateTmp hides. So:
-# - RestrictAddressFamilies has no AF_UNIX (and no AF_NETLINK): the unit cannot open a unix socket at all, abstract ones included. Pipes and
-#   socketpair() are not affected (systemd.exec: "sockets created with socketpair() are unaffected"), which is what node's child_process uses.
+# NETWORK AND SOCKETS. This unit runs Claude (a prompt can steer it) and the commands Claude runs, so it gets the narrowest reach that still
+# lets Claude Code's Bash sandbox start. Other services on this host listen on loopback and on the container bridges with no login of their own,
+# and another tenant's program can listen on an abstract unix socket that no file permission or PrivateTmp hides. So:
+# - RestrictAddressFamilies is AF_UNIX AF_INET AF_INET6 AF_NETLINK (Jasher, 21 Oct 2026). Claude Code runs every Bash command inside bubblewrap
+#   (its sandbox settings: enabled, failIfUnavailable), and on the server, without these two, every Bash call failed: the sandbox listens on a
+#   unix socket of its own in /tmp (EAFNOSUPPORT without AF_UNIX), and bwrap needs a NETLINK_ROUTE socket to bring up loopback in its own network
+#   namespace. bwrap also needs to make a user namespace, which Ubuntu's AppArmor allows only to programs with a profile that says so:
+#   /etc/apparmor.d/bulig-bwrap (deploy/apparmor/bulig-bwrap, installed by release-remote.sh). NoNewPrivileges stays on (bwrap ran with it on the server, 21 Oct).
+#   KNOWN LIMIT: with AF_UNIX this unit can reach other tenants' ABSTRACT unix sockets (the same limit as the kernel; fence-check.sh reports it
+#   from the properties and never connects). The commands Claude runs are inside bwrap's own network namespace, where the host's abstract
+#   sockets do not exist; Claude Code's own process and the worker are not. Netlink reaches the kernel only (no other service): it can read the
+#   host's interfaces and routes, and change nothing, because this unit has no capabilities (CapabilityBoundingSet= is empty).
+#   KNOWN LIMIT: commands inside the sandbox have NO NETWORK. Claude Code's sandbox proxy is reached on the host's loopback (127.0.0.1, ::1),
+#   which the IP filter below denies, so `npm install` from a stage times out. Loopback stays closed on purpose (it reaches every service on
+#   the host's loopback); the planned fix is a network namespace of the worker's own (RUNBOOK, Known limits).
 # - IPAddressDeny/Allow filter every IP packet in both directions (an Allow match wins, then a Deny match, then the packet is let through,
 #   which is the public internet). They match ADDRESSES, NOT PORTS: 127.74.3.1 is allowed for the kernel gateway, so a service listening on
 #   every address is also reachable at 127.74.3.1, with a loopback source (it may treat that as trusted). The host's own public addresses are denied as well; they
 #   are read from the machine at setup time into a drop-in (bulig-worker.service.d/10-host-addresses.conf, root-owned), not written here.
 # - DNS: /etc/resolv.conf is the systemd-resolved stub on 127.0.0.53, which would have to be allowed, and an allowed address reaches every
 #   listener on it. So the unit gets resolved's upstream list in its place (public servers, which the deny list does not touch).
-# - InaccessiblePaths hides the other sockets a unix connection could have reached (tailscaled, snapd, docker) if AF_UNIX were ever allowed.
+# - InaccessiblePaths hides THESE paths only, not every unix socket: tailscaled, snapd and docker (as for the kernel), and, because this unit has
+#   AF_UNIX: the Postgres socket folder, the system D-Bus folder, snapd's second socket, systemd's userdb folder (users are in /etc/passwd, so
+#   nss "files" answers first), resolved's varlink sockets (DNS goes through the upstream list below) and /run/user (no login session here).
+#   None of them is needed by node, Claude Code or bwrap. They were added on top of the set proven in transient units on 21 Oct 2026;
+#   fence-check.sh's bwrap probe runs with them. The journal's sockets stay reachable on purpose (logging).
+#   KNOWN LIMIT: every OTHER path socket whose file and folder permissions let bulig-worker in stays connectable (another tenant's service
+#   socket under /run or /var/lib, for example). fence-check.sh lists each one from the file (stat and access, never a connection) in every
+#   run, and fails only if one is Bulig's own. A network namespace of the worker's own would not change this: path sockets are files.
 IPAddressDeny=127.0.0.0/8 ::1/128 169.254.0.0/16 fe80::/10 224.0.0.0/4 ff00::/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7
 IPAddressAllow=127.74.3.1/32
 BindReadOnlyPaths=/run/systemd/resolve/resolv.conf:/etc/resolv.conf
-InaccessiblePaths=-/run/tailscale -/run/snapd.socket -/run/docker.sock -/var/run/docker.sock
-RestrictAddressFamilies=AF_INET AF_INET6
+InaccessiblePaths=-/run/tailscale -/run/snapd.socket -/run/docker.sock -/var/run/docker.sock -/run/postgresql -/var/run/postgresql -/run/dbus -/run/snapd-snap.socket -/run/systemd/userdb -/run/systemd/resolve/io.systemd.Resolve -/run/systemd/resolve/io.systemd.Resolve.Monitor -/run/user
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 # NOT set on purpose:
 #   MemoryDenyWriteExecute  node's JIT needs writable+executable memory.
-#   RestrictNamespaces      Claude Code's own sandbox uses namespaces if it is switched on.
+#   RestrictNamespaces      Claude Code's Bash sandbox (bubblewrap) makes user, mount, pid and network namespaces for every command.
 
 [Install]
 WantedBy=multi-user.target

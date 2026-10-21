@@ -5,7 +5,8 @@
 #   usage: bash <incoming>/deploy/release-remote.sh <short-sha> <keep>        (arguments checked below)
 #
 # THE INVARIANT: root never creates, writes, chmods, chowns or deletes a path whose parent a Bulig user owns or can write. Every path
-# this script writes is under /var/lib/bulig-checks, /opt/bulig, /usr/local/lib/bulig, /etc/bulig or /etc/systemd/system (all root's).
+# this script writes is under /var/lib/bulig-checks, /opt/bulig, /usr/local/lib/bulig, /etc/bulig, /etc/systemd/system or (one file,
+# bulig-bwrap) /etc/apparmor.d, all root's.
 # It never goes near /var/lib/bulig or /var/lib/bulig-worker: systemd makes those (StateDirectory=), and the programs fill them.
 #
 # What it does with the delivered tree:
@@ -15,7 +16,8 @@
 #     never enters a folder that user wrote to. The tar is unpacked by root inside a second sandbox that can write one folder only,
 #     checked (types, hard links, set-id bits, links that leave the release), and only then are the node_modules folders moved next to a
 #     fresh copy of the delivered code. A build script cannot change a delivered file or keep a handle into the live release.
-#   - both `current` links and the unit files are swapped, the services restarted, health checked; any failure puts all of it back.
+#   - both `current` links and the unit files are swapped, bwrap's AppArmor profile (/etc/apparmor.d/bulig-bwrap) installed and loaded if it
+#     differs, the services restarted, health checked; any failure puts all of it back.
 #
 # BULIG_DEPLOY_TEST_ROOT puts every path under a throwaway folder and skips the owner checks. On the server it is never set.
 set -euo pipefail
@@ -185,6 +187,53 @@ restore_units() {
   done
 }
 
+# --- 3b. the AppArmor profile for bubblewrap (Jasher, 21 Oct 2026) ---------------------------------------------------------------------
+# Claude Code runs every Bash command in bubblewrap, which makes a user namespace. Ubuntu 24.04 (kernel.apparmor_restrict_unprivileged_userns=1)
+# allows that only to a program whose AppArmor profile says `userns`, so deploy/apparmor/bulig-bwrap gives /usr/bin/bwrap exactly that and
+# nothing else (the profile is unconfined otherwise). It is /etc/apparmor.d/bulig-bwrap (root, 0644), written only when it differs from the
+# release's copy, then loaded with apparmor_parser -r; a file that is already right but not loaded is loaded. No other file in /etc/apparmor.d is
+# touched. Where AppArmor is not enabled, nothing is written and a note says so. A failure fails the release, which puts the previous file
+# (or no file) back, like the units.
+aa_src="$tk_rel/apparmor/$BULIG_APPARMOR_PROFILE"
+aa_dst="$BULIG_APPARMOR_DIR/$BULIG_APPARMOR_PROFILE"
+aa_backup="$work/apparmor-backup"
+aa_changed=0
+aa_loaded() { [ -r "$BULIG_APPARMOR_LOADED" ] && grep -q "^$BULIG_APPARMOR_PROFILE " "$BULIG_APPARMOR_LOADED"; }
+install_apparmor() {
+  if [ "$(cat "$BULIG_APPARMOR_ENABLED" 2>/dev/null)" != "Y" ]; then
+    echo "apparmor: not enabled on this machine, so $aa_dst is not installed (Claude Code's Bash sandbox needs bwrap to make user namespaces; see the RUNBOOK)"
+    return 0
+  fi
+  command -v apparmor_parser >/dev/null 2>&1 || { echo "apparmor: enabled, but apparmor_parser is not installed, so bwrap's profile cannot be loaded" >&2; return 1; }
+  [ -f "$aa_src" ] || { echo "apparmor: the release has no apparmor/$BULIG_APPARMOR_PROFILE" >&2; return 1; }
+  # (need_dir and install_root_file die on a refusal; in a subshell that is a failed step, so the rollback below still runs)
+  (need_dir "$BULIG_APPARMOR_DIR") || return 1
+  [ ! -L "$aa_dst" ] || { echo "apparmor: $aa_dst is a link. Not touching it." >&2; return 1; }
+  if [ -f "$aa_dst" ] && cmp -s "$aa_src" "$aa_dst"; then
+    if aa_loaded; then echo "apparmor: $aa_dst is as in the release and loaded"; return 0; fi
+    apparmor_parser -r "$aa_dst" || { echo "apparmor: apparmor_parser -r $aa_dst failed" >&2; return 1; }
+    echo "apparmor: $aa_dst was as in the release but not loaded; loaded it"
+    return 0
+  fi
+  if [ -f "$aa_dst" ]; then cp -p "$aa_dst" "$aa_backup"; fi
+  aa_changed=1
+  (install_root_file "$aa_dst") <"$aa_src" || return 1
+  apparmor_parser -r "$aa_dst" || { echo "apparmor: apparmor_parser -r $aa_dst failed" >&2; return 1; }
+  echo "apparmor: installed and loaded $aa_dst (root, 0644)"
+}
+# restore_apparmor: only if this release changed the file. The previous one goes back and is reloaded, or, when there was none, the profile is
+# unloaded and the file removed. A file that was already right but not loaded, and was only loaded here, stays loaded on a rollback: the file
+# on disk is unchanged, and a reboot would load it anyway.
+restore_apparmor() {
+  [ "$aa_changed" -eq 1 ] || return 0
+  if [ -f "$aa_backup" ]; then
+    { (install_root_file "$aa_dst") <"$aa_backup" && apparmor_parser -r "$aa_dst"; } || echo "apparmor: could not put the previous $aa_dst back" >&2
+  else
+    if [ -f "$aa_dst" ]; then apparmor_parser -R "$aa_dst" || true; fi
+    rm -f "$aa_dst"
+  fi
+}
+
 # --- 4. swap both links, install the units of the new release, restart, check --------------------------------------------------------
 # Every step ends in "|| return 1": inside an `if` the shell ignores set -e, so a failed step would otherwise be skipped over and the
 # release would look fine.
@@ -199,6 +248,7 @@ apply_release() {
     echo "config: created $BULIG_CRED_DIR/config.json from the VPS template (Telegram off, no local worker). Edit it as root; it is never overwritten."
   fi
   write_host_dropin bulig-worker.service || return 1
+  install_apparmor || return 1
   systemctl daemon-reload || return 1
   systemctl enable bulig-loopback.service bulig.service bulig-worker.service >/dev/null 2>&1 || return 1
   systemctl start bulig-loopback.service || return 1
@@ -233,6 +283,7 @@ if [ -n "$prev_healthy" ] && [ -d "$prev_healthy" ]; then
   swap_link "$prev" "$cur"
   if [ -n "$prev_tk" ] && [ -d "$prev_tk" ]; then swap_link "$prev_tk" "$tk_cur"; fi
   restore_units
+  restore_apparmor
   systemctl daemon-reload
   systemctl restart bulig.service bulig-worker.service
   if [ -x "$tk_cur/health.sh" ] && "$tk_cur/health.sh" --wait 40; then
@@ -249,6 +300,7 @@ else
   systemctl stop bulig-loopback.service || true
   rm -f "$cur" "$tk_cur" "$healthy_file"
   restore_units
+  restore_apparmor
   systemctl daemon-reload || true
 fi
 exit 1

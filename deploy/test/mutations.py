@@ -480,9 +480,13 @@ M = [
     ("postcheck: any oneshot counts as started by a timer", "run.sh", "lib/snapshot.sh", "  if grep -qx 'Type=oneshot' <<<\"$props\"; then\n", "  if grep -qx 'Type=oneshot' <<<\"$props\"; then return 0\n"),
     ("postcheck: a failed timer service is only info", "run.sh", "lib/snapshot.sh", '      *" failed "*) echo "warn  $u is failed now', '      *" failed "*) echo "info  $u is failed now'),
     ("postcheck: every section drops a timer service's lines", "run.sh", "lib/snapshot.sh", '    sec == "rs" && index(units, " " $1 " ") { next }', '    index(units, " " $1 " ") { next }'),
-    ("postcheck: a new container from any image is info", "run.sh", "lib/snapshot.sh", "!($1 in seen) && ($2 in running) { print $1, $2 }", "!($1 in seen) { print $1, $2 }"),
+    ("postcheck: a new container from any image is info", "run.sh", "lib/snapshot.sh", "!($1 in seen) && ($2 in running) { print \"new\", $1, $2 }", "!($1 in seen) { print \"new\", $1, $2 }"),
     ("postcheck: an image only stopped at the precheck counts as running", "run.sh", "lib/snapshot.sh", 'if ($3 == "running") running[$2] = 1; next', 'running[$2] = 1; next'),
-    ("postcheck: any container line not in the precheck is info", "run.sh", "lib/snapshot.sh", "!($1 in seen) && ($2 in running) { print $1, $2 }", "($2 in running) { print $1, $2 }"),
+    ("postcheck: any container line not in the precheck is info", "run.sh", "lib/snapshot.sh", "!($1 in seen) && ($2 in running) { print \"new\", $1, $2 }", "($2 in running) { print \"new\", $1, $2 }"),
+    ("postcheck: a gone container is info even when its image runs nowhere", "run.sh", "lib/snapshot.sh", 'if (bstate[n] != "running" || !(bimg[n] in running_now)) continue', 'if (bstate[n] != "running") continue'),
+    ("postcheck: a gone container always fails again", "run.sh", "lib/snapshot.sh", '          if (!(n in now)) print "gone", n, bimg[n]\n', ""),
+    ("postcheck: a stopped container always fails again", "run.sh", "lib/snapshot.sh", '          else if (aimg[n] == bimg[n] && astate[n] != "running") print "stopped", n, bimg[n]\n', ""),
+    ("postcheck: a known container on a new image counts as stopped", "run.sh", "lib/snapshot.sh", 'else if (aimg[n] == bimg[n] && astate[n] != "running")', 'else if (aimg[n] != "")'),
     ("postcheck: the RUNBOOK drops the timer note", "units.sh", "RUNBOOK.md", "the run state of a service a timer starts", "the run state of some services"),
 ]
 

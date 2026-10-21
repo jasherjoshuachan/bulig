@@ -2,7 +2,7 @@
 # The "after" picture: compare ths-prod-01 to the precheck and fail on any difference in what the snapshot covers (see lib/snapshot.sh),
 # apart from Bulig's own users, units, cluster and folders. Read-only except for temp files in /var/lib/bulig-checks.
 # Not compared, only reported (see snapshot_compare in lib/snapshot.sh): the run state of services a timer starts (a "failed" one is a warn
-# line that names it), and new containers from an image that was already running. Their unit files, enabled state and timers still are.
+# line that names it), and containers that come and go while their image keeps running. Unit files, enabled state and timers still are.
 # It does NOT prove anything it does not list: files outside the snapshot, data inside other databases, and live behaviour are not checked.
 # No arguments: it compares against /var/lib/bulig-checks/precheck.snapshot.
 set -euo pipefail

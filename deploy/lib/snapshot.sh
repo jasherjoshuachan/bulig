@@ -75,8 +75,9 @@ snapshot() {
 # Two kinds of churn that Bulig cannot cause and that happen on every run are reported, not compared:
 #   - the run state of a service a timer starts (a oneshot is "activating" mid-run, "inactive dead" after, "failed" if its own run failed).
 #     Its unit file, its enabled state and the timer itself are still compared, in their own sections.
-#   - a new container from an image that was already running at the precheck (a per-session agent container).
-#     A new image, a removed container or a container that changed state still fails.
+#   - a new container from an image that was already running at the precheck (a per-session agent container), and a container that is
+#     gone or stopped while its image still runs in another container. A new image, a container whose image no longer runs anywhere,
+#     or a known container on a new image still fails.
 SNAPSHOT_RUNSTATE_SECTIONS='^## (running services|every service unit and its state)'
 SNAPSHOT_TIMER_SECTION='^## timers and what they start'
 SNAPSHOT_DOCKER_SECTION='^## docker containers'
@@ -122,17 +123,32 @@ snapshot_compare() {
       *) echo "info  $u: ${b:-not loaded} -> ${a:-not loaded} (a timer starts it; its run state is not compared)" ;;
     esac
   done
-  # New containers from an image that was already running.
-  while read -r ctr; do
-    [ -n "$ctr" ] || continue
-    new_ctrs="$new_ctrs ${ctr%% *}"
-    echo "info  new container ${ctr%% *} from ${ctr#* } (that image was already running at the precheck; not compared)"
+  # Containers that come and go next to a long-lived one from the same image (per-session agent containers):
+  #   new:  a container the precheck did not have, from an image that was running at the precheck;
+  #   gone: a container the precheck had running that is gone (or stopped, same image) now, while its image still runs in another one.
+  local kind name img
+  while read -r kind name img; do
+    [ -n "$name" ] || continue
+    new_ctrs="$new_ctrs $name"
+    case "$kind" in
+      new) echo "info  new container $name from $img (that image was already running at the precheck; not compared)" ;;
+      gone) echo "info  container $name from $img is gone now (that image still runs in another container; not compared)" ;;
+      stopped) echo "info  container $name from $img is stopped now (that image still runs in another container; not compared)" ;;
+    esac
   done < <(awk -v h="$SNAPSHOT_DOCKER_SECTION" '
       FNR == 1 { file++ }
       /^## / { on = ($0 ~ h); next }
       !on || NF < 3 { next }
-      file == 1 { seen[$1] = 1; if ($3 == "running") running[$2] = 1; next }
-      !($1 in seen) && ($2 in running) { print $1, $2 }' "$before" "$after")
+      file == 1 { seen[$1] = 1; bimg[$1] = $2; bstate[$1] = $3; if ($3 == "running") running[$2] = 1; next }
+      { now[$1] = 1; aimg[$1] = $2; astate[$1] = $3; if ($3 == "running") running_now[$2] = 1 }
+      !($1 in seen) && ($2 in running) { print "new", $1, $2 }
+      END {
+        for (n in seen) {
+          if (bstate[n] != "running" || !(bimg[n] in running_now)) continue
+          if (!(n in now)) print "gone", n, bimg[n]
+          else if (aimg[n] == bimg[n] && astate[n] != "running") print "stopped", n, bimg[n]
+        }
+      }' "$before" "$after")
   # The copies: the same lines minus those.
   snapshot_drop "$before" "$timed" "$new_ctrs" >"$3"
   snapshot_drop "$after" "$timed" "$new_ctrs" >"$4"

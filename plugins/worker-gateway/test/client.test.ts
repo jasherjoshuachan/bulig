@@ -8,7 +8,7 @@ import { git as gitSync, makeWorld, sleep, tmp, waitFor } from './support.ts';
 import { git } from '@bulig/git';
 
 describe('assertSafeKernelUrl', () => {
-  it.each(['http://127.0.0.1:7431', 'http://localhost:7431', 'http://[::1]:7431', 'http://100.101.102.103:7431', 'http://100.64.0.1', 'http://100.127.255.255', 'http://[fd7a:115c:a1e0::1]:7431', 'https://kernel.example.com'])('allows %s', (url) => {
+  it.each(['http://127.0.0.1:7431', 'http://localhost:7431', 'http://[::1]:7431', 'http://100.101.102.103:7431', 'http://100.64.0.1', 'http://100.127.255.255', 'http://[fd7a:115c:a1e0::1]:7431', 'https://kernel.example.com'])('allows %s', (url) => { // scan-forbidden: allow-addresses (a Tailscale test address)
     expect(() => assertSafeKernelUrl(url)).not.toThrow();
   });
 

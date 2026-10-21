@@ -24,18 +24,18 @@ describe('where the endpoint may listen', () => {
     expect(() => parseGatewayConfig({ listen: ['127.0.0.1', address], workers }, env)).toThrow(/every interface/);
   });
 
-  it.each(['localhost', 'example.com', '', '1.2.3', '100.64.0.1/10'])('refuses %j: only IP addresses are accepted', (address) => {
+  it.each(['localhost', 'example.com', '', '1.2.3', '100.64.0.1/10'])('refuses %j: only IP addresses are accepted', (address) => { // scan-forbidden: allow-addresses (a Tailscale test address)
     expect(() => assertBindable(address)).toThrow(GatewayConfigError);
   });
 
-  it.each(['127.0.0.1', '127.5.5.5', '::1', '[::1]', '100.64.0.1', '100.101.102.103', '100.127.255.255', 'fd7a:115c:a1e0::1', 'fd7a:115c:a1e0:ab12::7'])('accepts %s: this machine or the Tailscale tunnel', (address) => {
+  it.each(['127.0.0.1', '127.5.5.5', '::1', '[::1]', '100.64.0.1', '100.101.102.103', '100.127.255.255', 'fd7a:115c:a1e0::1', 'fd7a:115c:a1e0:ab12::7'])('accepts %s: this machine or the Tailscale tunnel', (address) => { // scan-forbidden: allow-addresses (a Tailscale test address)
     expect(parseGatewayConfig({ listen: [address], workers }, env).listen).toHaveLength(1);
   });
 
   it.each([
     '203.0.113.5', '8.8.8.8', '192.168.1.10', '10.0.0.1', '172.16.0.1', '169.254.1.1', '100.63.255.255', '100.128.0.1', '126.255.255.255', '128.0.0.1', // scan-forbidden: allow-addresses (refusal boundaries)
     '2001:db8::1', 'fe80::1', 'fd7a:115c:a1e1::1', 'fd7a:115c:a1df::1', 'fc00::1',
-    '::ffff:203.0.113.5', '::ffff:127.0.0.1', '::ffff:100.64.0.1', '::ffff:cb00:7105',
+    '::ffff:203.0.113.5', '::ffff:127.0.0.1', '::ffff:100.64.0.1', '::ffff:cb00:7105', // scan-forbidden: allow-addresses (a Tailscale test address)
   ])('refuses %s: it is not this machine or Tailscale, so a token could cross an open network', (address) => {
     expect(() => parseGatewayConfig({ listen: [address], workers }, env)).toThrow(/neither this machine nor the Tailscale tunnel/);
   });

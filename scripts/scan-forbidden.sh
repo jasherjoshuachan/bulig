@@ -9,7 +9,8 @@ root="${SCAN_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
 # --- Built-in checks, always on: no real host detail may be committed to this public repo. ---------------------------------------------------
 # A real address of a server, or a note about what else runs on it, does not belong in a public repository. Allowed addresses: loopback
 # (127.0.0.0/8, which includes the gateway's 127.74.3.1), 0.0.0.0, the private ranges (10/8, 172.16/12, 192.168/16), the Tailscale range
-# (100.64/10) and the documentation ranges (192.0.2/24, 198.51.100/24, 203.0.113/24; for IPv6 2001:db8::/32). Anything else is a hit. The
+# written as itself (100.64.0.0/10, the deny-list entry; any other address in 100.64/10 is a hit unless its line carries the marker below)
+# and the documentation ranges (192.0.2/24, 198.51.100/24, 203.0.113/24; for IPv6 2001:db8::/32). Anything else is a hit. The
 # strings below are the ones that identified a real machine and its other tenants once; they are written in pieces so this file does not
 # contain them. A hit prints file:line and the rule's name, never the text.
 cd "$root" || exit 1
@@ -32,7 +33,6 @@ def allowed4(o):
     if a == 127 or a == 0 or a == 10: return True
     if a == 172 and 16 <= b <= 31: return True
     if a == 192 and b == 168: return True
-    if a == 100 and 64 <= b <= 127: return True
     if (a, b, c) in ((192, 0, 2), (198, 51, 100), (203, 0, 113)): return True
     if a == 255: return True  # a netmask
     return False
@@ -51,6 +51,9 @@ for f in files:
             # The base of a well-known range written as a prefix (link-local 169.254.0.0/16, multicast 224.0.0.0/4)
             # names no host; a host inside it is still caught.
             if o in ([169, 254, 0, 0], [224, 0, 0, 0]) and line[m.end():m.end() + 1] == "/": continue
+            # The Tailscale range is allowed only as the deny-list entry itself, 100.64.0.0/10: a Mac or server on a tailnet has an
+            # address inside it, so any other address there is a hit unless its line carries the marker.
+            if o == [100, 64, 0, 0] and line[m.end():m.end() + 3] == "/10" and not line[m.end() + 3:m.end() + 4].isdigit(): continue
             if not allowed4(o):
                 print(path + ":" + str(n) + " (ipv4-outside-allowed-ranges)")
         for m in ([] if addresses_ok else v6.finditer(line)):

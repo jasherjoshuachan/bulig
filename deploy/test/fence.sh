@@ -19,12 +19,12 @@ export BULIG_DEPLOY_TEST_ROOT="$root"
 cat >"$stubs/ip" <<'STUB'
 #!/usr/bin/env bash
 case "$*" in
-  *"dev tailscale0"*) echo "6: tailscale0    inet 100.64.0.10/32 scope global tailscale0" ;;
+  *"dev tailscale0"*) echo "6: tailscale0    inet 100.64.0.10/32 scope global tailscale0" ;;  # scan-forbidden: allow-addresses (a Tailscale test address)
   *"scope global"*)
     cat <<'DATA'
 2: eth0    inet 203.0.113.10/32 metric 100 scope global dynamic eth0
 2: eth0    inet6 2001:db8::10/64 scope global
-6: tailscale0    inet 100.64.0.10/32 scope global tailscale0
+6: tailscale0    inet 100.64.0.10/32 scope global tailscale0  scan-forbidden: allow-addresses (a Tailscale test address)
 6: tailscale0    inet6 fd00:db8::10/128 scope global
 7: docker0    inet 172.16.0.1/16 brd 172.16.255.255 scope global docker0
 8: br-1    inet 172.23.0.1/16 scope global br-1
@@ -96,27 +96,27 @@ cp "$work/ip.real" "$stubs/ip"
 
 echo "set-mac-worker.sh"
 mw="$SD/bulig.service.d/20-mac-worker.conf"
-expect_ok "a Tailscale address is accepted" bash "$deploy/set-mac-worker.sh" 100.101.102.103
-if [ "$(grep -v '^#' "$mw" | tr '\n' '|')" = "[Service]|IPAddressAllow=100.101.102.103/32|" ]; then ok "the drop-in allows that one /32"; else bad "mac drop-in: $(cat "$mw")"; fi
+expect_ok "a Tailscale address is accepted" bash "$deploy/set-mac-worker.sh" 100.101.102.103  # scan-forbidden: allow-addresses (a Tailscale test address)
+if [ "$(grep -v '^#' "$mw" | tr '\n' '|')" = "[Service]|IPAddressAllow=100.101.102.103/32|" ]; then ok "the drop-in allows that one /32"; else bad "mac drop-in: $(cat "$mw")"; fi  # scan-forbidden: allow-addresses (a Tailscale test address)
 if [ "$(mode "$mw")" = "644" ]; then ok "root-owned mode 644"; else bad "mode $(mode "$mw")"; fi
 # (the addresses just outside the Tailscale range are built from parts: the repository scan refuses to have them written out)
-for bad_ip in 127.0.0.1 10.0.0.5 "100.$((64 - 1)).255.255" "100.$((127 + 1)).0.1" "$((4 * 2)).$((4 * 2)).$((4 * 2)).$((4 * 2))" 100.101.102 100.101.102.103/32 100.101.102.256 100.064.1.1 100.101.102.103.4 mac.tail.net "" "100.101.102.103 100.64.1.1"; do
+for bad_ip in 127.0.0.1 10.0.0.5 "100.$((64 - 1)).255.255" "100.$((127 + 1)).0.1" "$((4 * 2)).$((4 * 2)).$((4 * 2)).$((4 * 2))" 100.101.102 100.101.102.103/32 100.101.102.256 100.064.1.1 100.101.102.103.4 mac.tail.net "" "100.101.102.103 100.64.1.1"; do  # scan-forbidden: allow-addresses (a Tailscale test address)
   expect_fail_msg "refused: '$bad_ip'" "" bash "$deploy/set-mac-worker.sh" "$bad_ip"
-  if [ "$(grep -c 'IPAddressAllow' "$mw")" = "1" ] && grep -q "100.101.102.103/32" "$mw"; then :; else bad "the drop-in changed after a refusal of '$bad_ip'"; fi
+  if [ "$(grep -c 'IPAddressAllow' "$mw")" = "1" ] && grep -q "100.101.102.103/32" "$mw"; then :; else bad "the drop-in changed after a refusal of '$bad_ip'"; fi  # scan-forbidden: allow-addresses (a Tailscale test address)
 done
-expect_fail_msg "two arguments are refused" "usage: set-mac-worker.sh" bash "$deploy/set-mac-worker.sh" 100.101.102.103 100.64.1.1
+expect_fail_msg "two arguments are refused" "usage: set-mac-worker.sh" bash "$deploy/set-mac-worker.sh" 100.101.102.103 100.64.1.1  # scan-forbidden: allow-addresses (a Tailscale test address)
 : >"$log/systemctl"
-bash "$deploy/set-mac-worker.sh" 100.101.102.104 >/dev/null 2>&1
+bash "$deploy/set-mac-worker.sh" 100.101.102.104 >/dev/null 2>&1  # scan-forbidden: allow-addresses (a Tailscale test address)
 if grep -q "daemon-reload" "$log/systemctl"; then ok "systemd is told to reload after the drop-in changes"; else bad "no daemon-reload after set-mac-worker"; fi
-expect_ok "100.64.0.0 is the lowest Tailscale address" bash "$deploy/set-mac-worker.sh" 100.64.0.0
-expect_ok "100.127.255.255 is the highest" bash "$deploy/set-mac-worker.sh" 100.127.255.255
-if grep -q "IPAddressAllow=100.127.255.255/32" "$mw" && [ "$(grep -c IPAddressAllow "$mw")" = "1" ]; then ok "a second run replaces the first (one peer at a time)"; else bad "mac drop-in after rerun: $(cat "$mw")"; fi
+expect_ok "100.64.0.0 is the lowest Tailscale address" bash "$deploy/set-mac-worker.sh" 100.64.0.0  # scan-forbidden: allow-addresses (a Tailscale test address)
+expect_ok "100.127.255.255 is the highest" bash "$deploy/set-mac-worker.sh" 100.127.255.255  # scan-forbidden: allow-addresses (a Tailscale test address)
+if grep -q "IPAddressAllow=100.127.255.255/32" "$mw" && [ "$(grep -c IPAddressAllow "$mw")" = "1" ]; then ok "a second run replaces the first (one peer at a time)"; else bad "mac drop-in after rerun: $(cat "$mw")"; fi  # scan-forbidden: allow-addresses (a Tailscale test address)
 expect_ok "--remove deletes it" bash "$deploy/set-mac-worker.sh" --remove
 if [ ! -e "$mw" ]; then ok "and the kernel allows no Tailscale peer again"; else bad "drop-in still there"; fi
 expect_fail_msg "no argument is refused" "usage: set-mac-worker.sh" bash "$deploy/set-mac-worker.sh"
 mkdir -p "$SD/bulig.service.d"
 ln -s "$work/elsewhere" "$mw"
-expect_fail_msg "a link where the drop-in belongs is refused (set)" "is a link" bash "$deploy/set-mac-worker.sh" 100.101.102.103
+expect_fail_msg "a link where the drop-in belongs is refused (set)" "is a link" bash "$deploy/set-mac-worker.sh" 100.101.102.103  # scan-forbidden: allow-addresses (a Tailscale test address)
 expect_fail_msg "a link where the drop-in belongs is refused (remove)" "is a link" bash "$deploy/set-mac-worker.sh" --remove
 rm -f "$mw"
 
@@ -276,7 +276,7 @@ LISTEN 0 4096 127.0.0.1:41001 0.0.0.0:*
 LISTEN 0 4096 [::1]:41002 [::]:*
 LISTEN 0 4096 127.0.0.53%lo:53 0.0.0.0:*
 LISTEN 0 4096 172.16.0.1:41003 0.0.0.0:*
-LISTEN 0 4096 100.64.0.10:41004 0.0.0.0:*
+LISTEN 0 4096 100.64.0.10:41004 0.0.0.0:*  scan-forbidden: allow-addresses (a Tailscale test address)
 LISTEN 0 128 0.0.0.0:41005 0.0.0.0:*
 LISTEN 0 128 [::]:41005 [::]:*
 LISTEN 0 128 *:41006 *:*
@@ -293,7 +293,7 @@ cat >"$work/d-ip" <<'DATA'
 1: lo    inet 127.0.0.1/8 scope host lo
 2: eth0    inet 203.0.113.10/32 scope global eth0
 2: eth0    inet6 2001:db8::10/64 scope global
-6: tailscale0    inet 100.64.0.10/32 scope global tailscale0
+6: tailscale0    inet 100.64.0.10/32 scope global tailscale0  scan-forbidden: allow-addresses (a Tailscale test address)
 7: docker0    inet 172.16.0.1/16 scope global docker0
 8: br-1    inet 172.20.0.1/16 scope global br-1
 DATA
@@ -306,11 +306,11 @@ chk 127.0.0.1:41001 "$ALL"
 chk "[::1]:41002" "$ALL"
 chk 127.0.0.53:53 "$ALL"
 chk 172.16.0.1:41003 "$ALL"
-chk 100.64.0.10:41004 "$ALL"
+chk 100.64.0.10:41004 "$ALL"  # scan-forbidden: allow-addresses (a Tailscale test address)
 chk 127.0.0.1:41005 "$ALL"
 chk "[::1]:41005" "$ALL"
 chk 172.16.0.1:41005 "$ALL"
-chk 100.64.0.10:41005 "$ALL"
+chk 100.64.0.10:41005 "$ALL"  # scan-forbidden: allow-addresses (a Tailscale test address)
 chk 203.0.113.10:41005 "$WORKERISH"
 chk "[2001:db8::10]:41005" "$WORKERISH"
 chk 127.0.0.1:41006 "$ALL"
@@ -344,7 +344,7 @@ import importlib.util, sys
 spec = importlib.util.spec_from_file_location("fp", sys.argv[1])
 fp = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(fp)
-want = {"::ffff:127.0.0.1": "loopback", "::ffff:10.1.2.3": "private", "::ffff:100.64.0.10": "tailscale", "::ffff:203.0.113.10": "public", "::ffff:0.0.0.0": "wildcard", "::1": "loopback", "2001:db8::1": "public"}
+want = {"::ffff:127.0.0.1": "loopback", "::ffff:10.1.2.3": "private", "::ffff:100.64.0.10": "tailscale", "::ffff:203.0.113.10": "public", "::ffff:0.0.0.0": "wildcard", "::1": "loopback", "2001:db8::1": "public"}  # scan-forbidden: allow-addresses (a Tailscale test address)
 got = {k: fp.classify(k) for k in want}
 assert got == want, got
 print("classify ok")
@@ -376,15 +376,20 @@ expect_fail_msg "a call with an argument is refused" "usage: set-secret.sh" bash
 if ! grep -rqE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' "$deploy/fence/extra-probes.template"; then ok "the template holds no address at all (only <ADDRESS>)"; else bad "an address in the template"; fi
 
 echo "fence-check.sh"
+# the hung probe's marker: `sleep 40.<this run's pid>`, matched whole (so 40.12 never matches 40.123), found and killed by this run only
+export STUB_HANG_SECS="40.$$"
+hang_left() { pgrep -f "^sleep ${STUB_HANG_SECS//./\\.}\$" >/dev/null 2>&1; }
+hang_kill() { pkill -f "^sleep ${STUB_HANG_SECS//./\\.}\$" 2>/dev/null || true; }
 # stand-in for systemd-run: records the arguments, then runs what comes after "--" here (the probe, with python3 in place of /usr/bin/python3)
 cat >"$stubs/systemd-run" <<'STUB'
 #!/usr/bin/env bash
 echo "systemd-run $*" >>"$STUB_LOG/runs"
 if [ -n "${STUB_RUN_FAIL:-}" ]; then echo "Failed to start transient service: property refused" >&2; exit 1; fi
 if [ -n "${STUB_RUN_EMPTY:-}" ]; then exit 0; fi
-# STUB_RUN_HANG=<set>: that set's unit never finishes (it sleeps), as a probe stuck on something would
+# STUB_RUN_HANG=<set>: that set's unit never finishes (it sleeps), as a probe stuck on something would. It sleeps STUB_HANG_SECS, a number
+# unique to this test run, so the run can find and stop its own sleeper without touching another run's (or any other `sleep 40`)
 while [ "$1" != "--" ]; do
-  case "$1" in --unit=bulig-fence-"${STUB_RUN_HANG:-no-such-set}"-*) exec sleep 40.13 ;; esac
+  case "$1" in --unit=bulig-fence-"${STUB_RUN_HANG:-no-such-set}"-*) exec sleep "$STUB_HANG_SECS" ;; esac
   shift
 done
 shift
@@ -404,7 +409,7 @@ chmod +x "$stubs/systemd-run"
 new_host
 for u in bulig.service bulig-worker.service; do cp "$deploy/systemd/$u" "$SD/$u"; done
 bash "$deploy/host-addresses.sh" >/dev/null 2>&1
-bash "$deploy/set-mac-worker.sh" 100.101.102.103 >/dev/null 2>&1
+bash "$deploy/set-mac-worker.sh" 100.101.102.103 >/dev/null 2>&1  # scan-forbidden: allow-addresses (a Tailscale test address)
 mkdir -p "$work/empty"
 printf 'deny worker,kernel,build,cli-worker,cli-kernel leak tcp 127.0.0.1:%s\nallow worker,kernel,build,cli-worker,cli-kernel http http http://127.0.0.1:%s/x\n' "$tcp_port" "$http_port" >"$work/fc-leak.txt"
 printf 'deny worker,kernel,build,cli-worker,cli-kernel gone tcp 127.0.0.1:%s\nallow worker,kernel,build,cli-worker,cli-kernel http http http://127.0.0.1:%s/x\nallow-late worker,cli-worker late http http://127.0.0.1:%s/x\n' "$closed_port" "$http_port" "$closed_port" >"$work/fc-clean.txt"
@@ -422,7 +427,7 @@ run_for() { grep -- "--unit=bulig-fence-$1-" "$log/runs" | head -1; }
 w="$(run_for worker)"
 case "$w" in *"--uid=bulig-worker"*"-p IPAddressDeny=$DENY $HOSTS "*"-p IPAddressAllow=127.74.3.1/32 "*"-p RestrictAddressFamilies=AF_INET AF_INET6 "*"-p InaccessiblePaths=$INACC "*"-p BindReadOnlyPaths=$RES "*) ok "worker set: read from the installed unit and its drop-in (uid, deny with the host addresses, the gateway allow, no AF_UNIX, hidden sockets, upstream resolvers)" ;; *) bad "worker run: $w" ;; esac
 k="$(run_for kernel)"
-case "$k" in *"--uid=bulig "*"-p IPAddressDeny=$DENY "*"-p IPAddressAllow=127.74.3.1/32 100.101.102.103/32 "*"-p RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 "*) ok "kernel set: keeps AF_UNIX, allows its gateway and exactly the Mac worker's /32 from the drop-in" ;; *) bad "kernel run: $k" ;; esac
+case "$k" in *"--uid=bulig "*"-p IPAddressDeny=$DENY "*"-p IPAddressAllow=127.74.3.1/32 100.101.102.103/32 "*"-p RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 "*) ok "kernel set: keeps AF_UNIX, allows its gateway and exactly the Mac worker's /32 from the drop-in" ;; *) bad "kernel run: $k" ;; esac  # scan-forbidden: allow-addresses (a Tailscale test address)
 b="$(run_for build)"
 case "$b" in *"-p DynamicUser=yes"*"-p RestrictAddressFamilies=AF_INET AF_INET6"*"-p IPAddressDeny=$DENY $HOSTS "*) ok "build set: DynamicUser, no AF_UNIX, the deny list with the host addresses" ;; *) bad "build run: $b" ;; esac
 case "$b" in *"--uid="* | *"IPAddressAllow"*) bad "the build set has a named user or an Allow: $b" ;; *) ok "and no named user and no Allow" ;; esac
@@ -470,10 +475,10 @@ printf '[Service]\nIPAddressAllow=127.0.0.1/32\nRestrictAddressFamilies=AF_UNIX\
 : >"$log/runs"
 BULIG_FENCE_PROBES="$work/fc-clean.txt" bash "$deploy/fence-check.sh" worker >/dev/null 2>&1 || true
 case "$(run_for worker)" in *"IPAddressAllow=127.74.3.1/32 127.0.0.1/32"*"RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX"*) ok "a drop-in that adds 127.0.0.1 and AF_UNIX is passed to the probe, so the probe would catch it" ;; *) bad "drop-in not merged: $(run_for worker)" ;; esac
-printf '[Service]\nIPAddressAllow=\nIPAddressAllow=100.64.1.1/32\n' >"$SD/bulig-worker.service.d/99-hole.conf"
+printf '[Service]\nIPAddressAllow=\nIPAddressAllow=100.64.1.1/32\n' >"$SD/bulig-worker.service.d/99-hole.conf"  # scan-forbidden: allow-addresses (a Tailscale test address)
 : >"$log/runs"
 BULIG_FENCE_PROBES="$work/fc-clean.txt" bash "$deploy/fence-check.sh" worker >/dev/null 2>&1 || true
-case "$(run_for worker)" in *"IPAddressAllow=100.64.1.1/32 "*) ok "an empty assignment resets the list, as in systemd" ;; *) bad "reset not honoured: $(run_for worker)" ;; esac
+case "$(run_for worker)" in *"IPAddressAllow=100.64.1.1/32 "*) ok "an empty assignment resets the list, as in systemd" ;; *) bad "reset not honoured: $(run_for worker)" ;; esac  # scan-forbidden: allow-addresses (a Tailscale test address)
 rm -f "$SD/bulig-worker.service.d/99-hole.conf"
 rc=0
 STUB_RUN_FAIL=1 BULIG_FENCE_PROBES="$work/fc-clean.txt" bash "$deploy/fence-check.sh" worker >"$work/fc.out" 2>&1 || rc=$?
@@ -876,7 +881,7 @@ if grep -q "^ok worker http works" "$work/fc-hang.out" && grep -q "^ok build htt
 if [ "$hang_secs" -le 12 ]; then ok "  and the cap is the total (about 5 s, not 5 s per set): ${hang_secs}s"; else bad "  hang took ${hang_secs}s"; fi
 if grep -q "^systemctl stop bulig-fence-kernel-[0-9]*.service" "$log/systemctl"; then ok "  the hung unit is stopped"; else bad "  no stop of the hung unit: $(cat "$log/systemctl")"; fi
 sleep 0.3
-if ! pgrep -f "sleep 40.13" >/dev/null 2>&1; then ok "  and nothing is left running"; else bad "  a hung probe is still running"; pkill -f "sleep 40.13" 2>/dev/null || true; fi
+if ! hang_left; then ok "  and nothing is left running"; else bad "  a hung probe is still running"; hang_kill; fi
 # the same, with a probe that really is waiting inside a set (deny timeout 10 s, cap 5 s): the partial result is shown
 for n in $(seq 1 8); do printf 'LISTEN 0 5 127.0.0.1:%s 0.0.0.0:*\n' "$((51000 + n))"; done >"$log/ss-tcp"
 rc=0
@@ -892,7 +897,7 @@ rc=0
 STUB_RUN_HANG=worker BULIG_FENCE_PROBES="$work/fc-clean.txt" bash "$deploy/fence-check.sh" worker kernel >"$work/fc-early.out" 2>&1 || rc=$?
 cp "$work/kernel.unit.keep" "$SD/bulig.service"
 sleep 0.3
-if [ "$rc" -ne 0 ] && grep -q "bulig.service is not installed" "$work/fc-early.out" && grep -q "^systemctl stop bulig-fence-worker-[0-9]*.service" "$log/systemctl" && ! pgrep -f "sleep 40.13" >/dev/null 2>&1; then ok "if the check stops early, the probe units already started are stopped and nothing is left running"; else bad "early exit rc=$rc: $(cat "$work/fc-early.out") $(cat "$log/systemctl")"; pkill -f "sleep 40.13" 2>/dev/null || true; fi
+if [ "$rc" -ne 0 ] && grep -q "bulig.service is not installed" "$work/fc-early.out" && grep -q "^systemctl stop bulig-fence-worker-[0-9]*.service" "$log/systemctl" && ! hang_left; then ok "if the check stops early, the probe units already started are stopped and nothing is left running"; else bad "early exit rc=$rc: $(cat "$work/fc-early.out") $(cat "$log/systemctl")"; hang_kill; fi
 kill "$second_pid" 2>/dev/null || true
 wait "$second_pid" 2>/dev/null || true
 

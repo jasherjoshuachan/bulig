@@ -1,9 +1,12 @@
 """Mutation proof for the deploy kit's tests. NOT part of scripts/verify.sh (it runs the suites dozens of times).
 
     python3 -I deploy/test/mutations.py <deploy dir> [name filter | from:<index>]
+    python3 -I deploy/test/mutations.py <deploy dir> --check     (seconds: only checks that every entry still applies; run.sh runs it)
 
 For each entry below: copy the kit to a temp folder, break ONE thing in one file (the text must be found exactly once), run the suite that
 is supposed to notice, and expect it to FAIL. A mutation the suite does not notice is reported as SURVIVED and the run exits non-zero.
+Before any suite runs, every selected entry is checked: its file and suite exist, its text is found exactly once, and the change really
+changes the file. One that does not is a stale mutation (the code moved on under it): the run stops there, names it, and exits non-zero.
 """
 import concurrent.futures
 import os
@@ -305,7 +308,11 @@ M = [
     ("r4: the RUNBOOK drops the server-first list", "units.sh", "RUNBOOK.md", "## Must be proven on the server first", "## Later"),
     # ---- round 5: scrub, extra probes, derived probes, first-release failure, unpack sandbox, stream cap ----
     ("scrub: any IPv4 is allowed", "scan.sh", "../scripts/scan-forbidden.sh", "if max(o) > 255: return True  # not an address (a version string, say)", "return True"),
-    ("scrub: the Tailscale range check is off by one", "scan.sh", "../scripts/scan-forbidden.sh", "if a == 100 and 64 <= b <= 127: return True", "if a == 100 and 63 <= b <= 128: return True"),
+    ("scrub: the whole Tailscale range is allowed again", "scan.sh", "../scripts/scan-forbidden.sh", "    if a == 192 and b == 168: return True\n", "    if a == 192 and b == 168: return True\n    if a == 100 and 64 <= b <= 127: return True\n"),
+    ("scrub: the Tailscale base passes without its /10", "scan.sh", "../scripts/scan-forbidden.sh", 'if o == [100, 64, 0, 0] and line[m.end():m.end() + 3] == "/10"', 'if o == [100, 64, 0, 0]'),
+    ("scrub: the Tailscale base passes with any prefix", "scan.sh", "../scripts/scan-forbidden.sh", 'line[m.end():m.end() + 3] == "/10"', 'line[m.end():m.end() + 1] == "/"'),
+    ("scrub: the Tailscale base passes with a longer number after /10", "scan.sh", "../scripts/scan-forbidden.sh", ' and not line[m.end() + 3:m.end() + 4].isdigit(): continue', ': continue'),
+    ("scrub: every 100.64.x.x passes as the Tailscale base", "scan.sh", "../scripts/scan-forbidden.sh", "if o == [100, 64, 0, 0] and", "if o[:2] == [100, 64] and"),
     ("scrub: 172.16/12 widened", "scan.sh", "../scripts/scan-forbidden.sh", "if a == 172 and 16 <= b <= 31: return True", "if a == 172 and 16 <= b <= 40: return True"),
     ("scrub: IPv6 global addresses are allowed", "scan.sh", "../scripts/scan-forbidden.sh", 'if not m.group(1).lower().replace("0db8", "db8").startswith("2001:db8"):', "if False:"),
     ("scrub: any 2001: IPv6 address is allowed", "scan.sh", "../scripts/scan-forbidden.sh", '.startswith("2001:db8")', '.startswith("2001:")'),
@@ -491,6 +498,28 @@ M = [
 ]
 
 
+def problems(entries, src):
+    """What is wrong with each entry, without running anything: a stale entry would otherwise sit there 'killed' or skipped unnoticed."""
+    out, seen = [], set()
+    for name, suite, rel, old, new in entries:
+        if name in seen:
+            out.append(f"{name}: the name is used twice")
+        seen.add(name)
+        if not os.path.isfile(os.path.join(src, "test", suite)):
+            out.append(f"{name}: no suite test/{suite}")
+        path = os.path.normpath(os.path.join(src, rel))
+        if not os.path.isfile(path):
+            out.append(f"{name}: no file {rel}")
+            continue
+        text = open(path).read()
+        n = text.count(old)
+        if n != 1:
+            out.append(f"{name}: {rel}: the text to change was found {n} times, not once")
+        elif text.replace(old, new) == text:
+            out.append(f"{name}: {rel}: the change leaves the file as it was")
+    return out
+
+
 def run(entry, src):
     name, suite, rel, old, new = entry
     tmp = tempfile.mkdtemp(prefix="bulig-mut-")
@@ -505,6 +534,8 @@ def run(entry, src):
         text = open(path).read()
         if text.count(old) != 1:
             return name, "BAD-MUTATION", f"{rel}: the text to change was found {text.count(old)} times"
+        if text.replace(old, new) == text:
+            return name, "BAD-MUTATION", f"{rel}: the change leaves the file as it was"
         open(path, "w").write(text.replace(old, new))
         try:
             r = subprocess.run(["bash", os.path.join(dst, "test", suite)], capture_output=True, text=True, timeout=900, stdin=subprocess.DEVNULL, env=dict(os.environ, BULIG_TEST_ONLY_THIS_FILE="1"))
@@ -521,7 +552,22 @@ def run(entry, src):
 def main():
     src = os.path.abspath(sys.argv[1])
     flt = sys.argv[2] if len(sys.argv) > 2 else ""
+    if flt == "--check":
+        bad = problems(M, src)
+        for line in bad:
+            print(f"BAD-MUTATION  {line}")
+        print(f"mutations: {len(M)} entries, {len(bad)} that no longer apply")
+        return 1 if bad else 0
     todo = M[int(flt[5:]):] if flt.startswith("from:") else [m for m in M if flt in m[0] or flt in m[1]]
+    if not todo:
+        print(f"no mutation matches {flt!r}")
+        return 1
+    bad = problems(todo, src)
+    if bad:
+        for line in bad:
+            print(f"BAD-MUTATION  {line}")
+        print(f"\n{len(bad)} mutation(s) no longer apply to the code. Fix or remove them first; nothing was run.")
+        return 1
     results = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
         for res in ex.map(lambda e: run(e, src), todo):

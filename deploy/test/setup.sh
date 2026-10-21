@@ -22,7 +22,7 @@ case "$*" in
     cat <<'DATA'
 2: eth0    inet 203.0.113.10/32 metric 100 scope global dynamic eth0
 2: eth0    inet6 2001:db8::10/64 scope global
-6: tailscale0    inet 100.64.0.10/32 scope global tailscale0
+6: tailscale0    inet 100.64.0.10/32 scope global tailscale0  scan-forbidden: allow-addresses (a Tailscale test address)
 7: docker0    inet 172.16.0.1/16 brd 172.16.255.255 scope global docker0
 DATA
     ;;

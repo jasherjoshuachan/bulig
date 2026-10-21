@@ -239,7 +239,7 @@ DATA
 echo 'Tue 2026-10-20 03:15:00 UTC 17h left n/a n/a bulig-backup.timer bulig-backup.service' >>"$w/data/timers.txt"
 printf 'bulig.service enabled\nbulig-worker.service enabled\n' >>"$w/data/unitfiles.txt"
 echo 'LISTEN 0 200 127.0.0.1:5436 0.0.0.0:* users:(("postgres",pid=1234,fd=5))' >>"$w/data/ss.txt"
-echo 'LISTEN 0 128 100.64.0.9:7431 0.0.0.0:* users:(("node",pid=1300,fd=19))' >>"$w/data/ss.txt"
+echo 'LISTEN 0 128 100.64.0.9:7431 0.0.0.0:* users:(("node",pid=1300,fd=19))' >>"$w/data/ss.txt"  # scan-forbidden: allow-addresses (a Tailscale test address)
 echo '16 bulig 5436 online postgres /var/lib/postgresql/16/bulig /var/log/postgresql/postgresql-16-bulig.log' >>"$w/data/clusters.txt"
 printf 'bulig:x:998:998::/var/lib/bulig:/usr/sbin/nologin\nbulig-worker:x:997:997::/var/lib/bulig-worker:/usr/sbin/nologin\n' >>"$w/data/passwd.txt"
 printf 'bulig:x:998:\nbulig-worker:x:997:\n' >>"$w/data/group.txt"
@@ -249,7 +249,7 @@ ln -s /etc/systemd/system/bulig.service "$w/root/etc/systemd/system/multi-user.t
 # Bulig's drop-in folders: the files inside are called 10-host-addresses.conf, not bulig-anything (postcheck flagged this on the first real run)
 mkdir -p "$w/root/etc/systemd/system/bulig-worker.service.d" "$w/root/etc/systemd/system/bulig.service.d" "$w/root/etc/systemd/system/bulig-backup.timer.wants"
 echo "IPAddressDeny=203.0.113.10/32" >"$w/root/etc/systemd/system/bulig-worker.service.d/10-host-addresses.conf"
-echo "IPAddressAllow=100.101.102.103/32" >"$w/root/etc/systemd/system/bulig.service.d/20-mac-worker.conf"
+echo "IPAddressAllow=100.101.102.103/32" >"$w/root/etc/systemd/system/bulig.service.d/20-mac-worker.conf"  # scan-forbidden: allow-addresses (a Tailscale test address)
 ln -s /etc/systemd/system/bulig-backup.timer "$w/root/etc/systemd/system/bulig-backup.timer.wants/link"
 mkdir -p "$w/root/etc/postgresql/16/bulig"
 echo "port = 5436" >"$w/root/etc/postgresql/16/bulig/postgresql.conf"
@@ -359,4 +359,9 @@ for suite in drill.sh release.sh setup.sh cluster.sh cli.sh gitcred.sh fence.sh 
   echo "== $suite"
   bash "$here/$suite" || suite_rc=1
 done
+# The mutation proof itself takes hours and is not run here, but a mutation whose text no longer matches the code would rot unseen until
+# then. Checking that every entry still applies takes a second.
+echo
+echo "== mutations.py --check"
+python3 -I "$here/mutations.py" "$deploy" --check || suite_rc=1
 exit "$suite_rc"

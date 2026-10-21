@@ -21,8 +21,13 @@ run_scan() { env -u BULIG_FORBIDDEN_TERMS XDG_CONFIG_HOME="$work/none" SCAN_ROOT
 echo "scan-forbidden.sh built-in checks"
 repo="$work/repo"
 mkrepo "$repo"
-expect_ok "allowed addresses (loopback, the gateway, private, tailscale, documentation) pass" run_scan "$repo"
-expect_ok "the real tree passes" env -u BULIG_FORBIDDEN_TERMS XDG_CONFIG_HOME="$work/none" bash "$scan"
+expect_ok "allowed addresses (loopback, the gateway, private, the Tailscale deny-list entry 100.64.0.0/10, documentation) pass" run_scan "$repo"
+# (only inside a git checkout: the mutation runner copies the kit to a plain folder, where this check would fail for every mutation alike)
+if git -C "$deploy/.." rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  expect_ok "the real tree passes" env -u BULIG_FORBIDDEN_TERMS XDG_CONFIG_HOME="$work/none" bash "$scan"
+else
+  echo "  skip  the real tree passes (not a git checkout)"
+fi
 
 offends() { # offends <label> <rule it must name> <the text>
   mkrepo "$repo"
@@ -38,6 +43,19 @@ pub4="$((4 * 2)).$((4 * 2)).$((4 * 2)).$((4 * 2))"
 offends "a public IPv4 address" ipv4-outside-allowed-ranges "ssh $pub4" "$pub4"
 offends "an address just below the Tailscale range" ipv4-outside-allowed-ranges "peer 100.$((64 - 1)).0.1" "100.63"
 offends "an address just above the Tailscale range" ipv4-outside-allowed-ranges "peer 100.$((127 + 1)).0.1" "100.128"
+# Tailscale (100.64/10): only the deny-list entry itself is allowed. A Mac or server on a tailnet has an address in there, so any other is a hit.
+ts4="100.$((64 + 37)).102.103"
+offends "a Tailscale host address" ipv4-outside-allowed-ranges "peer $ts4" "$ts4"
+tlo="100.$((60 + 4)).0.1"
+offends "the lowest Tailscale address" ipv4-outside-allowed-ranges "peer $tlo" "$tlo"
+thi="100.$((127)).255.255"
+offends "the highest Tailscale address" ipv4-outside-allowed-ranges "peer $thi" "$thi"
+tbase="100.$((60 + 4)).0.0"
+offends "the Tailscale range base with no prefix" ipv4-outside-allowed-ranges "from $tbase on" "$tbase"
+offends "the Tailscale range base with another prefix" ipv4-outside-allowed-ranges "deny $tbase/1$((1 + 1))" "$tbase"
+offends "a Tailscale host written with /10" ipv4-outside-allowed-ranges "deny $tlo/10" "$tlo"
+offends "the Tailscale range base with a longer number after /10" ipv4-outside-allowed-ranges "deny $tbase/10$((0 + 4))" "$tbase"
+offends "an IPv4-mapped Tailscale address" ipv4-outside-allowed-ranges "peer ::ffff:$ts4" "$ts4"
 offends "172.32 (just outside 172.16/12)" ipv4-outside-allowed-ranges "bridge 172.$((31 + 1)).0.1" "172.32"
 mkrepo "$repo"
 printf 'deny 169.254.0.0/16 224.0.0.0/4\n' >"$repo/ranges.txt"
@@ -66,6 +84,10 @@ mkrepo "$repo"
 printf '%s\n' "refuse $pub4 and peer 100.$((64 - 1)).0.1 and v6 $g6 // $mk" >"$repo/marked.txt"
 git -C "$repo" add marked.txt
 expect_ok "a line marked allow-addresses may name addresses outside the allowed ranges" run_scan "$repo"
+mkrepo "$repo"
+printf '%s\n' "6: tailscale0    inet $ts4/32 scope global tailscale0  $mk (a Tailscale test address)" >"$repo/marked.txt"
+git -C "$repo" add marked.txt
+expect_ok "a Tailscale address on a line marked allow-addresses passes" run_scan "$repo"
 offends "the marker does not excuse a port number" "port-1" "127.0.0.1:$p1 // $mk" "$p1"
 offends "the marker does not excuse an X display name" x-display "display X$((90 + 9)) // $mk" ""
 mkrepo "$repo"

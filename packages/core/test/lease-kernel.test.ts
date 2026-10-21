@@ -124,11 +124,11 @@ for (const adapter of ADAPTERS) {
           throw new Error('no thanks');
         },
       };
-      const { k } = kernelOn(counted, { plugins: [bad], enabled: ['bad'], leaseHolder: 'kernel-a', leaseTtlMs: 5_000, leaseHeartbeatMs: 100 });
+      const { k } = kernelOn(counted, { plugins: [bad], enabled: ['bad'], leaseHolder: 'kernel-a', leaseTtlMs: 5_000, leaseHeartbeatMs: room(100) });
       await expect(k.start()).rejects.toThrow('no thanks');
-      await sleep(30);
+      await sleep(room(30));
       const seen = renewals;
-      await sleep(450); // four beats of a heartbeat that was left running
+      await sleep(room(450)); // four beats of a heartbeat that was left running
       expect(renewals).toBe(seen);
       // and the next kernel need not wait for the lease to run out
       expect((await (await adapter.peek()).acquireLease('kernel-b', 5_000)).generation).toBe(2);
@@ -146,22 +146,25 @@ for (const adapter of ADAPTERS) {
           if (attempts++ === 0) throw new Error('first try fails');
         },
       };
-      const { k } = kernelOn(flaky, { plugins: [shaky], enabled: ['shaky'], leaseHolder: 'kernel-a', leaseTtlMs: 1_000, leaseHeartbeatMs: 60, onLeaseLost: (r) => void lost.push(r) });
+      const { k } = kernelOn(flaky, { plugins: [shaky], enabled: ['shaky'], leaseHolder: 'kernel-a', leaseTtlMs: room(1_000), leaseHeartbeatMs: room(60), onLeaseLost: (r) => void lost.push(r) });
       await expect(k.start()).rejects.toThrow('first try fails');
       await k.start();
       refuse = true;
-      await sleep(250);
+      await sleep(room(250));
       expect(lost).toHaveLength(1);
     });
 
     it('keeps the lease alive while stop() drains the queue, so a clean stop with slow queued work reports no lost lease', async () => {
       const store = await adapter.make();
       const lost: string[] = [];
-      const { k, errors } = kernelOn(store, { leaseHolder: 'kernel-a', leaseTtlMs: 500, leaseHeartbeatMs: 100, stopWaitMs: 100, storeTimeoutMs: 5_000, onLeaseLost: (r) => void lost.push(r) });
+      // At a 100 ms heartbeat this lost its lease on CI and on a loaded Mac with the renewal merely late ("did not come back within
+      // 100 ms"), and a 300 ms one has failed the same way on CI (chaos.test.ts). So the beat is one second. What it proves is the
+      // same: the work outlasts the wait in stop() and the whole lease, so only a heartbeat that runs through the drain keeps it.
+      const { k, errors } = kernelOn(store, { leaseHolder: 'kernel-a', leaseTtlMs: 2_500, leaseHeartbeatMs: 1_000, stopWaitMs: 100, storeTimeoutMs: 10_000, onLeaseLost: (r) => void lost.push(r) });
       await k.start();
       // Work that outlasts both the wait in stop() and the lease, and a task behind it that checks the lease only when it starts.
       void k.jobs.atomic(async () => {
-        await sleep(1_200);
+        await sleep(3_200);
       });
       const behind = k.jobs.list();
       await k.stop();
@@ -176,11 +179,11 @@ for (const adapter of ADAPTERS) {
       const lost: string[] = [];
       let refuse = false;
       const flaky = withLease(store, { renewLease: async (h, g, t) => (refuse ? false : store.renewLease(h, g, t)) });
-      const { k, errors } = kernelOn(flaky, { leaseHolder: 'kernel-a', leaseTtlMs: 1_000, leaseHeartbeatMs: 60, stopWaitMs: 100, onLeaseLost: (r) => void lost.push(r) });
+      const { k, errors } = kernelOn(flaky, { leaseHolder: 'kernel-a', leaseTtlMs: room(1_000), leaseHeartbeatMs: room(60), stopWaitMs: room(100), onLeaseLost: (r) => void lost.push(r) });
       await k.start();
       k.jobs
         .atomic(async () => {
-          await sleep(400);
+          await sleep(room(400));
         })
         .catch(() => {}); // the lease goes while it runs, so the queue gives up on it
       refuse = true;
@@ -194,10 +197,10 @@ for (const adapter of ADAPTERS) {
       const lost: string[] = [];
       let refuse = false;
       const flaky = withLease(store, { renewLease: async (h, g, t) => (refuse ? false : store.renewLease(h, g, t)) });
-      const { k } = kernelOn(flaky, { leaseHolder: 'kernel-a', leaseTtlMs: 1_000, leaseHeartbeatMs: 60, onLeaseLost: (r) => void lost.push(r) });
+      const { k } = kernelOn(flaky, { leaseHolder: 'kernel-a', leaseTtlMs: room(1_000), leaseHeartbeatMs: room(60), onLeaseLost: (r) => void lost.push(r) });
       await k.start();
       refuse = true;
-      await sleep(250);
+      await sleep(room(250));
       expect(lost).toHaveLength(1);
       await k.stop();
       expect(lost).toHaveLength(1);

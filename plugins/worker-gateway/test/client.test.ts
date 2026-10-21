@@ -213,7 +213,10 @@ describe('the worker, against a kernel that is just a script', () => {
       const w = makeWorld();
       const marks = join(tmp(), 'marks');
       writeFileSync(marks, '');
-      const k = kernel(stage(w), () => status);
+      // The heartbeat starts before the workspace is made, and a worker that loses contact before its Claude starts never starts it.
+      // So the kernel answers 200 until Claude is running, then turns bad: what this proves is that a running Claude is stopped, and
+      // that holds however long a loaded machine takes to make the worktree and start a process (it used to race lossMs).
+      const k = kernel(stage(w), () => (readFileSync(marks, 'utf8').includes('build') ? status : 200));
       const worker = make(w, k, '600000', marks);
       try {
         await waitFor(() => readFileSync(marks, 'utf8').includes('build'), 60_000, 'Claude to start');

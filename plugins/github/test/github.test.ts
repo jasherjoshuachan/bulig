@@ -7,7 +7,7 @@ import { afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { createKernel, SqliteStore, type Store } from '@bulig/core';
 import { definePlugin, type BuligEvent } from '@bulig/plugin-sdk';
 import { slowStore } from '../../../packages/core/test/slow-store.ts';
-import github, { judgeChecks } from '../src/index.ts';
+import github, { checksFromRollup, judgeChecks, type RollupEntry } from '../src/index.ts';
 
 /** The scope the older tests commit under: every file they write is a .txt file. */
 const SCOPE_TXT = ['*.txt'];
@@ -126,6 +126,71 @@ const until = async (cond: () => boolean, ms = 10_000) => {
     await new Promise((r) => setTimeout(r, 10));
   }
 };
+
+/** A read of the checks: `gh pr view --json headRefOid,statusCheckRollup` (gh 2.45 has no `gh pr checks --json`). */
+const readsChecks = (c: { args: string[] }) => c.args[1] === 'view' && (c.args[c.args.indexOf('--json') + 1] ?? '').split(',').includes('statusCheckRollup');
+
+describe('checksFromRollup', () => {
+  // Recorded on 22 Oct 2026: the same PR read with gh 2.45.0 (`gh pr view --json headRefOid,statusCheckRollup`, the
+  // Ubuntu 24.04 gh) and with gh 2.102 (`gh pr checks --json name,bucket,state,link`). The mapping must give what newer gh gives.
+  const recorded = fileURLToPath(new URL('./fixtures/gh-recorded/', import.meta.url));
+  const sorted = (list: { name?: string; bucket?: string; state?: string; link?: string }[]) =>
+    list.map((c) => ({ name: c.name, bucket: c.bucket, state: c.state, link: c.link || undefined })).sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
+  for (const [pr, shape] of [
+    ['kubernetes_kubernetes_143289', 'status contexts (prow) and check runs, failing and pending'],
+    ['vercel_next-js_100545', '120 check runs (past one page of 100), passing and skipped'],
+    ['jasherjoshuachan_bulig_64', 'one Actions check run'],
+  ] as const) {
+    it(`matches gh pr checks --json on recorded output: ${shape}`, () => {
+      const view = JSON.parse(readFileSync(join(recorded, `${pr}.gh245-pr-view.json`), 'utf8')) as { headRefOid: string; statusCheckRollup: RollupEntry[] };
+      const checks = JSON.parse(readFileSync(join(recorded, `${pr}.gh2102-pr-checks.json`), 'utf8')) as { name: string; bucket: string; state: string; link: string }[];
+      expect(view.headRefOid).toMatch(/^[0-9a-f]{40}$/);
+      expect(sorted(checksFromRollup(view.statusCheckRollup))).toEqual(sorted(checks));
+      // gh 2.102 lists them in its own order, so compare the gate's verdict as sets of names.
+      const verdict = (l: Parameters<typeof judgeChecks>[0]) => {
+        const v = judgeChecks(l);
+        return { failing: v.failing.sort(), pending: v.pending.sort() };
+      };
+      expect(verdict(checksFromRollup(view.statusCheckRollup))).toEqual(verdict(checks));
+    });
+  }
+
+  it('maps every state gh knows to its bucket, in both shapes, and anything else to pending', () => {
+    const run = (status: string, conclusion = '') => ({ __typename: 'CheckRun', name: `${status}-${conclusion}`, status, conclusion });
+    const ctx = (state: string) => ({ __typename: 'StatusContext', context: `ctx-${state}`, state });
+    const buckets = (rollup: RollupEntry[]) => checksFromRollup(rollup).map((c) => `${c.name}=${c.bucket}`);
+    expect(
+      buckets([
+        run('COMPLETED', 'SUCCESS'), run('COMPLETED', 'SKIPPED'), run('COMPLETED', 'NEUTRAL'), run('COMPLETED', 'FAILURE'),
+        run('COMPLETED', 'TIMED_OUT'), run('COMPLETED', 'ACTION_REQUIRED'), run('COMPLETED', 'CANCELLED'), run('COMPLETED', 'STALE'),
+        run('IN_PROGRESS'), run('QUEUED'), run('WAITING'), run('PENDING'), run('REQUESTED'),
+      ]),
+    ).toEqual([
+      'COMPLETED-SUCCESS=pass', 'COMPLETED-SKIPPED=skipping', 'COMPLETED-NEUTRAL=skipping', 'COMPLETED-FAILURE=fail',
+      'COMPLETED-TIMED_OUT=fail', 'COMPLETED-ACTION_REQUIRED=fail', 'COMPLETED-CANCELLED=cancel', 'COMPLETED-STALE=pending',
+      'IN_PROGRESS-=pending', 'QUEUED-=pending', 'WAITING-=pending', 'PENDING-=pending', 'REQUESTED-=pending',
+    ]);
+    expect(buckets([ctx('SUCCESS'), ctx('FAILURE'), ctx('ERROR'), ctx('PENDING'), ctx('EXPECTED'), ctx('MYSTERY')])).toEqual([
+      'ctx-SUCCESS=pass', 'ctx-FAILURE=fail', 'ctx-ERROR=fail', 'ctx-PENDING=pending', 'ctx-EXPECTED=pending', 'ctx-MYSTERY=pending',
+    ]);
+    expect(checksFromRollup([{ context: 'ci/x', state: 'SUCCESS', targetUrl: 'https://t' }, { name: 'r', status: 'COMPLETED', conclusion: 'SUCCESS', detailsUrl: 'https://d' }])).toEqual([
+      { name: 'ci/x', bucket: 'pass', state: 'SUCCESS', link: 'https://t' },
+      { name: 'r', bucket: 'pass', state: 'SUCCESS', link: 'https://d' },
+    ]);
+  });
+
+  it('keeps only the newest run of a re-run check, as gh does, but keeps same-named checks from other workflows', () => {
+    const list = checksFromRollup([
+      { name: 'verify', workflowName: 'ci', status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-21T10:00:00Z' },
+      { name: 'verify', workflowName: 'ci', status: 'COMPLETED', conclusion: 'SUCCESS', startedAt: '2026-10-21T11:00:00Z' },
+      { name: 'verify', workflowName: 'nightly', status: 'IN_PROGRESS', startedAt: '2026-10-21T09:00:00Z' },
+      { context: 'deploy', state: 'FAILURE', startedAt: '2026-10-21T08:00:00Z' },
+      { context: 'deploy', state: 'SUCCESS', startedAt: '2026-10-21T12:00:00Z' },
+    ]);
+    expect(list.map((c) => `${c.name}=${c.bucket}`)).toEqual(['deploy=pass', 'verify=pass', 'verify=pending']);
+    expect(checksFromRollup([])).toEqual([]);
+  });
+});
 
 describe('judgeChecks', () => {
   it('sorts passing, failing and pending', () => {
@@ -607,6 +672,45 @@ describe('merge.requested', () => {
     expect(existsSync(pr.cwd)).toBe(true);
   });
 
+  it('reads checks the way gh 2.45 can, never with gh pr checks --json', async () => {
+    const h = await setup();
+    const pr = await openPr(h);
+    h.setState({ log: join(h.root, 'gh.log'), checks: [{ name: 'ci', bucket: 'pass' }] });
+    h.fire('merge.requested', { cwd: pr.cwd, number: pr.number, headSha: pr.headSha });
+    await h.waitFor('pr.merged');
+    expect(h.calls().filter((c) => readsChecks(c)).length).toBe(1);
+    expect(h.calls().some((c) => c.args[1] === 'checks')).toBe(false);
+  });
+
+  it('judges recorded gh 2.45 output with status contexts: fails on the failing context and names it', async () => {
+    const h = await setup();
+    const pr = await openPr(h);
+    const rollup = [
+      { __typename: 'StatusContext', context: 'pull-kubernetes-linter-hints', startedAt: '2026-10-21T21:45:02Z', state: 'FAILURE', targetUrl: 'https://prow.k8s.io/view/1' },
+      { __typename: 'StatusContext', context: 'pull-kubernetes-e2e-gce', startedAt: '2026-10-21T21:34:35Z', state: 'PENDING', targetUrl: 'https://prow.k8s.io/view/2' },
+      { __typename: 'CheckRun', name: 'verify', workflowName: 'ci', status: 'COMPLETED', conclusion: 'SUCCESS', detailsUrl: 'https://example.test/runs/1', startedAt: '2026-10-21T21:15:09Z' },
+    ];
+    h.setState({ log: join(h.root, 'gh.log'), rollup });
+    h.fire('merge.requested', { cwd: pr.cwd, number: pr.number, headSha: pr.headSha });
+    const failed = await h.waitFor('merge.failed');
+    expect(failed.payload).toEqual({
+      reason: 'checks failing: pull-kubernetes-linter-hints. Fix the failing check, then run the job again.',
+      checks: [{ name: 'pull-kubernetes-linter-hints', link: 'https://prow.k8s.io/view/1' }],
+    });
+    expect(h.calls().some((c) => c.args[1] === 'merge')).toBe(false);
+  });
+
+  it('gives up when the checks read reports a head other than the approved one', async () => {
+    const h = await setup();
+    const pr = await openPr(h);
+    // The head check still sees the approved commit; the checks come back for a newer push.
+    h.setState({ log: join(h.root, 'gh.log'), checks: [{ name: 'ci', bucket: 'pass' }], checksHeadRefOid: 'e'.repeat(40) });
+    h.fire('merge.requested', { cwd: pr.cwd, number: pr.number, headSha: pr.headSha });
+    const failed = await h.waitFor('merge.failed');
+    expect((failed.payload as { reason: string }).reason).toBe(`PR head moved: approved ${pr.headSha.slice(0, 7)} but it is now eeeeeee`);
+    expect(h.calls().some((c) => c.args[1] === 'merge')).toBe(false);
+  });
+
   it('fails for good on a failing check, names it, and never calls merge', async () => {
     const h = await setup();
     const pr = await openPr(h);
@@ -631,7 +735,7 @@ describe('merge.requested', () => {
     h.setState({ log: join(h.root, 'gh.log'), checksSequence: [pending, pending, pending, [{ name: 'ci', bucket: 'pass' }]] });
     h.fire('merge.requested', { cwd: pr.cwd, number: pr.number, headSha: pr.headSha });
     await h.waitFor('pr.merged');
-    expect(h.calls().filter((c) => c.args[1] === 'checks').length).toBe(4);
+    expect(h.calls().filter((c) => readsChecks(c)).length).toBe(4);
     expect(h.calls().filter((c) => c.args[1] === 'merge')).toHaveLength(1);
     expect(h.seen.some((e) => e.type === 'merge.refused' || e.type === 'merge.failed')).toBe(false);
   });
@@ -667,12 +771,12 @@ describe('merge.requested', () => {
     const pr = await openPr(h);
     h.setState({ log: join(h.root, 'gh.log'), checks: [{ name: 'ci', bucket: 'pending' }] });
     h.fire('merge.requested', { cwd: pr.cwd, number: pr.number, headSha: pr.headSha });
-    await until(() => h.calls().filter((c) => c.args[1] === 'checks').length >= 2);
+    await until(() => h.calls().filter((c) => readsChecks(c)).length >= 2);
     (await h.k.jobs.setStatus(h.job.id, 'cancelled'));
     await new Promise((r) => setTimeout(r, 150));
-    const polls = h.calls().filter((c) => c.args[1] === 'checks').length;
+    const polls = h.calls().filter((c) => readsChecks(c)).length;
     await new Promise((r) => setTimeout(r, 200));
-    expect(h.calls().filter((c) => c.args[1] === 'checks').length).toBe(polls); // no more looking
+    expect(h.calls().filter((c) => readsChecks(c)).length).toBe(polls); // no more looking
     expect(h.calls().some((c) => c.args[1] === 'merge')).toBe(false);
     expect(h.seen.some((e) => e.type === 'merge.refused' || e.type === 'merge.failed' || e.type === 'pr.merged')).toBe(false);
   });
@@ -695,7 +799,7 @@ describe('merge.requested', () => {
     // gh answers green, but slowly, and does not stop when asked, so the answer still arrives after the cancel.
     h.setState({ log: join(h.root, 'gh.log'), checks: [{ name: 'ci', bucket: 'pass' }], checksDelayMs: 700, ignoreTerm: true });
     h.fire('merge.requested', { cwd: pr.cwd, number: pr.number, headSha: pr.headSha });
-    await until(() => h.calls().some((c) => c.args[1] === 'checks'));
+    await until(() => h.calls().some((c) => readsChecks(c)));
     (await h.k.jobs.setStatus(h.job.id, 'cancelled'));
     await new Promise((r) => setTimeout(r, 1500));
     expect(h.calls().some((c) => c.args[1] === 'merge')).toBe(false);
@@ -714,7 +818,7 @@ describe('merge.requested', () => {
     h.setState({ log: join(h.root, 'gh.log'), checks: [{ name: 'ci', bucket: 'pass' }], checksDelayMs: 300 });
     slow = true;
     h.fire('merge.requested', { cwd: pr.cwd, number: pr.number, headSha: pr.headSha });
-    await until(() => h.calls().some((c) => c.args[1] === 'checks'));
+    await until(() => h.calls().some((c) => readsChecks(c)));
     await h.k.jobs.setStatus(h.job.id, 'cancelled'); // returns once the announcement is in the log, 700 ms on
     await new Promise((r) => setTimeout(r, 200));
     expect(h.calls().some((c) => c.args[1] === 'merge')).toBe(false);
@@ -744,7 +848,7 @@ describe('merge.requested', () => {
     h.setState({ log: join(h.root, 'gh.log'), pidFile, hangChecksFirst: 1, checks: [{ name: 'ci', bucket: 'pass' }] });
     h.fire('merge.requested', { cwd: pr.cwd, number: pr.number, headSha: pr.headSha });
     await h.waitFor('pr.merged');
-    expect(h.calls().filter((c) => c.args[1] === 'checks').length).toBe(2);
+    expect(h.calls().filter((c) => readsChecks(c)).length).toBe(2);
     const pid = Number(readFileSync(pidFile, 'utf8').trim());
     expect(alive(pid)).toBe(false);
   });
@@ -756,7 +860,7 @@ describe('merge.requested', () => {
     h.fire('merge.requested', { cwd: pr.cwd, number: pr.number, headSha: pr.headSha });
     const failed = await h.waitFor('merge.failed');
     expect((failed.payload as { reason: string }).reason).toMatch(/^could not read checks: timed out after 2500ms/);
-    expect(h.calls().filter((c) => c.args[1] === 'checks').length).toBe(2);
+    expect(h.calls().filter((c) => readsChecks(c)).length).toBe(2);
   });
 
   it('cancel ends a running gh call at once, instead of waiting for its timeout', async () => {
@@ -792,12 +896,12 @@ describe('merge.requested', () => {
     const pr = await openPr(h);
     h.setState({ log: join(h.root, 'gh.log'), checks: [{ name: 'ci', bucket: 'pending' }] });
     h.fire('merge.requested', { cwd: pr.cwd, number: pr.number, headSha: pr.headSha });
-    await until(() => h.calls().filter((c) => c.args[1] === 'checks').length >= 2);
+    await until(() => h.calls().filter((c) => readsChecks(c)).length >= 2);
     await h.k.stop();
     await new Promise((r) => setTimeout(r, 100));
-    const polls = h.calls().filter((c) => c.args[1] === 'checks').length;
+    const polls = h.calls().filter((c) => readsChecks(c)).length;
     await new Promise((r) => setTimeout(r, 200));
-    expect(h.calls().filter((c) => c.args[1] === 'checks').length).toBe(polls);
+    expect(h.calls().filter((c) => readsChecks(c)).length).toBe(polls);
     expect(h.calls().some((c) => c.args[1] === 'merge')).toBe(false);
     expect(h.seen.some((e) => e.type === 'merge.refused' || e.type === 'merge.failed')).toBe(false);
   });
@@ -808,7 +912,7 @@ describe('merge.requested', () => {
     h.setState({ log: join(h.root, 'gh.log'), checksErrorFirst: 2, checks: [{ name: 'ci', bucket: 'pass' }] });
     h.fire('merge.requested', { cwd: pr.cwd, number: pr.number, headSha: pr.headSha });
     await h.waitFor('pr.merged');
-    expect(h.calls().filter((c) => c.args[1] === 'checks').length).toBe(3);
+    expect(h.calls().filter((c) => readsChecks(c)).length).toBe(3);
   });
 
   it('cancel ends the wait between retries at once, instead of sleeping out the delay', async () => {
@@ -816,14 +920,14 @@ describe('merge.requested', () => {
     const pr = await openPr(h);
     h.setState({ log: join(h.root, 'gh.log'), checksErrorFirst: 99, checks: [{ name: 'ci', bucket: 'pass' }] });
     h.fire('merge.requested', { cwd: pr.cwd, number: pr.number, headSha: pr.headSha });
-    await until(() => h.calls().filter((c) => c.args[1] === 'checks').length === 1);
+    await until(() => h.calls().filter((c) => readsChecks(c)).length === 1);
     (await h.k.jobs.setStatus(h.job.id, 'cancelled'));
     // Stopping waits for the running merge handler, so it only returns quickly if the 60s retry sleep was cut short.
     const stopped = Date.now();
     await h.k.stop();
     expect(Date.now() - stopped).toBeLessThan(3000);
     // No second try after the cancel, and nothing reported or merged.
-    expect(h.calls().filter((c) => c.args[1] === 'checks').length).toBe(1);
+    expect(h.calls().filter((c) => readsChecks(c)).length).toBe(1);
     expect(h.calls().some((c) => c.args[1] === 'merge')).toBe(false);
     expect(h.seen.some((e) => e.type === 'merge.refused' || e.type === 'merge.failed' || e.type === 'pr.merged')).toBe(false);
   });
@@ -835,7 +939,7 @@ describe('merge.requested', () => {
     h.fire('merge.requested', { cwd: pr.cwd, number: pr.number, headSha: pr.headSha });
     const failed = await h.waitFor('merge.failed');
     expect((failed.payload as { reason: string }).reason).toMatch(/^could not read checks: .*502/);
-    expect(h.calls().filter((c) => c.args[1] === 'checks').length).toBe(3);
+    expect(h.calls().filter((c) => readsChecks(c)).length).toBe(3);
     expect(h.calls().some((c) => c.args[1] === 'merge')).toBe(false);
   });
 

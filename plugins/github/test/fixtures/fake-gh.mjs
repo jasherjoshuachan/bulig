@@ -26,14 +26,12 @@ if (group === 'pr' && sub === 'create' && state.createExists) {
 } else if (group === 'pr' && sub === 'create') {
   console.log('Creating pull request...');
   console.log('https://github.com/example/repo/pull/7');
-} else if (group === 'pr' && sub === 'view') {
-  const json = args[args.indexOf('--json') + 1] ?? '';
-  const all = { number: 7, url: 'https://github.com/example/repo/pull/7', headRefOid: head(), baseRefName: 'main', state: state.prState ?? 'OPEN' };
-  const out = {};
-  for (const k of json.split(',')) out[k] = all[k];
-  console.log(JSON.stringify(out));
-} else if (group === 'pr' && sub === 'checks') {
-  // Calls are counted in the state file, so a test can change what gh says as checks "finish".
+} else if (group === 'pr' && sub === 'checks' && args.includes('--json')) {
+  // gh 2.45 (Ubuntu 24.04) has no --json on `pr checks`. The plugin must not depend on it.
+  console.error('unknown flag: --json');
+  process.exit(1);
+} else if (group === 'pr' && sub === 'view' && (args[args.indexOf('--json') + 1] ?? '').split(',').includes('statusCheckRollup')) {
+  // The checks read. Calls are counted in the state file, so a test can change what gh says as checks "finish".
   const call = state.checkCalls ?? 0;
   if (statePath) save({ ...state, checkCalls: call + 1 });
   // hangChecksFirst: the first N calls never answer. The pid is written down so a test can see the process die.
@@ -55,12 +53,23 @@ if (group === 'pr' && sub === 'create' && state.createExists) {
     console.error('something went wrong reading checks');
     process.exit(1);
   }
-  if (state.checks === undefined) {
-    console.error("no checks reported on the 'bulig' branch");
-    process.exit(1);
-  }
-  console.log(JSON.stringify(state.checks));
-  process.exit(state.checks.some((c) => c.bucket === 'fail') ? 1 : state.checks.some((c) => c.bucket === 'pending') ? 8 : 0);
+  // rollup: a raw statusCheckRollup, as gh prints it. Otherwise `checks` (in the bucket shape the tests read best) is
+  // written out as check runs, the way gh 2.45 prints them.
+  const run = { pass: ['COMPLETED', 'SUCCESS'], fail: ['COMPLETED', 'FAILURE'], cancel: ['COMPLETED', 'CANCELLED'], skipping: ['COMPLETED', 'SKIPPED'] };
+  const rollup =
+    state.rollup ??
+    (state.checks ?? []).map((c) => {
+      const [status, conclusion] = run[c.bucket] ?? ['IN_PROGRESS', ''];
+      return { __typename: 'CheckRun', name: c.name, workflowName: 'ci', status, conclusion, detailsUrl: c.link ?? '', startedAt: '2026-10-21T00:00:00Z' };
+    });
+  // checksHeadRefOid: the head this read reports, for a push that lands between the head check and the checks read.
+  console.log(JSON.stringify({ headRefOid: state.checksHeadRefOid ?? head(), statusCheckRollup: rollup }));
+} else if (group === 'pr' && sub === 'view') {
+  const json = args[args.indexOf('--json') + 1] ?? '';
+  const all = { number: 7, url: 'https://github.com/example/repo/pull/7', headRefOid: head(), baseRefName: 'main', state: state.prState ?? 'OPEN' };
+  const out = {};
+  for (const k of json.split(',')) out[k] = all[k];
+  console.log(JSON.stringify(out));
 } else if (group === 'pr' && sub === 'merge') {
   // A push that lands between the approval and the merge: the PR head is no longer the pinned one.
   const pinned = args[args.indexOf('--match-head-commit') + 1];

@@ -32,7 +32,9 @@ if (group === 'pr' && sub === 'create' && state.createExists) {
   process.exit(1);
 } else if (group === 'api' && /\/commits\/[^/]+\/status\?/.test(args.find((a) => a.startsWith('repos/')) ?? '')) {
   // The commit statuses (prow, Vercel and the like). statuses: raw REST entries; default none.
-  for (const s of state.statuses ?? []) console.log(JSON.stringify(s));
+  // One line per page, as `gh api --paginate --jq '[.total_count, [.statuses[] | {...}]]'` prints it.
+  const statuses = state.statuses ?? [];
+  console.log(JSON.stringify([statuses.length, statuses]));
 } else if (group === 'api' && /\/commits\/[^/]+\/check-runs\?/.test(args.find((a) => a.startsWith('repos/')) ?? '')) {
   // The checks read. Calls are counted in the state file, so a test can change what gh says as checks "finish".
   const call = state.checkCalls ?? 0;
@@ -57,7 +59,7 @@ if (group === 'pr' && sub === 'create' && state.createExists) {
     process.exit(1);
   }
   // runs: raw REST check runs. Otherwise `checks` (in the bucket shape the tests read best) is written out as check
-  // runs, one JSON object per line, the way `gh api --paginate --jq '.check_runs[]'` prints them.
+  // runs.
   const run = { pass: ['completed', 'success'], fail: ['completed', 'failure'], cancel: ['completed', 'cancelled'], skipping: ['completed', 'skipped'] };
   const runs =
     state.runs ??
@@ -65,7 +67,14 @@ if (group === 'pr' && sub === 'create' && state.createExists) {
       const [status, conclusion] = run[c.bucket] ?? ['in_progress', null];
       return { name: c.name, status, conclusion, details_url: c.link ?? null };
     });
-  for (const r of runs) console.log(JSON.stringify(r));
+  // One line per page of 100 (as `gh api --paginate --jq '[.total_count, [.check_runs[] | {...}]]'` prints it).
+  // runsTotal: the total_count GitHub reports; dropPage: a page index that never arrives.
+  const total = state.runsTotal ?? runs.length;
+  const pages = [];
+  for (let i = 0; i < Math.max(runs.length, 1); i += 100) pages.push(runs.slice(i, i + 100));
+  pages.forEach((p, i) => {
+    if (i !== state.dropPage) console.log(JSON.stringify([total, p]));
+  });
 } else if (group === 'pr' && sub === 'view') {
   const json = args[args.indexOf('--json') + 1] ?? '';
   const all = { number: 7, url: 'https://github.com/example/repo/pull/7', headRefOid: head(), baseRefName: 'main', state: state.prState ?? 'OPEN' };

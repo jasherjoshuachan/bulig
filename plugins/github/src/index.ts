@@ -197,7 +197,8 @@ export type StatusEntry = { context?: string; state?: string; target_url?: strin
 export function bucketOf(state: string): string {
   if (state === 'SUCCESS') return 'pass';
   if (state === 'SKIPPED' || state === 'NEUTRAL') return 'skipping';
-  if (state === 'ERROR' || state === 'FAILURE' || state === 'TIMED_OUT' || state === 'ACTION_REQUIRED') return 'fail';
+  // STARTUP_FAILURE (a workflow that never started) never resolves on its own, so it fails rather than waits.
+  if (state === 'ERROR' || state === 'FAILURE' || state === 'TIMED_OUT' || state === 'ACTION_REQUIRED' || state === 'STARTUP_FAILURE') return 'fail';
   if (state === 'CANCELLED') return 'cancel';
   return 'pending'; // EXPECTED, REQUESTED, WAITING, QUEUED, PENDING, IN_PROGRESS, STALE, anything new
 }
@@ -637,31 +638,38 @@ export default definePlugin({
         };
 
         // The checks of the approved commit itself (headSha is in the URL, so they cannot be another commit's), read
-        // through `gh api`, which gh 2.45 has (it has no `gh pr checks --json`). One JSON object per line, every page.
-        // A failed call or a line that is not JSON is a bad read, tried again only when it looks temporary.
-        const readList = async <T,>(path: string, field: string): Promise<{ list: T[] } | { error: string }> => {
-          let list: T[] | undefined;
+        // through `gh api`, which gh 2.45 has (it has no `gh pr checks --json`). Each page prints one line:
+        // [total_count, [rows]]. A failed call or a line not in that shape is a bad read, tried again only when it
+        // looks temporary. Fewer rows than GitHub's total_count means a page went missing: a missing page could hold
+        // the failing check, so that read is incomplete and never judged.
+        const readList = async <T,>(path: string, field: string, keep: string): Promise<{ list: T[] } | { error: string } | { incomplete: string }> => {
+          let got: { list: T[]; total: number } | undefined;
           const r = await again(async () => {
-            list = undefined;
-            const out = await runGh(cwd, ['api', '--paginate', path, '--jq', `.${field}[]`], wait.signal);
+            got = undefined;
+            const out = await runGh(cwd, ['api', '--paginate', path, '--jq', `[.total_count, [.${field}[] | {${keep}}]]`], wait.signal);
             if (out.code !== 0) return out;
             try {
-              list = out.stdout.split('\n').filter((l) => l.trim()).map((l) => JSON.parse(l) as T);
-              if (!list.every((x) => x !== null && typeof x === 'object' && !Array.isArray(x))) list = undefined;
+              const pages = out.stdout.split('\n').filter((l) => l.trim()).map((l) => JSON.parse(l) as unknown);
+              const ok = pages.length > 0 && pages.every((pg) => Array.isArray(pg) && pg.length === 2 && Number.isInteger(pg[0]) && Array.isArray(pg[1]) && pg[1].every((x) => x !== null && typeof x === 'object' && !Array.isArray(x)));
+              if (ok) {
+                const typed = pages as [number, T[]][];
+                got = { list: typed.flatMap((pg) => pg[1]), total: Math.max(...typed.map((pg) => pg[0])) };
+              }
             } catch {
-              list = undefined;
+              // not JSON: reported below
             }
             return out;
           }, wait.signal);
-          if (list) return { list };
+          if (got && got.list.length < got.total) return { incomplete: `GitHub reported ${got.total} ${field.replace('_', ' ')} for ${short(headSha)} but only ${got.list.length} were read` };
+          if (got) return { list: got.list };
           return { error: clipText((r.stderr || r.stdout).trim() || `gh api ${path} printed no ${field}`, 300) };
         };
-        const readChecks = async (): Promise<{ list: Check[] } | { error: string }> => {
+        const readChecks = async (): Promise<{ list: Check[] } | { error: string } | { incomplete: string }> => {
           if (!/^[0-9a-f]{40}$/.test(headSha)) return { error: `the approved head ${JSON.stringify(headSha)} is not a full commit SHA` };
-          const runs = await readList<CheckRunEntry>(`repos/{owner}/{repo}/commits/${headSha}/check-runs?filter=latest&per_page=100`, 'check_runs');
-          if ('error' in runs) return runs;
-          const statuses = await readList<StatusEntry>(`repos/{owner}/{repo}/commits/${headSha}/status?per_page=100`, 'statuses');
-          if ('error' in statuses) return statuses;
+          const runs = await readList<CheckRunEntry>(`repos/{owner}/{repo}/commits/${headSha}/check-runs?filter=latest&per_page=100`, 'check_runs', 'name, status, conclusion, details_url');
+          if (!('list' in runs)) return runs;
+          const statuses = await readList<StatusEntry>(`repos/{owner}/{repo}/commits/${headSha}/status?per_page=100`, 'statuses', 'context, state, target_url');
+          if (!('list' in statuses)) return statuses;
           return { list: checksFromApi(runs.list, statuses.list) };
         };
 
@@ -673,6 +681,8 @@ export default definePlugin({
           if (!(await gate())) return;
           const got = await readChecks();
           if ('error' in got) return (await over()) ? undefined : giveUp(`could not read checks: ${got.error}`);
+          // Not judged and not merged. Asking again may read every page.
+          if ('incomplete' in got) return (await over()) ? undefined : refuse(`checks read incomplete, not merging: ${got.incomplete}`);
           const list = got.list;
           if (list.length === 0) {
             if (!cfg.allowNoChecks) return giveUp('the PR has no checks and allowNoChecks is off. Turn it on or add a check, then run the job again.');

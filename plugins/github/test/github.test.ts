@@ -163,12 +163,12 @@ describe('checksFromApi', () => {
     expect(
       buckets([
         run('completed', 'success'), run('completed', 'skipped'), run('completed', 'neutral'), run('completed', 'failure'),
-        run('completed', 'timed_out'), run('completed', 'action_required'), run('completed', 'cancelled'), run('completed', 'stale'),
+        run('completed', 'timed_out'), run('completed', 'action_required'), run('completed', 'startup_failure'), run('completed', 'cancelled'), run('completed', 'stale'),
         run('in_progress'), run('queued'), run('waiting'), run('pending'), run('requested'),
       ]),
     ).toEqual([
       'completed-success=pass', 'completed-skipped=skipping', 'completed-neutral=skipping', 'completed-failure=fail',
-      'completed-timed_out=fail', 'completed-action_required=fail', 'completed-cancelled=cancel', 'completed-stale=pending',
+      'completed-timed_out=fail', 'completed-action_required=fail', 'completed-startup_failure=fail', 'completed-cancelled=cancel', 'completed-stale=pending',
       'in_progress-=pending', 'queued-=pending', 'waiting-=pending', 'pending-=pending', 'requested-=pending',
     ]);
     const ctx = (state: string) => ({ context: `ctx-${state}`, state });
@@ -693,8 +693,8 @@ describe('merge.requested', () => {
     await h.waitFor('pr.merged');
     const api = h.calls().filter((c) => c.args[0] === 'api');
     expect(api.map((c) => c.args)).toEqual([
-      ['api', '--paginate', `repos/{owner}/{repo}/commits/${pr.headSha}/check-runs?filter=latest&per_page=100`, '--jq', '.check_runs[]'],
-      ['api', '--paginate', `repos/{owner}/{repo}/commits/${pr.headSha}/status?per_page=100`, '--jq', '.statuses[]'],
+      ['api', '--paginate', `repos/{owner}/{repo}/commits/${pr.headSha}/check-runs?filter=latest&per_page=100`, '--jq', '[.total_count, [.check_runs[] | {name, status, conclusion, details_url}]]'],
+      ['api', '--paginate', `repos/{owner}/{repo}/commits/${pr.headSha}/status?per_page=100`, '--jq', '[.total_count, [.statuses[] | {context, state, target_url}]]'],
     ]);
   });
 
@@ -732,6 +732,50 @@ describe('merge.requested', () => {
     const failed = await h.waitFor('merge.failed');
     expect((failed.payload as { reason: string }).reason).toBe('checks failing: verify. Fix the failing check, then run the job again.');
     expect(h.calls().some((c) => c.args[1] === 'merge')).toBe(false);
+  });
+
+  it('reads every page: 150 check runs over two pages, and judges the one failure on the second page', async () => {
+    const h = await setup();
+    const pr = await openPr(h);
+    const runs = Array.from({ length: 150 }, (_, i) => ({ name: `job-${i}`, status: 'completed', conclusion: i === 140 ? 'failure' : 'success', details_url: null }));
+    h.setState({ log: join(h.root, 'gh.log'), runs });
+    h.fire('merge.requested', { cwd: pr.cwd, number: pr.number, headSha: pr.headSha });
+    const failed = await h.waitFor('merge.failed');
+    expect((failed.payload as { reason: string }).reason).toBe('checks failing: job-140. Fix the failing check, then run the job again.');
+  });
+
+  it('refuses the merge when a page of check runs is missing (fewer rows than total_count), even if all it read passed', async () => {
+    const h = await setup();
+    const pr = await openPr(h);
+    const runs = Array.from({ length: 150 }, (_, i) => ({ name: `job-${i}`, status: 'completed', conclusion: i === 140 ? 'failure' : 'success', details_url: null }));
+    h.setState({ log: join(h.root, 'gh.log'), runs, dropPage: 1 });
+    h.fire('merge.requested', { cwd: pr.cwd, number: pr.number, headSha: pr.headSha });
+    const refused = await h.waitFor('merge.refused');
+    expect((refused.payload as { reason: string }).reason).toBe(
+      `checks read incomplete, not merging: GitHub reported 150 check runs for ${pr.headSha.slice(0, 7)} but only 100 were read`,
+    );
+    expect(h.seen.some((e) => e.type === 'merge.failed')).toBe(false);
+    expect(h.calls().some((c) => c.args[1] === 'merge')).toBe(false);
+  });
+
+  it('refuses the merge when total_count says there are check runs but none came back', async () => {
+    const h = await setup({ allowNoChecks: true });
+    const pr = await openPr(h);
+    h.setState({ log: join(h.root, 'gh.log'), runs: [], runsTotal: 3 });
+    h.fire('merge.requested', { cwd: pr.cwd, number: pr.number, headSha: pr.headSha });
+    const refused = await h.waitFor('merge.refused');
+    expect((refused.payload as { reason: string }).reason).toMatch(/GitHub reported 3 check runs .* but only 0 were read/);
+    expect(h.calls().some((c) => c.args[1] === 'merge')).toBe(false);
+  });
+
+  it('fails on a workflow that never started (startup_failure) instead of waiting for it', async () => {
+    const h = await setup({ checksPollMs: 20, checksWaitMs: 60_000 });
+    const pr = await openPr(h);
+    h.setState({ log: join(h.root, 'gh.log'), runs: [{ name: 'ci', status: 'completed', conclusion: 'startup_failure', details_url: 'https://example.test/runs/5' }] });
+    h.fire('merge.requested', { cwd: pr.cwd, number: pr.number, headSha: pr.headSha });
+    const failed = await h.waitFor('merge.failed');
+    expect(failed.payload).toEqual({ reason: 'checks failing: ci. Fix the failing check, then run the job again.', checks: [{ name: 'ci', link: 'https://example.test/runs/5' }] });
+    expect(h.calls().filter((c) => readsChecks(c)).length).toBe(1);
   });
 
   it('refuses an approved head that is not a full commit SHA before it reaches a URL', async () => {

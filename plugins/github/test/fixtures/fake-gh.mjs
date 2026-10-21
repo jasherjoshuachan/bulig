@@ -1,12 +1,20 @@
 #!/usr/bin/env node
 // A stand-in for the gh CLI. State comes from the JSON file named by FAKE_GH_STATE.
 import { execFileSync } from 'node:child_process';
-import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 
 const args = process.argv.slice(2);
 const statePath = process.env.FAKE_GH_STATE;
 const state = statePath && existsSync(statePath) ? JSON.parse(readFileSync(statePath, 'utf8')) : {};
 if (state.log) appendFileSync(state.log, JSON.stringify({ args, token: process.env.GH_TOKEN ?? null, cwd: process.cwd() }) + '\n');
+
+// Two jobs can run gh at the same moment. A write in place truncates the file first, so a gh that reads in that instant
+// gets empty JSON and crashes, and the job's merge is refused or failed. Write a whole new file and rename it over the old one.
+const save = (next) => {
+  const tmp = `${statePath}.${process.pid}.tmp`;
+  writeFileSync(tmp, JSON.stringify(next));
+  renameSync(tmp, statePath);
+};
 
 const head = () => state.headRefOid ?? execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
 const [group, sub] = args;
@@ -27,7 +35,7 @@ if (group === 'pr' && sub === 'create' && state.createExists) {
 } else if (group === 'pr' && sub === 'checks') {
   // Calls are counted in the state file, so a test can change what gh says as checks "finish".
   const call = state.checkCalls ?? 0;
-  if (statePath) writeFileSync(statePath, JSON.stringify({ ...state, checkCalls: call + 1 }));
+  if (statePath) save({ ...state, checkCalls: call + 1 });
   // hangChecksFirst: the first N calls never answer. The pid is written down so a test can see the process die.
   if (call < (state.hangChecksFirst ?? 0)) {
     if (state.pidFile) appendFileSync(state.pidFile, `${process.pid}\n`);
@@ -61,7 +69,7 @@ if (group === 'pr' && sub === 'create' && state.createExists) {
     process.exit(1);
   }
   // Merging flips the PR to MERGED, even when gh then fails to tidy up locally.
-  if (statePath && (!state.mergeExit || state.mergeAnyway)) writeFileSync(statePath, JSON.stringify({ ...state, prState: 'MERGED' }));
+  if (statePath && (!state.mergeExit || state.mergeAnyway)) save({ ...state, prState: 'MERGED' });
   if (state.mergeExit) {
     console.error(state.mergeError ?? 'merge failed');
     process.exit(state.mergeExit);

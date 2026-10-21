@@ -2,7 +2,8 @@
 deploy/test/fence.sh against local listeners that count the connections they accept.
 
 THE RULE: this kit never completes a connection to anything that is not Bulig's, from any context, and never wakes a socket-activated unit
-that is not Bulig's. The only probes that connect are the "allow" ones (Bulig's own gateway, its Postgres socket, DNS, github, anthropic) and
+that is not Bulig's. The only probes that connect are the "allow" ones (Bulig's own gateway, its Postgres socket, DNS, github, anthropic, and a unix
+socket the probe makes for itself and removes) and
 the "deny" ones, which run inside the fence and must fail before they reach anything. A deny probe that SUCCEEDS is a real connection to
 another service: that is exactly why it is a failure, and why the other modes never connect at all.
 
@@ -52,6 +53,13 @@ JOBS = 32
 
 
 NAME_OK = re.compile(r"[A-Za-z0-9._-]{1,64}\Z")
+
+# What a failed sandbox probe says, so the report names the likely causes instead of leaving bwrap's one line to be decoded (21 Oct 2026).
+SANDBOX_HINT = ("Claude Code's Bash sandbox (bubblewrap) cannot start in this set. Likely causes: the AppArmor profile bulig-bwrap is not loaded "
+                "(bwrap: 'setting up uid map: Permission denied'; release-remote.sh installs it), or the unit lacks AF_NETLINK or AF_UNIX "
+                "('Failed to create NETLINK_ROUTE socket'); or bubblewrap is not installed")
+UNIX_SELF_HINT = ("Claude Code's sandbox listens on a unix socket of its own like this one; without AF_UNIX every Bash call fails "
+                  "(EAFNOSUPPORT, as seen on the server on 21 Oct 2026)")
 
 
 def parse_probes(path, set_name, host_addrs):
@@ -135,6 +143,40 @@ def attempt(kind, target, timeout=TIMEOUT):
         if kind == "exec":
             subprocess.run(target.split(), check=True, timeout=20, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
             return True, "exited 0"
+        if kind == "sandbox":
+            # Claude Code's sandbox without Claude: bwrap making its namespaces (user, mount, pid, net, ...) and running a command in them.
+            try:
+                subprocess.run(target.split(), check=True, timeout=20, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            except subprocess.CalledProcessError as e:
+                err = " / ".join((e.stderr or b"").decode("utf8", "replace").split("\n")).strip()[:160]  # one result line, however bwrap printed it
+                return False, "exit " + str(e.returncode) + ": " + err + ". " + SANDBOX_HINT
+            except Exception as e:
+                return False, f"{type(e).__name__}: {e}. " + SANDBOX_HINT
+            return True, "bwrap made its namespaces and ran the command"
+        if kind == "unix-self":
+            # A unix socket of its own, in a fresh private folder: listen, connect to itself, remove it. It reaches nothing else.
+            import shutil
+            import tempfile
+
+            d = tempfile.mkdtemp(prefix="bulig-fence-")
+            try:
+                path = os.path.join(d, "self.sock")
+                try:
+                    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                except OSError as e:
+                    return False, f"{type(e).__name__}: {e}. " + UNIX_SELF_HINT
+                try:
+                    srv.bind(path)
+                    srv.listen(1)
+                    c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    c.settimeout(timeout)
+                    c.connect(path)
+                    c.close()
+                finally:
+                    srv.close()
+                return True, "listened on and connected to a unix socket of its own"
+            finally:
+                shutil.rmtree(d, ignore_errors=True)
         if kind == "pwd":
             import pwd
 
@@ -156,6 +198,10 @@ def attempt(kind, target, timeout=TIMEOUT):
 
 ALL_SETS = "worker,kernel,build,cli-worker,cli-kernel"
 WORKERISH = "worker,build,cli-worker"
+# The sets that keep AF_UNIX: the kernel's (Postgres) and, since 21 Oct 2026, the worker's (Claude Code's sandbox). Another tenant's abstract
+# socket is a known limit there (reported, never connected to); only the build, which has no AF_UNIX, gets a deny probe for it.
+WITH_UNIX = "worker,kernel,cli-worker,cli-kernel"
+NO_UNIX = "build"
 GATEWAY = ("127.74.3.1", "7431")  # the kernel's own gateway: the worker is meant to reach it
 MAX_DERIVED = 400
 
@@ -270,8 +316,8 @@ def derive(ss_tcp, ss_unix, ip_addr):
         if len(f) >= 5 and f[4].startswith("@") and len(f[4]) > 1 and "," not in f[4] and "=" not in f[4]:
             names.add(f[4][1:])
     for n, name in enumerate(sorted(names), 1):  # numbered after sorting, so the order ss printed in does not matter
-        add("deny", WORKERISH, f"abstract-{n}", "abstract", name)
-        add("known", "kernel,cli-kernel", f"abstract-{n}", "abstract", name)
+        add("deny", NO_UNIX, f"abstract-{n}", "abstract", name)
+        add("known", WITH_UNIX, f"abstract-{n}", "abstract", name)
     lines = [out[k] for k in sorted(out)]
     return lines[:MAX_DERIVED]
 

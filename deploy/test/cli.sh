@@ -60,6 +60,8 @@ check "only the gateway address is let through (no DNS stub, no Tailscale range)
 check "the kernel's one-off commands keep AF_UNIX (Postgres)" "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6"
 check "and cannot see the tailscale, snapd or docker sockets" "InaccessiblePaths=-/run/tailscale -/run/snapd.socket -/run/docker.sock -/var/run/docker.sock"
 check "and resolve names through resolved's upstream list" "BindReadOnlyPaths=/run/systemd/resolve/resolv.conf:/etc/resolv.conf"
+for k in ProtectKernelTunables ProtectKernelLogs ProtectHostname; do check "the kernel's one-off commands keep $k, as bulig.service does" "$k=yes"; done
+absent "and no stand-ins they do not need" "^ReadOnlyPaths=|^SystemCallFilter="
 check "the CLI is run from the root-owned release" "/opt/bulig/current/packages/cli/bin/bulig.mjs"
 if [ "$(tail -1 "$work/argv")" = "status" ]; then ok "the arguments reach the CLI"; else bad "last arg: $(tail -1 "$work/argv")"; fi
 check "a pipe for stdin and stdout" "--pipe"
@@ -76,10 +78,15 @@ absent "none of the kernel's secrets or its config" "pg-url|gh-token|worker-toke
 absent "no ReadWritePaths" "ReadWritePaths"
 check "the worker's one-off commands cannot reach Tailscale or this machine's own public addresses" "IPAddressDeny=127.0.0.0/8 ::1/128 169.254.0.0/16 fe80::/10 224.0.0.0/4 ff00::/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7 2001:db8::10/128 203.0.113.10/32"
 check "only the gateway address is let through" "IPAddressAllow=127.74.3.1/32"
-check "the worker's one-off commands have no unix sockets at all" "RestrictAddressFamilies=AF_INET AF_INET6"
-if [ "$(grep -c '^RestrictAddressFamilies=' "$work/argv")" = "1" ] && ! grep -q 'RestrictAddressFamilies=.*AF_UNIX' "$work/argv"; then ok "and nothing else in the command line gives AF_UNIX back"; else bad "address-family lines: $(grep Restrict "$work/argv")"; fi
-check "and cannot see the tailscale, snapd or docker sockets" "InaccessiblePaths=-/run/tailscale -/run/snapd.socket -/run/docker.sock -/var/run/docker.sock"
+check "the worker's one-off commands get the worker unit's families: AF_UNIX and AF_NETLINK for Claude Code's sandbox, and IP" "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK"
+if [ "$(grep -c '^RestrictAddressFamilies=' "$work/argv")" = "1" ] && ! grep -q 'RestrictAddressFamilies=.*AF_PACKET' "$work/argv"; then ok "and nothing else in the command line changes the family list"; else bad "address-family lines: $(grep Restrict "$work/argv")"; fi
+check "and cannot see the tailscale, snapd or docker sockets, the Postgres socket folder or the system bus" "InaccessiblePaths=-/run/tailscale -/run/snapd.socket -/run/docker.sock -/var/run/docker.sock -/run/postgresql -/var/run/postgresql -/run/dbus"
 check "and resolve names through resolved's upstream list" "BindReadOnlyPaths=/run/systemd/resolve/resolv.conf:/etc/resolv.conf"
+# the same hardening as bulig-worker.service, so Claude Code's sandbox works in a one-off command too (bwrap needs a /proc it can mount)
+absent "the worker's one-off commands set none of ProtectKernelTunables, ProtectKernelLogs, ProtectHostname or ProcSubset" "^(ProtectKernelTunables|ProtectKernelLogs|ProtectHostname|ProcSubset)="
+check "and keep sysfs read-only instead" "ReadOnlyPaths=/sys"
+check "and cannot read the kernel log or rename the host" "SystemCallFilter=~syslog sethostname setdomainname"
+for p in NoNewPrivileges=yes CapabilityBoundingSet= PrivateTmp=yes PrivateDevices=yes ProtectSystem=strict ProtectHome=yes ProtectKernelModules=yes ProtectControlGroups=yes ProtectClock=yes ProtectProc=invisible; do check "and keep $p" "$p"; done
 if [ "$(grep -c '^LoadCredential=' "$work/argv")" = "3" ]; then ok "and exactly three credentials, no more"; else bad "worker credentials: $(grep '^LoadCredential=' "$work/argv" | tr '\n' ' ')"; fi
 if [ "$(tail -4 "$work/argv" | tr '\n' ' ')" = "git clone https://example.invalid/r /var/lib/bulig-worker/work/r " ]; then ok "--exec runs the program as given"; else bad "tail: $(tail -4 "$work/argv" | tr '\n' ' ')"; fi
 absent "--exec does not run the bulig CLI" "bulig.mjs"

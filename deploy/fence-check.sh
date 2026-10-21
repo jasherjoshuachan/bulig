@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Does the fence hold on this machine? For each Bulig property set, run a short probe INSIDE a transient unit that has exactly that set's
 # network, socket and path properties, and require that it CANNOT reach other tenants' services (localhost, the docker bridge, tailscale, the
-# machine's own addresses, unix sockets including an abstract one) and CAN do what the unit needs (DNS, https, its own gateway, a child
-# process, a user lookup). Any unexpected success is a failure. The probe list is one file, fence/probes.txt.
+# machine's own addresses, unix sockets including an abstract one where the set has no AF_UNIX) and CAN do what the unit needs (DNS, https, its
+# own gateway, a child process, a user lookup, and for the worker sets Claude Code's Bash sandbox: a unix socket of its own and bwrap). Any
+# unexpected success is a failure. The probe list is one file, fence/probes.txt.
 #   Probes: fence/probes.txt (published, generic) + ones derived from what this machine listens on + /etc/bulig/fence-extra-probes.txt (root, 0600,
 #   required: this script fails without it).
 #   usage (root):  fence-check.sh [worker|kernel|build|cli-worker|cli-kernel|all] [--no-late | --late-only] [--late-strict]
@@ -24,7 +25,8 @@
 #   - A target that systemd holds as a socket for another unit (systemctl list-sockets) is never connected to by anything. It is judged from the
 #     unit's properties only, and reported as "activation socket: checked by properties only".
 #   - Known limits are reported from the unit's properties and ss, labelled "known limit, not tested by connecting".
-#   - What does connect: the allow probes (Bulig's own gateway and Postgres socket, DNS, github, anthropic) and the deny probes inside the fence,
+#   - What does connect: the allow probes (Bulig's own gateway and Postgres socket, DNS, github, anthropic, a unix socket the probe makes for
+#     itself) and the deny probes inside the fence,
 #     which must fail before they reach anything. A deny probe that succeeds IS a real connection to another service; that is why it is a failure.
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -119,8 +121,9 @@ for s in "${sets[@]}"; do
       ;;
     # The real build sets HOME explicitly (release-remote.sh); a DynamicUser has no passwd entry to take it from.
     build) build_fence_props; props=("${FENCE_BUILD[@]}" --setenv=HOME=/var/tmp/home) ;;
-    cli-worker) cli_fence_props worker; props=("${FENCE_CLI[@]}"); ids=(--uid=bulig-worker) ;;
-    cli-kernel) cli_fence_props kernel; props=("${FENCE_CLI[@]}"); ids=(--uid=bulig) ;;
+    # (with bulig-cli.sh's own hardening, so the sandbox probe sees the /proc a real one-off command has)
+    cli-worker) cli_fence_props worker; cli_harden_props worker; props=("${FENCE_CLI[@]}" "${CLI_HARDEN[@]}"); ids=(--uid=bulig-worker) ;;
+    cli-kernel) cli_fence_props kernel; cli_harden_props kernel; props=("${FENCE_CLI[@]}" "${CLI_HARDEN[@]}"); ids=(--uid=bulig) ;;
   esac
   [ "${#props[@]}" -gt 0 ] || die "no fence properties found for $s (is the unit installed?)"
   # The unit's properties, handed to the probe as plain values: known limits and activation sockets are judged from them.

@@ -85,6 +85,20 @@ DATA
 esac
 STUB
 
+# apparmor_parser: logs its call; STUB_AA_FAIL makes it fail. -r marks the profile loaded in the fake /sys list, -R unmarks it.
+cat >"$stubs/apparmor_parser" <<'STUB'
+#!/usr/bin/env bash
+echo "apparmor_parser $*" >>"$STUB_LOG/calls"
+if [ -n "${STUB_AA_FAIL:-}" ]; then echo "apparmor_parser: syntax error" >&2; exit 1; fi
+loaded="$BULIG_DEPLOY_TEST_ROOT/sys/kernel/security/apparmor/profiles"
+if [ -d "$(dirname "$loaded")" ]; then
+  case "$1" in
+    -r) grep -v '^bulig-bwrap ' "$loaded" >"$loaded.n" 2>/dev/null; echo "bulig-bwrap (unconfined)" >>"$loaded.n"; /bin/mv "$loaded.n" "$loaded" ;;
+    -R) grep -v '^bulig-bwrap ' "$loaded" >"$loaded.n" 2>/dev/null; /bin/mv "$loaded.n" "$loaded" ;;
+  esac
+fi
+exit 0
+STUB
 cat >"$stubs/flock" <<'STUB'
 #!/usr/bin/env bash
 exit 0
@@ -138,6 +152,8 @@ deliver() {
   cp "$deploy/release-remote.sh" "$inc/deploy/"
   cp "$deploy"/lib/*.sh "$inc/deploy/lib/"
   cp "$deploy/bulig.config.vps.json" "$inc/deploy/"
+  cp -R "$deploy/apparmor" "$inc/deploy/"
+  if [ -n "${STUB_PROFILE:-}" ]; then printf '%s\n' "$STUB_PROFILE" >"$inc/deploy/apparmor/bulig-bwrap"; fi
   if [ "$hx" = "flag" ]; then
     # healthy only once the flag file exists (a cause outside the release, such as a missing credential, that is fixed between two runs)
     printf '#!/usr/bin/env bash\n[ -e "%s" ]\n' "$work/health-ok" >"$inc/deploy/health.sh"
@@ -231,6 +247,7 @@ if [ -f "$r/etc/bulig/config.json" ] && [ "$(mode "$r/etc/bulig/config.json")" =
 if [ -z "$(find "$r" -name 'config.json' -not -path "$r/etc/bulig/*")" ] && [ -z "$(find "$r" -name '.bulig' -print -quit)" ]; then ok "no config was written anywhere else (no .bulig folder, no second config.json)"; else bad "a config turned up elsewhere: $(find "$r" -name 'config.json' -o -name '.bulig')"; fi
 if user_folders_untouched; then ok "nothing under /var/lib/bulig or /var/lib/bulig-worker was created, changed or deleted"; else bad "a user folder changed: $(find "$r/var/lib/bulig" "$r/var/lib/bulig-worker" -newer "$work/ref-old")"; fi
 if [ -z "$(leftovers)" ]; then ok "no incoming or work folders are left behind"; else bad "left: $(leftovers)"; fi
+if grep -q "apparmor: not enabled on this machine" "$work/out" && [ ! -e "$r/etc/apparmor.d/bulig-bwrap" ] && ! grep -q "^apparmor_parser" "$STUB_LOG/calls"; then ok "where AppArmor is not enabled, the profile is skipped with a note (nothing written, apparmor_parser not run)"; else bad "apparmor without AppArmor: $(grep apparmor "$work/out" "$STUB_LOG/calls")"; fi
 build_call="$(grep -- '--unit=bulig-build-' "$STUB_LOG/calls" | head -1)"
 extract_call="$(grep -- '--unit=bulig-extract-' "$STUB_LOG/calls" | head -1)"
 for p in DynamicUser=yes PrivateTmp=yes KillMode=control-group ProtectSystem=strict NoNewPrivileges=yes MemoryMax= TasksMax=; do
@@ -392,6 +409,92 @@ ln -sfn "$r/opt/bulig/releases/$F" "$r/opt/bulig/current"
 echo "stale" >"$r/opt/bulig/.healthy-sha"
 incF4="$(deliver "$F" flag)"
 expect_ok "a current link whose release never passed health is released again, not refused" run_remote "$F" "$incF4"
+
+# --- 6c. bwrap's AppArmor profile ---
+echo "the AppArmor profile for bubblewrap"
+AAP="$r/etc/apparmor.d/bulig-bwrap"
+LOADED="$r/sys/kernel/security/apparmor/profiles"
+mkdir -p "$r/sys/module/apparmor/parameters" "$(dirname "$LOADED")" "$r/etc/apparmor.d"
+echo Y >"$r/sys/module/apparmor/parameters/enabled"
+: >"$LOADED"
+echo "# someone else's profile" >"$r/etc/apparmor.d/usr.bin.other"
+cp -p "$r/etc/apparmor.d/usr.bin.other" "$work/other.keep"
+aa_calls() { grep '^apparmor_parser' "$STUB_LOG/calls" | tr '\n' '|'; }
+live() { link_of "$r/opt/bulig/current"; }
+: >"$STUB_LOG/calls"
+incH1="$(deliver "a1a1a1a1a1a1" 0)"
+expect_ok "a release with AppArmor enabled runs" run_remote "a1a1a1a1a1a1" "$incH1"
+if [ -f "$AAP" ] && cmp -s "$AAP" "$deploy/apparmor/bulig-bwrap" && [ "$(mode "$AAP")" = "644" ]; then ok "the profile is installed as shipped, mode 644"; else bad "profile: $(mode "$AAP" 2>&1)"; fi
+if [ "$(aa_calls)" = "apparmor_parser -r $AAP|" ]; then ok "and loaded once with apparmor_parser -r"; else bad "apparmor_parser calls: $(aa_calls)"; fi
+if cmp -s "$r/etc/apparmor.d/usr.bin.other" "$work/other.keep" && [ "$(find "$r/etc/apparmor.d" -type f | wc -l | tr -d ' ')" = "2" ]; then ok "and no other file in /etc/apparmor.d is touched or added"; else bad "/etc/apparmor.d: $(find "$r/etc/apparmor.d" -type f)"; fi
+if user_folders_untouched; then ok "and the user folders are untouched"; else bad "a user folder changed"; fi
+: >"$STUB_LOG/calls"
+incH2="$(deliver "a2a2a2a2a2a2" 0)"
+run_remote "a2a2a2a2a2a2" "$incH2" >"$work/out" 2>&1
+if [ "$(live)" = "a2a2a2a2a2a2" ] && [ -z "$(aa_calls)" ] && grep -q "is as in the release and loaded" "$work/out"; then ok "a release whose profile is already installed and loaded writes nothing and does not reload it"; else bad "unchanged profile: $(aa_calls) $(cat "$work/out")"; fi
+: >"$LOADED"
+: >"$STUB_LOG/calls"
+incH3="$(deliver "a3a3a3a3a3a3" 0)"
+run_remote "a3a3a3a3a3a3" "$incH3" >"$work/out" 2>&1
+if [ "$(live)" = "a3a3a3a3a3a3" ] && [ "$(aa_calls)" = "apparmor_parser -r $AAP|" ] && grep -q "but not loaded; loaded it" "$work/out"; then ok "a profile that is right on disk but not loaded is loaded"; else bad "not-loaded profile: $(aa_calls) $(cat "$work/out")"; fi
+# a release whose health check fails puts the previous profile back and reloads it
+echo "# the previous profile" >"$AAP"
+cp -p "$AAP" "$work/aa.prev"
+: >"$STUB_LOG/calls"
+incH4="$(deliver "a4a4a4a4a4a4" 1)"
+expect_fail_msg "a release that changes the profile and then fails its health check fails" "FAILED" run_remote "a4a4a4a4a4a4" "$incH4"
+if cmp -s "$AAP" "$work/aa.prev" && [ "$(live)" = "a3a3a3a3a3a3" ]; then ok "the rollback puts the previous profile back (and the links)"; else bad "after rollback: $(cat "$AAP") / $(live)"; fi
+if [ "$(aa_calls)" = "apparmor_parser -r $AAP|apparmor_parser -r $AAP|" ]; then ok "and reloads it"; else bad "rollback calls: $(aa_calls)"; fi
+# apparmor_parser fails: the release fails and rolls back
+: >"$STUB_LOG/calls"
+incH5="$(deliver "a5a5a5a5a5a5" 0)"
+STUB_AA_FAIL=1 run_remote "a5a5a5a5a5a5" "$incH5" >"$work/out" 2>&1
+rc=$?
+if [ "$rc" -ne 0 ] && grep -q "apparmor_parser -r $AAP failed" "$work/out" && grep -q "rolling back" "$work/out" && [ "$(live)" = "a3a3a3a3a3a3" ]; then ok "a profile apparmor_parser refuses fails the release, which rolls back"; else bad "parser failure rc=$rc: $(cat "$work/out")"; fi
+if cmp -s "$AAP" "$work/aa.prev"; then ok "and the previous profile is back on disk"; else bad "profile after a parser failure: $(cat "$AAP")"; fi
+first_aa="$(grep -n '^apparmor_parser -r' "$STUB_LOG/calls" | head -1 | cut -d: -f1)"
+first_restart="$(grep -n '^systemctl restart bulig.service bulig-worker.service' "$STUB_LOG/calls" | head -1 | cut -d: -f1)"
+if [ "$(grep -c '^systemctl restart bulig.service bulig-worker.service' "$STUB_LOG/calls")" = "1" ] && [ -n "$first_aa" ] && [ "$first_aa" -lt "${first_restart:-0}" ]; then ok "and the services were restarted only once, by the rollback (the profile is loaded before the new release starts)"; else bad "restarts around the profile: $(grep -n 'apparmor_parser\|systemctl restart' "$STUB_LOG/calls")"; fi
+# no profile before, and the release fails: the profile is unloaded and removed
+rm -f "$AAP"
+: >"$STUB_LOG/calls"
+incH6="$(deliver "a6a6a6a6a6a6" 1)"
+expect_fail_msg "a release that adds the profile and fails its health check fails" "FAILED" run_remote "a6a6a6a6a6a6" "$incH6"
+if [ ! -e "$AAP" ] && [ "$(aa_calls)" = "apparmor_parser -r $AAP|apparmor_parser -R $AAP|" ]; then ok "and the profile it added is unloaded (apparmor_parser -R) and removed"; else bad "after a failed first install: $(ls "$AAP" 2>&1) $(aa_calls)"; fi
+# a link where the profile belongs is refused, and the release rolls back
+ln -s "$work/aa.prev" "$AAP"
+incH7="$(deliver "a7a7a7a7a7a7" 0)"
+expect_fail_msg "a link where the profile belongs fails the release" "is a link. Not touching it." run_remote "a7a7a7a7a7a7" "$incH7"
+if [ -L "$AAP" ] && cmp -s "$work/aa.prev" <(echo "# the previous profile") && [ "$(live)" = "a3a3a3a3a3a3" ]; then ok "and neither the link nor its target is changed, and the links are back"; else bad "after a link: $(ls -l "$AAP") $(live)"; fi
+rm -f "$AAP"
+# a link to a file that already matches the release is refused too (it must not count as "already installed")
+cp "$deploy/apparmor/bulig-bwrap" "$work/aa.same"
+ln -s "$work/aa.same" "$AAP"
+incH7b="$(deliver "a7b7a7b7a7b7" 0)"
+expect_fail_msg "a link to a matching profile fails the release too" "is a link. Not touching it." run_remote "a7b7a7b7a7b7" "$incH7b"
+rm -f "$AAP"
+# AppArmor on, but no apparmor_parser
+mv "$stubs/apparmor_parser" "$work/aa-stub"
+incH8="$(deliver "a8a8a8a8a8a8" 0)"
+expect_fail_msg "AppArmor enabled without apparmor_parser fails the release" "apparmor_parser is not installed" run_remote "a8a8a8a8a8a8" "$incH8"
+mv "$work/aa-stub" "$stubs/apparmor_parser"
+if [ ! -e "$AAP" ] && [ "$(live)" = "a3a3a3a3a3a3" ]; then ok "and nothing is written"; else bad "after a missing parser: $(ls "$AAP" 2>&1) $(live)"; fi
+# a release that ships a different profile replaces the installed one
+cp "$deploy/apparmor/bulig-bwrap" "$AAP"
+: >"$STUB_LOG/calls"
+incH9="$(STUB_PROFILE='# a newer profile' deliver "a9a9a9a9a9a9" 0)"
+expect_ok "a release with a changed profile runs" run_remote "a9a9a9a9a9a9" "$incH9"
+if grep -qx '# a newer profile' "$AAP" && [ "$(aa_calls)" = "apparmor_parser -r $AAP|" ]; then ok "and the installed profile is replaced and reloaded"; else bad "changed profile: $(cat "$AAP") $(aa_calls)"; fi
+if user_folders_untouched && [ -z "$(leftovers)" ]; then ok "and the user folders and /var/lib/bulig-checks are clean after all of it"; else bad "dirty after the AppArmor cases: $(leftovers)"; fi
+# a failed FIRST release (nothing to go back to) that added the profile unloads and removes it as well
+wipe_root
+rm -f "$AAP"
+: >"$LOADED"
+: >"$STUB_LOG/calls"
+incH10="$(deliver "b1b1b1b1b1b1" 1)"
+expect_fail_msg "a first release that adds the profile and fails its health check fails" "no healthy release to go back to" run_remote "b1b1b1b1b1b1" "$incH10"
+if [ ! -e "$AAP" ] && [ "$(aa_calls)" = "apparmor_parser -r $AAP|apparmor_parser -R $AAP|" ] && ! grep -q '^bulig-bwrap ' "$LOADED"; then ok "and the profile it added is unloaded and removed"; else bad "after a failed first release: $(ls "$AAP" 2>&1) $(aa_calls)"; fi
+rm -rf "$r/sys" "$r/etc/apparmor.d"
 
 # --- 7. bad arguments ---
 echo "arguments"

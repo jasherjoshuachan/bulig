@@ -27,13 +27,31 @@ for u in bulig.service bulig-worker.service; do
   want "$u" PrivateTmp true
   want "$u" CapabilityBoundingSet ""
   want "$u" KillMode control-group
-  for k in ProtectKernelTunables ProtectKernelModules ProtectKernelLogs ProtectControlGroups RestrictSUIDSGID LockPersonality PrivateDevices; do
+  for k in ProtectKernelModules ProtectControlGroups ProtectClock RestrictSUIDSGID LockPersonality PrivateDevices; do
     want "$u" "$k" true
   done
+  want "$u" ProtectProc invisible
   if value "$u" ExecStart | grep -q '^/usr/bin/node /opt/bulig/current/'; then ok "$u: runs code from the root-owned /opt/bulig/current"; else bad "$u ExecStart: $(value "$u" ExecStart)"; fi
   if has "$u" ReadWritePaths; then bad "$u has ReadWritePaths= (StateDirectory is the only writable place): $(value "$u" ReadWritePaths)"; else ok "$u: no ReadWritePaths (the StateDirectory is the one writable place)"; fi
   if has "$u" ExecStartPre || has "$u" ExecStartPost || has "$u" PermissionsStartOnly; then bad "$u runs a helper around ExecStart"; else ok "$u: no helper steps around ExecStart"; fi
 done
+
+echo "the kernel keeps every /proc protection"
+for k in ProtectKernelTunables ProtectKernelLogs ProtectHostname; do want bulig.service "$k" true; done
+
+echo "the worker's hardening: the set proven with Claude Code's Bash sandbox on the server (21 Oct 2026)"
+# bwrap mounts a fresh /proc for every sandboxed command, and the kernel refuses it when part of the unit's /proc is mounted over: these four
+# must never come back on the worker (each one broke `--proc /proc` on the server).
+for k in ProtectKernelTunables ProtectKernelLogs ProtectHostname ProcSubset; do
+  if has bulig-worker.service "$k"; then bad "bulig-worker.service sets $k=$(value bulig-worker.service "$k") (bwrap cannot mount /proc then)"; else ok "bulig-worker.service does not set $k (bwrap needs a /proc it can mount)"; fi
+done
+# what stands in for them, and the rest of the proven set
+want bulig-worker.service ReadOnlyPaths "/sys"
+want bulig-worker.service SystemCallFilter "~syslog sethostname setdomainname"
+want bulig-worker.service ProtectClock true
+want bulig-worker.service ProtectProc invisible
+WSVC0="$(cat "$sd/bulig-worker.service")"
+if grep -q 'ProtectKernelTunables -> ReadOnlyPaths=/sys' <<<"$WSVC0" && grep -q 'ProtectKernelLogs -> SystemCallFilter=~syslog' <<<"$WSVC0" && grep -q 'ProtectHostname -> SystemCallFilter=~sethostname setdomainname' <<<"$WSVC0" && grep -q "Can't mount proc on /newroot/proc" <<<"$WSVC0"; then ok "the worker unit says what each removed protection was swapped for, and why (the bwrap error)"; else bad "the worker unit does not explain the /proc swaps"; fi
 
 echo "credentials: each unit holds only its own"
 kernel_creds="$(value bulig.service LoadCredential | sort | tr '\n' ' ')"
@@ -51,11 +69,13 @@ echo "network and sockets: what each unit can reach"
 DENY="127.0.0.0/8 ::1/128 169.254.0.0/16 fe80::/10 224.0.0.0/4 ff00::/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7"
 INACC="-/run/tailscale -/run/snapd.socket -/run/docker.sock -/var/run/docker.sock"
 RES="/run/systemd/resolve/resolv.conf:/etc/resolv.conf"
-# the worker: no unix socket of any kind, the gateway address and nothing else local
-want bulig-worker.service RestrictAddressFamilies "AF_INET AF_INET6"
+# the worker: AF_UNIX and AF_NETLINK for Claude Code's Bash sandbox (Jasher, 21 Oct 2026), the gateway address and nothing else local, and
+# because it has AF_UNIX, the Postgres socket folder and the system bus hidden as well
+INACC_WORKER="$INACC -/run/postgresql -/var/run/postgresql -/run/dbus"
+want bulig-worker.service RestrictAddressFamilies "AF_UNIX AF_INET AF_INET6 AF_NETLINK"
 want bulig-worker.service IPAddressDeny "$DENY"
 want bulig-worker.service IPAddressAllow "127.74.3.1/32"
-want bulig-worker.service InaccessiblePaths "$INACC"
+want bulig-worker.service InaccessiblePaths "$INACC_WORKER"
 want bulig-worker.service BindReadOnlyPaths "$RES"
 # the kernel: keeps AF_UNIX for Postgres, the gateway address only; a Mac worker's /32 comes from a drop-in, none by default
 want bulig.service RestrictAddressFamilies "AF_UNIX AF_INET AF_INET6"
@@ -110,10 +130,15 @@ for u in bulig.service bulig-worker.service bulig-backup.service bulig-restore-d
   if [ -z "$missing" ]; then ok "$u denies localhost, link-local, multicast, 10/8, 172.16/12, 192.168/16, 100.64/10 and fc00::/7"; else bad "$u does not deny:$missing"; fi
   if grep -qE '127\.0\.0\.53' <(grep -v '^#' "$sd/$u"); then bad "$u names the DNS stub 127.0.0.53 in a setting"; else ok "$u does not name the DNS stub (DNS goes through resolved's upstream list)"; fi
 done
-# Only the loopback unit, which uses netlink to add an address, may have anything but IP families; neither the worker nor the build may have unix sockets.
-case " $(value bulig-worker.service RestrictAddressFamilies) " in *AF_UNIX* | *AF_NETLINK* | *AF_PACKET*) bad "the worker unit allows a non-IP socket family" ;; *) ok "the worker unit allows IP sockets only (no AF_UNIX, no AF_NETLINK)" ;; esac
+# The worker has exactly AF_UNIX, AF_NETLINK and IP (Claude Code's sandbox needs the first two; nothing needs AF_PACKET or any other family).
+wf=" $(value bulig-worker.service RestrictAddressFamilies) "
+case "$wf" in *AF_PACKET* | *"~"*) bad "the worker unit allows a raw or every other socket family: $wf" ;; *) ok "the worker unit allows no raw socket family and is an allow list" ;; esac
+if [ "$(tr ' ' '\n' <<<"$wf" | grep -c '^AF_')" = "4" ]; then ok "the worker unit allows four families only"; else bad "the worker unit's families: $wf"; fi
+WSVC="$(cat "$sd/bulig-worker.service")"
+if grep -q 'KNOWN LIMIT: with AF_UNIX this unit can reach other tenants'"'"' ABSTRACT unix sockets' <<<"$WSVC" && grep -q '/etc/apparmor.d/bulig-bwrap' <<<"$WSVC" && grep -q 'EAFNOSUPPORT' <<<"$WSVC" && grep -q 'NETLINK_ROUTE' <<<"$WSVC"; then ok "the worker unit says why it has AF_UNIX and AF_NETLINK, names the AppArmor profile, and states the abstract-socket limit"; else bad "the worker unit's comment does not explain its families honestly"; fi
+if grep -q 'has no AF_UNIX' <<<"$WSVC" || grep -q 'if AF_UNIX were ever allowed' <<<"$WSVC"; then bad "the worker unit still claims it has no AF_UNIX"; else ok "the worker unit no longer claims it has no AF_UNIX"; fi
 case " $(value bulig.service RestrictAddressFamilies) " in *AF_UNIX*) ok "the kernel keeps AF_UNIX (its Postgres socket): a documented limit, see the RUNBOOK" ;; *) bad "the kernel unit lost AF_UNIX, so it cannot reach Postgres" ;; esac
-if grep -q '^## Known limits' "$deploy/RUNBOOK.md" && sed -n '/^## Known limits/,/^## Must be proven/p' "$deploy/RUNBOOK.md" | grep -q 'deny unix addr=@\*\*' && sed -n '/^## Known limits/,/^## Must be proven/p' "$deploy/RUNBOOK.md" | grep -qi 'abstract'; then ok "the RUNBOOK's Known limits name the kernel's abstract-socket reach and the AppArmor next step"; else bad "RUNBOOK Known limits section is missing the abstract-socket limit"; fi
+if grep -q '^## Known limits' "$deploy/RUNBOOK.md" && sed -n '/^## Known limits/,/^## Must be proven/p' "$deploy/RUNBOOK.md" | grep -q 'AppArmor profile for the kernel with `deny unix addr=@\*\*,`' && sed -n '/^## Known limits/,/^## Must be proven/p' "$deploy/RUNBOOK.md" | grep -qi 'abstract'; then ok "the RUNBOOK's Known limits name the kernel's abstract-socket reach and the AppArmor next step"; else bad "RUNBOOK Known limits section is missing the abstract-socket limit"; fi
 # a wording check: no file claims the allowed addresses are limited to a port
 if grep -rniE 'only (the )?(dns|port 53)|answers dns and nothing else|dns and nothing else' "$sd" "$deploy/RUNBOOK.md" >/dev/null; then bad "a file still claims an allowed address is DNS-only: $(grep -rniE 'dns and nothing else|only dns' "$sd" "$deploy/RUNBOOK.md" | head -2)"; else ok "no file claims an allowed address reaches only DNS or only one port"; fi
 for u in bulig-worker.service bulig.service; do
@@ -147,6 +172,24 @@ else bad "uninstall text: postcheck order not found"; fi
 if grep -q 'ProtectKernelTunables' <(grep -n 'unpacks the tar as root' "$deploy/RUNBOOK.md") && grep -q 'ProtectClock' <(grep -n 'unpacks the tar as root' "$deploy/RUNBOOK.md"); then ok "the RUNBOOK's claim about the unpack sandbox lists the kernel protections it really has"; else bad "RUNBOOK unpack claim"; fi
 if grep -q 'Depends on PR #50' "$deploy/RUNBOOK.md"; then ok "the RUNBOOK names its dependency on PR #50 (config credential, gh-token, gateway)"; else bad "no PR #50 dependency note"; fi
 if grep -q 'loopback address, so it may treat it as local and trusted' "$deploy/RUNBOOK.md" && ! grep -q 'public anyway' <(grep -v 'not "public anyway"' "$deploy/RUNBOOK.md"); then ok "the RUNBOOK says requests from the gateway address reach wildcard listeners with a loopback source (not 'public anyway')"; else bad "RUNBOOK wildcard-listener wording"; fi
+
+echo "the AppArmor profile for bubblewrap"
+AA="$deploy/apparmor/bulig-bwrap"
+if [ -f "$AA" ] && grep -qx 'profile bulig-bwrap /usr/bin/bwrap flags=(unconfined) {' "$AA"; then ok "deploy/apparmor/bulig-bwrap attaches to /usr/bin/bwrap only, as profile bulig-bwrap"; else bad "the profile header: $(grep profile "$AA" 2>&1)"; fi
+rules="$(sed -n '/^profile /,/^}/p' "$AA" | sed '1d;$d' | sed 's/^ *//' | grep -v '^#' | grep -v '^$' | tr '\n' '|')"
+if [ "$rules" = "userns,|include if exists <local/bulig-bwrap>|" ]; then ok "and grants userns and nothing else (plus the local override include)"; else bad "the profile's rules: $rules"; fi
+if grep -qx 'abi <abi/4.0>,' "$AA" && grep -qx 'include <tunables/global>' "$AA"; then ok "and uses the AppArmor 4.0 abi with the global tunables (Ubuntu 24.04)"; else bad "the profile's abi/include lines"; fi
+FP="$(sed -n '/^## Footprint/,/^## Cutover/p' "$deploy/RUNBOOK.md")"
+if grep -q '/etc/apparmor.d/bulig-bwrap' <<<"$FP" && grep -q 'apparmor_parser -r' <<<"$FP"; then ok "the RUNBOOK's footprint lists the AppArmor profile and how it is loaded"; else bad "the RUNBOOK's footprint does not list the AppArmor profile"; fi
+if grep -q 'apparmor_parser -R /etc/apparmor.d/bulig-bwrap' <<<"$UNINST" && grep -q 'rm /etc/apparmor.d/bulig-bwrap' <<<"$UNINST"; then ok "the RUNBOOK's removal steps unload and remove the AppArmor profile"; else bad "the removal steps leave the AppArmor profile behind"; fi
+ITEM6="$(sed -n '/^## Must be proven on the server first/,/^## Things to know/p' "$deploy/RUNBOOK.md" | sed -n '/^6\. /,/^7\. /p')"
+if grep -q 'build and test stages ran Bash commands in the sandbox' <<<"$ITEM6" && grep -q "test stage's verdict PASS" <<<"$ITEM6" && grep -q 'bwrap-sandbox' <<<"$ITEM6" && grep -q 'Correction, 21 Oct 2026' <<<"$ITEM6" && grep -q 'wrongly counted' <<<"$ITEM6"; then ok "server-first item 6 needs a job whose build and test stages ran Bash in the sandbox (test verdict PASS) and the bwrap probe, and says it was wrongly counted on 21 Oct"; else bad "server-first item 6: $ITEM6"; fi
+if grep -q 'one real synthetic job\.' <<<"$ITEM6" || grep -q 'runs without `AF_UNIX`' <<<"$ITEM6"; then bad "item 6 still counts any synthetic job, or still says the worker has no AF_UNIX"; else ok "and no longer counts any synthetic job"; fi
+KL="$(sed -n '/^## Known limits/,/^## Must be proven/p' "$deploy/RUNBOOK.md")"
+if grep -q "The worker can reach other tenants' abstract unix sockets too" <<<"$KL"; then ok "the RUNBOOK's Known limits name the worker's abstract-socket reach"; else bad "Known limits do not name the worker's abstract-socket reach"; fi
+if grep -q "Commands in Claude Code's sandbox have no network\*\*" <<<"$KL" && grep -q '\*\*Loopback stays closed\*\*' <<<"$KL" && grep -q 'Planned follow-up: run the worker in its own network namespace' <<<"$KL"; then ok "the RUNBOOK's Known limits say sandboxed commands have no network, that loopback stays closed, and the network-namespace follow-up"; else bad "Known limits miss the sandbox network limit, the closed loopback or the follow-up"; fi
+if grep -q 'KNOWN LIMIT: commands inside the sandbox have NO NETWORK' <<<"$WSVC"; then ok "the worker unit states the sandbox network limit"; else bad "the worker unit does not state the sandbox network limit"; fi
+if grep -q 'the worker is a different unit with no AF_UNIX' "$sd/bulig.service"; then bad "the kernel unit still says the worker has no AF_UNIX"; else ok "the kernel unit no longer says the worker has no AF_UNIX"; fi
 
 echo "the gateway address"
 gw="127.74.3.1"

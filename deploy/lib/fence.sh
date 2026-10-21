@@ -31,6 +31,22 @@ unit_last() {
   printf '%s' "$out"
 }
 
+# Besides the network and path properties, the ones that decide whether Claude Code's sandbox (bwrap) can start: they change what /proc looks like,
+# which system calls work and which capabilities a process can hold, so the bwrap probe has to run with the unit's real values (21 Oct 2026).
+FENCE_LIST_EXTRA="ReadOnlyPaths SystemCallFilter SystemCallArchitectures"
+FENCE_SINGLE_EXTRA="ProtectKernelTunables ProtectKernelLogs ProtectHostname ProcSubset ProtectKernelModules ProtectControlGroups ProtectClock PrivateDevices NoNewPrivileges RestrictSUIDSGID RestrictRealtime LockPersonality MemoryDenyWriteExecute"
+# Passed on even when empty: CapabilityBoundingSet= (empty) is the unit's real value, and leaving it out would give the probe every capability.
+FENCE_KEEP_EMPTY="CapabilityBoundingSet"
+# unit_has <unit> <Key>: is the key set at all in the unit file or a drop-in (an empty assignment counts)?
+unit_has() {
+  local unit="$1" key="$2" f
+  for f in "$BULIG_UNIT_DIR/$unit" "$BULIG_UNIT_DIR/$unit.d"/*.conf; do
+    [ -f "$f" ] || continue
+    if grep -q "^$key=" "$f"; then return 0; fi
+  done
+  return 1
+}
+
 # unit_fence_props <unit>: sets UNIT_PROPS (the -p arguments for systemd-run) and UNIT_USER by reading the unit file and its drop-ins. This is the
 # offline path (tests, and any machine without systemd); on the server fence-check.sh uses unit_loaded_props.
 UNIT_PROPS=()
@@ -40,13 +56,16 @@ unit_fence_props() {
   UNIT_PROPS=()
   UNIT_USER="$(unit_last "$unit" User)"
   [ -z "$(unit_list "$unit" SupplementaryGroups)" ] || die "$unit has SupplementaryGroups=$(unit_list "$unit" SupplementaryGroups): a Bulig user must not gain another group's files or sockets"
-  for key in IPAddressDeny IPAddressAllow RestrictAddressFamilies InaccessiblePaths BindPaths BindReadOnlyPaths; do
+  for key in IPAddressDeny IPAddressAllow RestrictAddressFamilies InaccessiblePaths BindPaths BindReadOnlyPaths $FENCE_LIST_EXTRA; do
     v="$(unit_list "$unit" "$key")"
     if [ -n "$v" ]; then UNIT_PROPS+=(-p "$key=$v"); fi
   done
-  for key in ProtectSystem PrivateTmp ProtectHome ProtectProc; do
+  for key in ProtectSystem PrivateTmp ProtectHome ProtectProc $FENCE_SINGLE_EXTRA; do
     v="$(unit_last "$unit" "$key")"
     if [ -n "$v" ]; then UNIT_PROPS+=(-p "$key=$v"); fi
+  done
+  for key in $FENCE_KEEP_EMPTY; do
+    if unit_has "$unit" "$key"; then UNIT_PROPS+=(-p "$key=$(unit_list "$unit" "$key")"); fi
   done
 }
 
@@ -54,19 +73,22 @@ unit_fence_props() {
 # changes and a unit file edited without a daemon-reload not yet applied. Dies if the unit is not loaded or has supplementary groups.
 unit_loaded_props() {
   local unit="$1" out key v
-  out="$(systemctl show -p LoadState,User,IPAddressDeny,IPAddressAllow,RestrictAddressFamilies,InaccessiblePaths,BindPaths,BindReadOnlyPaths,SupplementaryGroups,ProtectSystem,PrivateTmp,ProtectHome,ProtectProc "$unit")" || die "systemctl show $unit failed"
+  out="$(systemctl show -p "LoadState,User,IPAddressDeny,IPAddressAllow,RestrictAddressFamilies,InaccessiblePaths,BindPaths,BindReadOnlyPaths,SupplementaryGroups,ProtectSystem,PrivateTmp,ProtectHome,ProtectProc,${FENCE_LIST_EXTRA// /,},${FENCE_SINGLE_EXTRA// /,},${FENCE_KEEP_EMPTY// /,}" "$unit")" || die "systemctl show $unit failed"
   shown() { printf '%s\n' "$out" | awk -F= -v k="$1" '$1 == k { sub(/^[^=]*=/, ""); print; exit }'; }
   [ "$(shown LoadState)" = "loaded" ] || die "$unit is not loaded by systemd, so its fence cannot be tested"
   [ -z "$(shown SupplementaryGroups)" ] || die "$unit has SupplementaryGroups=$(shown SupplementaryGroups): a Bulig user must not gain another group's files or sockets"
   UNIT_PROPS=()
   UNIT_USER="$(shown User)"
-  for key in IPAddressDeny IPAddressAllow RestrictAddressFamilies InaccessiblePaths BindPaths BindReadOnlyPaths; do
+  for key in IPAddressDeny IPAddressAllow RestrictAddressFamilies InaccessiblePaths BindPaths BindReadOnlyPaths $FENCE_LIST_EXTRA; do
     v="$(shown "$key")"
     if [ -n "$v" ]; then UNIT_PROPS+=(-p "$key=$v"); fi
   done
-  for key in ProtectSystem PrivateTmp ProtectHome ProtectProc; do
+  for key in ProtectSystem PrivateTmp ProtectHome ProtectProc $FENCE_SINGLE_EXTRA; do
     v="$(shown "$key")"
     if [ -n "$v" ]; then UNIT_PROPS+=(-p "$key=$v"); fi
+  done
+  for key in $FENCE_KEEP_EMPTY; do
+    if printf '%s\n' "$out" | grep -q "^$key="; then UNIT_PROPS+=(-p "$key=$(shown "$key")"); fi
   done
 }
 

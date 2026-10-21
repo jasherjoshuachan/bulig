@@ -178,21 +178,31 @@ else
 fi
 
 # --- 2b. the "before" picture, just before this release changes anything the snapshot covers (lib/snapshot.sh) -----------------------
-# Everything above wrote only under Bulig's own folders and ran Bulig's own transient units, which the snapshot leaves out; from step 3 on,
-# unit files, the AppArmor profile and services change. So the comparison against THIS snapshot after the health check (release_compare)
-# covers this release, not every other tenant's work since the precheck (precheck.snapshot stays: it is the baseline for removing Bulig).
-# /var/lib/bulig-checks/release-<sha>.before.snapshot, root, 0600; the newest $SNAPSHOT_RELEASE_KEEP are kept, older ones removed.
-# It runs in a child shell so that set -e holds inside snapshot(), as in precheck.sh: a command that fails there leaves no snapshot rather
-# than a partial one. A missing snapshot does not refuse the release (health decides it); the comparison is skipped and says so.
-snap="$CHK/release-$short.before.snapshot"
-# shellcheck disable=SC2016
-if bash -c 'set -euo pipefail; . "$1/lib/common.sh"; . "$1/lib/snapshot.sh"; trap '\''[ -z "${SNAPSHOT_TMP:-}" ] || rm -f "$SNAPSHOT_TMP"'\'' EXIT; snapshot_save "$2"; snapshot_prune_releases' _ "$here" "$snap"; then
-  echo "release: saved the before snapshot $snap ($(wc -l <"$snap" | tr -d ' ') lines)"
-else
-  echo "release: WARNING: could not take the before snapshot (see above), so this release will not be compared with it" >&2
-  rm -f "$snap"
-  snap=""
-fi
+# take_before_snapshot is the first thing apply_release (step 4) does. Everything before it wrote only under Bulig's own folders and ran
+# Bulig's own transient units, which the snapshot leaves out; after it come the unit files, the host drop-in, the AppArmor profile and the
+# services. So the comparison against THIS snapshot after the health check (release_compare) covers this release, not every other tenant's
+# work since the precheck (precheck.snapshot stays: it is the baseline for removing Bulig).
+# /var/lib/bulig-checks/release-<sha>.before.snapshot, root, 0600. It is taken in a child shell so that set -e holds inside snapshot(), as in
+# precheck.sh: a command that fails there leaves no snapshot rather than a partial one. A missing snapshot does not refuse the release (health
+# decides it); the comparison is skipped and says so. Only once it is written are the older ones pruned (the newest $SNAPSHOT_RELEASE_KEEP
+# stay, and the new one always does), in a second child: a prune that fails is a warning and never touches the new snapshot.
+snap=""
+take_before_snapshot() {
+  snap="$CHK/release-$short.before.snapshot"
+  # shellcheck disable=SC2016
+  if bash -c 'set -euo pipefail; . "$1/lib/common.sh"; . "$1/lib/snapshot.sh"; trap '\''[ -z "${SNAPSHOT_TMP:-}" ] || rm -f "$SNAPSHOT_TMP"'\'' EXIT; snapshot_save "$2"' _ "$here" "$snap"; then
+    echo "release: saved the before snapshot $snap ($(wc -l <"$snap" | tr -d ' ') lines)"
+  else
+    echo "release: WARNING: could not take the before snapshot (see above), so this release will not be compared with it" >&2
+    rm -f "$snap"
+    snap=""
+    return 0
+  fi
+  # shellcheck disable=SC2016
+  if ! bash -c 'set -euo pipefail; . "$1/lib/common.sh"; . "$1/lib/snapshot.sh"; snapshot_prune_releases "$(basename "$2")"' _ "$here" "$snap"; then
+    echo "release: WARNING: could not prune the older before snapshots in $CHK (see above). The new one is kept and used." >&2
+  fi
+}
 # release_compare <when>: postcheck.sh against that snapshot. It reports and never decides: health decides the release. Another tenant can
 # change things while a release runs, so a difference is not proof that this release made it (see the RUNBOOK, step 5).
 release_compare() {
@@ -271,6 +281,7 @@ restore_apparmor() {
 # Every step ends in "|| return 1": inside an `if` the shell ignores set -e, so a failed step would otherwise be skipped over and the
 # release would look fine.
 apply_release() {
+  take_before_snapshot
   swap_link "$rel" "$cur" || return 1
   swap_link "$tk_rel" "$tk_cur" || return 1
   echo "current -> $rel, tools -> $tk_rel (previous: ${prev:-none})"

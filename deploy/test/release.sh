@@ -143,6 +143,12 @@ for a in "$@"; do if [ "$a" = "-T" ]; then t=1; else args+=("$a"); fi; done
 if [ "$t" -eq 1 ] && [ -L "${args[1]}" ]; then rm -f "${args[1]}"; fi
 exec /bin/mv "${args[@]}"
 STUB
+# install: logged (the unit files, the host drop-in and the AppArmor profile are all written with it), then the real one
+cat >"$stubs/install" <<'STUB'
+#!/usr/bin/env bash
+echo "install $*" >>"$STUB_LOG/calls"
+exec /usr/bin/install "$@"
+STUB
 cat >"$stubs/head" <<'STUB'
 #!/usr/bin/env bash
 echo "head $*" >>"$STUB_LOG/head"
@@ -343,7 +349,8 @@ first_snap="$(grep -n '^systemctl list-units' "$STUB_LOG/calls" | head -1 | cut 
 build_line="$(grep -n -- '--unit=bulig-build-' "$STUB_LOG/calls" | head -1 | cut -d: -f1)"
 first_change="$(grep -n '^systemctl daemon-reload' "$STUB_LOG/calls" | head -1 | cut -d: -f1)"
 if [ -f "$snapA" ] && [ "$(mode "$snapA")" = "600" ] && grep -q '^nginx.service enabled$' "$snapA"; then ok "the release saved its before snapshot as release-<sha>.before.snapshot, mode 600"; else bad "before snapshot: $(ls -l "$r/var/lib/bulig-checks")"; fi
-if [ -n "$first_snap" ] && [ "$first_snap" -gt "${build_line:-999999}" ] && [ "$first_snap" -lt "${first_change:-0}" ]; then ok "it is taken after the build and before systemd is reloaded with the new units (calls $build_line < $first_snap < $first_change)"; else bad "snapshot order: build $build_line, snapshot $first_snap, daemon-reload $first_change"; fi
+first_write="$(grep -n "^install .*$r/etc/" "$STUB_LOG/calls" | head -1 | cut -d: -f1)"
+if [ -n "$first_snap" ] && [ "$first_snap" -gt "${build_line:-999999}" ] && [ "$first_snap" -lt "${first_write:-0}" ] && [ "$first_snap" -lt "${first_change:-0}" ]; then ok "it is taken after the build and before the first write under /etc (unit files, drop-in, AppArmor) and the reload (calls $build_line < $first_snap < $first_write, $first_change)"; else bad "snapshot order: build $build_line, snapshot $first_snap, first /etc write $first_write, daemon-reload $first_change"; fi
 if grep -q "^release: postcheck after the health check, against $snapA" "$work/out" && grep -q "^release: postcheck ok" "$work/out" && grep -q "^postcheck: the snapshot matches release-$A.before.snapshot" "$work/out"; then ok "after the health check the host is compared with it, and the result is reported"; else bad "release postcheck output: $(grep -i postcheck "$work/out")"; fi
 if [ "$(grep -n '^release: healthy on' "$work/out" | cut -d: -f1)" -lt "$(grep -n '^release: postcheck after' "$work/out" | cut -d: -f1)" ]; then ok "and only once health passed"; else bad "postcheck before health: $(grep -n 'healthy on\|postcheck after' "$work/out")"; fi
 
@@ -407,6 +414,22 @@ V="7d7d7d7d7d7d"
 incV="$(deliver "$V" 0)"
 expect_ok "a release with older snapshots around runs" run_remote "$V" "$incV"
 if [ "$(snapshots)" = "release-000000000003.before.snapshot release-000000000004.before.snapshot release-000000000005.before.snapshot release-000000000006.before.snapshot release-$V.before.snapshot " ]; then ok "it keeps its own and the four newest before it, and removes the older ones"; else bad "snapshots kept: $(snapshots)"; fi
+# files dated ahead of the clock: the new snapshot is still never pruned
+for n in 1 2 3 4 5; do cp "$r/var/lib/bulig-checks/release-$V.before.snapshot" "$r/var/lib/bulig-checks/release-99999999999$n.before.snapshot"; touch -t "20990101000$n" "$r/var/lib/bulig-checks/release-99999999999$n.before.snapshot"; done
+W="7c7c7c7c7c7c"
+incW="$(deliver "$W" 0)"
+expect_ok "a release with five snapshots dated ahead of the clock runs" run_remote "$W" "$incW"
+if [ -f "$r/var/lib/bulig-checks/release-$W.before.snapshot" ] && grep -q "^release: postcheck ok" "$work/out" && [ "$(snapshots)" = "release-$W.before.snapshot release-999999999991.before.snapshot release-999999999992.before.snapshot release-999999999993.before.snapshot release-999999999994.before.snapshot release-999999999995.before.snapshot " ]; then ok "and its own snapshot is kept and used, while the older ones go"; else bad "with future-dated files: $(snapshots)"; fi
+rm -f "$r/var/lib/bulig-checks"/release-99999999999?.before.snapshot
+# a prune that fails is a warning: the new snapshot stays and is compared against
+mkdir -p "$r/var/lib/bulig-checks/release-0000000000aa.before.snapshot/x"
+touch -t 201801010000 "$r/var/lib/bulig-checks/release-0000000000aa.before.snapshot"
+for n in 1 2 3 4 5; do cp "$r/var/lib/bulig-checks/release-$W.before.snapshot" "$r/var/lib/bulig-checks/release-00000000001$n.before.snapshot"; done
+X="7b7b7b7b7b7b"
+incX="$(deliver "$X" 0)"
+expect_ok "a release whose prune fails still runs" run_remote "$X" "$incX"
+if grep -q "could not prune the older before snapshots" "$work/out" && [ -f "$r/var/lib/bulig-checks/release-$X.before.snapshot" ] && grep -q "^release: postcheck after the health check, against $r/var/lib/bulig-checks/release-$X.before.snapshot" "$work/out" && grep -q "^release: postcheck ok" "$work/out"; then ok "a prune that fails is a warning, and the new snapshot is kept and compared against"; else bad "failed prune: $(grep -i 'prune\|postcheck' "$work/out") / $(snapshots)"; fi
+rm -rf "$r/var/lib/bulig-checks/release-0000000000aa.before.snapshot"
 
 # --- 5. a config that is already there is never overwritten ---
 echo "release E (existing config)"

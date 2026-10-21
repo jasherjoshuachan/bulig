@@ -94,12 +94,14 @@ snapshot_release_files() {
   { ls -1t "$BULIG_CHECKS_DIR" 2>/dev/null || true; } | { grep -E "$SNAPSHOT_RELEASE_RE" || true; }
 }
 
-# snapshot_prune_releases: keep the newest $SNAPSHOT_RELEASE_KEEP release-before snapshots, remove the older ones. Nothing else.
+# snapshot_prune_releases [<name>]: keep the newest $SNAPSHOT_RELEASE_KEEP release-before snapshots, remove the older ones. Nothing else.
+# <name> (the snapshot just written) is never removed, wherever it falls in the order (a clock that went back, files dated ahead).
 snapshot_prune_releases() {
-  local n=0 f
+  local n=0 f keep="${1:-}"
   while IFS= read -r f; do
     n=$((n + 1))
     [ "$n" -gt "$SNAPSHOT_RELEASE_KEEP" ] || continue
+    [ "$f" != "$keep" ] || continue
     rm -f "${BULIG_CHECKS_DIR:?}/$f"
   done < <(snapshot_release_files)
 }
@@ -109,9 +111,11 @@ snapshot_prune_releases() {
 #   - the run state of a service a timer starts (a oneshot is "activating" mid-run, "inactive dead" after, "failed" if its own run failed).
 #     Its unit file, its enabled state and the timer itself are still compared, in their own sections.
 #   - transient units that systemd-run makes (run-u*.service, run-p*.service): they come, run and go. Any change to their lines is info.
-#   - a template instance (name@instance.service) that is in one snapshot and not the other: an instance that appeared or went away.
-#     One that is in both and changed state is still compared, and so is the template's unit file. (Another Postgres cluster's
-#     postgresql@... instance is covered by the clusters section too, which is compared.)
+#   - a template instance (name@instance.service) that is in one snapshot and not the other: an instance that appeared or went away, but
+#     only when systemd knows it now and it is not socket-activated (instance_not_socket_started; fail closed, so one that went away and
+#     that systemd has already forgotten is compared). One that is in both and
+#     changed state is still compared, and so is the template's unit file. (Another Postgres cluster's postgresql@... instance is covered by
+#     the clusters section too, which is compared.)
 #   - a new container from an image that was already running before (a per-session agent container), and a container that is gone or
 #     stopped while its image still runs in another container. A new image, a container whose image no longer runs anywhere, or a known
 #     container on a new image still fails.
@@ -159,7 +163,7 @@ snapshot_compare() {
       timed="$timed $u"
     elif grep -Eq "$SNAPSHOT_TRANSIENT" <<<"$u"; then
       churn="$churn $u"
-    elif grep -Eq "$SNAPSHOT_INSTANCE" <<<"$u" && ! { snapshot_has_unit "$before" "$u" && snapshot_has_unit "$after" "$u"; }; then
+    elif grep -Eq "$SNAPSHOT_INSTANCE" <<<"$u" && ! { snapshot_has_unit "$before" "$u" && snapshot_has_unit "$after" "$u"; } && instance_not_socket_started "$u"; then
       churn="$churn $u"
     fi
   done
@@ -216,6 +220,21 @@ snapshot_compare() {
   # The copies: the same lines minus those.
   snapshot_drop "$before" "$timed $churn" "$new_ctrs" "$uf_churn" >"$3"
   snapshot_drop "$after" "$timed $churn" "$new_ctrs" "$uf_churn" >"$4"
+}
+
+# instance_not_socket_started <unit>: true only when systemd knows the unit now (LoadState=loaded), nothing in its TriggeredBy is a .socket,
+# and no socket unit of its template's name (<prefix>.socket: the Accept=yes kind, one instance per connection) or of its own name exists.
+# Anything else is false, including a unit systemd no longer knows and a systemctl that does not answer: then the instance is compared (fail
+# closed). A connection can start a socket-activated service, and a Bulig check once did exactly that (20 Oct 2026): such a start must fail.
+instance_not_socket_started() {
+  local u="$1" props s
+  props="$(systemctl show -p LoadState -p TriggeredBy --no-pager "$u" 2>/dev/null)" || return 1
+  grep -qx 'LoadState=loaded' <<<"$props" || return 1
+  if grep -Eq '^TriggeredBy=(.* )?[^ ]+\.socket( |$)' <<<"$props"; then return 1; fi
+  for s in "${u%%@*}.socket" "${u%.service}.socket"; do
+    if [ -n "$(systemctl list-unit-files --no-legend --plain --no-pager "$s" 2>/dev/null)" ]; then return 1; fi
+  done
+  return 0
 }
 
 # snapshot_has_unit <file> <unit>: true if the unit is in that snapshot's run-state sections at all.

@@ -19,10 +19,16 @@ Group=bulig-worker
 StateDirectory=bulig-worker
 StateDirectoryMode=0700
 WorkingDirectory=/opt/bulig/current
-# Only two credentials: the Claude token, and this worker's own token for the gateway. Not the config, not the database URL, not the
-# GitHub token: the worker reads no kernel config and gets everything it needs from its flags.
+# Three credentials: the Claude token, this worker's own token for the gateway, and a GitHub token that can only READ one repository (the
+# worker's own clone is of a private repo). Not the config, not the database URL, not the kernel's GitHub token (the one that can push):
+# the worker reads no kernel config and gets everything else it needs from its flags. The read token reaches git through a credential
+# helper in the worker's own global git config (deploy/git-credential-bulig-read, set up in the RUNBOOK), never through a URL or a file.
 LoadCredential=claude-token:/etc/bulig/claude-token
 LoadCredential=worker-token:/etc/bulig/worker-token
+LoadCredential=github-read-token:/etc/bulig/github-read-token
+# The read token is optional (a public repository needs none). systemd refuses to start a unit whose LoadCredential= file
+# is missing; SetCredential= with the same ID is the default it falls back to, and the helper treats "none" as "no token".
+SetCredential=github-read-token:none
 # Not secret, root-owned: BULIG_WORKER_REPOS="--repo <kernelPath>=<localClone> ..." (see worker.env.example). The worker needs at least one.
 EnvironmentFile=/etc/bulig/worker.env
 Environment=HOME=/var/lib/bulig-worker
@@ -46,6 +52,8 @@ Nice=10
 LimitNOFILE=65536
 
 NoNewPrivileges=true
+# No core dumps: a crashing process could otherwise leave a credential in /var/crash.
+LimitCORE=0
 CapabilityBoundingSet=
 AmbientCapabilities=
 PrivateTmp=true
@@ -76,7 +84,7 @@ SystemCallArchitectures=native
 # - DNS: /etc/resolv.conf is the systemd-resolved stub on 127.0.0.53, which would have to be allowed, and an allowed address reaches every
 #   listener on it. So the unit gets resolved's upstream list in its place (public servers, which the deny list does not touch).
 # - InaccessiblePaths hides the other sockets a unix connection could have reached (tailscaled, snapd, docker) if AF_UNIX were ever allowed.
-IPAddressDeny=localhost link-local multicast 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7
+IPAddressDeny=127.0.0.0/8 ::1/128 169.254.0.0/16 fe80::/10 224.0.0.0/4 ff00::/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7
 IPAddressAllow=127.74.3.1/32
 BindReadOnlyPaths=/run/systemd/resolve/resolv.conf:/etc/resolv.conf
 InaccessiblePaths=-/run/tailscale -/run/snapd.socket -/run/docker.sock -/var/run/docker.sock

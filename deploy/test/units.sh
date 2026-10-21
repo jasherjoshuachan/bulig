@@ -39,13 +39,15 @@ echo "credentials: each unit holds only its own"
 kernel_creds="$(value bulig.service LoadCredential | sort | tr '\n' ' ')"
 worker_creds="$(value bulig-worker.service LoadCredential | sort | tr '\n' ' ')"
 if [ "$kernel_creds" = "config:/etc/bulig/config.json gh-token:/etc/bulig/gh-token pg-url:/etc/bulig/pg-url worker-tokens:/etc/bulig/worker-tokens " ]; then ok "the kernel holds config, pg-url, gh-token and worker-tokens"; else bad "kernel credentials: $kernel_creds"; fi
-if [ "$worker_creds" = "claude-token:/etc/bulig/claude-token worker-token:/etc/bulig/worker-token " ]; then ok "the worker holds claude-token and worker-token only"; else bad "worker credentials: $worker_creds"; fi
+if [ "$worker_creds" = "claude-token:/etc/bulig/claude-token github-read-token:/etc/bulig/github-read-token worker-token:/etc/bulig/worker-token " ]; then ok "the worker holds claude-token, github-read-token and worker-token only"; else bad "worker credentials: $worker_creds"; fi
 if value bulig.service LoadCredential | grep -q claude; then bad "the kernel unit holds the Claude token"; else ok "the kernel unit never holds the Claude token"; fi
+if value bulig.service LoadCredential | grep -q 'github-read-token'; then bad "the kernel unit holds the worker's read-only GitHub token"; else ok "the kernel unit never holds the worker's read-only GitHub token"; fi
+if value bulig-worker.service LoadCredential | grep -q 'gh-token'; then bad "the worker unit holds the kernel's GitHub token (the one that can push)"; else ok "the worker unit never holds the kernel's gh-token"; fi
 if value bulig-worker.service LoadCredential | grep -qE 'pg-url|gh-token|config|worker-tokens'; then bad "the worker unit holds a kernel secret or the config"; else ok "the worker unit holds no kernel secret and no config"; fi
 if [ "$(value bulig.service Environment | tr '\n' ' ')" = "HOME=/var/lib/bulig PATH=/usr/local/bin:/usr/bin:/bin " ]; then ok "the kernel's environment is only HOME and PATH (no secret in it)"; else bad "kernel environment: $(value bulig.service Environment)"; fi
 
 echo "network and sockets: what each unit can reach"
-DENY="localhost link-local multicast 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7"
+DENY="127.0.0.0/8 ::1/128 169.254.0.0/16 fe80::/10 224.0.0.0/4 ff00::/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7"
 INACC="-/run/tailscale -/run/snapd.socket -/run/docker.sock -/var/run/docker.sock"
 RES="/run/systemd/resolve/resolv.conf:/etc/resolv.conf"
 # the worker: no unix socket of any kind, the gateway address and nothing else local
@@ -75,9 +77,17 @@ for u in bulig.service bulig-worker.service bulig-backup.service bulig-restore-d
     *) ok "$u does not allow 127.0.0.1, localhost, the DNS stub, Tailscale as a range, the docker bridge or everything" ;;
   esac
 done
+# systemd-run refuses a symbolic name (localhost, link-local, multicast, any) inside a list, and the fence check copies
+# unit values into systemd-run, so no IP list anywhere in the kit may use one (found on the server, 20 Oct 2026).
+sym_hits="$(grep -nE '^(IPAddressDeny|IPAddressAllow)=.*\b(localhost|link-local|multicast)\b' "$sd"/*.service 2>/dev/null; grep -nE 'BULIG_IP_DENY_PRIVATE=.*\b(localhost|link-local|multicast)\b' "$deploy/lib/common.sh")"
+if [ -z "$sym_hits" ]; then ok "no IP list in the units or lib/common.sh uses a symbolic name (systemd-run cannot parse one in a list)"; else bad "a symbolic name in an IP list: $sym_hits"; fi
+if [ "$(value bulig-worker.service SetCredential)" = "github-read-token:none" ]; then ok "the worker starts without a read token (SetCredential default none)"; else bad "bulig-worker.service has no SetCredential=github-read-token:none, so a missing token file stops the unit"; fi
+for u in bulig.service bulig-worker.service; do
+  if [ "$(value "$u" LimitCORE)" = "0" ]; then ok "$u writes no core dump (LimitCORE=0)"; else bad "$u can write a core dump holding a credential"; fi
+done
 for u in bulig.service bulig-worker.service bulig-backup.service bulig-restore-drill.service; do
   missing=""
-  for t in localhost link-local multicast 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7; do
+  for t in 127.0.0.0/8 ::1/128 169.254.0.0/16 fe80::/10 224.0.0.0/4 ff00::/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7; do
     case " $(value "$u" IPAddressDeny) " in *" $t "*) ;; *) missing="$missing $t" ;; esac
   done
   if [ -z "$missing" ]; then ok "$u denies localhost, link-local, multicast, 10/8, 172.16/12, 192.168/16, 100.64/10 and fc00::/7"; else bad "$u does not deny:$missing"; fi

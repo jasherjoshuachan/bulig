@@ -11,7 +11,21 @@
 #   build           the transient release-build unit's properties (build_fence_props in lib/common.sh)
 #   cli-worker, cli-kernel   bulig-cli.sh's properties (cli_fence_props in lib/common.sh)
 #   --late-only     only the probes that need the kernel to be up (the gateway); --late-strict makes a miss a failure, not a warning
-# Run it in the server phase (health.sh does). It starts one short transient unit per set.
+# Run it in the server phase (health.sh does). It starts one short transient unit per set, ALL AT THE SAME TIME, and waits for every one of them.
+#   Speed (none of this changes a verdict): a blocked connection is a DROPPED packet, so it ends in a timeout, and run one after another that
+#   was 5 sets x about 180 probes x 3 s (about 40 minutes on the server). Now: blocked (deny) probes wait only BULIG_FENCE_DENY_TIMEOUT seconds
+#   (default 1.5; allow probes keep their 3 s and a timeout is still a FAIL for them), run BULIG_FENCE_JOBS at a time inside their unit (default
+#   32), and the sets run side by side. A set that has not finished after BULIG_FENCE_SET_TIMEOUT seconds in total (default 240) is stopped and
+#   reported as "FAIL <set> timeout ..." (so health fails; a set that hangs never passes). Results print in a fixed order: the sets as asked,
+#   each set's probes in the probe file's order.
+#
+# THE RULE: this script never completes a connection to anything that is not Bulig's, from any context, and never wakes a socket-activated unit.
+#   - "Is it listening?" comes from ss (tcp listeners, unix and abstract listeners), never from connecting.
+#   - A target that systemd holds as a socket for another unit (systemctl list-sockets) is never connected to by anything. It is judged from the
+#     unit's properties only, and reported as "activation socket: checked by properties only".
+#   - Known limits are reported from the unit's properties and ss, labelled "known limit, not tested by connecting".
+#   - What does connect: the allow probes (Bulig's own gateway and Postgres socket, DNS, github, anthropic) and the deny probes inside the fence,
+#     which must fail before they reach anything. A deny probe that succeeds IS a real connection to another service; that is why it is a failure.
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/common.sh
@@ -49,14 +63,44 @@ common_args=(--host-addrs "$host_addrs")
 # One probe stream for all sets: the published probes, the ones derived from what this machine is listening on right now, and the extra file.
 # It is handed to the probe on stdin, so the unit never needs to read a file of root's.
 work="$(private_tmpdir)"
-trap 'rm -rf "$work"' EXIT
-python3 -I "$probe" derive <({ ss -H -ltn 2>/dev/null || true; }) <({ ss -H -xl 2>/dev/null || true; }) <({ ip -o addr 2>/dev/null || true; }) >"$work/derived"
+pids=()
+names=()
+# shellcheck disable=SC2329
+cleanup() { # whatever is still running (an early exit, ^C, a die) is stopped, so no probe unit is left behind; then the work folder goes
+  local i
+  for i in ${pids[@]+"${!pids[@]}"}; do
+    if kill -0 "${pids[$i]}" 2>/dev/null; then
+      systemctl stop "${names[$i]}.service" >/dev/null 2>&1 || true
+      kill "${pids[$i]}" 2>/dev/null || true
+    fi
+  done
+  rm -rf "$work"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+deny_timeout="${BULIG_FENCE_DENY_TIMEOUT:-1.5}"
+par="${BULIG_FENCE_JOBS:-32}"
+set_cap="${BULIG_FENCE_SET_TIMEOUT:-240}"
+[[ "$deny_timeout" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "BULIG_FENCE_DENY_TIMEOUT must be a number of seconds, not '$deny_timeout'"
+[[ "$par" =~ ^[0-9]+$ ]] && [ "$par" -ge 1 ] && [ "$par" -le 256 ] || die "BULIG_FENCE_JOBS must be a whole number from 1 to 256, not '$par'"
+[[ "$set_cap" =~ ^[0-9]+$ ]] && [ "$set_cap" -ge 5 ] && [ "$set_cap" -le 3600 ] || die "BULIG_FENCE_SET_TIMEOUT must be a whole number of seconds from 5 to 3600, not '$set_cap'"
+# What the machine listens on, and which of those sockets systemd holds for another unit. Read once, as text. If either cannot be read, stop:
+# without them the check could not tell a socket-activated target from any other, and connecting to one would start that service.
+ss -H -ltn >"$work/ss-tcp" 2>/dev/null || die "ss -H -ltn failed, so the listeners cannot be read (the fence check never connects to find out)"
+ss -H -xl >"$work/ss-unix" 2>/dev/null || die "ss -H -xl failed, so the unix listeners cannot be read (the fence check never connects to find out)"
+systemctl list-sockets --all --no-legend --plain --no-pager >"$work/sockets" 2>/dev/null || die "systemctl list-sockets failed, so socket-activated targets cannot be told apart (the fence check never connects to find out)"
+{ ip -o addr 2>/dev/null || true; } >"$work/ip-addr"
+python3 -I "$probe" derive "$work/ss-tcp" "$work/ss-unix" "$work/ip-addr" >"$work/derived"
 cat "$static_probes" "$work/derived" "$BULIG_FENCE_EXTRA" >"$work/all-probes"
 
 fail=0
+# Start every set. (Everything that can refuse a set - a missing unit, no IP filter - happens in this loop, before a probe unit exists for a later
+# set to leave behind; the cleanup above stops the ones already started if it does.)
 for s in "${sets[@]}"; do
-  # 1. Outside every fence: which deny targets are really listening? (A target that is not there proves nothing when it cannot be reached.)
-  control="$(python3 -I "$probe" control "$s" - "${common_args[@]}" <"$work/all-probes" | paste -sd, -)"
+  # 1. Which deny targets are really listening? From ss, without connecting. (A target that is not there proves nothing when it cannot be reached.)
+  #    (Whether a target is socket-activated is decided inside the fenced run, from the target and the systemctl list-sockets text it is given.)
+  control="$(python3 -I "$probe" control "$s" - --ss-tcp "$work/ss-tcp" --ss-unix "$work/ss-unix" "${common_args[@]}" <"$work/all-probes" | paste -sd, -)"
   # 2. The set's properties.
   ids=()
   case "$s" in
@@ -79,11 +123,45 @@ for s in "${sets[@]}"; do
     cli-kernel) cli_fence_props kernel; props=("${FENCE_CLI[@]}"); ids=(--uid=bulig) ;;
   esac
   [ "${#props[@]}" -gt 0 ] || die "no fence properties found for $s (is the unit installed?)"
+  # The unit's properties, handed to the probe as plain values: known limits and activation sockets are judged from them.
+  prop_value() { # prop_value <Key>: the value of -p Key=... in props (the last one), or nothing
+    local v="" e
+    for e in "${props[@]}"; do case "$e" in "$1="*) v="${e#*=}" ;; esac; done
+    printf '%s' "$v"
+  }
   # 3. Inside: the probe, with exactly those properties. (The unit's other properties do not change what it can reach.)
+  #    It runs in the background, writing to its own file; the next loop reads them in order.
+  unit_name="bulig-fence-$s-$$"
+  systemd-run --quiet --pipe --wait --collect --unit="$unit_name" ${ids[@]+"${ids[@]}"} "${props[@]}" -p "RuntimeMaxSec=$((set_cap + 15))" \
+    -- /usr/bin/python3 -I "$probe" fenced "$s" - "${common_args[@]}" --control "$control" \
+    --activation-text "$(cat "$work/sockets")" --af "$(prop_value RestrictAddressFamilies)" --ip-deny "$(prop_value IPAddressDeny)" --ip-allow "$(prop_value IPAddressAllow)" \
+    --inaccessible "$(prop_value InaccessiblePaths)" --deny-timeout "$deny_timeout" --jobs "$par" ${late_flag[@]+"${late_flag[@]}"} <"$work/all-probes" >"$work/out-$s" 2>&1 &
+  pids+=("$!")
+  names+=("$unit_name")
+done
+# Collect them in the order they were asked for. The whole run has one clock: every set started together, so every set is due at the same moment.
+deadline=$((SECONDS + set_cap))
+for i in "${!sets[@]}"; do
+  s="${sets[$i]}"
+  while kill -0 "${pids[$i]}" 2>/dev/null && [ "$SECONDS" -lt "$deadline" ]; do sleep 0.2; done
   rc=0
-  out="$(systemd-run --quiet --pipe --wait --collect --unit="bulig-fence-$s-$$" ${ids[@]+"${ids[@]}"} "${props[@]}" \
-    -- /usr/bin/python3 -I "$probe" fenced "$s" - "${common_args[@]}" --control "$control" ${late_flag[@]+"${late_flag[@]}"} <"$work/all-probes" 2>&1)" || rc=$?
-  printf '%s\n' "$out"
+  timed_out=0
+  if kill -0 "${pids[$i]}" 2>/dev/null; then
+    # Not finished in time. Stop the unit (that kills the probe inside it), then the waiting systemd-run.
+    timed_out=1
+    systemctl stop "${names[$i]}.service" >/dev/null 2>&1 || true
+    kill "${pids[$i]}" 2>/dev/null || true
+    wait "${pids[$i]}" 2>/dev/null || true
+  else
+    wait "${pids[$i]}" || rc=$?
+  fi
+  out="$(cat "$work/out-$s")"
+  if [ -n "$out" ]; then printf '%s\n' "$out"; fi
+  if [ "$timed_out" -eq 1 ]; then
+    echo "FAIL $s timeout the set did not finish within ${set_cap}s ($(grep -cE '^(ok|FAIL|warn|info) ' <<<"$out" || true) result lines came before it was stopped); a set that does not finish is never a pass"
+    fail=1
+    continue
+  fi
   # (here-strings, not printf | grep -q: under pipefail grep -q can close the pipe early and make printf fail)
   if grep -q '^FAIL ' <<<"$out"; then fail=1; fi
   # The probe exits 1 only after printing its FAIL lines. Any other non-zero exit means it did not run (a property systemd refused, a crash).
@@ -95,5 +173,6 @@ for s in "${sets[@]}"; do
   # A set that printed nothing at all did not run.
   if [ -z "$out" ]; then echo "FAIL $s no-output the probe printed nothing"; fail=1; fi
 done
+echo "info fence-check ${#sets[@]} set(s) in ${SECONDS}s (blocked probes wait ${deny_timeout}s, ${par} at a time)"
 if [ "$fail" -eq 0 ]; then echo "fence-check: ok"; else echo "fence-check: FAILED"; fi
 exit "$fail"

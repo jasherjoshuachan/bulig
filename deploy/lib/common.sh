@@ -26,7 +26,9 @@ BULIG_GATEWAY_PORT=7431
 #  - RestrictAddressFamilies without AF_UNIX: no unix socket at all, abstract ones included. socketpair() is not affected by it.
 #  - InaccessiblePaths: the other unix sockets that could be reached if AF_UNIX were ever allowed ("-" = ignore a missing path).
 #  - BindReadOnlyPaths: resolved's upstream resolver list instead of the 127.0.0.53 stub, so no localhost address has to be allowed for DNS.
-BULIG_IP_DENY_PRIVATE="localhost link-local multicast 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7"
+# Numeric prefixes only: systemd-run (systemd 255) refuses a symbolic name such as localhost inside a list
+# ("Failed to parse IP address prefix"), and these go into transient units. Unit files share the same rule.
+BULIG_IP_DENY_PRIVATE="127.0.0.0/8 ::1/128 169.254.0.0/16 fe80::/10 224.0.0.0/4 ff00::/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7"
 BULIG_AF_NO_UNIX="AF_INET AF_INET6"
 BULIG_AF_WITH_UNIX="AF_UNIX AF_INET AF_INET6"
 BULIG_INACCESSIBLE="-/run/tailscale -/run/snapd.socket -/run/docker.sock -/var/run/docker.sock"
@@ -51,7 +53,7 @@ BULIG_USERS="bulig bulig-worker"
 BULIG_USER_STATE_PREFIXES="$R/var/lib/bulig $R/var/lib/bulig-worker"
 
 # One secret per root-only file in /etc/bulig, loaded by systemd LoadCredential= into the units that need it. Each unit gets only its own.
-BULIG_CREDENTIALS="pg-url gh-token worker-tokens claude-token worker-token drill-pw"
+BULIG_CREDENTIALS="pg-url gh-token worker-tokens claude-token worker-token github-read-token drill-pw"
 # R2 settings: the only names the backup file may hold.
 BULIG_BACKUP_KEYS="R2_ENDPOINT R2_BUCKET AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_DEFAULT_REGION AWS_REQUEST_CHECKSUM_CALCULATION AWS_RESPONSE_CHECKSUM_VALIDATION"
 
@@ -219,6 +221,7 @@ cli_fence_props() {
         -p "InaccessiblePaths=$BULIG_INACCESSIBLE" -p "BindReadOnlyPaths=$BULIG_RESOLV_BIND") ;;
     *) die "role must be kernel or worker" ;;
   esac
+  FENCE_CLI+=(-p LimitCORE=0) # no core dumps: a crash could leave a credential in /var/crash
 }
 
 # wildcard_listeners: TCP listeners on every address (0.0.0.0, ::, *), as addr:port, one per line. An allowed address such as 127.74.3.1 reaches
@@ -311,7 +314,7 @@ install_root_file() {
 # fence_extra_check <file>: dies unless the file holds at least one probe and every probe line is complete: expect (deny|known), sets (known
 # names), a name, a kind (tcp|unix|abstract) and a target, with no <placeholder> left.
 fence_extra_check() {
-  local f="$1" line trimmed n=0 expect sets name kind target s
+  local f="$1" line trimmed n=0 expect sets name kind target s seen=" "
   while IFS= read -r line || [ -n "$line" ]; do
     trimmed="${line#"${line%%[![:space:]]*}"}"
     case "$trimmed" in '' | '#'*) continue ;; esac
@@ -323,6 +326,12 @@ fence_extra_check() {
     case "$kind" in tcp | unix | abstract) ;; *) die "fence-extra-probes: kind must be tcp, unix or abstract: $line" ;; esac
     [ -n "$name" ] && [ -n "$target" ] || die "fence-extra-probes: a probe needs five fields: $line"
     case "$line" in *'<'* | *'>'*) die "fence-extra-probes: a <placeholder> is still in: $line" ;; esac
+    # A name is how the control result finds its probe, so it is plain and unique per set (a comma or a repeat would hide an activation flag).
+    [[ "$name" =~ ^[A-Za-z0-9._-]{1,64}$ ]] || die "fence-extra-probes: a name may only hold letters, digits, dot, underscore and dash (1 to 64): $line"
+    for s in ${sets//,/ }; do
+      case "$seen" in *" $s/$name "*) die "fence-extra-probes: the name '$name' is used twice for the set $s: $line" ;; esac
+      seen="$seen$s/$name "
+    done
     n=$((n + 1))
   done <"$f"
   [ "$n" -gt 0 ] || die "fence-extra-probes: the file holds no probe"

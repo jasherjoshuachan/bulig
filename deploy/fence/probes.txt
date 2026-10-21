@@ -8,11 +8,15 @@
 #      missing or has no probe in it, so the machine-specific probes cannot be silently skipped.
 # Columns:   expect   sets   name   kind   target
 #
-# expect  deny        must FAIL to connect (any error). A failed connection only counts as blocked when the control run outside the fence
-#                     reached the same target; otherwise it is "inconclusive" (a warning).
-#         allow       must succeed.
+# expect  deny        must FAIL to connect (any error). It runs inside the fence, which must stop it before it reaches anything. A failed
+#                     connection only counts as blocked when ss listed the target (read as root, outside the fence, without connecting);
+#                     otherwise it is "inconclusive" (a warning). A target that systemd holds as a socket for another unit is never
+#                     connected to: it is judged from the unit's properties ("activation socket: checked by properties only").
+#         allow       must succeed. These are Bulig's own targets; they are the only probes that connect for real.
 #         allow-late  must succeed, but only a warning if it does not (the kernel may not be up yet).
-#         known       a documented limit: reported, never fails.
+#         known       a documented limit: reported, never fails, and NEVER tested by connecting (it is reported from the unit's properties and
+#                     ss). Only the kinds that connect to nothing (pwd, node, exec, spawn, socketpair) are actually run.
+# THE RULE: the kit never completes a connection to anything that is not Bulig's, and never wakes another service's socket.
 # sets    comma list of: worker kernel build cli-worker cli-kernel
 # kind    tcp host:port | [v6]:port | unix path | abstract name (leading NUL added) | dns hostname | https hostname | http url
 #         | pwd (getpwuid of the running uid) | socketpair (AF_UNIX socketpair, what node child_process uses) | spawn (run a child)

@@ -2,8 +2,9 @@
 # Put one secret on the server from stdin, so it never appears in a command line, shell history or ps. Prints the length, never the value.
 # It writes only to fixed files under /etc/bulig (root's) and refuses anything else: there is no path argument.
 #   one secret, one root-only file (loaded by systemd LoadCredential= into the unit that needs it):
-#     set-secret.sh --credential <pg-url|gh-token|worker-tokens|claude-token|worker-token|drill-pw> < value
+#     set-secret.sh --credential <pg-url|gh-token|worker-tokens|claude-token|worker-token|github-read-token|drill-pw> < value
 #     security find-generic-password -s <item> -w | ssh ths-prod-01 '/usr/local/lib/bulig/current/set-secret.sh --credential gh-token'
+#     (github-read-token is the worker's read-only token for its own clone; Keychain item bulig-worker-read-token on the Mac)
 #   one worker's token (a line "id=token" in worker-tokens, which the kernel reads; for the id "vps" also the worker's own worker-token):
 #     openssl rand -hex 32 | ssh ths-prod-01 '/usr/local/lib/bulig/current/set-secret.sh --worker-token vps'
 #   the worker's repositories (not secret; /etc/bulig/worker.env, read by bulig-worker.service; at least one is needed):

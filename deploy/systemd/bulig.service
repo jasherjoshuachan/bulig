@@ -57,6 +57,8 @@ LimitNOFILE=65536
 
 # Hardening (same set as personal-credential-broker, minus what node and git need).
 NoNewPrivileges=true
+# No core dumps: a crashing process could otherwise leave a credential in /var/crash.
+LimitCORE=0
 CapabilityBoundingSet=
 AmbientCapabilities=
 PrivateTmp=true
@@ -85,7 +87,7 @@ SystemCallArchitectures=native
 # KNOWN LIMIT: this unit keeps AF_UNIX (the Postgres socket), so it can still reach other tenants' ABSTRACT unix sockets.
 # It runs no worker code (the worker is a different unit with no AF_UNIX); an AppArmor profile (deny unix addr=@**,) is the next step.
 # DNS comes from resolved's upstream list, not the 127.0.0.53 stub (see bulig-worker.service).
-IPAddressDeny=localhost link-local multicast 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7
+IPAddressDeny=127.0.0.0/8 ::1/128 169.254.0.0/16 fe80::/10 224.0.0.0/4 ff00::/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7
 IPAddressAllow=127.74.3.1/32
 BindReadOnlyPaths=/run/systemd/resolve/resolv.conf:/etc/resolv.conf
 InaccessiblePaths=-/run/tailscale -/run/snapd.socket -/run/docker.sock -/var/run/docker.sock

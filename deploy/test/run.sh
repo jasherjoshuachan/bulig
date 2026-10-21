@@ -29,7 +29,7 @@ expect_fail_msg "an absolute path as the name is refused" "unknown credential '/
 expect_fail_msg "an old-style NAME FILE call is refused" "usage: set-secret.sh" bash -c "echo v | '$ss' R2_BUCKET '$root/tmp/evil'"
 expect_fail_msg "a third argument is refused" "usage: set-secret.sh" bash -c "echo v | '$ss' --credential pg-url '$root/tmp/evil'"
 expect_fail_msg "no arguments is refused" "usage: set-secret.sh" bash -c "echo v | '$ss'"
-for n in pg-url gh-token worker-tokens claude-token worker-token drill-pw; do
+for n in pg-url gh-token worker-tokens claude-token worker-token github-read-token drill-pw; do
   expect_ok "the known credential $n is accepted" bash -c "echo v | '$ss' --credential $n"
 done
 expect_ok "backup key R2_BUCKET is written" bash -c "echo mybucket | '$ss' --backup-key R2_BUCKET"
@@ -235,6 +235,11 @@ printf 'bulig:x:998:\nbulig-worker:x:997:\n' >>"$w/data/group.txt"
 echo "x" >"$w/root/etc/systemd/system/bulig.service"
 echo "x" >"$w/root/etc/systemd/system/bulig-backup.timer"
 ln -s /etc/systemd/system/bulig.service "$w/root/etc/systemd/system/multi-user.target.wants/bulig.service"
+# Bulig's drop-in folders: the files inside are called 10-host-addresses.conf, not bulig-anything (postcheck flagged this on the first real run)
+mkdir -p "$w/root/etc/systemd/system/bulig-worker.service.d" "$w/root/etc/systemd/system/bulig.service.d" "$w/root/etc/systemd/system/bulig-backup.timer.wants"
+echo "IPAddressDeny=203.0.113.10/32" >"$w/root/etc/systemd/system/bulig-worker.service.d/10-host-addresses.conf"
+echo "IPAddressAllow=100.101.102.103/32" >"$w/root/etc/systemd/system/bulig.service.d/20-mac-worker.conf"
+ln -s /etc/systemd/system/bulig-backup.timer "$w/root/etc/systemd/system/bulig-backup.timer.wants/link"
 mkdir -p "$w/root/etc/postgresql/16/bulig"
 echo "port = 5436" >"$w/root/etc/postgresql/16/bulig/postgresql.conf"
 echo "0 0 * * * root true" >"$w/root/etc/cron.d/bulig-x"
@@ -260,6 +265,9 @@ check_change "a new group" "echo 'wheel2:x:1002:' >>data/group.txt"
 check_change "a changed crontab" "echo '* * * * * evil' >>data/crontab.txt"
 check_change "a new /etc/cron.d file" "echo '* * * * * root evil' >root/etc/cron.d/evil"
 check_change "an edited unit file under /etc/systemd/system" "echo 'ExecStart=/bin/evil' >>root/etc/systemd/system/clientapp.service"
+check_change "a drop-in under another service's folder" "mkdir -p root/etc/systemd/system/clientapp.service.d && echo '[Service]' >root/etc/systemd/system/clientapp.service.d/override.conf"
+check_change "a drop-in under a folder that only ends in bulig" "mkdir -p root/etc/systemd/system/notbulig.service.d && echo '[Service]' >root/etc/systemd/system/notbulig.service.d/override.conf"
+check_change "a drop-in under a folder that only has bulig in the middle" "mkdir -p root/etc/systemd/system/x-bulig-y.service.d && echo '[Service]' >root/etc/systemd/system/x-bulig-y.service.d/override.conf"
 check_change "a new unit file under /etc/systemd/system" "echo x >root/etc/systemd/system/evil.service"
 check_change "a new enable link under /etc/systemd/system" "ln -s /etc/systemd/system/evil.service root/etc/systemd/system/multi-user.target.wants/evil.service"
 check_change "an edited postgresql config of another cluster" "echo 'fsync = off' >>root/etc/postgresql/16/main/postgresql.conf"
@@ -287,7 +295,7 @@ suite_rc=$?
 # The other suites: the restore drill and backup (stubbed tools), and the server half of a release (stubbed systemd).
 # (BULIG_TEST_ONLY_THIS_FILE=1: mutations.py runs one suite at a time)
 if [ -n "${BULIG_TEST_ONLY_THIS_FILE:-}" ]; then exit "$suite_rc"; fi
-for suite in drill.sh release.sh setup.sh cluster.sh cli.sh fence.sh health.sh scan.sh units.sh invariant.sh; do
+for suite in drill.sh release.sh setup.sh cluster.sh cli.sh gitcred.sh fence.sh health.sh scan.sh units.sh invariant.sh; do
   echo
   echo "== $suite"
   bash "$here/$suite" || suite_rc=1

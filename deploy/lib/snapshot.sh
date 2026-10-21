@@ -43,11 +43,13 @@ snapshot() {
   echo "## service unit files (state)"
   systemctl list-unit-files --type=service --no-legend --plain --no-pager | awk '{print $1, $2}' | grep -Ev "$SNAPSHOT_OWN" | sort || true
 
-  echo "## /etc/systemd/system: file hashes and link targets (names containing bulig left out)"
+  # Bulig's own: any file or link whose name contains bulig, and anything whose first folder or file name under /etc/systemd/system starts with
+  # bulig (bulig-worker.service.d/10-host-addresses.conf is a file called 10-host-addresses.conf inside a Bulig folder).
+  echo "## /etc/systemd/system: file hashes and link targets (Bulig's own left out: names containing bulig, and everything under a bulig* name)"
   if [ -d "$R/etc/systemd/system" ]; then
-    find "$R/etc/systemd/system" -type f -not -name '*bulig*' -print0 | sort -z | xargs -0 -r sha256sum
+    find "$R/etc/systemd/system" -type f -not -name '*bulig*' -not -path "$R/etc/systemd/system/bulig*" -print0 | sort -z | xargs -0 -r sha256sum
     # shellcheck disable=SC2016
-    find "$R/etc/systemd/system" -type l -not -name '*bulig*' -print0 | sort -z | xargs -0 -r -n1 sh -c 'echo "$0 -> $(readlink "$0")"'
+    find "$R/etc/systemd/system" -type l -not -name '*bulig*' -not -path "$R/etc/systemd/system/bulig*" -print0 | sort -z | xargs -0 -r -n1 sh -c 'echo "$0 -> $(readlink "$0")"'
   fi
 
   echo "## postgresql config of the other clusters (sha256)"

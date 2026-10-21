@@ -38,11 +38,12 @@ done
 echo "credentials: each unit holds only its own"
 kernel_creds="$(value bulig.service LoadCredential | sort | tr '\n' ' ')"
 worker_creds="$(value bulig-worker.service LoadCredential | sort | tr '\n' ' ')"
-if [ "$kernel_creds" = "config:/etc/bulig/config.json gh-token:/etc/bulig/gh-token pg-url:/etc/bulig/pg-url worker-tokens:/etc/bulig/worker-tokens " ]; then ok "the kernel holds config, pg-url, gh-token and worker-tokens"; else bad "kernel credentials: $kernel_creds"; fi
+if [ "$kernel_creds" = "config:/etc/bulig/config.json gh-token:/etc/bulig/gh-token pg-url:/etc/bulig/pg-url telegram-token:/etc/bulig/telegram-token worker-tokens:/etc/bulig/worker-tokens " ]; then ok "the kernel holds config, pg-url, gh-token, telegram-token and worker-tokens"; else bad "kernel credentials: $kernel_creds"; fi
 if [ "$worker_creds" = "claude-token:/etc/bulig/claude-token github-read-token:/etc/bulig/github-read-token worker-token:/etc/bulig/worker-token " ]; then ok "the worker holds claude-token, github-read-token and worker-token only"; else bad "worker credentials: $worker_creds"; fi
 if value bulig.service LoadCredential | grep -q claude; then bad "the kernel unit holds the Claude token"; else ok "the kernel unit never holds the Claude token"; fi
 if value bulig.service LoadCredential | grep -q 'github-read-token'; then bad "the kernel unit holds the worker's read-only GitHub token"; else ok "the kernel unit never holds the worker's read-only GitHub token"; fi
 if value bulig-worker.service LoadCredential | grep -q 'gh-token'; then bad "the worker unit holds the kernel's GitHub token (the one that can push)"; else ok "the worker unit never holds the kernel's gh-token"; fi
+if grep -qiE '^[A-Za-z]+=.*telegram' "$sd/bulig-worker.service"; then bad "the worker unit holds the Telegram bot token"; else ok "the worker unit never holds the Telegram bot token (no setting names it)"; fi
 if value bulig-worker.service LoadCredential | grep -qE 'pg-url|gh-token|config|worker-tokens'; then bad "the worker unit holds a kernel secret or the config"; else ok "the worker unit holds no kernel secret and no config"; fi
 if [ "$(value bulig.service Environment | tr '\n' ' ')" = "HOME=/var/lib/bulig PATH=/usr/local/bin:/usr/bin:/bin " ]; then ok "the kernel's environment is only HOME and PATH (no secret in it)"; else bad "kernel environment: $(value bulig.service Environment)"; fi
 
@@ -81,6 +82,22 @@ done
 # unit values into systemd-run, so no IP list anywhere in the kit may use one (found on the server, 20 Oct 2026).
 sym_hits="$(grep -nE '^(IPAddressDeny|IPAddressAllow)=.*\b(localhost|link-local|multicast)\b' "$sd"/*.service 2>/dev/null; grep -nE 'BULIG_IP_DENY_PRIVATE=.*\b(localhost|link-local|multicast)\b' "$deploy/lib/common.sh")"
 if [ -z "$sym_hits" ]; then ok "no IP list in the units or lib/common.sh uses a symbolic name (systemd-run cannot parse one in a list)"; else bad "a symbolic name in an IP list: $sym_hits"; fi
+if [ "$(value bulig.service SetCredential)" = "telegram-token:none" ]; then ok "the kernel starts before cutover with no bot token (SetCredential default none)"; else bad "bulig.service has no SetCredential=telegram-token:none (and nothing else), so the missing token file stops the kernel before cutover"; fi
+if grep -qE '^(Environment|EnvironmentFile|PassEnvironment)=.*(TELEGRAM|telegram)' "$sd/bulig.service"; then bad "bulig.service passes the bot token through the environment"; else ok "bulig.service gives the bot token only as a credential, never in the environment"; fi
+TG_CUT="$(sed -n '/^## Cutover/,/^## Rollback/p' "$deploy/RUNBOOK.md")"
+# The cutover order: each marker must come after the one before it (byte offsets inside the section).
+order_ok=1 prev=0
+for m in 'systemctl start bulig-backup.service' 'bulig.mjs status > <mac jobs file>' 'launchctl bootout' '.backup <snapshot path>' 'systemctl stop bulig-worker bulig bulig-backup.timer bulig-restore-drill.timer' \
+  'ALTER DATABASE bulig RENAME TO bulig_precut' "CREATE DATABASE bulig OWNER bulig" '--to-credential pg-url --dry-run' "--to-credential pg-url'" \
+  'set-secret.sh --credential telegram-token' 'systemctl start bulig bulig-worker' "bulig-cli.sh status' | diff <mac jobs file> -" 'DROP DATABASE bulig_precut'; do
+  n="$(grep -boF -- "$m" <<<"$TG_CUT" | head -1 | cut -d: -f1)"
+  if [ -z "$n" ] || [ "$n" -le "$prev" ]; then order_ok=0; echo "    cutover order: '$m' missing or out of order" >&2; break; fi
+  prev="$n"
+done
+if [ "$order_ok" -eq 1 ]; then ok "the Cutover runs backup, Mac job list, Mac stop, snapshot, stop, rename, empty record, dry run, copy, bot token, start, status, and drops bulig_precut last"; else bad "the Cutover steps are missing or out of order"; fi
+if grep -q "Keep \`bulig_precut\`" <<<"$TG_CUT" && grep -q "only with Jasher's yes" <<<"$TG_CUT"; then ok "the Cutover keeps bulig_precut until Jasher says to drop it"; else bad "the Cutover does not keep bulig_precut or drops it without Jasher's yes"; fi
+if grep -q -- '--to-env' <<<"$(sed -n '/^8\. \*\*Copy over the old record/,/^9\. \*\*Synthetic/p' "$deploy/RUNBOOK.md")$TG_CUT"; then bad "step 8 or the Cutover passes the database URL through an environment variable (--to-env)"; else ok "step 8 and the Cutover read the database URL from the pg-url credential (--to-credential), never an environment variable"; fi
+if grep -q "set-secret.sh --credential telegram-token'" <<<"$TG_CUT" && grep -q 'SetCredential=telegram-token:none' <<<"$TG_CUT" && ! grep -q 'add `telegram-token` to `BULIG_CREDENTIALS`' <<<"$TG_CUT"; then ok "the Cutover installs the bot token with set-secret and describes the wiring the release already has"; else bad "the Cutover's bot-token step does not match the units (set-secret --credential telegram-token, SetCredential default none)"; fi
 if [ "$(value bulig-worker.service SetCredential)" = "github-read-token:none" ]; then ok "the worker starts without a read token (SetCredential default none)"; else bad "bulig-worker.service has no SetCredential=github-read-token:none, so a missing token file stops the unit"; fi
 for u in bulig.service bulig-worker.service; do
   if [ "$(value "$u" LimitCORE)" = "0" ]; then ok "$u writes no core dump (LimitCORE=0)"; else bad "$u can write a core dump holding a credential"; fi

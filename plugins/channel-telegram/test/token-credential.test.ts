@@ -70,6 +70,51 @@ describe('the Telegram bot token', () => {
     }
   });
 
+  it('the unit default "none" (no token file installed) is no token: never sent, the environment variable is used instead', async () => {
+    const f = await fake('bot-from-env');
+    process.env[TOKEN_ENV] = 'bot-from-env';
+    credentials({ 'telegram-token': 'none' });
+    const b = await boot(f);
+    try {
+      await until(() => f.calls.length > 0, 'a call carrying the right token');
+    } finally {
+      await shutdown(b);
+    }
+  });
+
+  it('"none" with no environment variable stops the plugin at start, as with no credential', async () => {
+    // This fake would accept "none" as a token, so a plugin that sent it would start.
+    const f = await fake('none');
+    delete process.env[TOKEN_ENV];
+    credentials({ 'telegram-token': 'none' });
+    await expect(boot(f)).rejects.toThrow(/bot token is not set.*telegram-token/);
+    expect(f.calls.length).toBe(0);
+  });
+
+  it('"none" with spaces or newlines around it is still no token, from the credential or the environment', async () => {
+    // This fake would accept "none" as a token, so a plugin that sent it (trimmed or not) would start.
+    const f = await fake('none');
+    credentials({ 'telegram-token': ' none \n\n' });
+    process.env[TOKEN_ENV] = '\tnone\n';
+    await expect(boot(f)).rejects.toThrow(/bot token is not set/);
+    credentials({ 'telegram-token': ' \n \n' });
+    process.env[TOKEN_ENV] = '  ';
+    await expect(boot(f)).rejects.toThrow(/bot token is not set/);
+    expect(f.calls.length).toBe(0);
+  });
+
+  it('a real token with a newline or spaces around it is used without them', async () => {
+    const f = await fake('bot-from-the-credential');
+    delete process.env[TOKEN_ENV];
+    credentials({ 'telegram-token': '  bot-from-the-credential \n\n' });
+    const b = await boot(f);
+    try {
+      await until(() => f.calls.length > 0, 'a call carrying the trimmed token');
+    } finally {
+      await shutdown(b);
+    }
+  });
+
   it('with neither, the plugin stops at start and says what to set', async () => {
     const f = await fake('whatever');
     delete process.env[TOKEN_ENV];

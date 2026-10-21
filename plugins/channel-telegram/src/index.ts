@@ -8,10 +8,18 @@ import { clipText } from '@bulig/text';
 
 export { TelegramApi, TelegramError } from './api.ts';
 
+/** The credential value that means "no token was installed" (the unit's SetCredential= default). */
+const NO_TOKEN = 'none';
+/** A token value with the whitespace around it removed, or undefined when that leaves nothing or "none". */
+const usableToken = (value: string | undefined): string | undefined => {
+  const t = value?.trim();
+  return t && t !== NO_TOKEN ? t : undefined;
+};
+
 export interface TelegramConfig {
   /** Name of the environment variable that holds the bot token. Default BULIG_TELEGRAM_TOKEN. */
   tokenEnv?: string;
-  /** A file name in $CREDENTIALS_DIRECTORY (systemd LoadCredential=) that holds the bot token. Default "telegram-token". It wins over tokenEnv when the file is there. */
+  /** A file name in $CREDENTIALS_DIRECTORY (systemd LoadCredential=) that holds the bot token. Default "telegram-token". It wins over tokenEnv when the file is there, unless it holds "none" (no token installed). */
   tokenCredential?: string;
   /** Only these chats may talk to the bot. Everyone else is ignored without a reply. */
   allowedChatIds: number[];
@@ -226,7 +234,10 @@ export function createTelegramChannel(options: TelegramChannelOptions = {}): Plu
       ctx.require('approval.grant');
       const cfg = ctx.config as unknown as TelegramConfig;
       const tokenEnv = cfg.tokenEnv ?? 'BULIG_TELEGRAM_TOKEN';
-      const token = readCredential(cfg.tokenCredential ?? 'telegram-token') ?? process.env[tokenEnv];
+      // "none" is bulig.service's SetCredential= default, used when no token file was installed (systemd refuses to start a unit whose
+      // LoadCredential= file is missing). It means no token, the same as no credential, so it is never sent to Telegram as one. Spaces
+      // and newlines around a value are dropped first, so a hand-written "none " or an empty line also counts as no token.
+      const token = usableToken(readCredential(cfg.tokenCredential ?? 'telegram-token')) ?? usableToken(process.env[tokenEnv]);
       if (!token) throw new Error(`channel-telegram: the bot token is not set. Export it as ${tokenEnv}${cfg.tokenCredential ? `, or add the credential ${cfg.tokenCredential}` : ' (or give the unit a telegram-token credential)'}.`);
       const allowed = cfg.allowedChatIds;
       if (!Array.isArray(allowed) || allowed.length === 0 || !allowed.every((n) => Number.isInteger(n))) {

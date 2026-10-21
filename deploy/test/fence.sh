@@ -134,7 +134,7 @@ want="-p DynamicUser=yes -p RestrictAddressFamilies=AF_INET AF_INET6 -p IPAddres
 if [ "$got" = "$want" ]; then ok "build: throwaway user, no AF_UNIX, private ranges and the host's addresses denied, nothing allowed, sockets hidden, upstream resolvers"; else bad "build props: $got"; fi
 # shellcheck disable=SC2016
 got="$(props 'cli_fence_props worker; printf "%s\n" "${FENCE_CLI[@]}"')"
-INACC_W="$INACC -/run/postgresql -/var/run/postgresql -/run/dbus"
+INACC_W="$INACC -/run/postgresql -/var/run/postgresql -/run/dbus -/run/snapd-snap.socket -/run/systemd/userdb -/run/systemd/resolve/io.systemd.Resolve -/run/systemd/resolve/io.systemd.Resolve.Monitor -/run/user"
 want="-p RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK -p IPAddressDeny=$DENY $HOSTS -p IPAddressAllow=127.74.3.1/32 -p InaccessiblePaths=$INACC_W -p BindReadOnlyPaths=$RES -p LimitCORE=0 "
 if [ "$got" = "$want" ]; then ok "cli worker: AF_UNIX and AF_NETLINK for Claude Code's sandbox, denies like the build, allows the gateway address only, hides the Postgres folder and the system bus too"; else bad "cli worker props: $got"; fi
 # The worker's one-off commands are meant to have the same fence as bulig-worker.service: compare them key by key (the unit's deny list plus
@@ -340,7 +340,8 @@ sed '1!G;h;$!d' "$work/d-tcp" >"$work/d-tcp-rev"
 sed '1!G;h;$!d' "$work/d-unix" >"$work/d-unix-rev"
 python3 -I "$deploy/fence-probe.py" derive "$work/d-tcp-rev" "$work/d-unix-rev" "$work/d-ip" >"$work/derived3.txt"
 if cmp -s "$work/derived.txt" "$work/derived3.txt"; then ok "derived: listeners in the reverse order give the same, sorted list"; else bad "derived list depends on the order ss printed in"; fi
-if ! grep -qvE '^(deny|known) ' "$work/derived.txt"; then ok "derived: every line is a probe line"; else bad "odd derived output"; fi
+if ! grep -qvE '^(deny|known|reach) ' "$work/derived.txt"; then ok "derived: every line is a probe line"; else bad "odd derived output"; fi
+if [ "$(grep '^reach ' "$work/derived.txt")" = "reach worker,cli-worker path-1 unix-path /run/example.sock" ]; then ok "derived: the listening path socket becomes one reach line for the worker sets (an abstract one does not)"; else bad "reach lines: $(grep '^reach ' "$work/derived.txt")"; fi
 # the derived lines are valid probe lines: the probe reads them
 dc="$(python3 -I "$deploy/fence-probe.py" control worker - "${CA[@]}" --host-addrs "203.0.113.10/32" <"$work/derived.txt" | wc -l | tr -d ' ')"
 if [ "$dc" -ge 10 ]; then ok "derived: the probe reads the lines it was given ($dc probes in the worker set)"; else bad "derived lines not read ($dc)"; fi
@@ -605,6 +606,46 @@ known_n="$(grep -c 'known limit, not tested by connecting' <<<"$res")"
 if [ "$known_n" = "1" ] && grep -q "^info worker an-abstract known limit, not tested by connecting" <<<"$res" && [ "$(grep -cE '^(ok|warn) worker (tailscaled-socket|snapd-socket|docker-socket|postgres-socket) ' <<<"$res")" = "4" ]; then ok "with the worker's families and hidden paths, the tailscaled, snapd, docker and Postgres deny probes still run (their paths are hidden), and an abstract one is a known limit"; else bad "worker unix probes: $res"; fi
 res="$(probe fenced worker "$work/w-unix.txt" --control "" --af "$WAF" --inaccessible "$INACC" --activation-text "" || true)"
 if grep -q "^info worker postgres-socket known limit, not tested by connecting" <<<"$res"; then ok "and without the worker's extra hidden paths the Postgres probe would be a known limit, not a test (so the hidden folder is what makes it count)"; else bad "postgres without the hidden folder: $(grep postgres <<<"$res")"; fi
+
+echo "path sockets the worker sets could connect to (judged from the file, never connected to)"
+sk="$(mktemp -d /tmp/bf-XXXXXX)"
+mkdir -p "$sk/open" "$sk/shut"
+python3 -I - "$sk" <<'PYS'
+import os, socket, sys
+d = sys.argv[1]
+for name, mode in (("open/other.sock", 0o666), ("open/closed.sock", 0o000), ("shut/inside.sock", 0o666)):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.bind(os.path.join(d, name))
+    s.close()
+    os.chmod(os.path.join(d, name), mode)
+open(os.path.join(d, "open/plain-file"), "w").close()
+PYS
+chmod 000 "$sk/shut"
+{ for f in open/other.sock open/closed.sock shut/inside.sock open/plain-file open/missing.sock; do printf 'u_str LISTEN 0 5 %s 1 * 0\n' "$sk/$f"; done; } >"$work/r-unix"
+: >"$work/r-tcp"; : >"$work/r-ip"
+probe derive "$work/r-tcp" "$work/r-unix" "$work/r-ip" | grep '^reach ' >"$work/reach.txt"
+if [ "$(wc -l <"$work/reach.txt" | tr -d ' ')" = "5" ]; then ok "every listening path socket from ss gets a reach line"; else bad "reach lines: $(cat "$work/reach.txt")"; fi
+me="$(id -u)"
+res="$(probe fenced worker "$work/reach.txt" --control "" --af "$WAF" --activation-text "" --self-uid 99999 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && grep -q "^info worker path-[0-9]* known limit, not tested by connecting: unix path $sk/open/other.sock is connectable from this set" <<<"$res"; then ok "a world-connectable socket of someone else is listed as a known limit, and nothing fails"; else bad "other socket rc=$rc: $res"; fi
+if [ "$me" != "0" ]; then
+  if ! grep -q "closed.sock\|inside.sock\|plain-file\|missing.sock" <<<"$res"; then ok "a socket with no permission, one behind a closed folder, a plain file and a missing path are not listed"; else bad "unreachable ones listed: $res"; fi
+  if grep -q "^info worker path-sockets 5 listening path sockets: 1 connectable from this set (known limit, listed above), 0 its own, 0 Bulig's own (must be 0), 4 not reachable" <<<"$res"; then ok "and one summary line counts them"; else bad "summary: $(grep path-sockets <<<"$res")"; fi
+fi
+res="$(probe fenced worker "$work/reach.txt" --control "" --af "$WAF" --activation-text "" --self-uid 99999 --bulig-uid "$me" 2>&1)"; rc=$?
+if [ "$rc" -eq 1 ] && grep -q "^FAIL worker path-[0-9]* a Bulig socket is connectable from this set: $sk/open/other.sock" <<<"$res"; then ok "a connectable socket owned by the kernel's user is a FAIL (exit 1)"; else bad "bulig-owned socket rc=$rc: $res"; fi
+res="$(probe fenced worker "$work/reach.txt" --control "" --af "$WAF" --activation-text "" 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && grep -q "^info worker path-[0-9]* this set's own socket: $sk/open/other.sock" <<<"$res"; then ok "the set's own socket is listed as its own"; else bad "own socket rc=$rc: $res"; fi
+if python3 -I -c 'import importlib.util,sys; s=importlib.util.spec_from_file_location("fp", sys.argv[1]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); sys.exit(0 if m.BULIG_OWN_PATHS == ("/run/postgresql/.s.PGSQL.5436",) and "/var/lib/bulig/" in m.BULIG_OWN_PREFIXES else 1)' "$deploy/fence-probe.py"; then ok "the Bulig Postgres socket and the kernel's folders count as Bulig's own"; else bad "Bulig's own paths"; fi
+printf "%s * 0\n" "$sk/open/other.sock" >"$work/r-act"
+res="$(probe fenced worker "$work/reach.txt" --control "" --af "$WAF" --activation-text "$(cat "$work/r-act")" --self-uid 99999 2>&1)"
+if grep -q "other.sock is connectable from this set (.*; an activation socket)" <<<"$res"; then ok "an activation socket is named as one (and still never connected to)"; else bad "activation note: $(grep other.sock <<<"$res")"; fi
+printf 'reach worker x unix /run/x.sock\n' >"$work/reach-bad.txt"
+expect_fail_msg "a reach line of another kind is refused" "a reach line is kind unix-path" python3 -I "$deploy/fence-probe.py" fenced worker "$work/reach-bad.txt" --control "" --af "$WAF" --activation-text ""
+printf 'known worker x unix-path /run/x.sock\n' >"$work/reach-bad.txt"
+expect_fail_msg "and a unix-path line that is not a reach line" "a reach line is kind unix-path" python3 -I "$deploy/fence-probe.py" fenced worker "$work/reach-bad.txt" --control "" --af "$WAF" --activation-text ""
+if grep -q -- '--bulig-uid "$bulig_uid"' "$deploy/fence-check.sh" && grep -q 'bulig_uid="$(id -u bulig' "$deploy/fence-check.sh"; then ok "fence-check hands the kernel user's uid to every set"; else bad "fence-check does not pass --bulig-uid"; fi
+chmod 755 "$sk/shut"; rm -rf "$sk"
 
 echo "the kit never connects to another service, and never wakes one"
 # Listeners that count the connections they accept: tcp_port, the unix socket and (Linux) the abstract one stand for ANOTHER service;

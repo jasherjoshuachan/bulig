@@ -71,7 +71,7 @@ INACC="-/run/tailscale -/run/snapd.socket -/run/docker.sock -/var/run/docker.soc
 RES="/run/systemd/resolve/resolv.conf:/etc/resolv.conf"
 # the worker: AF_UNIX and AF_NETLINK for Claude Code's Bash sandbox (Jasher, 21 Oct 2026), the gateway address and nothing else local, and
 # because it has AF_UNIX, the Postgres socket folder and the system bus hidden as well
-INACC_WORKER="$INACC -/run/postgresql -/var/run/postgresql -/run/dbus"
+INACC_WORKER="$INACC -/run/postgresql -/var/run/postgresql -/run/dbus -/run/snapd-snap.socket -/run/systemd/userdb -/run/systemd/resolve/io.systemd.Resolve -/run/systemd/resolve/io.systemd.Resolve.Monitor -/run/user"
 want bulig-worker.service RestrictAddressFamilies "AF_UNIX AF_INET AF_INET6 AF_NETLINK"
 want bulig-worker.service IPAddressDeny "$DENY"
 want bulig-worker.service IPAddressAllow "127.74.3.1/32"
@@ -188,6 +188,8 @@ if grep -q 'one real synthetic job\.' <<<"$ITEM6" || grep -q 'runs without `AF_U
 KL="$(sed -n '/^## Known limits/,/^## Must be proven/p' "$deploy/RUNBOOK.md")"
 if grep -q "The worker can reach other tenants' abstract unix sockets too" <<<"$KL"; then ok "the RUNBOOK's Known limits name the worker's abstract-socket reach"; else bad "Known limits do not name the worker's abstract-socket reach"; fi
 if grep -q "Commands in Claude Code's sandbox have no network\*\*" <<<"$KL" && grep -q '\*\*Loopback stays closed\*\*' <<<"$KL" && grep -q 'Planned follow-up: run the worker in its own network namespace' <<<"$KL"; then ok "the RUNBOOK's Known limits say sandboxed commands have no network, that loopback stays closed, and the network-namespace follow-up"; else bad "Known limits miss the sandbox network limit, the closed loopback or the follow-up"; fi
+if grep -q "The worker can connect to other path sockets whose permissions let it in" <<<"$KL" && grep -q 'never a connection' <<<"$KL" && grep -q 'The planned network namespace does \*\*not\*\* fix this' <<<"$KL" && ! grep -q 'Path sockets are hidden' "$deploy/RUNBOOK.md"; then ok "the RUNBOOK says only listed paths are hidden, other path sockets stay connectable (listed by the fence check), and the namespace does not fix it"; else bad "the RUNBOOK's path-socket limit is missing or still claims every path socket is hidden"; fi
+if grep -q 'InaccessiblePaths hides THESE paths only' <<<"$WSVC" && grep -q 'KNOWN LIMIT: every OTHER path socket' <<<"$WSVC" && ! grep -q 'hides the unix sockets a path connection could reach' <<<"$WSVC"; then ok "the worker unit says which paths are hidden and that other path sockets stay connectable"; else bad "the worker unit's InaccessiblePaths comment overclaims"; fi
 if grep -q 'KNOWN LIMIT: commands inside the sandbox have NO NETWORK' <<<"$WSVC"; then ok "the worker unit states the sandbox network limit"; else bad "the worker unit does not state the sandbox network limit"; fi
 if grep -q 'the worker is a different unit with no AF_UNIX' "$sd/bulig.service"; then bad "the kernel unit still says the worker has no AF_UNIX"; else ok "the kernel unit no longer says the worker has no AF_UNIX"; fi
 

@@ -38,6 +38,7 @@ import os
 import re
 import socket
 import ssl
+import stat
 import subprocess
 import sys
 import http.client
@@ -73,8 +74,11 @@ def parse_probes(path, set_name, host_addrs):
         if len(parts) != 5:
             raise SystemExit(f"bad probe line: {line!r}")
         expect, sets, name, kind, target = parts
-        if expect not in ("deny", "known", "allow", "allow-late"):
+        if expect not in ("deny", "known", "allow", "allow-late", "reach"):
             raise SystemExit(f"unknown expectation {expect!r}")
+        # A reach line is a path socket that ss lists: it is judged from the file (stat and access, never connect), so it is only that kind.
+        if (expect == "reach") != (kind == "unix-path"):
+            raise SystemExit(f"a reach line is kind unix-path and only a reach line is: {line!r}")
         # A deny probe is only ever a tcp address, a unix socket or an abstract socket: those are the kinds whose activation can be checked
         # against systemctl list-sockets, and whose fence (IP filter, no AF_UNIX) stops them first. http, https or dns would connect without that.
         if expect == "deny" and kind not in ("tcp", "unix", "abstract"):
@@ -204,6 +208,15 @@ WITH_UNIX = "worker,kernel,cli-worker,cli-kernel"
 NO_UNIX = "build"
 GATEWAY = ("127.74.3.1", "7431")  # the kernel's own gateway: the worker is meant to reach it
 MAX_DERIVED = 400
+# Path sockets the worker sets could connect to (they have AF_UNIX since 21 Oct 2026). Every listening path socket that ss lists becomes a
+# "reach" line for these sets, judged inside the unit from the file itself (stat and access, never a connection), so what InaccessiblePaths,
+# PrivateTmp, ProtectHome and the folders' modes leave reachable is listed in every health run.
+REACH_SETS = "worker,cli-worker"
+MAX_REACH = 400
+# Bulig's own sockets, which the worker must never be able to reach: the kernel's (anything under its folders or owned by its user, passed as
+# --bulig-uid) and the Bulig Postgres cluster's socket. A reachable one is a FAIL.
+BULIG_OWN_PATHS = ("/run/postgresql/.s.PGSQL.5436",)
+BULIG_OWN_PREFIXES = ("/var/lib/bulig/", "/opt/bulig/", "/usr/local/lib/bulig/", "/etc/bulig/", "/var/lib/bulig-checks/", "/var/backups/bulig/", "/run/bulig/")
 
 
 def unmap(a):
@@ -319,7 +332,37 @@ def derive(ss_tcp, ss_unix, ip_addr):
         add("deny", NO_UNIX, f"abstract-{n}", "abstract", name)
         add("known", WITH_UNIX, f"abstract-{n}", "abstract", name)
     lines = [out[k] for k in sorted(out)]
-    return lines[:MAX_DERIVED]
+    paths = set()
+    for line in open(ss_unix):
+        f = line.split()
+        if len(f) >= 5 and f[1] == "LISTEN" and f[4].startswith("/"):
+            paths.add(norm_path(f[4]))
+    reach = [f"reach {REACH_SETS} path-{n} unix-path {p}" for n, p in enumerate(sorted(paths), 1)]
+    if len(reach) > MAX_REACH:
+        print(f"fence-probe derive: {len(reach)} listening path sockets, only the first {MAX_REACH} are judged", file=sys.stderr)
+    return lines[:MAX_DERIVED] + reach[:MAX_REACH]
+
+
+def path_reach(path, self_uid, bulig_uid):
+    """(class, detail) for a listening path socket, as seen from THIS process (inside the unit), without connecting: 'unreachable' (not there in
+    this unit's view, hidden by InaccessiblePaths, a folder on the way closed, or no write permission on the socket for this user), 'own' (this
+    user's own socket), 'bulig' (Bulig's own: must never be reachable) or 'other'. connect() on a unix socket needs search permission on every
+    folder on the way and write permission on the socket, which is what access(W_OK) checks (a read-only mount does not matter for a socket)."""
+    try:
+        st = os.stat(path)
+    except OSError as e:
+        return "unreachable", (e.strerror or type(e).__name__).lower()
+    if not stat.S_ISSOCK(st.st_mode):
+        return "unreachable", "not a socket in this unit's view (hidden by InaccessiblePaths, or another file there)"
+    if not os.access(path, os.W_OK):
+        return "unreachable", "no permission for this user"
+    detail = f"{stat.filemode(st.st_mode)} uid {st.st_uid} gid {st.st_gid}"
+    if st.st_uid == self_uid:
+        return "own", detail
+    p = norm_path(path)
+    if (bulig_uid is not None and st.st_uid == bulig_uid) or p in BULIG_OWN_PATHS or p.startswith(BULIG_OWN_PREFIXES):
+        return "bulig", detail
+    return "other", detail
 
 
 # ---- reading the host without connecting to it -------------------------------------------------------------------------------------------------
@@ -547,7 +590,7 @@ def main(argv):
         return 2
     mode, set_name, probes_file = argv[1], argv[2], argv[3]
     opts = {"--host-addrs": "", "--control": None, "--af": None, "--ip-deny": "", "--ip-allow": "", "--inaccessible": "",
-            "--ss-tcp": None, "--ss-unix": None, "--activation-text": None,
+            "--ss-tcp": None, "--ss-unix": None, "--activation-text": None, "--bulig-uid": "", "--self-uid": "",
             "--deny-timeout": str(DENY_TIMEOUT), "--jobs": str(JOBS)}
     late = "both"
     i = 4
@@ -597,11 +640,30 @@ def main(argv):
     # only the probes that really have to attempt something become a job. The results are printed in the probe file's order, whatever order
     # the jobs finish in, so a run reads the same every time and two modes can be compared line by line.
     todo = []  # (job, line, failed): a job is a function returning (line, failed); without one the result is already known
+    try:
+        bulig_uid = int(opts["--bulig-uid"]) if opts["--bulig-uid"] not in ("", "-1") else None
+        self_uid = int(opts["--self-uid"]) if opts["--self-uid"] else os.getuid()  # (--self-uid: the tests only)
+    except ValueError:
+        raise SystemExit("--bulig-uid and --self-uid are numbers")
+    reach_count = {"listed": 0, "unreachable": 0, "own": 0, "other": 0, "bulig": 0}
     for expect, name, kind, target in probes:
         is_late = expect == "allow-late"
         if late == "only" and not is_late:
             continue
         if late == "no" and is_late:
+            continue
+        if expect == "reach":
+            # Judged from the file only. Listed so that it is seen in every run; only a reachable Bulig socket fails.
+            cls, why = path_reach(target, self_uid, bulig_uid)
+            reach_count["listed"] += 1
+            reach_count[cls] += 1
+            act = "; an activation socket" if is_activation("unix", target, activation) else ""
+            if cls == "bulig":
+                todo.append((None, f"FAIL {set_name} {name} a Bulig socket is connectable from this set: {target} ({why}{act}); hide it with InaccessiblePaths", True))
+            elif cls == "other":
+                todo.append((None, f"info {set_name} {name} known limit, not tested by connecting: unix path {target} is connectable from this set ({why}{act})", False))
+            elif cls == "own":
+                todo.append((None, f"info {set_name} {name} this set's own socket: {target} ({why})", False))
             continue
         state = control.get(name)
         # Socket activation is decided from the TARGET, here, every time. The control result is only a hint about whether ss listed it.
@@ -635,6 +697,10 @@ def main(argv):
                 todo.append((None, f"info {set_name} {name} known limit, not tested by connecting: {kind} {target[:60]} ({ss_note(state)}; {why})", False))
                 continue
         todo.append((make_job(set_name, expect, name, kind, target, state, deny_timeout), "", False))
+    if reach_count["listed"]:
+        c = reach_count
+        todo.append((None, f"info {set_name} path-sockets {c['listed']} listening path sockets: {c['other']} connectable from this set (known limit, "
+                     f"listed above), {c['own']} its own, {c['bulig']} Bulig's own (must be 0), {c['unreachable']} not reachable", False))
     return emit(todo, jobs)
 
 

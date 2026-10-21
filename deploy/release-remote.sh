@@ -222,7 +222,8 @@ install_apparmor() {
   echo "apparmor: installed and loaded $aa_dst (root, 0644)"
 }
 # restore_apparmor: only if this release changed the file. The previous one goes back and is reloaded, or, when there was none, the profile is
-# unloaded and the file removed.
+# unloaded and the file removed. A file that was already right but not loaded, and was only loaded here, stays loaded on a rollback: the file
+# on disk is unchanged, and a reboot would load it anyway.
 restore_apparmor() {
   [ "$aa_changed" -eq 1 ] || return 0
   if [ -f "$aa_backup" ]; then

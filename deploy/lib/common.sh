@@ -27,8 +27,10 @@ BULIG_GATEWAY_PORT=7431
 #    The worker and its one-off commands have AF_UNIX and AF_NETLINK (Jasher, 21 Oct 2026): Claude Code runs every Bash command in bubblewrap,
 #    which needs a unix socket of its own (the sandbox's proxy, in the unit's private /tmp) and netlink (to bring up loopback in its own network
 #    namespace). So the worker sets can reach other tenants' ABSTRACT unix sockets, as the kernel can: a known limit, reported by fence-check.sh.
-#  - InaccessiblePaths: the other unix sockets on this host, hidden from the file view. The worker also loses the Postgres socket folder and the
-#    system D-Bus folder, since it now has AF_UNIX and needs neither ("-" = ignore a missing path).
+#  - InaccessiblePaths: named unix sockets and folders, hidden from the file view ("-" = ignore a missing path). Only these are hidden; it is not
+#    every socket. The worker, which has AF_UNIX, also loses the Postgres socket folder, the system D-Bus folder, snapd's second socket, systemd's
+#    userdb folder, resolved's varlink sockets and /run/user, none of which it needs. Any other path socket whose permissions let the worker's user
+#    in stays connectable: a known limit, listed from the files (never by connecting) by fence-check.sh in every run.
 #  - BindReadOnlyPaths: resolved's upstream resolver list instead of the 127.0.0.53 stub, so no localhost address has to be allowed for DNS.
 # Numeric prefixes only: systemd-run (systemd 255) refuses a symbolic name such as localhost inside a list
 # ("Failed to parse IP address prefix"), and these go into transient units. Unit files share the same rule.
@@ -37,7 +39,7 @@ BULIG_AF_NO_UNIX="AF_INET AF_INET6"
 BULIG_AF_WITH_UNIX="AF_UNIX AF_INET AF_INET6"
 BULIG_AF_WORKER="AF_UNIX AF_INET AF_INET6 AF_NETLINK"
 BULIG_INACCESSIBLE="-/run/tailscale -/run/snapd.socket -/run/docker.sock -/var/run/docker.sock"
-BULIG_INACCESSIBLE_WORKER="-/run/tailscale -/run/snapd.socket -/run/docker.sock -/var/run/docker.sock -/run/postgresql -/var/run/postgresql -/run/dbus"
+BULIG_INACCESSIBLE_WORKER="-/run/tailscale -/run/snapd.socket -/run/docker.sock -/var/run/docker.sock -/run/postgresql -/var/run/postgresql -/run/dbus -/run/snapd-snap.socket -/run/systemd/userdb -/run/systemd/resolve/io.systemd.Resolve -/run/systemd/resolve/io.systemd.Resolve.Monitor -/run/user"
 BULIG_RESOLV_BIND="/run/systemd/resolve/resolv.conf:/etc/resolv.conf"
 
 # The tests run the scripts against a throwaway folder: BULIG_DEPLOY_TEST_ROOT puts every fixed path under it and skips the

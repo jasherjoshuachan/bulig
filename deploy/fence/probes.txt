@@ -38,6 +38,10 @@ deny  worker,kernel,build,cli-worker,cli-kernel  resolver-stub-dns-tcp   tcp    
 deny  worker,kernel,build,cli-worker,cli-kernel  tailscaled-socket       unix      /run/tailscale/tailscaled.sock
 deny  worker,kernel,build,cli-worker,cli-kernel  snapd-socket            unix      /run/snapd.socket
 deny  worker,kernel,build,cli-worker,cli-kernel  docker-socket           unix      /run/docker.sock
+# --- system sockets the worker never needs, hidden from it because it has AF_UNIX (the kernel keeps them; it has had AF_UNIX all along)
+deny  worker,build,cli-worker                    snapd-snap-socket       unix      /run/snapd-snap.socket
+deny  worker,build,cli-worker                    userdb-multiplexer      unix      /run/systemd/userdb/io.systemd.Multiplexer
+deny  worker,build,cli-worker                    resolved-varlink        unix      /run/systemd/resolve/io.systemd.Resolve
 # --- Bulig's own Postgres socket: the kernel needs it, the worker and the build must not have it (the build has no AF_UNIX; the worker's
 #     InaccessiblePaths hides the socket folder)
 deny  worker,build,cli-worker                    postgres-socket         unix      /var/run/postgresql/.s.PGSQL.5436

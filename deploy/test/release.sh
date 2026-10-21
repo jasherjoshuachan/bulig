@@ -121,7 +121,30 @@ echo "head $*" >>"$STUB_LOG/head"
 exec /usr/bin/head "$@"
 STUB
 chmod +x "$stubs"/*
-export PATH="$stubs:/usr/bin:/bin:/usr/sbin:/sbin"
+# The system admin folders (/usr/sbin, /sbin) are reached through a copy of links that leaves out every AppArmor tool: on a Linux machine with
+# AppArmor (CI runners included) the real apparmor_parser lives there, and no test may ever run it (as root it would load a profile into the
+# real kernel). The release finds only the stand-in above, or, when a test removes the stand-in, nothing at all.
+sbin="$work/sbin"
+mkdir -p "$sbin"
+for d in /usr/sbin /sbin; do
+  [ -d "$d" ] || continue
+  for f in "$d"/*; do
+    n="${f##*/}"
+    case "$n" in apparmor_parser | aa-* | apparmor*) continue ;; esac
+    if [ -x "$f" ] && [ ! -e "$sbin/$n" ]; then ln -s "$f" "$sbin/$n"; fi
+  done
+done
+export PATH="$stubs:/usr/bin:/bin:$sbin"
+# aa_guard: stop the whole suite if any apparmor_parser other than the stand-in could be found on PATH (or on /usr/bin, /bin, which stay).
+aa_guard() {
+  local d
+  IFS=: read -r -a _dirs <<<"$PATH"
+  for d in "${_dirs[@]}"; do
+    [ "$d" = "$stubs" ] && continue
+    if [ -e "$d/apparmor_parser" ]; then echo "  FAIL  the real apparmor_parser is reachable at $d/apparmor_parser: refusing to run a release test" >&2; exit 1; fi
+  done
+}
+aa_guard
 
 # What a normal pnpm install leaves: node_modules at the root and in a package, links inside .pnpm, a workspace link, a .bin shim.
 mk_modules() { # mk_modules <dir>
@@ -167,6 +190,7 @@ deliver() {
   echo "$inc"
 }
 run_remote() { # run_remote <short> <incoming>: what `ssh host bash <incoming>/deploy/release-remote.sh <short> 5` runs
+  aa_guard
   bash "$2/deploy/release-remote.sh" "$1" 5
 }
 link_of() { readlink "$1" 2>/dev/null | xargs -I{} basename {}; }
@@ -475,6 +499,7 @@ expect_fail_msg "a link to a matching profile fails the release too" "is a link.
 rm -f "$AAP"
 # AppArmor on, but no apparmor_parser
 mv "$stubs/apparmor_parser" "$work/aa-stub"
+if [ -z "$(command -v apparmor_parser)" ]; then ok "with the stand-in removed, no apparmor_parser at all is on the test PATH (the real one is never reached)"; else bad "an apparmor_parser is still reachable: $(command -v apparmor_parser)"; exit 1; fi
 incH8="$(deliver "a8a8a8a8a8a8" 0)"
 expect_fail_msg "AppArmor enabled without apparmor_parser fails the release" "apparmor_parser is not installed" run_remote "a8a8a8a8a8a8" "$incH8"
 mv "$work/aa-stub" "$stubs/apparmor_parser"

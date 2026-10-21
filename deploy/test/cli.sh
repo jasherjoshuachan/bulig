@@ -80,7 +80,7 @@ check "the worker's one-off commands cannot reach Tailscale or this machine's ow
 check "only the gateway address is let through" "IPAddressAllow=127.74.3.1/32"
 check "the worker's one-off commands get the worker unit's families: AF_UNIX and AF_NETLINK for Claude Code's sandbox, and IP" "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK"
 if [ "$(grep -c '^RestrictAddressFamilies=' "$work/argv")" = "1" ] && ! grep -q 'RestrictAddressFamilies=.*AF_PACKET' "$work/argv"; then ok "and nothing else in the command line changes the family list"; else bad "address-family lines: $(grep Restrict "$work/argv")"; fi
-check "and cannot see the tailscale, snapd or docker sockets, the Postgres socket folder or the system bus" "InaccessiblePaths=-/run/tailscale -/run/snapd.socket -/run/docker.sock -/var/run/docker.sock -/run/postgresql -/var/run/postgresql -/run/dbus"
+check "and cannot see the tailscale, snapd or docker sockets, the Postgres socket folder or the system bus" "InaccessiblePaths=-/run/tailscale -/run/snapd.socket -/run/docker.sock -/var/run/docker.sock -/run/postgresql -/var/run/postgresql -/run/dbus -/run/snapd-snap.socket -/run/systemd/userdb -/run/systemd/resolve/io.systemd.Resolve -/run/systemd/resolve/io.systemd.Resolve.Monitor -/run/user"
 check "and resolve names through resolved's upstream list" "BindReadOnlyPaths=/run/systemd/resolve/resolv.conf:/etc/resolv.conf"
 # the same hardening as bulig-worker.service, so Claude Code's sandbox works in a one-off command too (bwrap needs a /proc it can mount)
 absent "the worker's one-off commands set none of ProtectKernelTunables, ProtectKernelLogs, ProtectHostname or ProcSubset" "^(ProtectKernelTunables|ProtectKernelLogs|ProtectHostname|ProcSubset)="

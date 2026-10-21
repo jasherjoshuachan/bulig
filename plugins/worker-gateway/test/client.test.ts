@@ -228,6 +228,49 @@ describe('the worker, against a kernel that is just a script', () => {
       }
     }, 120_000); // its own waits add up to 90 s (Claude start, then give up), past the 60 s default
 
+    it('answers that are bad from the first heartbeat, while the worktree is still being made, stop the stage before Claude starts and send nothing', async () => {
+      const w = makeWorld();
+      // The stage's base is a commit the worker's clone does not have yet, so making the worktree starts with a fetch. The clone's
+      // upload-pack is a script that holds that fetch until the test lets it go, so the worker gives the stage up (lossMs) while it is
+      // still preparing it, however fast or slow the machine is.
+      writeFileSync(join(w.repo, 'later.txt'), 'later\n');
+      gitSync(w.repo, 'add', '-A');
+      gitSync(w.repo, 'commit', '-qm', 'later');
+      gitSync(w.repo, 'push', '-q', 'origin', 'main');
+      const later = gitSync(w.repo, 'rev-parse', 'HEAD');
+      const gate = tmp();
+      const held = join(gate, 'held');
+      const release = join(gate, 'release');
+      const pack = join(gate, 'upload-pack.sh');
+      // Polls for the release file, and gives up after 60 s so a failed test does not leave it behind.
+      writeFileSync(pack, `#!/bin/sh\n: > "${held}"\ni=0\nwhile [ ! -e "${release}" ] && [ "$i" -lt 1200 ]; do sleep 0.05; i=$((i + 1)); done\nexec git-upload-pack "$@"\n`, { mode: 0o755 });
+      gitSync(w.clone, 'config', 'remote.origin.uploadpack', pack);
+      const k = kernel({ ...stage(w), workspace: { repo: w.repo, base: later } }, () => 500);
+      const lines: string[] = [];
+      let claudeAsked = 0; // the worker reads claudeBin only to start Claude, so any read means it went on to start one
+      const worker = startRemoteWorker({
+        kernelUrl: 'http://127.0.0.1:1', workerId: 'mac', token: 'mac-token-0123456789abcdef', slots: 1, repos: { [w.repo]: w.clone }, workdir: w.workdir,
+        get claudeBin() {
+          claudeAsked++;
+          return SLOW;
+        },
+        log: (line) => lines.push(line), lossMs: 1000, retryMs: 50, fetch: k.fetchImpl,
+      });
+      try {
+        await waitFor(() => existsSync(held), 30_000, 'the fetch for the base to start');
+        await waitFor(() => lines.some((l) => l.includes('stopped: the kernel keeps answering 500 to heartbeats')), 30_000, 'the worker to give the stage up');
+        writeFileSync(release, '');
+        await waitFor(() => worker.running() === 0, 30_000, 'the stage to be cleaned up');
+        expect(claudeAsked).toBe(0);
+        expect(k.results).toEqual([]);
+        expect(existsSync(join(w.workdir, 'stage-1'))).toBe(false);
+        expect(gitSync(w.clone, 'worktree', 'list').split('\n')).toHaveLength(1);
+      } finally {
+        writeFileSync(release, '');
+        await worker.stop();
+      }
+    }, 120_000);
+
     it('control: 200 answers keep the run going and its result is sent', async () => {
       const w = makeWorld();
       const marks = join(tmp(), 'marks');

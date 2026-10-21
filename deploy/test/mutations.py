@@ -470,6 +470,20 @@ M = [
     ("postcheck: files in a Bulig drop-in folder are not Bulig's", "run.sh", "lib/snapshot.sh", """find "$R/etc/systemd/system" -type f -not -name '*bulig*' -not -path "$R/etc/systemd/system/bulig*" """, """find "$R/etc/systemd/system" -type f -not -name '*bulig*' """),
     ("postcheck: links in a Bulig folder are not Bulig's", "run.sh", "lib/snapshot.sh", """find "$R/etc/systemd/system" -type l -not -name '*bulig*' -not -path "$R/etc/systemd/system/bulig*" """, """find "$R/etc/systemd/system" -type l -not -name '*bulig*' """),
     ("postcheck: any folder with bulig in its name is Bulig's", "run.sh", "lib/snapshot.sh", """find "$R/etc/systemd/system" -type f -not -name '*bulig*' -not -path "$R/etc/systemd/system/bulig*" """, """find "$R/etc/systemd/system" -type f -not -name '*bulig*' -not -path "$R/etc/systemd/system/*bulig*" """),
+    # ---- postcheck: timer-started run state and per-session containers are reported, not compared; everything else still fails ----
+    ("postcheck: the raw snapshots are compared again (the fix reverted)", "run.sh", "postcheck.sh", '"$after.before" "$after.after" >"$after.diff"', '"$before" "$after" >"$after.diff"'),
+    ("postcheck: no service counts as started by a timer", "run.sh", "lib/snapshot.sh", '    if timer_started "$u" "$before" "$after"; then timed="$timed $u"; fi\n', ""),
+    ("postcheck: the timers list is not read", "run.sh", "lib/snapshot.sh", """awk -v u="$u" '$2 == u { found = 1 } END { exit !found }'; then return 0; fi""", """awk -v u="$u" 'END { exit 1 }'; then return 0; fi"""),
+    ("postcheck: TriggeredBy is not read", "run.sh", "lib/snapshot.sh", "if grep -Eq '^TriggeredBy=(.* )?[^ ]+\\.timer( |$)' <<<\"$props\"; then return 0; fi", ":"),
+    ("postcheck: a .socket trigger counts as a timer", "run.sh", "lib/snapshot.sh", "'^TriggeredBy=(.* )?[^ ]+\\.timer( |$)'", "'^TriggeredBy=.+'"),
+    ("postcheck: a oneshot's same-name timer is not looked for", "run.sh", "lib/snapshot.sh", '    if [ -n "$(systemctl list-unit-files --no-legend --plain --no-pager "$base.timer" 2>/dev/null)" ]; then return 0; fi\n', ""),
+    ("postcheck: any oneshot counts as started by a timer", "run.sh", "lib/snapshot.sh", "  if grep -qx 'Type=oneshot' <<<\"$props\"; then\n", "  if grep -qx 'Type=oneshot' <<<\"$props\"; then return 0\n"),
+    ("postcheck: a failed timer service is only info", "run.sh", "lib/snapshot.sh", '      *" failed "*) echo "warn  $u is failed now', '      *" failed "*) echo "info  $u is failed now'),
+    ("postcheck: every section drops a timer service's lines", "run.sh", "lib/snapshot.sh", '    sec == "rs" && index(units, " " $1 " ") { next }', '    index(units, " " $1 " ") { next }'),
+    ("postcheck: a new container from any image is info", "run.sh", "lib/snapshot.sh", "!($1 in seen) && ($2 in running) { print $1, $2 }", "!($1 in seen) { print $1, $2 }"),
+    ("postcheck: an image only stopped at the precheck counts as running", "run.sh", "lib/snapshot.sh", 'if ($3 == "running") running[$2] = 1; next', 'running[$2] = 1; next'),
+    ("postcheck: any container line not in the precheck is info", "run.sh", "lib/snapshot.sh", "!($1 in seen) && ($2 in running) { print $1, $2 }", "($2 in running) { print $1, $2 }"),
+    ("postcheck: the RUNBOOK drops the timer note", "units.sh", "RUNBOOK.md", "the run state of a service a timer starts", "the run state of some services"),
 ]
 
 

@@ -144,11 +144,11 @@ Stop at the first failure and read the message: every script says what it refuse
     ssh ths-prod-01 'systemctl start bulig-restore-drill.service && journalctl -u bulig-restore-drill.service -n 5 --no-pager'
     ```
 
-12. **Postcheck.** The "after" picture. It must say the snapshot is identical to the precheck (apart from Bulig's own things).
+12. **Postcheck.** The "after" picture. It must say the snapshot matches the precheck (apart from Bulig's own things, and anything it lists as `info` or `warn`).
     ```bash
     ssh ths-prod-01 '/usr/local/lib/bulig/current/postcheck.sh'
     ```
-    A diff of unrelated services that started or stopped on their own (a nightly job) needs a human read: check it is not Bulig's doing before calling it noise, and add the pattern to `SNAPSHOT_NOISE` in `lib/snapshot.sh` if it is.
+    Two kinds of churn happen on every run and are reported, not compared. First, the run state of a service a timer starts (it is TriggeredBy a `.timer`, a timer in the snapshot starts it, or it is a oneshot with a `.timer` of the same name): "activating" mid-run or "inactive dead" after is an `info` line, and a `failed` one is a `warn` line that names the unit. Read every `warn`: that service's own run failed, which is not Bulig's doing but is still a real failure for its owner. The unit file, its enabled state and the timer itself are still compared. Second, a new container from an image that was already running at the precheck (a per-session agent container) is an `info` line; a new image, a removed container or a container that changed state still fails. Anything else that differs fails. A diff of other unrelated services that started or stopped on their own needs a human read: check it is not Bulig's doing before calling it noise, and add the pattern to `SNAPSHOT_NOISE` in `lib/snapshot.sh` if it is. The comparison reads the snapshot format as it is, so a precheck taken by an older kit still compares.
 
 ## What each unit can reach (network and sockets)
 

@@ -87,14 +87,14 @@ if grep -qE '^(Environment|EnvironmentFile|PassEnvironment)=.*(TELEGRAM|telegram
 TG_CUT="$(sed -n '/^## Cutover/,/^## Rollback/p' "$deploy/RUNBOOK.md")"
 # The cutover order: each marker must come after the one before it (byte offsets inside the section).
 order_ok=1 prev=0
-for m in 'systemctl start bulig-backup.service' 'launchctl bootout' '.backup <snapshot path>' 'systemctl stop bulig-worker bulig bulig-backup.timer bulig-restore-drill.timer' \
+for m in 'systemctl start bulig-backup.service' 'bulig.mjs status > <mac jobs file>' 'launchctl bootout' '.backup <snapshot path>' 'systemctl stop bulig-worker bulig bulig-backup.timer bulig-restore-drill.timer' \
   'ALTER DATABASE bulig RENAME TO bulig_precut' "CREATE DATABASE bulig OWNER bulig" '--to-credential pg-url --dry-run' "--to-credential pg-url'" \
-  'set-secret.sh --credential telegram-token' 'systemctl start bulig bulig-worker' 'bulig-cli.sh status' 'DROP DATABASE bulig_precut'; do
+  'set-secret.sh --credential telegram-token' 'systemctl start bulig bulig-worker' "bulig-cli.sh status' | diff <mac jobs file> -" 'DROP DATABASE bulig_precut'; do
   n="$(grep -boF -- "$m" <<<"$TG_CUT" | head -1 | cut -d: -f1)"
   if [ -z "$n" ] || [ "$n" -le "$prev" ]; then order_ok=0; echo "    cutover order: '$m' missing or out of order" >&2; break; fi
   prev="$n"
 done
-if [ "$order_ok" -eq 1 ]; then ok "the Cutover runs backup, Mac stop, snapshot, stop, rename, empty record, dry run, copy, bot token, start, status, and drops bulig_precut last"; else bad "the Cutover steps are missing or out of order"; fi
+if [ "$order_ok" -eq 1 ]; then ok "the Cutover runs backup, Mac job list, Mac stop, snapshot, stop, rename, empty record, dry run, copy, bot token, start, status, and drops bulig_precut last"; else bad "the Cutover steps are missing or out of order"; fi
 if grep -q "Keep \`bulig_precut\`" <<<"$TG_CUT" && grep -q "only with Jasher's yes" <<<"$TG_CUT"; then ok "the Cutover keeps bulig_precut until Jasher says to drop it"; else bad "the Cutover does not keep bulig_precut or drops it without Jasher's yes"; fi
 if grep -q -- '--to-env' <<<"$(sed -n '/^8\. \*\*Copy over the old record/,/^9\. \*\*Synthetic/p' "$deploy/RUNBOOK.md")$TG_CUT"; then bad "step 8 or the Cutover passes the database URL through an environment variable (--to-env)"; else ok "step 8 and the Cutover read the database URL from the pg-url credential (--to-credential), never an environment variable"; fi
 if grep -q "set-secret.sh --credential telegram-token'" <<<"$TG_CUT" && grep -q 'SetCredential=telegram-token:none' <<<"$TG_CUT" && ! grep -q 'add `telegram-token` to `BULIG_CREDENTIALS`' <<<"$TG_CUT"; then ok "the Cutover installs the bot token with set-secret and describes the wiring the release already has"; else bad "the Cutover's bot-token step does not match the units (set-secret --credential telegram-token, SetCredential default none)"; fi

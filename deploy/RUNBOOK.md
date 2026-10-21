@@ -223,8 +223,9 @@ The VPS record already holds rows (the earlier copy in step 8, the synthetic job
    ```bash
    ssh ths-prod-01 'systemctl start bulig-backup.service && journalctl -u bulig-backup.service -n 5 --no-pager'
    ```
-2. **Stop the Mac**, then take a consistent snapshot of its SQLite file (outside the repository):
+2. **Save the Mac's job list, then stop the Mac**, then take a consistent snapshot of its SQLite file (outside the repository). `bulig status` only reads, so it runs while serve is up. Nothing in the list may be `running`; if a job is, wait for it to finish or park, and save the list again:
    ```bash
+   cd <the Mac's bulig checkout> && node packages/cli/bin/bulig.mjs status > <mac jobs file>
    launchctl bootout gui/$(id -u)/dev.bulig.serve
    sqlite3 <path of the Mac's SQLite file> ".backup <snapshot path>"
    ```
@@ -253,9 +254,9 @@ The VPS record already holds rows (the earlier copy in step 8, the synthetic job
    ssh ths-prod-01 'systemctl start bulig bulig-worker && systemctl start bulig-backup.timer bulig-restore-drill.timer'
    ssh ths-prod-01 '/usr/local/lib/bulig/current/health.sh'
    ```
-9. **Check the record.** `status` must list the Mac's jobs as the Mac showed them before step 2. Then send a message to the bot and watch `journalctl -u bulig -f`.
+9. **Check the record.** `status` on the server must print the same list as the file saved in step 2 (no output from `diff`). Then send a message to the bot and watch `journalctl -u bulig -f`.
    ```bash
-   ssh ths-prod-01 '/usr/local/lib/bulig/current/bulig-cli.sh status'
+   ssh ths-prod-01 '/usr/local/lib/bulig/current/bulig-cli.sh status' | diff <mac jobs file> -
    ```
 10. **Keep `bulig_precut`** until the next backup and the next restore drill both pass on the new record (`bulig-backup: ok`, `bulig-restore-drill: ok`). Drop it only with Jasher's yes: `runuser -u postgres -- psql -X -h /var/run/postgresql -p 5436 -d postgres -c 'DROP DATABASE bulig_precut'`.
 

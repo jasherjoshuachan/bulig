@@ -11,7 +11,8 @@ Copies a Bulig SQLite record (schema version ${COPY_SCHEMA_VERSION}) into an emp
   --to-env         the name of the environment variable that holds the Postgres connection string (it must name a host)
   --to-credential  the name of a file in $CREDENTIALS_DIRECTORY (systemd LoadCredential=) that holds it, for example pg-url.
                    On a server use this one: the URL and its password never go into an environment variable or an argument.
-                   Give exactly one of the two.  --dry-run        do everything, print the comparison, then undo it. The database keeps its tables (the schema is
+                   Give exactly one of the two.
+  --dry-run        do everything, print the comparison, then undo it. The database keeps its tables (the schema is
                    set up first, as the kernel would) but no rows.`;
 
 const pad = (s: string, n: number) => (s.length >= n ? s : s + ' '.repeat(n - s.length));

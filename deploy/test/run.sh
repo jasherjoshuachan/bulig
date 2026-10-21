@@ -29,7 +29,7 @@ expect_fail_msg "an absolute path as the name is refused" "unknown credential '/
 expect_fail_msg "an old-style NAME FILE call is refused" "usage: set-secret.sh" bash -c "echo v | '$ss' R2_BUCKET '$root/tmp/evil'"
 expect_fail_msg "a third argument is refused" "usage: set-secret.sh" bash -c "echo v | '$ss' --credential pg-url '$root/tmp/evil'"
 expect_fail_msg "no arguments is refused" "usage: set-secret.sh" bash -c "echo v | '$ss'"
-for n in pg-url gh-token worker-tokens claude-token worker-token github-read-token drill-pw; do
+for n in pg-url gh-token worker-tokens claude-token worker-token github-read-token drill-pw telegram-token; do
   expect_ok "the known credential $n is accepted" bash -c "echo v | '$ss' --credential $n"
 done
 expect_ok "backup key R2_BUCKET is written" bash -c "echo mybucket | '$ss' --backup-key R2_BUCKET"

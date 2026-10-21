@@ -217,9 +217,13 @@ Everything this kit adds or changes (nothing else is touched):
 Not part of the steps above, and nobody runs it without his yes, **and only after every item in "Must be proven on the server first" has been shown, and `health.sh` and `postcheck.sh` both pass**. Moving Telegram means two things happen in a fixed order, because two kernels must never poll one bot (Telegram answers the second `getUpdates` with a conflict).
 
 1. Stop the Mac: `launchctl bootout gui/$(id -u)/dev.bulig.serve`.
-2. Put the bot token on the server as a credential for the kernel only: add `telegram-token` to `BULIG_CREDENTIALS` in `lib/common.sh` and `LoadCredential=telegram-token:/etc/bulig/telegram-token` to `bulig.service` (a reviewed change, then `release.sh`), then `security find-generic-password -s bulig-telegram-bot -w | ssh ths-prod-01 'bash /usr/local/lib/bulig/current/set-secret.sh --credential telegram-token'`.
-3. In `/etc/bulig/config.json` (root) add `"channel-telegram"` to `enabled`, add its grants and its `pluginConfig` block (`allowedChatIds`, `allowedUserIds`, `repos`; copy the shape from `bulig.config.example.json`).
-4. `systemctl restart bulig` and run `health.sh`.
+2. Put the bot token on the server as a credential for the kernel only. The release already carries the wiring: `telegram-token` is a known name in `lib/common.sh`, and `bulig.service` has `LoadCredential=telegram-token:/etc/bulig/telegram-token` with `SetCredential=telegram-token:none` as the default while the file is missing (the worker unit never holds it). channel-telegram reads the token from `$CREDENTIALS_DIRECTORY/telegram-token` (no environment variable; a value of `none` counts as no token, so the plugin stops at start by name instead of sending it to Telegram). Install the file:
+   ```bash
+   security find-generic-password -s bulig-telegram-bot -w | ssh ths-prod-01 'bash /usr/local/lib/bulig/current/set-secret.sh --credential telegram-token'
+   ```
+   It prints the length, never the value. The running kernel does not see it until the restart in step 4 (systemd copies credentials at start).
+3. In `/etc/bulig/config.json` (root) add `"channel-telegram"` to `enabled`, add its grants and its `pluginConfig` block (`allowedChatIds`, `allowedUserIds`, `repos`; copy the shape from `bulig.config.example.json`). Leave out `tokenCredential` (the default name is `telegram-token`); the example's `tokenEnv` can stay, the credential wins over it.
+4. `systemctl restart bulig` and run `health.sh`. If the journal says `channel-telegram: the bot token is not set`, the file from step 2 is missing or empty (the unit got the `none` default).
 5. Send a message to the bot and watch `journalctl -u bulig -f`.
 
 To undo: remove `channel-telegram` from `enabled`, restart, then start the Mac serve again (`launchctl bootstrap ...`). The Mac's SQLite file is still the copy it was before the move, so going back loses anything done on the VPS since cutover; decide that first.

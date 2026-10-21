@@ -28,11 +28,17 @@ StateDirectoryMode=0700
 WorkingDirectory=/opt/bulig/current
 # Everything the kernel reads from outside its own folder comes in as a credential: a root-only file (0600), one thing each, found in
 # $CREDENTIALS_DIRECTORY. The kernel looks for its config at $CREDENTIALS_DIRECTORY/config first (PR #50). It does NOT hold the Claude
-# token: that goes only to bulig-worker.service, a different user. A missing file stops the unit from starting, on purpose.
+# token: that goes only to bulig-worker.service, a different user. A missing file stops the unit from starting, on purpose, except the
+# Telegram bot token below.
 LoadCredential=config:/etc/bulig/config.json
 LoadCredential=pg-url:/etc/bulig/pg-url
 LoadCredential=gh-token:/etc/bulig/gh-token
 LoadCredential=worker-tokens:/etc/bulig/worker-tokens
+# The Telegram bot token, for channel-telegram (kernel only; the worker never holds it). It is installed at cutover (RUNBOOK), so until
+# then the file is missing: SetCredential= with the same ID is the default systemd falls back to, and channel-telegram treats "none"
+# as "no token" (it stops at start, by name, if it is enabled with no token). Nothing reads the token from the environment here.
+LoadCredential=telegram-token:/etc/bulig/telegram-token
+SetCredential=telegram-token:none
 Environment=HOME=/var/lib/bulig
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
 ExecStart=/usr/bin/node /opt/bulig/current/packages/cli/bin/bulig.mjs serve

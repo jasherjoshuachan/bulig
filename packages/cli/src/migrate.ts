@@ -1,15 +1,18 @@
 import { resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import { assertPostgresUrl, copySqliteToPostgres, CopyRefusedError, COPY_SCHEMA_VERSION, type CopyReport } from '@bulig/core';
+import { readCredential } from '@bulig/worker-claude-code';
 import type { Io } from './commands.ts';
 
-const USAGE = `usage: bulig migrate sqlite-to-postgres --from <sqlite-file> --to-env <ENV_VAR> [--dry-run]
+const USAGE = `usage: bulig migrate sqlite-to-postgres --from <sqlite-file> (--to-env <ENV_VAR> | --to-credential <NAME>) [--dry-run]
 
 Copies a Bulig SQLite record (schema version ${COPY_SCHEMA_VERSION}) into an empty Postgres database, once.
-  --from     the SQLite file. It is opened read-only. Copy the file first if a Bulig is still writing to it.
-  --to-env   the name of the environment variable that holds the Postgres connection string (it must name a host)
-  --dry-run  do everything, print the comparison, then undo it. The database keeps its tables (the schema is
-             set up first, as the kernel would) but no rows.`;
+  --from           the SQLite file. It is opened read-only. Copy the file first if a Bulig is still writing to it.
+  --to-env         the name of the environment variable that holds the Postgres connection string (it must name a host)
+  --to-credential  the name of a file in $CREDENTIALS_DIRECTORY (systemd LoadCredential=) that holds it, for example pg-url.
+                   On a server use this one: the URL and its password never go into an environment variable or an argument.
+                   Give exactly one of the two.  --dry-run        do everything, print the comparison, then undo it. The database keeps its tables (the schema is
+                   set up first, as the kernel would) but no rows.`;
 
 const pad = (s: string, n: number) => (s.length >= n ? s : s + ' '.repeat(n - s.length));
 
@@ -30,28 +33,40 @@ export async function cmdMigrate(args: string[], io: Io): Promise<number> {
     io.err(`bulig: ${what ? `unknown migration "${what}"\n\n` : ''}${USAGE}`);
     return 2;
   }
-  let values: { from?: string; 'to-env'?: string; 'dry-run'?: boolean };
+  let values: { from?: string; 'to-env'?: string; 'to-credential'?: string; 'dry-run'?: boolean };
   try {
-    ({ values } = parseArgs({ args: rest, options: { from: { type: 'string' }, 'to-env': { type: 'string' }, 'dry-run': { type: 'boolean' } }, strict: true }));
+    ({ values } = parseArgs({
+      args: rest,
+      options: { from: { type: 'string' }, 'to-env': { type: 'string' }, 'to-credential': { type: 'string' }, 'dry-run': { type: 'boolean' } },
+      strict: true,
+    }));
   } catch (err) {
     io.err(`bulig: ${err instanceof Error ? err.message : String(err)}\n\n${USAGE}`);
     return 2;
   }
-  if (!values.from || !values['to-env']) {
-    io.err(`bulig: migrate sqlite-to-postgres needs --from and --to-env\n\n${USAGE}`);
+  const envName = values['to-env'];
+  const credName = values['to-credential'];
+  if (!values.from || (envName === undefined) === (credName === undefined)) {
+    io.err(`bulig: migrate sqlite-to-postgres needs --from and exactly one of --to-env and --to-credential\n\n${USAGE}`);
     return 2;
   }
-  const name = values['to-env'];
-  const url = (io.env ?? process.env)[name];
+  const env = io.env ?? process.env;
+  // What the target is called in messages. The value itself is never printed: it may hold a password.
+  const name = credName !== undefined ? `credential ${credName}` : (envName as string);
+  const where = credName !== undefined ? `the credential ${credName}` : `the environment variable ${envName}`;
+  const url = credName !== undefined ? readCredential(credName, env) : env[envName as string];
   if (!url) {
-    io.err(`bulig: the environment variable ${name} is not set. Set it to the Postgres connection string of the empty database.`);
+    io.err(
+      credName !== undefined
+        ? `bulig: ${where} is not there (no file ${credName} in $CREDENTIALS_DIRECTORY${env.CREDENTIALS_DIRECTORY ? '' : ', which is not set'}). Give the unit that credential (bulig-cli.sh --as kernel loads pg-url).`
+        : `bulig: ${where} is not set. Set it to the Postgres connection string of the empty database.`,
+    );
     return 2;
   }
   try {
     assertPostgresUrl(url);
   } catch {
-    // Never repeat the value: it may hold a password.
-    io.err(`bulig: the environment variable ${name} does not hold a usable Postgres connection string. It must start with postgres:// or postgresql:// and name a host.`);
+    io.err(`bulig: ${where} does not hold a usable Postgres connection string. It must start with postgres:// or postgresql:// and name a host.`);
     return 2;
   }
   const dryRun = values['dry-run'] === true;

@@ -117,9 +117,10 @@ Stop at the first failure and read the message: every script says what it refuse
    ```bash
    ssh ths-prod-01 'systemctl stop bulig.service'
    ssh ths-prod-01 '/usr/local/lib/bulig/current/bulig-cli.sh --as kernel --exec sh -c "cat > /var/lib/bulig/state/import.sqlite"' < <path of the Mac's SQLite file>
-   ssh ths-prod-01 '/usr/local/lib/bulig/current/bulig-cli.sh migrate sqlite-to-postgres --from /var/lib/bulig/state/import.sqlite --to-env BULIG_PG_URL --dry-run'
+   ssh ths-prod-01 '/usr/local/lib/bulig/current/bulig-cli.sh migrate sqlite-to-postgres --from /var/lib/bulig/state/import.sqlite --to-credential pg-url --dry-run'
+   ssh ths-prod-01 '/usr/local/lib/bulig/current/bulig-cli.sh migrate sqlite-to-postgres --from /var/lib/bulig/state/import.sqlite --to-credential pg-url'
    ```
-   After the real copy, remove it again (`bulig-cli.sh --exec rm /var/lib/bulig/state/import.sqlite`) and start the kernel. (How PR-E names the target is its own detail. `bulig-cli.sh` runs as user `bulig` with the kernel's credentials.)
+   `--to-credential pg-url` reads the connection string from the one-off unit's `$CREDENTIALS_DIRECTORY/pg-url` (`bulig-cli.sh --as kernel` loads it), so the URL and its password never go into an environment variable or an argument. The copy goes only into an empty record: on a database that already holds rows it refuses with exit 2 and writes nothing (the Cutover below makes a fresh one). After the real copy, remove the file again (`bulig-cli.sh --exec rm /var/lib/bulig/state/import.sqlite`) and start the kernel. `bulig-cli.sh` runs as user `bulig` with the kernel's credentials.
 
 9. **Synthetic jobs.** One on the VPS worker, one on the Mac worker over Tailscale. Exactly one PR each, on the sandbox repo. Jobs run through the two services; one-off commands go through `bulig-cli.sh`. For the Mac worker, add its token (`set-secret.sh --worker-token mac`), let that one peer in with its Tailscale address (the kernel allows no Tailscale peer until you do, and then exactly one /32), add the VPS's own Tailscale address (`tailscale ip -4` on the server) next to `127.74.3.1` in `listen` in `/etc/bulig/config.json` (root edit), and restart `bulig.service`:
     ```bash
@@ -214,19 +215,51 @@ Everything this kit adds or changes (nothing else is touched):
 
 ## Cutover (Jasher only)
 
-Not part of the steps above, and nobody runs it without his yes, **and only after every item in "Must be proven on the server first" has been shown, and `health.sh` and `postcheck.sh` both pass**. Moving Telegram means two things happen in a fixed order, because two kernels must never poll one bot (Telegram answers the second `getUpdates` with a conflict).
+Not part of the steps above, and nobody runs it without his yes, **and only after every item in "Must be proven on the server first" has been shown, and `health.sh` and `postcheck.sh` both pass**. Cutover moves two things: Telegram, and the Mac's live record. They happen in a fixed order, because two kernels must never poll one bot (Telegram answers the second `getUpdates` with a conflict) and only one may write the record.
 
-1. Stop the Mac: `launchctl bootout gui/$(id -u)/dev.bulig.serve`.
-2. Put the bot token on the server as a credential for the kernel only. The release already carries the wiring: `telegram-token` is a known name in `lib/common.sh`, and `bulig.service` has `LoadCredential=telegram-token:/etc/bulig/telegram-token` with `SetCredential=telegram-token:none` as the default while the file is missing (the worker unit never holds it). channel-telegram reads the token from `$CREDENTIALS_DIRECTORY/telegram-token` (no environment variable; a value of `none` counts as no token, so the plugin stops at start by name instead of sending it to Telegram). Install the file:
+The VPS record already holds rows (the earlier copy in step 8, the synthetic jobs), and `bulig migrate sqlite-to-postgres` only copies into an empty record. So the old VPS record is set aside under another name, kept, and a fresh empty `bulig` takes the Mac's copy. `pg-url` does not change. Jobs that exist only in the old VPS record (the synthetic ones) stay in `bulig_precut` and are not carried over.
+
+1. **Backup first.** One backup by hand; look for `bulig-backup: ok`:
+   ```bash
+   ssh ths-prod-01 'systemctl start bulig-backup.service && journalctl -u bulig-backup.service -n 5 --no-pager'
+   ```
+2. **Stop the Mac**, then take a consistent snapshot of its SQLite file (outside the repository):
+   ```bash
+   launchctl bootout gui/$(id -u)/dev.bulig.serve
+   sqlite3 <path of the Mac's SQLite file> ".backup <snapshot path>"
+   ```
+3. **Stop the units and the timers** on the server, so nothing writes or reads the record while it moves:
+   ```bash
+   ssh ths-prod-01 'systemctl stop bulig-worker bulig bulig-backup.timer bulig-restore-drill.timer'
+   ```
+4. **Set the old record aside and make an empty one**, as the `postgres` superuser over the socket (the same statements `setup-cluster.sh` uses):
+   ```bash
+   ssh ths-prod-01 "runuser -u postgres -- psql -X -h /var/run/postgresql -p 5436 -d postgres -v ON_ERROR_STOP=1 -c 'ALTER DATABASE bulig RENAME TO bulig_precut' -c 'CREATE DATABASE bulig OWNER bulig' -c 'REVOKE CONNECT ON DATABASE bulig FROM PUBLIC'"
+   ```
+5. **Copy the snapshot in**, as in step 8: pipe it in, dry run, real copy, remove the file. Both runs must end with every table `same`:
+   ```bash
+   ssh ths-prod-01 '/usr/local/lib/bulig/current/bulig-cli.sh --as kernel --exec sh -c "cat > /var/lib/bulig/state/import.sqlite"' < <snapshot path>
+   ssh ths-prod-01 '/usr/local/lib/bulig/current/bulig-cli.sh migrate sqlite-to-postgres --from /var/lib/bulig/state/import.sqlite --to-credential pg-url --dry-run'
+   ssh ths-prod-01 '/usr/local/lib/bulig/current/bulig-cli.sh migrate sqlite-to-postgres --from /var/lib/bulig/state/import.sqlite --to-credential pg-url'
+   ssh ths-prod-01 '/usr/local/lib/bulig/current/bulig-cli.sh --as kernel --exec rm /var/lib/bulig/state/import.sqlite'
+   ```
+6. **Put the bot token on the server** as a credential for the kernel only. The release already carries the wiring: `telegram-token` is a known name in `lib/common.sh`, and `bulig.service` has `LoadCredential=telegram-token:/etc/bulig/telegram-token` with `SetCredential=telegram-token:none` as the default while the file is missing (the worker unit never holds it). channel-telegram reads the token from `$CREDENTIALS_DIRECTORY/telegram-token` (no environment variable; a value of `none` counts as no token, so the plugin stops at start by name instead of sending it to Telegram). It prints the length, never the value:
    ```bash
    security find-generic-password -s bulig-telegram-bot -w | ssh ths-prod-01 'bash /usr/local/lib/bulig/current/set-secret.sh --credential telegram-token'
    ```
-   It prints the length, never the value. The running kernel does not see it until the restart in step 4 (systemd copies credentials at start).
-3. In `/etc/bulig/config.json` (root) add `"channel-telegram"` to `enabled`, add its grants and its `pluginConfig` block (`allowedChatIds`, `allowedUserIds`, `repos`; copy the shape from `bulig.config.example.json`). Leave out `tokenCredential` (the default name is `telegram-token`); the example's `tokenEnv` can stay, the credential wins over it.
-4. `systemctl restart bulig` and run `health.sh`. If the journal says `channel-telegram: the bot token is not set`, the file from step 2 is missing or empty (the unit got the `none` default).
-5. Send a message to the bot and watch `journalctl -u bulig -f`.
+7. **Turn the channel on.** In `/etc/bulig/config.json` (root) add `"channel-telegram"` to `enabled`, add its grants and its `pluginConfig` block (`allowedChatIds`, `allowedUserIds`, `repos`; copy the shape from `bulig.config.example.json`). Leave out `tokenCredential` (the default name is `telegram-token`); the example's `tokenEnv` can stay, the credential wins over it.
+8. **Start** the units and the timers, then run `health.sh`. If the journal says `channel-telegram: the bot token is not set`, the file from step 6 is missing or empty (the unit got the `none` default).
+   ```bash
+   ssh ths-prod-01 'systemctl start bulig bulig-worker && systemctl start bulig-backup.timer bulig-restore-drill.timer'
+   ssh ths-prod-01 '/usr/local/lib/bulig/current/health.sh'
+   ```
+9. **Check the record.** `status` must list the Mac's jobs as the Mac showed them before step 2. Then send a message to the bot and watch `journalctl -u bulig -f`.
+   ```bash
+   ssh ths-prod-01 '/usr/local/lib/bulig/current/bulig-cli.sh status'
+   ```
+10. **Keep `bulig_precut`** until the next backup and the next restore drill both pass on the new record (`bulig-backup: ok`, `bulig-restore-drill: ok`). Drop it only with Jasher's yes: `runuser -u postgres -- psql -X -h /var/run/postgresql -p 5436 -d postgres -c 'DROP DATABASE bulig_precut'`.
 
-To undo: remove `channel-telegram` from `enabled`, restart, then start the Mac serve again (`launchctl bootstrap ...`). The Mac's SQLite file is still the copy it was before the move, so going back loses anything done on the VPS since cutover; decide that first.
+To undo: stop the units, remove `channel-telegram` from `enabled`, and start the Mac serve again (`launchctl bootstrap ...`). The Mac's SQLite file is still the copy it was before the move, so going back loses anything done on the VPS since cutover; decide that first. To go back to the old VPS record as well, swap the names back (`bulig` to another name, `bulig_precut` to `bulig`) with the units stopped.
 
 ## Rollback
 

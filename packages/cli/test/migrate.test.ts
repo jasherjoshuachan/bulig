@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -88,7 +88,11 @@ describePg('bulig migrate sqlite-to-postgres', () => {
     expect((await w.run('migrate')).code).toBe(2);
     const noFrom = await w.run('migrate', 'sqlite-to-postgres', '--to-env', 'TARGET_URL');
     expect(noFrom).toMatchObject({ code: 2 });
-    expect(noFrom.err).toContain('needs --from and --to-env');
+    expect(noFrom.err).toContain('needs --from and exactly one of --to-env and --to-credential');
+    const both = await w.run('migrate', 'sqlite-to-postgres', '--from', w.from, '--to-env', 'TARGET_URL', '--to-credential', 'pg-url');
+    expect(both.code).toBe(2);
+    expect(both.err).toContain('exactly one of --to-env and --to-credential');
+    expect((await w.run('migrate', 'sqlite-to-postgres', '--from', w.from)).code).toBe(2);
     const unset = await w.run('migrate', 'sqlite-to-postgres', '--from', w.from, '--to-env', 'NOT_SET_ANYWHERE');
     expect(unset.code).toBe(2);
     expect(unset.err).toContain('NOT_SET_ANYWHERE is not set');
@@ -101,5 +105,53 @@ describePg('bulig migrate sqlite-to-postgres', () => {
     const missing = await w.run('migrate', 'sqlite-to-postgres', '--from', join(w.dir, 'nope.sqlite'), '--to-env', 'TARGET_URL');
     expect(missing.code).toBe(2);
     expect(missing.err).toContain('no SQLite file');
+  });
+
+  // On the server, bulig-cli.sh --as kernel gives the one-off unit the pg-url credential (systemd LoadCredential=). The URL holds the
+  // password, so it is read from that file and never passed through an environment variable or an argument.
+  const credentialDir = (files: Record<string, string>) => {
+    const d = mkdtempSync(join(tmpdir(), 'bulig-migrate-cred-'));
+    dirs.push(d);
+    for (const [n, v] of Object.entries(files)) {
+      writeFileSync(join(d, n), v + '\n');
+      chmodSync(join(d, n), 0o400);
+    }
+    return d;
+  };
+
+  it('--to-credential reads the URL from $CREDENTIALS_DIRECTORY and copies, with no URL in the environment', async () => {
+    const w = await world();
+    w.io.env = { CREDENTIALS_DIRECTORY: credentialDir({ 'pg-url': w.db.url }) };
+    const dry = await w.run('migrate', 'sqlite-to-postgres', '--from', w.from, '--to-credential', 'pg-url', '--dry-run');
+    expect(dry.code).toBe(0);
+    expect(dry.out).toContain('Nothing was kept');
+    expect(await rowsIn(w.db.url)).toBe('0');
+    const r = await w.run('migrate', 'sqlite-to-postgres', '--from', w.from, '--to-credential', 'pg-url');
+    expect(r.code).toBe(0);
+    expect(r.out).toContain('every table matches');
+    expect(r.out).toContain('named by credential pg-url');
+    expect(r.out + r.err).not.toContain(w.db.url);
+    expect(Number(await rowsIn(w.db.url))).toBeGreaterThan(0);
+  });
+
+  it('--to-credential says plainly what is missing or wrong, without printing the connection string', async () => {
+    const w = await world();
+    w.io.env = {};
+    const noDir = await w.run('migrate', 'sqlite-to-postgres', '--from', w.from, '--to-credential', 'pg-url');
+    expect(noDir.code).toBe(2);
+    expect(noDir.err).toMatch(/credential pg-url is not there.*CREDENTIALS_DIRECTORY, which is not set/);
+    w.io.env = { CREDENTIALS_DIRECTORY: credentialDir({ 'other': w.db.url }) };
+    const noFile = await w.run('migrate', 'sqlite-to-postgres', '--from', w.from, '--to-credential', 'pg-url');
+    expect(noFile.code).toBe(2);
+    expect(noFile.err).toContain('no file pg-url in $CREDENTIALS_DIRECTORY');
+    w.io.env = { CREDENTIALS_DIRECTORY: credentialDir({ 'pg-url': 'postgresql:///bulig?password=hunter2' }) };
+    const noHost = await w.run('migrate', 'sqlite-to-postgres', '--from', w.from, '--to-credential', 'pg-url');
+    expect(noHost.code).toBe(2);
+    expect(noHost.err).toContain('the credential pg-url does not hold a usable Postgres connection string');
+    expect(noHost.err + noHost.out).not.toContain('hunter2');
+    w.io.env = { CREDENTIALS_DIRECTORY: credentialDir({ 'pg-url': w.db.url }) };
+    const pathLike = await w.run('migrate', 'sqlite-to-postgres', '--from', w.from, '--to-credential', '../pg-url');
+    expect(pathLike.code).toBe(2);
+    expect(pathLike.err).toContain('credential ../pg-url is not there');
   });
 });

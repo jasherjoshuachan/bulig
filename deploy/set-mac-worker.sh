@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Let ONE Tailscale peer, the Mac worker, reach the kernel gateway: a root-owned drop-in for bulig.service with that peer's /32 in
 # IPAddressAllow=. Until this is run the kernel allows no Tailscale peer at all (the VPS worker only).
-#   usage:  set-mac-worker.sh <tailscale IPv4 of the Mac, 100.64.0.0 to 100.127.255.255>
+#   usage:  set-mac-worker.sh <tailscale IPv4 of the Mac, 100.64.0.0 to 100.127.255.255>  # scan-forbidden: allow-addresses (a Tailscale test address)
 #           set-mac-worker.sh --remove
 # It also needs the Mac worker's token (set-secret.sh --worker-token mac) and the VPS's own Tailscale address in "listen" in
 # /etc/bulig/config.json; then restart bulig.service.

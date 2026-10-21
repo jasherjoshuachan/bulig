@@ -13,8 +13,19 @@ import { boot, fakeHuman, newDb, SCOPE_BLOCK, settle, type Sent } from './harnes
 
 const PASS = 'All good.\nVERDICT: PASS';
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
-// A short lease keeps the test quick, but not so short that a busy machine stalling the process for a moment loses it by accident.
-const LEASE = { leaseTtlMs: 1_500, leaseHeartbeatMs: 300, leaseWaitMs: 10_000 };
+// A short lease keeps the test quick, but not so short that a healthy kernel loses it by accident. A renewal that has not come
+// back by the next beat counts as lost (ADR 0010, decision 4), so the heartbeat is the longest a Postgres renewal may take. At
+// 300 ms the second kernel lost its lease on a loaded CI runner ("the renewal did not come back within 300 ms"), and renewals
+// of over 100 ms show up on a loaded Mac. One second is well clear of that, and the lease is four beats long.
+const LEASE = { leaseTtlMs: 4_000, leaseHeartbeatMs: 1_000, leaseWaitMs: 15_000 };
+/** Poll until `check` holds, for things another kernel does on its own time. */
+async function until(check: () => boolean, what: string, ms = 15_000): Promise<void> {
+  const end = Date.now() + ms;
+  while (!check()) {
+    if (Date.now() > end) throw new Error(`timed out waiting for ${what}`);
+    await sleep(25);
+  }
+}
 
 /** What GitHub knows, shared by every kernel in a scenario, like the real one is. Creating a PR twice for a branch makes no second PR, as gh would say "already exists", but is counted. */
 class FakeGithubServer {
@@ -249,20 +260,20 @@ for (const adapter of ADAPTERS) {
       expect((await first.k.jobs.stages(job.id)).at(-1)).toMatchObject({ name: 'build', status: 'running' });
       const before = (await first.k.bus.replay()).map((e) => ({ id: e.id, seq: e.seq! }));
       stalled = true;
-      await sleep(LEASE.leaseTtlMs + 250); // the lease runs out
 
       const second = await rigFor('kernel-2', await record.openAlongside(), github, stall);
-      await second.k.start(); // takes the lease at once: it has run out
+      await second.k.start(); // waits for the first kernel's lease to run out (nothing renews it now), then takes it
       await settle(second.k);
       expect(second.sent.map((s) => s.stage)).toEqual(['build', 'test', 'docs', 'review']);
 
       // The first kernel's stalled build now reports. It must change nothing.
       const logBefore = (await second.k.bus.replay()).length;
       stall.release!();
-      await sleep(300);
+      // The first kernel finds out it is no longer the writer when that report reaches its own lease check. Wait for that, not a set time.
+      await until(() => first.errors.some((m) => /executor lease was lost/.test(m)), 'the first kernel to refuse its late report');
       await settle(second.k);
       expect((await second.k.bus.replay()).length).toBe(logBefore);
-      // The first kernel found out it was no longer the writer, and said so, once.
+      // and it said so once
       expect(first.errors.filter((m) => /executor lease was lost/.test(m))).toHaveLength(1);
 
       second.human.grant(job.id, 'merge', (await second.k.jobs.stages(job.id)).find((s) => s.name === 'approve-merge' && s.status === 'running')!.id);

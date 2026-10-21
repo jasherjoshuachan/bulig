@@ -30,7 +30,10 @@ if (group === 'pr' && sub === 'create' && state.createExists) {
   // gh 2.45 (Ubuntu 24.04) has no --json on `pr checks`. The plugin must not depend on it.
   console.error('unknown flag: --json');
   process.exit(1);
-} else if (group === 'pr' && sub === 'view' && (args[args.indexOf('--json') + 1] ?? '').split(',').includes('statusCheckRollup')) {
+} else if (group === 'api' && /\/commits\/[^/]+\/status\?/.test(args.find((a) => a.startsWith('repos/')) ?? '')) {
+  // The commit statuses (prow, Vercel and the like). statuses: raw REST entries; default none.
+  for (const s of state.statuses ?? []) console.log(JSON.stringify(s));
+} else if (group === 'api' && /\/commits\/[^/]+\/check-runs\?/.test(args.find((a) => a.startsWith('repos/')) ?? '')) {
   // The checks read. Calls are counted in the state file, so a test can change what gh says as checks "finish".
   const call = state.checkCalls ?? 0;
   if (statePath) save({ ...state, checkCalls: call + 1 });
@@ -44,7 +47,7 @@ if (group === 'pr' && sub === 'create' && state.createExists) {
   if (state.ignoreTerm) process.on('SIGTERM', () => {});
   if (state.checksDelayMs) await new Promise((r) => setTimeout(r, state.checksDelayMs));
   if (call < (state.checksErrorFirst ?? 0)) {
-    console.error('HTTP 502: Bad Gateway (https://api.github.com/graphql)');
+    console.error('HTTP 502: Bad Gateway (https://api.github.com/repos/example/repo/commits/x/check-runs)');
     process.exit(1);
   }
   // checksSequence: one answer per call after the errors; the last answer repeats.
@@ -53,17 +56,16 @@ if (group === 'pr' && sub === 'create' && state.createExists) {
     console.error('something went wrong reading checks');
     process.exit(1);
   }
-  // rollup: a raw statusCheckRollup, as gh prints it. Otherwise `checks` (in the bucket shape the tests read best) is
-  // written out as check runs, the way gh 2.45 prints them.
-  const run = { pass: ['COMPLETED', 'SUCCESS'], fail: ['COMPLETED', 'FAILURE'], cancel: ['COMPLETED', 'CANCELLED'], skipping: ['COMPLETED', 'SKIPPED'] };
-  const rollup =
-    state.rollup ??
+  // runs: raw REST check runs. Otherwise `checks` (in the bucket shape the tests read best) is written out as check
+  // runs, one JSON object per line, the way `gh api --paginate --jq '.check_runs[]'` prints them.
+  const run = { pass: ['completed', 'success'], fail: ['completed', 'failure'], cancel: ['completed', 'cancelled'], skipping: ['completed', 'skipped'] };
+  const runs =
+    state.runs ??
     (state.checks ?? []).map((c) => {
-      const [status, conclusion] = run[c.bucket] ?? ['IN_PROGRESS', ''];
-      return { __typename: 'CheckRun', name: c.name, workflowName: 'ci', status, conclusion, detailsUrl: c.link ?? '', startedAt: '2026-10-21T00:00:00Z' };
+      const [status, conclusion] = run[c.bucket] ?? ['in_progress', null];
+      return { name: c.name, status, conclusion, details_url: c.link ?? null };
     });
-  // checksHeadRefOid: the head this read reports, for a push that lands between the head check and the checks read.
-  console.log(JSON.stringify({ headRefOid: state.checksHeadRefOid ?? head(), statusCheckRollup: rollup }));
+  for (const r of runs) console.log(JSON.stringify(r));
 } else if (group === 'pr' && sub === 'view') {
   const json = args[args.indexOf('--json') + 1] ?? '';
   const all = { number: 7, url: 'https://github.com/example/repo/pull/7', headRefOid: head(), baseRefName: 'main', state: state.prState ?? 'OPEN' };

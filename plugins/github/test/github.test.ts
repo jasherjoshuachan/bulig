@@ -7,7 +7,7 @@ import { afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { createKernel, SqliteStore, type Store } from '@bulig/core';
 import { definePlugin, type BuligEvent } from '@bulig/plugin-sdk';
 import { slowStore } from '../../../packages/core/test/slow-store.ts';
-import github, { checksFromRollup, judgeChecks, type RollupEntry } from '../src/index.ts';
+import github, { checksFromApi, judgeChecks, type CheckRunEntry, type StatusEntry } from '../src/index.ts';
 
 /** The scope the older tests commit under: every file they write is a .txt file. */
 const SCOPE_TXT = ['*.txt'];
@@ -127,68 +127,71 @@ const until = async (cond: () => boolean, ms = 10_000) => {
   }
 };
 
-/** A read of the checks: `gh pr view --json headRefOid,statusCheckRollup` (gh 2.45 has no `gh pr checks --json`). */
-const readsChecks = (c: { args: string[] }) => c.args[1] === 'view' && (c.args[c.args.indexOf('--json') + 1] ?? '').split(',').includes('statusCheckRollup');
+/** A read of the checks: `gh api` on the approved commit's check runs (gh 2.45 has no `gh pr checks --json`). */
+const readsChecks = (c: { args: string[] }) => c.args[0] === 'api' && c.args.some((a) => /\/check-runs\?/.test(a));
 
-describe('checksFromRollup', () => {
-  // Recorded on 22 Oct 2026: the same PR read with gh 2.45.0 (`gh pr view --json headRefOid,statusCheckRollup`, the
-  // Ubuntu 24.04 gh) and with gh 2.102 (`gh pr checks --json name,bucket,state,link`). The mapping must give what newer gh gives.
+describe('checksFromApi', () => {
+  // Recorded on 22 Oct 2026 for the same PR head: gh 2.45.0 (the Ubuntu 24.04 gh) running
+  // `gh api --paginate repos/<o>/<r>/commits/<sha>/check-runs?filter=latest&per_page=100 --jq '.check_runs[]'` and
+  // `.../status?per_page=100 --jq '.statuses[]'` (each line cut down to the fields shown), and gh 2.102 running
+  // `gh pr checks --json name,bucket,state,link`. The plugin's verdict must be newer gh's verdict.
   const recorded = fileURLToPath(new URL('./fixtures/gh-recorded/', import.meta.url));
+  const lines = <T,>(file: string) => readFileSync(join(recorded, file), 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l) as T);
   const sorted = (list: { name?: string; bucket?: string; state?: string; link?: string }[]) =>
     list.map((c) => ({ name: c.name, bucket: c.bucket, state: c.state, link: c.link || undefined })).sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
+  const verdict = (l: Parameters<typeof judgeChecks>[0]) => {
+    const v = judgeChecks(l);
+    return { failing: v.failing.sort(), pending: v.pending.sort() };
+  };
   for (const [pr, shape] of [
-    ['kubernetes_kubernetes_143289', 'status contexts (prow) and check runs, failing and pending'],
-    ['vercel_next-js_100545', '120 check runs (past one page of 100), passing and skipped'],
+    ['kubernetes_kubernetes_143289', '14 commit statuses (prow), failing and pending'],
+    ['vercel_next-js_100545', '120 check runs (two pages), passing and skipped'],
     ['jasherjoshuachan_bulig_64', 'one Actions check run'],
   ] as const) {
     it(`matches gh pr checks --json on recorded output: ${shape}`, () => {
-      const view = JSON.parse(readFileSync(join(recorded, `${pr}.gh245-pr-view.json`), 'utf8')) as { headRefOid: string; statusCheckRollup: RollupEntry[] };
+      const got = checksFromApi(lines<CheckRunEntry>(`${pr}.gh245-check-runs.jsonl`), lines<StatusEntry>(`${pr}.gh245-status.jsonl`));
       const checks = JSON.parse(readFileSync(join(recorded, `${pr}.gh2102-pr-checks.json`), 'utf8')) as { name: string; bucket: string; state: string; link: string }[];
-      expect(view.headRefOid).toMatch(/^[0-9a-f]{40}$/);
-      expect(sorted(checksFromRollup(view.statusCheckRollup))).toEqual(sorted(checks));
-      // gh 2.102 lists them in its own order, so compare the gate's verdict as sets of names.
-      const verdict = (l: Parameters<typeof judgeChecks>[0]) => {
-        const v = judgeChecks(l);
-        return { failing: v.failing.sort(), pending: v.pending.sort() };
-      };
-      expect(verdict(checksFromRollup(view.statusCheckRollup))).toEqual(verdict(checks));
+      expect(got.length).toBeGreaterThan(0);
+      expect(sorted(got)).toEqual(sorted(checks));
+      expect(verdict(got)).toEqual(verdict(checks));
     });
   }
 
-  it('maps every state gh knows to its bucket, in both shapes, and anything else to pending', () => {
-    const run = (status: string, conclusion = '') => ({ __typename: 'CheckRun', name: `${status}-${conclusion}`, status, conclusion });
-    const ctx = (state: string) => ({ __typename: 'StatusContext', context: `ctx-${state}`, state });
-    const buckets = (rollup: RollupEntry[]) => checksFromRollup(rollup).map((c) => `${c.name}=${c.bucket}`);
+  it('maps every state gh knows to its bucket, for check runs and statuses, and anything else to pending', () => {
+    const run = (status: string, conclusion: string | null = null) => ({ name: `${status}-${conclusion ?? ''}`, status, conclusion });
+    const buckets = (runs: CheckRunEntry[], statuses: StatusEntry[] = []) => checksFromApi(runs, statuses).map((c) => `${c.name}=${c.bucket}`);
     expect(
       buckets([
-        run('COMPLETED', 'SUCCESS'), run('COMPLETED', 'SKIPPED'), run('COMPLETED', 'NEUTRAL'), run('COMPLETED', 'FAILURE'),
-        run('COMPLETED', 'TIMED_OUT'), run('COMPLETED', 'ACTION_REQUIRED'), run('COMPLETED', 'CANCELLED'), run('COMPLETED', 'STALE'),
-        run('IN_PROGRESS'), run('QUEUED'), run('WAITING'), run('PENDING'), run('REQUESTED'),
+        run('completed', 'success'), run('completed', 'skipped'), run('completed', 'neutral'), run('completed', 'failure'),
+        run('completed', 'timed_out'), run('completed', 'action_required'), run('completed', 'cancelled'), run('completed', 'stale'),
+        run('in_progress'), run('queued'), run('waiting'), run('pending'), run('requested'),
       ]),
     ).toEqual([
-      'COMPLETED-SUCCESS=pass', 'COMPLETED-SKIPPED=skipping', 'COMPLETED-NEUTRAL=skipping', 'COMPLETED-FAILURE=fail',
-      'COMPLETED-TIMED_OUT=fail', 'COMPLETED-ACTION_REQUIRED=fail', 'COMPLETED-CANCELLED=cancel', 'COMPLETED-STALE=pending',
-      'IN_PROGRESS-=pending', 'QUEUED-=pending', 'WAITING-=pending', 'PENDING-=pending', 'REQUESTED-=pending',
+      'completed-success=pass', 'completed-skipped=skipping', 'completed-neutral=skipping', 'completed-failure=fail',
+      'completed-timed_out=fail', 'completed-action_required=fail', 'completed-cancelled=cancel', 'completed-stale=pending',
+      'in_progress-=pending', 'queued-=pending', 'waiting-=pending', 'pending-=pending', 'requested-=pending',
     ]);
-    expect(buckets([ctx('SUCCESS'), ctx('FAILURE'), ctx('ERROR'), ctx('PENDING'), ctx('EXPECTED'), ctx('MYSTERY')])).toEqual([
-      'ctx-SUCCESS=pass', 'ctx-FAILURE=fail', 'ctx-ERROR=fail', 'ctx-PENDING=pending', 'ctx-EXPECTED=pending', 'ctx-MYSTERY=pending',
+    const ctx = (state: string) => ({ context: `ctx-${state}`, state });
+    expect(buckets([], [ctx('success'), ctx('failure'), ctx('error'), ctx('pending'), ctx('mystery')])).toEqual([
+      'ctx-success=pass', 'ctx-failure=fail', 'ctx-error=fail', 'ctx-pending=pending', 'ctx-mystery=pending',
     ]);
-    expect(checksFromRollup([{ context: 'ci/x', state: 'SUCCESS', targetUrl: 'https://t' }, { name: 'r', status: 'COMPLETED', conclusion: 'SUCCESS', detailsUrl: 'https://d' }])).toEqual([
-      { name: 'ci/x', bucket: 'pass', state: 'SUCCESS', link: 'https://t' },
+    expect(checksFromApi([{ name: 'r', status: 'completed', conclusion: 'success', details_url: 'https://d' }], [{ context: 'ci/x', state: 'success', target_url: 'https://t' }])).toEqual([
       { name: 'r', bucket: 'pass', state: 'SUCCESS', link: 'https://d' },
+      { name: 'ci/x', bucket: 'pass', state: 'SUCCESS', link: 'https://t' },
     ]);
+    expect(checksFromApi([], [])).toEqual([]);
   });
 
-  it('keeps only the newest run of a re-run check, as gh does, but keeps same-named checks from other workflows', () => {
-    const list = checksFromRollup([
-      { name: 'verify', workflowName: 'ci', status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-10-21T10:00:00Z' },
-      { name: 'verify', workflowName: 'ci', status: 'COMPLETED', conclusion: 'SUCCESS', startedAt: '2026-10-21T11:00:00Z' },
-      { name: 'verify', workflowName: 'nightly', status: 'IN_PROGRESS', startedAt: '2026-10-21T09:00:00Z' },
-      { context: 'deploy', state: 'FAILURE', startedAt: '2026-10-21T08:00:00Z' },
-      { context: 'deploy', state: 'SUCCESS', startedAt: '2026-10-21T12:00:00Z' },
-    ]);
-    expect(list.map((c) => `${c.name}=${c.bucket}`)).toEqual(['deploy=pass', 'verify=pass', 'verify=pending']);
-    expect(checksFromRollup([])).toEqual([]);
+  it('never lets a later passing push run hide a failed pull_request run of the same check', () => {
+    // Same name, same workflow, two check suites (two events). gh without the event would keep only the newer one.
+    const list = checksFromApi(
+      [
+        { name: 'verify', status: 'completed', conclusion: 'failure', details_url: 'https://example.test/pull_request/1' },
+        { name: 'verify', status: 'completed', conclusion: 'success', details_url: 'https://example.test/push/2' },
+      ],
+      [],
+    );
+    expect(judgeChecks(list)).toEqual({ failing: ['verify'], pending: [] });
   });
 });
 
@@ -682,15 +685,30 @@ describe('merge.requested', () => {
     expect(h.calls().some((c) => c.args[1] === 'checks')).toBe(false);
   });
 
-  it('judges recorded gh 2.45 output with status contexts: fails on the failing context and names it', async () => {
+  it('reads the checks of the approved commit itself, paginated, and the statuses too', async () => {
     const h = await setup();
     const pr = await openPr(h);
-    const rollup = [
-      { __typename: 'StatusContext', context: 'pull-kubernetes-linter-hints', startedAt: '2026-10-21T21:45:02Z', state: 'FAILURE', targetUrl: 'https://prow.k8s.io/view/1' },
-      { __typename: 'StatusContext', context: 'pull-kubernetes-e2e-gce', startedAt: '2026-10-21T21:34:35Z', state: 'PENDING', targetUrl: 'https://prow.k8s.io/view/2' },
-      { __typename: 'CheckRun', name: 'verify', workflowName: 'ci', status: 'COMPLETED', conclusion: 'SUCCESS', detailsUrl: 'https://example.test/runs/1', startedAt: '2026-10-21T21:15:09Z' },
-    ];
-    h.setState({ log: join(h.root, 'gh.log'), rollup });
+    h.setState({ log: join(h.root, 'gh.log'), checks: [{ name: 'ci', bucket: 'pass' }] });
+    h.fire('merge.requested', { cwd: pr.cwd, number: pr.number, headSha: pr.headSha });
+    await h.waitFor('pr.merged');
+    const api = h.calls().filter((c) => c.args[0] === 'api');
+    expect(api.map((c) => c.args)).toEqual([
+      ['api', '--paginate', `repos/{owner}/{repo}/commits/${pr.headSha}/check-runs?filter=latest&per_page=100`, '--jq', '.check_runs[]'],
+      ['api', '--paginate', `repos/{owner}/{repo}/commits/${pr.headSha}/status?per_page=100`, '--jq', '.statuses[]'],
+    ]);
+  });
+
+  it('judges commit statuses: fails on the failing one and names it', async () => {
+    const h = await setup();
+    const pr = await openPr(h);
+    h.setState({
+      log: join(h.root, 'gh.log'),
+      checks: [{ name: 'verify', bucket: 'pass' }],
+      statuses: [
+        { context: 'pull-kubernetes-linter-hints', state: 'failure', target_url: 'https://prow.k8s.io/view/1' },
+        { context: 'pull-kubernetes-e2e-gce', state: 'pending', target_url: 'https://prow.k8s.io/view/2' },
+      ],
+    });
     h.fire('merge.requested', { cwd: pr.cwd, number: pr.number, headSha: pr.headSha });
     const failed = await h.waitFor('merge.failed');
     expect(failed.payload).toEqual({
@@ -700,15 +718,30 @@ describe('merge.requested', () => {
     expect(h.calls().some((c) => c.args[1] === 'merge')).toBe(false);
   });
 
-  it('gives up when the checks read reports a head other than the approved one', async () => {
+  it('does not merge when a pull_request run failed and a later push run of the same check passed', async () => {
     const h = await setup();
     const pr = await openPr(h);
-    // The head check still sees the approved commit; the checks come back for a newer push.
-    h.setState({ log: join(h.root, 'gh.log'), checks: [{ name: 'ci', bucket: 'pass' }], checksHeadRefOid: 'e'.repeat(40) });
+    h.setState({
+      log: join(h.root, 'gh.log'),
+      runs: [
+        { name: 'verify', status: 'completed', conclusion: 'failure', details_url: 'https://example.test/pr-run', started_at: '2026-10-21T10:00:00Z', check_suite: { id: 1 } },
+        { name: 'verify', status: 'completed', conclusion: 'success', details_url: 'https://example.test/push-run', started_at: '2026-10-21T11:00:00Z', check_suite: { id: 2 } },
+      ],
+    });
     h.fire('merge.requested', { cwd: pr.cwd, number: pr.number, headSha: pr.headSha });
     const failed = await h.waitFor('merge.failed');
-    expect((failed.payload as { reason: string }).reason).toBe(`PR head moved: approved ${pr.headSha.slice(0, 7)} but it is now eeeeeee`);
+    expect((failed.payload as { reason: string }).reason).toBe('checks failing: verify. Fix the failing check, then run the job again.');
     expect(h.calls().some((c) => c.args[1] === 'merge')).toBe(false);
+  });
+
+  it('refuses an approved head that is not a full commit SHA before it reaches a URL', async () => {
+    const h = await setup();
+    const pr = await openPr(h);
+    h.setState({ log: join(h.root, 'gh.log'), checks: [{ name: 'ci', bucket: 'pass' }], headRefOid: '../../x' });
+    h.fire('merge.requested', { cwd: pr.cwd, number: pr.number, headSha: '../../x' });
+    const failed = await h.waitFor('merge.failed');
+    expect((failed.payload as { reason: string }).reason).toMatch(/not a full commit SHA/);
+    expect(h.calls().some((c) => c.args[0] === 'api' || c.args[1] === 'merge')).toBe(false);
   });
 
   it('fails for good on a failing check, names it, and never calls merge', async () => {

@@ -188,54 +188,40 @@ export function judgeChecks(checks: Check[]): { failing: string[]; pending: stri
   return { failing, pending };
 }
 
-/**
- * One entry of `gh pr view --json statusCheckRollup`: a check run (name, status, conclusion, detailsUrl) or a commit
- * status context (context, state, targetUrl). gh has printed this since long before 2.45, the gh Ubuntu 24.04 ships.
- */
-export type RollupEntry = {
-  __typename?: string;
-  name?: string;
-  workflowName?: string;
-  status?: string;
-  conclusion?: string;
-  detailsUrl?: string;
-  context?: string;
-  state?: string;
-  targetUrl?: string;
-  startedAt?: string;
-};
+/** A check run from `GET /repos/{o}/{r}/commits/{sha}/check-runs?filter=latest`, as the plugin asks gh to print it. */
+export type CheckRunEntry = { name?: string; status?: string; conclusion?: string | null; details_url?: string | null };
+/** A commit status from `GET /repos/{o}/{r}/commits/{sha}/status` (the combined status). */
+export type StatusEntry = { context?: string; state?: string; target_url?: string | null };
+
+/** A check state (GraphQL spelling, upper case) in gh's buckets, as pkg/cmd/pr/checks/aggregate.go sorts them. Unknown is pending. */
+export function bucketOf(state: string): string {
+  if (state === 'SUCCESS') return 'pass';
+  if (state === 'SKIPPED' || state === 'NEUTRAL') return 'skipping';
+  if (state === 'ERROR' || state === 'FAILURE' || state === 'TIMED_OUT' || state === 'ACTION_REQUIRED') return 'fail';
+  if (state === 'CANCELLED') return 'cancel';
+  return 'pending'; // EXPECTED, REQUESTED, WAITING, QUEUED, PENDING, IN_PROGRESS, STALE, anything new
+}
 
 /**
- * Turn the rollup into the checks `gh pr checks --json name,bucket,state,link` would print. `gh pr checks --json`
- * only arrived after gh 2.45, so this is the same mapping gh does (pkg/cmd/pr/checks/aggregate.go): newest first,
- * one entry per status context and per check name and workflow (an older run of the same check is dropped), and the
- * state sorted into the buckets pass, skipping, fail, cancel and pending. A state nobody listed is pending.
+ * Turn the commit's check runs and statuses into the checks `gh pr checks --json name,bucket,state,link` would print.
+ * `gh pr checks --json` only arrived after gh 2.45 (what Ubuntu 24.04 ships), so the plugin reads the REST API instead.
+ *
+ * Nothing is dropped or merged here, so a pass can never hide a failure. GitHub does the only deduping: filter=latest
+ * returns the latest run of a check per check suite, and the combined status the latest status per context. Runs in
+ * different suites all count: a pull_request run that failed is never hidden by a later push run of the same name
+ * that passed (gh's own dedupe would hide it when it cannot see the event). A failed run keeps blocking until it is
+ * re-run and passes. Erring this way can block a merge gh would allow, never the other way round.
  */
-export function checksFromRollup(rollup: RollupEntry[]): Check[] {
-  const time = (e: RollupEntry) => {
-    const t = Date.parse(e.startedAt ?? '');
-    return Number.isNaN(t) ? -Infinity : t;
-  };
-  const newest = rollup.map((e, i) => ({ e, i })).sort((a, b) => time(b.e) - time(a.e) || a.i - b.i);
-  const seen = new Set<string>();
+export function checksFromApi(runs: CheckRunEntry[], statuses: StatusEntry[]): Check[] {
   const out: Check[] = [];
-  for (const { e } of newest) {
-    const key = e.context ? `context:${e.context}` : `run:${e.name ?? ''}/${e.workflowName ?? ''}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    const state = e.state || (e.status === 'COMPLETED' ? (e.conclusion ?? '') : (e.status ?? ''));
-    const bucket =
-      state === 'SUCCESS'
-        ? 'pass'
-        : state === 'SKIPPED' || state === 'NEUTRAL'
-          ? 'skipping'
-          : state === 'ERROR' || state === 'FAILURE' || state === 'TIMED_OUT' || state === 'ACTION_REQUIRED'
-            ? 'fail'
-            : state === 'CANCELLED'
-              ? 'cancel'
-              : 'pending';
-    const link = e.detailsUrl || e.targetUrl;
-    out.push({ name: e.name || e.context || undefined, bucket, state, ...(link && { link }) });
+  for (const r of runs) {
+    const status = (r.status ?? '').toUpperCase();
+    const state = status === 'COMPLETED' ? (r.conclusion ?? '').toUpperCase() : status;
+    out.push({ name: r.name || undefined, bucket: bucketOf(state), state, ...(r.details_url && { link: r.details_url }) });
+  }
+  for (const c of statuses) {
+    const state = (c.state ?? '').toUpperCase();
+    out.push({ name: c.context || undefined, bucket: bucketOf(state), state, ...(c.target_url && { link: c.target_url }) });
   }
   return out;
 }
@@ -650,26 +636,33 @@ export default definePlugin({
           return true;
         };
 
-        // The checks, read from the PR's status rollup, not `gh pr checks --json` (gh 2.45 has no --json there).
-        // The head commit comes back in the same answer, so the checks are known to be those of that commit. A failed
-        // call or output that is not the expected JSON is a bad read, tried again only when it looks temporary.
-        const readChecks = async (): Promise<{ list: Check[] } | { moved: string } | { error: string }> => {
-          let view: { headRefOid: string; statusCheckRollup: RollupEntry[] } | undefined;
+        // The checks of the approved commit itself (headSha is in the URL, so they cannot be another commit's), read
+        // through `gh api`, which gh 2.45 has (it has no `gh pr checks --json`). One JSON object per line, every page.
+        // A failed call or a line that is not JSON is a bad read, tried again only when it looks temporary.
+        const readList = async <T,>(path: string, field: string): Promise<{ list: T[] } | { error: string }> => {
+          let list: T[] | undefined;
           const r = await again(async () => {
-            view = undefined;
-            const out = await runGh(cwd, ['pr', 'view', n, '--json', 'headRefOid,statusCheckRollup'], wait.signal);
+            list = undefined;
+            const out = await runGh(cwd, ['api', '--paginate', path, '--jq', `.${field}[]`], wait.signal);
             if (out.code !== 0) return out;
             try {
-              const v = JSON.parse(out.stdout) as { headRefOid?: unknown; statusCheckRollup?: unknown };
-              const rollup = v.statusCheckRollup ?? [];
-              if (typeof v.headRefOid === 'string' && Array.isArray(rollup)) view = { headRefOid: v.headRefOid, statusCheckRollup: rollup as RollupEntry[] };
+              list = out.stdout.split('\n').filter((l) => l.trim()).map((l) => JSON.parse(l) as T);
+              if (!list.every((x) => x !== null && typeof x === 'object' && !Array.isArray(x))) list = undefined;
             } catch {
-              // not JSON: reported below
+              list = undefined;
             }
             return out;
           }, wait.signal);
-          if (view) return view.headRefOid === headSha ? { list: checksFromRollup(view.statusCheckRollup) } : { moved: view.headRefOid };
-          return { error: clipText((r.stderr || r.stdout).trim() || 'gh pr view printed no status rollup', 300) };
+          if (list) return { list };
+          return { error: clipText((r.stderr || r.stdout).trim() || `gh api ${path} printed no ${field}`, 300) };
+        };
+        const readChecks = async (): Promise<{ list: Check[] } | { error: string }> => {
+          if (!/^[0-9a-f]{40}$/.test(headSha)) return { error: `the approved head ${JSON.stringify(headSha)} is not a full commit SHA` };
+          const runs = await readList<CheckRunEntry>(`repos/{owner}/{repo}/commits/${headSha}/check-runs?filter=latest&per_page=100`, 'check_runs');
+          if ('error' in runs) return runs;
+          const statuses = await readList<StatusEntry>(`repos/{owner}/{repo}/commits/${headSha}/status?per_page=100`, 'statuses');
+          if ('error' in statuses) return statuses;
+          return { list: checksFromApi(runs.list, statuses.list) };
         };
 
         const waitMs = cfg.checksWaitMs ?? 900_000;
@@ -680,8 +673,6 @@ export default definePlugin({
           if (!(await gate())) return;
           const got = await readChecks();
           if ('error' in got) return (await over()) ? undefined : giveUp(`could not read checks: ${got.error}`);
-          // Pushed to between the head check and the checks read: these checks are not the approved commit's.
-          if ('moved' in got) return giveUp(`PR head moved: approved ${short(headSha)} but it is now ${short(got.moved)}`);
           const list = got.list;
           if (list.length === 0) {
             if (!cfg.allowNoChecks) return giveUp('the PR has no checks and allowNoChecks is off. Turn it on or add a check, then run the job again.');

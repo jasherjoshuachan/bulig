@@ -597,15 +597,26 @@ printf 'allow worker us-self unix-self -\n' >"$work/us.txt"
 res="$(python3 -I "$deploy/test/fenced-standin.py" "$deploy/fence-probe.py" fenced worker "$work/us.txt" --control "" --af "$NOUNIX" --activation-text "" || true)"
 if grep -q "^FAIL worker us-self should work but did not" <<<"$res" && grep -q "EAFNOSUPPORT" <<<"$res" && grep -q "Claude Code's sandbox listens on a unix socket of its own" <<<"$res"; then ok "in a set with no AF_UNIX the unix-self probe FAILs and says why (the error seen on the server)"; else bad "unix-self without AF_UNIX: $res"; fi
 if [ -z "$(find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'bulig-fence-*' -newer "$work/probes.txt" 2>/dev/null | head -1)" ]; then ok "and it leaves no temporary folder behind"; else bad "a bulig-fence-* folder was left in ${TMPDIR:-/tmp}"; fi
-# the worker sets have AF_UNIX: the published unix deny probes still run there, because InaccessiblePaths hides their paths; an abstract one does not
+# The worker sets have AF_UNIX: a unix deny probe runs there only when InaccessiblePaths hides its path, and an abstract one never does.
+# (Never against the machine's real sockets: here nothing fences the probe, so a run against /run/docker.sock and the like would really
+# connect to them, as it did on a CI runner. The paths below are in a fresh folder; nothing listens there.)
 WAF="AF_UNIX AF_INET AF_INET6 AF_NETLINK"
-grep -E '^deny .*(unix|abstract) ' "$P" | grep -E '(^| )deny +[a-z,-]*worker' >"$work/w-unix.txt"
-printf 'deny worker an-abstract abstract example-name\n' >>"$work/w-unix.txt"
-res="$(probe fenced worker "$work/w-unix.txt" --control "" --af "$WAF" --inaccessible "$INACC_W" --activation-text "" || true)"
-known_n="$(grep -c 'known limit, not tested by connecting' <<<"$res")"
-if [ "$known_n" = "1" ] && grep -q "^info worker an-abstract known limit, not tested by connecting" <<<"$res" && [ "$(grep -cE '^(ok|warn) worker (tailscaled-socket|snapd-socket|docker-socket|postgres-socket) ' <<<"$res")" = "4" ]; then ok "with the worker's families and hidden paths, the tailscaled, snapd, docker and Postgres deny probes still run (their paths are hidden), and an abstract one is a known limit"; else bad "worker unix probes: $res"; fi
-res="$(probe fenced worker "$work/w-unix.txt" --control "" --af "$WAF" --inaccessible "$INACC" --activation-text "" || true)"
-if grep -q "^info worker postgres-socket known limit, not tested by connecting" <<<"$res"; then ok "and without the worker's extra hidden paths the Postgres probe would be a known limit, not a test (so the hidden folder is what makes it count)"; else bad "postgres without the hidden folder: $(grep postgres <<<"$res")"; fi
+wd="$(mktemp -d /tmp/bfw-XXXXXX)"
+printf 'deny worker hidden-one unix %s/hidden/a.sock\ndeny worker open-one unix %s/open/b.sock\ndeny worker an-abstract abstract example-name\n' "$wd" "$wd" >"$work/w-unix.txt"
+res="$(probe fenced worker "$work/w-unix.txt" --control "" --af "$WAF" --inaccessible "-$wd/hidden" --activation-text "" || true)"
+if grep -q "^warn worker hidden-one inconclusive" <<<"$res" && grep -q "^info worker open-one known limit, not tested by connecting" <<<"$res" && grep -q "^info worker an-abstract known limit, not tested by connecting" <<<"$res"; then ok "with AF_UNIX, a deny probe whose path is hidden is run (it cannot reach anything), one whose path is not hidden and an abstract one are known limits, never connected to"; else bad "worker unix probes: $res"; fi
+rm -rf "$wd"
+# and every published unix deny probe for the worker sets is under one of the worker's hidden paths, so on the server each one is a real test
+# (checked as text: the paths are never opened here)
+unhidden=""
+while read -r _ sets name _ target; do
+  case ",$sets," in *,worker,* | *,cli-worker,*) ;; *) continue ;; esac
+  t="${target/#\/var\/run\//\/run\/}"
+  hit=0
+  for h in $INACC_W; do h="${h#-}"; h="${h/#\/var\/run\//\/run\/}"; case "$t" in "$h" | "$h"/*) hit=1 ;; esac; done
+  [ "$hit" -eq 1 ] || unhidden="$unhidden $name"
+done < <(grep -E '^deny +[^ ]+ +[^ ]+ +unix ' "$P")
+if [ -z "$unhidden" ] && [ "$(grep -cE '^deny +[^ ]*worker[^ ]* +[^ ]+ +unix ' "$P")" -ge 7 ]; then ok "every published unix deny probe for the worker sets (tailscaled, snapd x2, docker, Postgres, userdb, resolved) is under the worker's hidden paths"; else bad "published worker unix probes not hidden:$unhidden"; fi
 
 echo "path sockets the worker sets could connect to (judged from the file, never connected to)"
 sk="$(mktemp -d /tmp/bf-XXXXXX)"

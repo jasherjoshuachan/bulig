@@ -149,6 +149,7 @@ cat "$STUB_DATA/docker.txt"
 STUB
 cat >"$stubs/ss" <<'STUB'
 #!/usr/bin/env bash
+if [ -n "${STUB_SS_FAIL:-}" ]; then echo "ss: cannot open netlink socket" >&2; exit 1; fi
 cat "$STUB_DATA/ss.txt"
 STUB
 cat >"$stubs/pg_lsclusters" <<'STUB'
@@ -294,16 +295,49 @@ if [ -f "$checks/precheck.snapshot" ] && [ "$(mode "$checks")" = "700" ]; then o
 # The same fixture that makes the no-argument run succeed must make the run with an argument fail, and for the stated reason.
 expect_fail_msg "precheck.sh with an argument is refused" "takes no arguments" bash "$deploy/precheck.sh" "$w/root/tmp-elsewhere"
 expect_ok "postcheck.sh passes when nothing changed" bash "$deploy/postcheck.sh"
-expect_fail_msg "postcheck.sh with an argument is refused" "takes no arguments" bash "$deploy/postcheck.sh" "$w/root/tmp-elsewhere"
+cp -p "$checks/precheck.snapshot" "$work/precheck.keep"
+expect_fail "precheck.sh fails when a command in the snapshot fails (ss here)" env STUB_SS_FAIL=1 bash "$deploy/precheck.sh"
+if cmp -s "$checks/precheck.snapshot" "$work/precheck.keep" && [ "$(find "$checks" -type f | wc -l | tr -d ' ')" = "1" ]; then ok "and it leaves the old precheck as it was, and no temp file"; else bad "after a failed precheck: $(ls "$checks")"; fi
+expect_fail_msg "postcheck.sh with an argument other than --against is refused" "usage: postcheck.sh [--against <snapshot file>]" bash "$deploy/postcheck.sh" "$w/root/tmp-elsewhere"
+expect_fail_msg "and --against with no file" "usage: postcheck.sh [--against <snapshot file>]" bash "$deploy/postcheck.sh" --against
+expect_fail_msg "and --against a file that is not there" "no snapshot file at $w/root/tmp-elsewhere" bash "$deploy/postcheck.sh" --against "$w/root/tmp-elsewhere"
 if [ ! -e "$w/root/tmp-elsewhere" ]; then ok "neither script touched the path it was given"; else bad "a script created the path it was given"; fi
 echo 'LISTEN 0 1 0.0.0.0:8080 0.0.0.0:* users:(("python3",pid=7,fd=3))' >>"$w/data/ss.txt"
 expect_fail_msg "postcheck.sh fails after a change, and shows it" "8080" bash "$deploy/postcheck.sh"
 if [ "$(find "$checks" -type f | wc -l | tr -d ' ')" = "1" ]; then ok "postcheck left no temp files"; else bad "postcheck left extra files in $checks"; fi
+if grep -q "comparing against $checks/precheck.snapshot" "$work/out"; then ok "with no release snapshot it compares against the precheck, and says so"; else bad "baseline line: $(head -3 "$work/out")"; fi
+
+# The baseline: each release takes its own "before" snapshot (release-<sha>.before.snapshot); postcheck uses the newest, and --against any.
+echo "postcheck baselines"
+save_snap() { # save_snap <file>: snapshot_save of the world $w, as release-remote.sh does it
+  ( . "$deploy/lib/common.sh"; . "$deploy/lib/snapshot.sh"; snapshot_save "$1" )
+}
+save_snap "$checks/release-bbbbbbbbbbbb.before.snapshot"
+if [ "$(mode "$checks/release-bbbbbbbbbbbb.before.snapshot")" = "600" ] && [ "$(find "$checks" -type f | wc -l | tr -d ' ')" = "2" ]; then ok "snapshot_save writes one file, mode 600, and no temp file"; else bad "snapshot_save: $(ls -l "$checks")"; fi
+expect_ok "postcheck.sh passes against the newest release snapshot, taken after the 8080 listener came" bash "$deploy/postcheck.sh"
+if grep -q "comparing against $checks/release-bbbbbbbbbbbb.before.snapshot" "$work/out" && grep -q "matches release-bbbbbbbbbbbb.before.snapshot" "$work/out"; then ok "and it names the snapshot it used"; else bad "baseline line: $(head -3 "$work/out")"; fi
+expect_fail_msg "postcheck.sh --against precheck.snapshot still fails on the 8080 listener" "8080" bash "$deploy/postcheck.sh" --against "$checks/precheck.snapshot"
+expect_ok "postcheck.sh --against the release snapshot passes" bash "$deploy/postcheck.sh" --against "$checks/release-bbbbbbbbbbbb.before.snapshot"
+cp -p "$checks/precheck.snapshot" "$checks/release-aaaaaaaaaaaa.before.snapshot"
+touch -t 202001010000 "$checks/release-aaaaaaaaaaaa.before.snapshot"
+expect_ok "an older release snapshot is not the one used" bash "$deploy/postcheck.sh"
+touch -t 202001010000 "$checks/release-bbbbbbbbbbbb.before.snapshot"
+touch "$checks/release-aaaaaaaaaaaa.before.snapshot"
+expect_fail_msg "the newest one is, by the time it was written" "8080" bash "$deploy/postcheck.sh"
+cp -p "$checks/release-bbbbbbbbbbbb.before.snapshot" "$checks/release-notasha.before.snapshot"
+touch "$checks/release-notasha.before.snapshot"
+expect_fail_msg "a file that only looks like one (no 12-digit sha) is never the baseline" "comparing against $checks/release-aaaaaaaaaaaa.before.snapshot" bash "$deploy/postcheck.sh"
+# keep the newest five, remove the older ones, nothing else
+for n in 1 2 3 4 5 6; do cp -p "$checks/precheck.snapshot" "$checks/release-00000000000$n.before.snapshot"; touch -t "20200101000$n" "$checks/release-00000000000$n.before.snapshot"; done
+( . "$deploy/lib/common.sh"; . "$deploy/lib/snapshot.sh"; snapshot_prune_releases )
+kept="$(cd "$checks" && ls -1 | sort | tr '\n' ' ')"
+# (newest first: aaaa, then 6, 5, 4, 3; 2, 1 and bbbb are older)
+if [ "$kept" = "precheck.snapshot release-000000000003.before.snapshot release-000000000004.before.snapshot release-000000000005.before.snapshot release-000000000006.before.snapshot release-aaaaaaaaaaaa.before.snapshot release-notasha.before.snapshot " ]; then ok "pruning keeps the newest five release snapshots, and the precheck and other files"; else bad "after pruning: $kept"; fi
 
 # Churn Bulig cannot cause: a service a timer starts changes run state on its own schedule, and an agent starts a container per session.
 # postcheck reports those and does not compare them; everything else about them still is. One case per fresh world.
-post_case() { # post_case <label> <pass|fail> <text the output must contain> <command run inside the world folder after the precheck>
-  local label="$1" want="$2" text="$3" cmd="$4" pw="$work/pw" rc=0
+post_case() { # post_case <label> <pass|fail> <text the output must contain> <command run inside the world folder after the precheck> [before it]
+  local label="$1" want="$2" text="$3" cmd="$4" pre="${5:-}" pw="$work/pw" rc=0
   new_world "$pw"
   # clientjob: a oneshot its timer (in the timers list) starts. reportjob: systemd says a timer triggers it, but no timer is listed.
   # digestjob: a oneshot with a .timer of the same name among the unit files. plainjob: a oneshot with no timer at all.
@@ -315,6 +349,7 @@ post_case() { # post_case <label> <pass|fail> <text the output must contain> <co
   printf 'Type=oneshot\nTriggeredBy=plainjob.socket\n' >"$pw/data/show/plainjob.service"
   (
     export STUB_DATA="$pw/data" BULIG_DEPLOY_TEST_ROOT="$pw/root"
+    if [ -n "$pre" ]; then (cd "$pw" && eval "$pre"); fi
     bash "$deploy/precheck.sh" >/dev/null 2>&1 || exit 9
     cd "$pw" && eval "$cmd"
     bash "$deploy/postcheck.sh"
@@ -347,6 +382,26 @@ post_case "a removed container still fails" fail "-clientweb ghcr.io/client/web:
 post_case "a stopped container still fails" fail "+clientweb ghcr.io/client/web:1.4 exited" "sed -i.bak 's/^clientweb ghcr.io\/client\/web:1.4 running/clientweb ghcr.io\/client\/web:1.4 exited/' data/docker.txt"
 post_case "a known container under a new image still fails" fail "+clientweb agent-session:latest running" "sed -i.bak 's/^clientweb ghcr.io\/client\/web:1.4 running/clientweb agent-session:latest running/' data/docker.txt"
 post_case "info lines do not hide a real change elsewhere" fail "8080" "$(st clientjob.service 'failed failed'); echo 'ncl-a1-sess-2-q9z agent-session:latest running' >>data/docker.txt; echo 'LISTEN 0 1 0.0.0.0:8080 0.0.0.0:* users:((\"python3\",pid=7,fd=3))' >>data/ss.txt"
+# Transient systemd-run units and template instances that come and go (other tenants' normal work, 114 lines a day on the server).
+unit() { echo "echo '$1 loaded $2 x' >>data/units.txt"; } # unit <name> <active and sub state>
+post_case "a new transient run-u unit is info" pass "info  run-u123.service: not loaded -> active running (a transient systemd-run unit; not compared)" "$(unit run-u123.service 'active running')"
+post_case "a new transient run-p unit that failed is a warn that names it" pass "warn  run-p4242-i4243.service is failed now (not loaded before)" "$(unit run-p4242-i4243.service 'failed failed')"
+post_case "a transient unit that went away is info" pass "info  run-u7.service: active running -> not loaded" "sed -i.bak '/^run-u7.service/d' data/units.txt" "$(unit run-u7.service 'active running')"
+post_case "a transient unit that changed state is info" pass "info  run-u7.service: active running -> inactive dead" "sed -i.bak 's/^run-u7.service loaded active running/run-u7.service loaded inactive dead/' data/units.txt" "$(unit run-u7.service 'active running')"
+post_case "a transient unit's line in the unit files list is info" pass "info  run-u9.service: its unit file line changed" "echo 'run-u9.service transient' >>data/unitfiles.txt"
+post_case "a name that only starts with run- is not transient and still fails" fail "+run-backup.service active running" "$(unit run-backup.service 'active running')"
+post_case "a new template instance is info" pass "info  worker@job-17.service: not loaded -> active running (a template instance that came or went; not compared)" "$(unit worker@job-17.service 'active running')"
+post_case "a new template instance that failed is a warn that names it" pass "warn  worker@job-18.service is failed now (not loaded before)" "$(unit worker@job-18.service 'failed failed')"
+post_case "a template instance that went away is info" pass "info  worker@a.service: active running -> not loaded" "sed -i.bak '/^worker@a.service/d' data/units.txt" "$(unit worker@a.service 'active running')"
+post_case "a template instance that was there before and changed state still fails" fail "+getty@tty1.service inactive dead" "sed -i.bak 's/^getty@tty1.service loaded active running/getty@tty1.service loaded inactive dead/' data/units.txt" "$(unit getty@tty1.service 'active running')"
+post_case "a new template unit file still fails" fail "+worker@.service enabled" "echo 'worker@.service enabled' >>data/unitfiles.txt"
+post_case "an enabled instance in the unit files list still fails" fail "+worker@job-1.service enabled" "echo 'worker@job-1.service enabled' >>data/unitfiles.txt"
+post_case "transient and instance lines do not hide a real change elsewhere" fail "8080" "$(unit run-u5.service 'active running'); $(unit worker@j.service 'failed failed'); echo 'LISTEN 0 1 0.0.0.0:8080 0.0.0.0:* users:((\"python3\",pid=7,fd=3))' >>data/ss.txt"
+# Bulig's own units are filtered out of every snapshot; even in a hand-made one, a Bulig instance or a Bulig transient-looking name is never churn.
+printf '## every service unit and its state (x)\nnginx.service active running\n## service unit files (state)\nnginx.service enabled\n' >"$work/own-b"
+printf '## every service unit and its state (x)\nbulig-cli@w1.service active running\nnginx.service active running\nrun-u3.service active running\n## service unit files (state)\nnginx.service enabled\n' >"$work/own-a"
+own_out="$(export STUB_DATA="$w/data"; . "$deploy/lib/common.sh"; . "$deploy/lib/snapshot.sh"; snapshot_compare "$work/own-b" "$work/own-a" "$work/own-b2" "$work/own-a2"; diff "$work/own-b2" "$work/own-a2")"
+if grep -q '^> bulig-cli@w1.service active running' <<<"$own_out" && ! grep -q '^> run-u3' <<<"$own_out" && grep -q '^info  run-u3.service' <<<"$own_out" && ! grep -q 'info  bulig' <<<"$own_out"; then ok "a Bulig template instance is never counted as churn (it stays in the diff), a transient one next to it is"; else bad "Bulig's own as churn: $own_out"; fi
 
 
 finish

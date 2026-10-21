@@ -71,16 +71,57 @@ snapshot() {
   stat -c '%a %U %G %n' / /etc /tmp /opt /var/lib /var/backups /run 2>/dev/null || true
 }
 
+# ---- the baselines --------------------------------------------------------------------------------------------------------------
+# precheck.snapshot: taken once, before Bulig was installed (precheck.sh). It stays: it is the baseline for removing Bulig (RUNBOOK).
+# release-<sha>.before.snapshot: taken by every release just before it changes anything on the host (release-remote.sh), so the
+# comparison after it covers that release only, not every other tenant's work since the precheck. The newest few are kept.
+SNAPSHOT_RELEASE_KEEP=5
+SNAPSHOT_RELEASE_RE='^release-[0-9a-f]{12}\.before\.snapshot$'
+
+# snapshot_save <file>: a snapshot into <file> (inside /var/lib/bulig-checks), root-only (0600), whole or not at all.
+# Call it where set -e holds (not inside an if or after ||), so any command in snapshot() that fails stops it. The temp file is
+# SNAPSHOT_TMP, for the caller's EXIT trap to remove when that happens.
+snapshot_save() {
+  local out="$1"
+  SNAPSHOT_TMP="$(mktemp "$BULIG_CHECKS_DIR/snapshot.XXXXXX")"
+  snapshot >"$SNAPSHOT_TMP"
+  chmod 600 "$SNAPSHOT_TMP"
+  mv "$SNAPSHOT_TMP" "$out"
+}
+
+# snapshot_release_files: the release-before snapshots in /var/lib/bulig-checks, newest first (by time written), one name per line.
+snapshot_release_files() {
+  { ls -1t "$BULIG_CHECKS_DIR" 2>/dev/null || true; } | { grep -E "$SNAPSHOT_RELEASE_RE" || true; }
+}
+
+# snapshot_prune_releases: keep the newest $SNAPSHOT_RELEASE_KEEP release-before snapshots, remove the older ones. Nothing else.
+snapshot_prune_releases() {
+  local n=0 f
+  while IFS= read -r f; do
+    n=$((n + 1))
+    [ "$n" -gt "$SNAPSHOT_RELEASE_KEEP" ] || continue
+    rm -f "${BULIG_CHECKS_DIR:?}/$f"
+  done < <(snapshot_release_files)
+}
+
 # ---- comparing two snapshots (postcheck.sh). It reads the format above as it is, so a precheck taken by an older kit still compares. ----
-# Two kinds of churn that Bulig cannot cause and that happen on every run are reported, not compared:
+# Churn that Bulig cannot cause and that happens all the time is reported, not compared:
 #   - the run state of a service a timer starts (a oneshot is "activating" mid-run, "inactive dead" after, "failed" if its own run failed).
 #     Its unit file, its enabled state and the timer itself are still compared, in their own sections.
-#   - a new container from an image that was already running at the precheck (a per-session agent container), and a container that is
-#     gone or stopped while its image still runs in another container. A new image, a container whose image no longer runs anywhere,
-#     or a known container on a new image still fails.
+#   - transient units that systemd-run makes (run-u*.service, run-p*.service): they come, run and go. Any change to their lines is info.
+#   - a template instance (name@instance.service) that is in one snapshot and not the other: an instance that appeared or went away.
+#     One that is in both and changed state is still compared, and so is the template's unit file. (Another Postgres cluster's
+#     postgresql@... instance is covered by the clusters section too, which is compared.)
+#   - a new container from an image that was already running before (a per-session agent container), and a container that is gone or
+#     stopped while its image still runs in another container. A new image, a container whose image no longer runs anywhere, or a known
+#     container on a new image still fails.
+# Bulig's own units are never in a snapshot (SNAPSHOT_OWN), and they are never counted as churn either.
 SNAPSHOT_RUNSTATE_SECTIONS='^## (running services|every service unit and its state)'
 SNAPSHOT_TIMER_SECTION='^## timers and what they start'
 SNAPSHOT_DOCKER_SECTION='^## docker containers'
+SNAPSHOT_UNITFILE_SECTION='^## service unit files'
+SNAPSHOT_TRANSIENT='^run-[up][0-9][^ ]*\.service$'
+SNAPSHOT_INSTANCE='^[^@ ]+@[^@ ]+\.service$'
 
 # snapshot_section <file> <header regex>: the lines of that section, without its header.
 snapshot_section() {
@@ -107,21 +148,44 @@ timer_started() {
 }
 
 # snapshot_compare <before> <after> <before out> <after out>: write copies of both snapshots without the churn above, so a plain diff of
-# the copies is the verdict, and print one info line per change left out (a warn line when a timer's service is now failed).
+# the copies is the verdict, and print one info line per change left out (a warn line when a timer's service, a transient unit or an
+# instance is failed now).
 snapshot_compare() {
-  local before="$1" after="$2" u ctr b a timed="" new_ctrs=""
-  # Services whose run-state lines differ, then the ones a timer starts.
+  local before="$1" after="$2" u b a what timed="" churn="" uf_churn="" new_ctrs=""
+  # Services whose run-state lines differ: the ones a timer starts, then transient units, then template instances that came or went.
   for u in $(comm -3 <(snapshot_section "$before" "$SNAPSHOT_RUNSTATE_SECTIONS" | sort) <(snapshot_section "$after" "$SNAPSHOT_RUNSTATE_SECTIONS" | sort) | awk '{print $1}' | sort -u); do
-    if timer_started "$u" "$before" "$after"; then timed="$timed $u"; fi
+    if grep -Eq "$SNAPSHOT_OWN" <<<"$u"; then continue; fi
+    if timer_started "$u" "$before" "$after"; then
+      timed="$timed $u"
+    elif grep -Eq "$SNAPSHOT_TRANSIENT" <<<"$u"; then
+      churn="$churn $u"
+    elif grep -Eq "$SNAPSHOT_INSTANCE" <<<"$u" && ! { snapshot_has_unit "$before" "$u" && snapshot_has_unit "$after" "$u"; }; then
+      churn="$churn $u"
+    fi
   done
   for u in $timed; do
-    b="$(snapshot_section "$before" '^## every service unit and its state' | awk -v u="$u" '$1 == u { print $2, $3; exit }')"
-    a="$(snapshot_section "$after" '^## every service unit and its state' | awk -v u="$u" '$1 == u { print $2, $3; exit }')"
+    b="$(snapshot_unit_state "$before" "$u")"
+    a="$(snapshot_unit_state "$after" "$u")"
     [ "$b" != "$a" ] || continue
     case " $a " in
-      *" failed "*) echo "warn  $u is failed now (${b:-not loaded} at the precheck). A timer starts it, so its run state is not compared, but its own run failed: look at it (systemctl status $u)." ;;
+      *" failed "*) echo "warn  $u is failed now (${b:-not loaded} before). A timer starts it, so its run state is not compared, but its own run failed: look at it (systemctl status $u)." ;;
       *) echo "info  $u: ${b:-not loaded} -> ${a:-not loaded} (a timer starts it; its run state is not compared)" ;;
     esac
+  done
+  for u in $churn; do
+    b="$(snapshot_unit_state "$before" "$u")"
+    a="$(snapshot_unit_state "$after" "$u")"
+    if grep -Eq "$SNAPSHOT_TRANSIENT" <<<"$u"; then what="a transient systemd-run unit"; else what="a template instance that came or went"; fi
+    case " $a " in
+      *" failed "*) echo "warn  $u is failed now (${b:-not loaded} before). It is $what, so it is not compared, but its own run failed: look at it (systemctl status $u)." ;;
+      *) echo "info  $u: ${b:-not loaded} -> ${a:-not loaded} ($what; not compared)" ;;
+    esac
+  done
+  # Transient units in the unit files list (state "transient") come and go with them.
+  for u in $(comm -3 <(snapshot_section "$before" "$SNAPSHOT_UNITFILE_SECTION" | sort) <(snapshot_section "$after" "$SNAPSHOT_UNITFILE_SECTION" | sort) | awk '{print $1}' | sort -u); do
+    if grep -Eq "$SNAPSHOT_OWN" <<<"$u" || ! grep -Eq "$SNAPSHOT_TRANSIENT" <<<"$u"; then continue; fi
+    uf_churn="$uf_churn $u"
+    case " $churn " in *" $u "*) ;; *) echo "info  $u: its unit file line changed (a transient systemd-run unit; not compared)" ;; esac
   done
   # Containers that come and go next to a long-lived one from the same image (per-session agent containers):
   #   new:  a container the precheck did not have, from an image that was running at the precheck;
@@ -131,7 +195,7 @@ snapshot_compare() {
     [ -n "$name" ] || continue
     new_ctrs="$new_ctrs $name"
     case "$kind" in
-      new) echo "info  new container $name from $img (that image was already running at the precheck; not compared)" ;;
+      new) echo "info  new container $name from $img (that image was already running before; not compared)" ;;
       gone) echo "info  container $name from $img is gone now (that image still runs in another container; not compared)" ;;
       stopped) echo "info  container $name from $img is stopped now (that image still runs in another container; not compared)" ;;
     esac
@@ -150,15 +214,27 @@ snapshot_compare() {
         }
       }' "$before" "$after")
   # The copies: the same lines minus those.
-  snapshot_drop "$before" "$timed" "$new_ctrs" >"$3"
-  snapshot_drop "$after" "$timed" "$new_ctrs" >"$4"
+  snapshot_drop "$before" "$timed $churn" "$new_ctrs" "$uf_churn" >"$3"
+  snapshot_drop "$after" "$timed $churn" "$new_ctrs" "$uf_churn" >"$4"
 }
 
-# snapshot_drop <file> <services> <containers>: the file without those services' run-state lines and those containers' lines.
+# snapshot_has_unit <file> <unit>: true if the unit is in that snapshot's run-state sections at all.
+snapshot_has_unit() {
+  snapshot_section "$1" "$SNAPSHOT_RUNSTATE_SECTIONS" | awk -v u="$2" '$1 == u { found = 1 } END { exit !found }'
+}
+
+# snapshot_unit_state <file> <unit>: its active and sub state in that snapshot ("active running"), or nothing when it is not there.
+snapshot_unit_state() {
+  snapshot_section "$1" '^## every service unit and its state' | awk -v u="$2" '$1 == u { print $2, $3; exit }'
+}
+
+# snapshot_drop <file> <services> <containers> <unit files>: the file without those services' run-state lines, those containers' lines
+# and those unit files' lines.
 snapshot_drop() {
-  awk -v units=" $2 " -v ctrs=" $3 " -v rs="$SNAPSHOT_RUNSTATE_SECTIONS" -v dk="$SNAPSHOT_DOCKER_SECTION" '
-    /^## / { sec = ($0 ~ rs) ? "rs" : ($0 ~ dk) ? "dk" : ""; print; next }
+  awk -v units=" $2 " -v ctrs=" $3 " -v ufs=" ${4:-} " -v rs="$SNAPSHOT_RUNSTATE_SECTIONS" -v dk="$SNAPSHOT_DOCKER_SECTION" -v uf="$SNAPSHOT_UNITFILE_SECTION" '
+    /^## / { sec = ($0 ~ rs) ? "rs" : ($0 ~ dk) ? "dk" : ($0 ~ uf) ? "uf" : ""; print; next }
     sec == "rs" && index(units, " " $1 " ") { next }
     sec == "dk" && index(ctrs, " " $1 " ") { next }
+    sec == "uf" && index(ufs, " " $1 " ") { next }
     { print }' "$1"
 }

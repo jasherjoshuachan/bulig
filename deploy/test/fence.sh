@@ -489,6 +489,11 @@ printf 'u_str LISTEN 0 4096 @example-abstract-name 1 * 0\n' >"$log/ss-unix"
 BULIG_FENCE_PROBES="$work/fc-clean.txt" bash "$deploy/fence-check.sh" worker kernel build >"$work/fc.out" 2>&1 || true
 if grep -q "^info worker abstract-1 known limit, not tested by connecting" "$work/fc.out" && grep -q "^info kernel abstract-1 known limit, not tested by connecting" "$work/fc.out" && grep -qE "^(ok|warn|FAIL) build abstract-1 " "$work/fc.out"; then ok "an abstract socket found with ss is probed: denied for the build, a known limit (never connected to) for the worker and the kernel"; else bad "derived abstract probes: $(grep abstract "$work/fc.out")"; fi
 : >"$log/ss-unix"
+# more listening path sockets than the cap: the output says so, as a warn line (not only on stderr)
+for n in $(seq 1 401); do printf 'u_str LISTEN 0 5 /run/many/s%03d.sock 1 * 0\n' "$n"; done >"$log/ss-unix"
+BULIG_FENCE_PROBES="$work/fc-clean.txt" bash "$deploy/fence-check.sh" worker >"$work/fc.out" 2>/dev/null || true
+if grep -q "^warn fence-check capped: 401 listening path sockets, only the first 400 (sorted by path) are judged and listed; the other 1 are not checked" "$work/fc.out" && grep -q "^info worker path-sockets 400 listening path sockets" "$work/fc.out"; then ok "past the cap, fence-check's own output has a warn line that says how many path sockets were not checked"; else bad "cap in the output: $(grep -i 'cap\|path-sockets' "$work/fc.out")"; fi
+: >"$log/ss-unix"
 if ! grep -q "work\." <(ls "$root/var/lib/bulig-checks" 2>/dev/null); then ok "the probe stream is removed afterwards"; else bad "work folder left in $(ls "$root/var/lib/bulig-checks")"; fi
 
 # a drop-in that opens a hole is part of what is tested
@@ -636,6 +641,17 @@ chmod 000 "$sk/shut"
 : >"$work/r-tcp"; : >"$work/r-ip"
 probe derive "$work/r-tcp" "$work/r-unix" "$work/r-ip" | grep '^reach ' >"$work/reach.txt"
 if [ "$(wc -l <"$work/reach.txt" | tr -d ' ')" = "5" ]; then ok "every listening path socket from ss gets a reach line"; else bad "reach lines: $(cat "$work/reach.txt")"; fi
+# the cap: up to 400 are judged, and a cap that is hit is said
+for n in $(seq 1 401); do printf 'u_str LISTEN 0 5 /run/many/s%03d.sock 1 * 0\n' "$n"; done >"$work/r-unix-many"
+probe derive "$work/r-tcp" "$work/r-unix-many" "$work/r-ip" >"$work/reach-many.txt" 2>"$work/reach-many.err"
+if [ "$(grep -c '^reach ' "$work/reach-many.txt")" = "400" ] && grep -q "401 listening path sockets, only the first 400 (sorted by path) are judged and listed; the other 1 are not checked" "$work/reach-many.err" && ! grep -q 's401.sock' "$work/reach-many.txt"; then ok "past 400 path sockets, the first 400 by path are judged and derive says how many were left out"; else bad "reach cap: $(grep -c '^reach ' "$work/reach-many.txt") lines, $(cat "$work/reach-many.err")"; fi
+head -400 "$work/r-unix-many" >"$work/r-unix-400"
+probe derive "$work/r-tcp" "$work/r-unix-400" "$work/r-ip" >/dev/null 2>"$work/reach-400.err"
+if [ ! -s "$work/reach-400.err" ]; then ok "and exactly 400 says nothing"; else bad "a note at 400: $(cat "$work/reach-400.err")"; fi
+# what an unreachable path is called (only counted, never listed): a plain file is not "hidden", a socket with no permission may be
+why="$(python3 -I -c 'import importlib.util,sys; s=importlib.util.spec_from_file_location("fp", sys.argv[1]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); print(m.path_reach(sys.argv[2], 99999, None)[1])' "$deploy/fence-probe.py" "$sk/open/plain-file")"
+if [ "$why" = "not a socket in this unit's view (another kind of file is there)" ]; then ok "a plain file where a socket was is 'another kind of file', not 'hidden by InaccessiblePaths'"; else bad "plain-file reason: $why"; fi
+if grep -q '"no permission for this user (or hidden by InaccessiblePaths: systemd'"'"'s mode-0000 socket is in its place)"' "$deploy/fence-probe.py"; then ok "and a socket with no permission names InaccessiblePaths as one cause (systemd mounts a mode-0000 socket over a hidden one)"; else bad "the no-permission reason does not name InaccessiblePaths"; fi
 me="$(id -u)"
 res="$(probe fenced worker "$work/reach.txt" --control "" --af "$WAF" --activation-text "" --self-uid 99999 2>&1)"; rc=$?
 if [ "$rc" -eq 0 ] && grep -q "^info worker path-[0-9]* known limit, not tested by connecting: unix path $sk/open/other.sock is connectable from this set" <<<"$res"; then ok "a world-connectable socket of someone else is listed as a known limit, and nothing fails"; else bad "other socket rc=$rc: $res"; fi

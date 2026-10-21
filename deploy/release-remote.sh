@@ -18,6 +18,8 @@
 #     fresh copy of the delivered code. A build script cannot change a delivered file or keep a handle into the live release.
 #   - both `current` links and the unit files are swapped, bwrap's AppArmor profile (/etc/apparmor.d/bulig-bwrap) installed and loaded if it
 #     differs, the services restarted, health checked; any failure puts all of it back.
+#   - just before the first of those changes, a "before" snapshot of the host (release-<sha>.before.snapshot); after the health check (or
+#     the rollback) postcheck.sh compares the host with it and reports the result. It never fails or rolls back the release.
 #
 # BULIG_DEPLOY_TEST_ROOT puts every path under a throwaway folder and skips the owner checks. On the server it is never set.
 set -euo pipefail
@@ -175,6 +177,37 @@ else
   mv -T "$tools" "$tk_rel"
 fi
 
+# --- 2b. the "before" picture, just before this release changes anything the snapshot covers (lib/snapshot.sh) -----------------------
+# Everything above wrote only under Bulig's own folders and ran Bulig's own transient units, which the snapshot leaves out; from step 3 on,
+# unit files, the AppArmor profile and services change. So the comparison against THIS snapshot after the health check (release_compare)
+# covers this release, not every other tenant's work since the precheck (precheck.snapshot stays: it is the baseline for removing Bulig).
+# /var/lib/bulig-checks/release-<sha>.before.snapshot, root, 0600; the newest $SNAPSHOT_RELEASE_KEEP are kept, older ones removed.
+# It runs in a child shell so that set -e holds inside snapshot(), as in precheck.sh: a command that fails there leaves no snapshot rather
+# than a partial one. A missing snapshot does not refuse the release (health decides it); the comparison is skipped and says so.
+snap="$CHK/release-$short.before.snapshot"
+# shellcheck disable=SC2016
+if bash -c 'set -euo pipefail; . "$1/lib/common.sh"; . "$1/lib/snapshot.sh"; trap '\''[ -z "${SNAPSHOT_TMP:-}" ] || rm -f "$SNAPSHOT_TMP"'\'' EXIT; snapshot_save "$2"; snapshot_prune_releases' _ "$here" "$snap"; then
+  echo "release: saved the before snapshot $snap ($(wc -l <"$snap" | tr -d ' ') lines)"
+else
+  echo "release: WARNING: could not take the before snapshot (see above), so this release will not be compared with it" >&2
+  rm -f "$snap"
+  snap=""
+fi
+# release_compare <when>: postcheck.sh against that snapshot. It reports and never decides: health decides the release. Another tenant can
+# change things while a release runs, so a difference is not proof that this release made it (see the RUNBOOK, step 5).
+release_compare() {
+  if [ -z "$snap" ]; then
+    echo "release: postcheck skipped $1: there is no before snapshot for this release" >&2
+    return 0
+  fi
+  echo "release: postcheck $1, against $snap"
+  if bash "$here/postcheck.sh" --against "$snap"; then
+    echo "release: postcheck ok: nothing the snapshot covers changed during this release, apart from Bulig's own things"
+  else
+    echo "release: WARNING: POSTCHECK FAILED $1: something the snapshot covers changed during this release and it is not Bulig's (the diff is above), or the postcheck could not run. Nothing is rolled back for it. Find out whose change it is: another tenant's, or this release's." >&2
+  fi
+}
+
 # --- 3. keep what is installed now (unit files), so a rollback restores all of it ---------------------------------------------------
 unit_backup="$work/unit-backup"
 mkdir -m 0700 "$unit_backup"
@@ -271,6 +304,7 @@ prune() { # prune <dir> <live path> <previous path>: keep the newest $keep relea
 if apply_release; then
   printf '%s\n' "$short" >"$healthy_file.new" && mv -T "$healthy_file.new" "$healthy_file"
   echo "release: healthy on $short"
+  release_compare "after the health check"
   prune "$OPT/releases" "$rel" "$prev"
   prune "$TK" "$tk_rel" "$prev_tk"
   exit 0
@@ -291,6 +325,7 @@ if [ -n "$prev_healthy" ] && [ -d "$prev_healthy" ]; then
   else
     echo "release: rollback is ALSO unhealthy. Look at journalctl -u bulig.service -u bulig-worker.service." >&2
   fi
+  release_compare "after the rollback"
 else
   # A failed FIRST release leaves nothing behind: services stopped and disabled (a reboot starts nothing), both current links and the unit files
   # removed, and no success marker, so the same sha can be released again.
@@ -302,5 +337,6 @@ else
   restore_units
   restore_apparmor
   systemctl daemon-reload || true
+  release_compare "after removing the failed first release"
 fi
 exit 1

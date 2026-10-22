@@ -1,18 +1,27 @@
 [Unit]
-Description=Bulig gateway loopback address (127.74.3.1 on lo)
+Description=Bulig gateway addresses (127.74.3.1 and 198.18.74.1 on lo)
 Documentation=https://github.com/jasherjoshuachan/bulig
-# The worker and the kernel talk over 127.74.3.1. A connection to a loopback address that is not assigned to lo as its own address carries
-# source 127.0.0.1 (the route says "src 127.0.0.1"), and each unit's IP filter would then have to let 127.0.0.1 through, which is where other
-# tenants' services listen. With 127.74.3.1/32 on lo the source is 127.74.3.1 too, so each side allows exactly that one address.
-# This adds one address alias to lo. Nothing else on the host's network is touched. It goes away when the unit stops.
-Before=bulig.service bulig-worker.service
+# The kernel's worker gateway listens on two addresses of its own on lo:
+# - 198.18.74.1 (22 Oct 2026): the worker runs in a network namespace of its own (bulig-netns.service), where 127.x is the namespace's own
+#   loopback. Its traffic leaves through pasta (bulig-pasta.service), which connects on the host. 198.18.74.1 is in 198.18.0.0/15, the range
+#   set aside for benchmark tests (RFC 2544): no real host has it, and it is in every Bulig deny list except where it is allowed as a /32. With it
+#   on lo, pasta's connection carries 198.18.74.1 at both ends, so pasta's unit and the kernel's each allow exactly that one address.
+# - 127.74.3.1: the address the worker used before the namespace. It stays for one release so a rollback to that release still works; the
+#   kernel's unit and one-off commands still allow it. A connection to a loopback address that is not assigned to lo as its own address
+#   carries source 127.0.0.1 (the route says "src 127.0.0.1"), and each unit's IP filter would then have to let 127.0.0.1 through, which is
+#   where other tenants' services listen. With the /32 on lo the source is that address too.
+# This adds two address aliases to lo. Nothing else on the host's network is touched. They go away when the unit stops.
+Before=bulig.service bulig-worker.service bulig-pasta.service
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-# "replace" makes a second start harmless. /usr/bin/ip on this host (/usr/sbin/ip is a link to it).
+# "replace" makes a second start harmless. /usr/bin/ip on this host (/usr/sbin/ip is a link to it). "-" on stop: an address that is already
+# gone (a release that adds the second one restarts this unit while only the first is there) is not a failure.
 ExecStart=/usr/bin/ip address replace 127.74.3.1/32 dev lo
-ExecStop=/usr/bin/ip address del 127.74.3.1/32 dev lo
+ExecStart=/usr/bin/ip address replace 198.18.74.1/32 dev lo
+ExecStop=-/usr/bin/ip address del 127.74.3.1/32 dev lo
+ExecStop=-/usr/bin/ip address del 198.18.74.1/32 dev lo
 CapabilityBoundingSet=CAP_NET_ADMIN
 AmbientCapabilities=CAP_NET_ADMIN
 NoNewPrivileges=true

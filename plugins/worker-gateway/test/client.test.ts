@@ -15,6 +15,15 @@ describe('assertSafeKernelUrl', () => {
   it.each(['http://example.com', 'http://203.0.113.5:7431', 'http://100.128.0.1', 'http://100.63.0.1', 'http://192.168.1.10:7431', 'http://box.tail1234.ts.net:7431', 'http://[::ffff:127.0.0.1]:7431', 'ftp://127.0.0.1', 'nonsense'])('refuses %s: a token must not cross an open network in the clear', (url) => { // scan-forbidden: allow-addresses (refusal boundaries)
     expect(() => assertSafeKernelUrl(url)).toThrow();
   });
+
+  // The worker in its own network namespace reaches the kernel at the deploy kit's one gateway address on lo. Only that address, not its range.
+  it('allows http to the worker namespace gateway 198.18.74.1', () => {
+    expect(() => assertSafeKernelUrl('http://198.18.74.1:7431')).not.toThrow();
+  });
+
+  it.each(['http://198.18.74.2:7431', 'http://198.18.0.1:7431', 'http://198.19.74.1:7431', 'http://[::ffff:198.18.74.1]:7431'])('refuses %s: only the one gateway address counts as this machine', (url) => {
+    expect(() => assertSafeKernelUrl(url)).toThrow();
+  });
 });
 
 describe('assertSafeKernelUrl, named hosts', () => {

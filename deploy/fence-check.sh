@@ -4,6 +4,9 @@
 # machine's own addresses, unix sockets including an abstract one where the set has no AF_UNIX) and CAN do what the unit needs (DNS, https, its
 # own gateway, a child process, a user lookup, and for the worker sets Claude Code's Bash sandbox: a unix socket of its own and bwrap). Any
 # unexpected success is a failure. The probe list is one file, fence/probes.txt.
+# The worker sets run in the worker's own network namespace (NetworkNamespacePath=/run/netns/bulig-worker, 22 Oct 2026). Their probe first
+# proves it is there (THE NETNS GUARD: its namespace's inode against the host's and the worker namespace's) and connects to nothing if not. Only
+# then does it try the host-only targets for real (loopback addresses, abstract sockets), which there can only be the namespace's own.
 # The worker sets have AF_UNIX, so every listening path socket ss lists is also judged for them from the file alone (stat and access inside the
 # unit, never a connection): the connectable ones are listed as known limits in every run, and a connectable Bulig socket is a failure.
 #   Probes: fence/probes.txt (published, generic) + ones derived from what this machine listens on + /etc/bulig/fence-extra-probes.txt (root, 0600,
@@ -140,13 +143,17 @@ for s in "${sets[@]}"; do
     for e in "${props[@]}"; do case "$e" in "$1="*) v="${e#*=}" ;; esac; done
     printf '%s' "$v"
   }
+  # The worker sets run in the worker's own network namespace (22 Oct 2026). Their probe gets --netns, and guards on it before anything else:
+  # in the host's namespace, or in any but the worker's, it FAILs and connects to nothing. A worker set without the namespace is refused here.
+  netns_args "$s" "$(prop_value NetworkNamespacePath)"
   # 3. Inside: the probe, with exactly those properties. (The unit's other properties do not change what it can reach.)
   #    It runs in the background, writing to its own file; the next loop reads them in order.
   unit_name="bulig-fence-$s-$$"
   systemd-run --quiet --pipe --wait --collect --unit="$unit_name" ${ids[@]+"${ids[@]}"} "${props[@]}" -p "RuntimeMaxSec=$((set_cap + 15))" \
     -- /usr/bin/python3 -I "$probe" fenced "$s" - "${common_args[@]}" --control "$control" \
     --activation-text "$(cat "$work/sockets")" --af "$(prop_value RestrictAddressFamilies)" --ip-deny "$(prop_value IPAddressDeny)" --ip-allow "$(prop_value IPAddressAllow)" \
-    --inaccessible "$(prop_value InaccessiblePaths)" --bulig-uid "$bulig_uid" --deny-timeout "$deny_timeout" --jobs "$par" ${late_flag[@]+"${late_flag[@]}"} <"$work/all-probes" >"$work/out-$s" 2>&1 &
+    --inaccessible "$(prop_value InaccessiblePaths)" --bulig-uid "$bulig_uid" --deny-timeout "$deny_timeout" --jobs "$par" ${late_flag[@]+"${late_flag[@]}"} \
+    ${NETNS_ARGS[@]+"${NETNS_ARGS[@]}"} <"$work/all-probes" >"$work/out-$s" 2>&1 &
   pids+=("$!")
   names+=("$unit_name")
 done

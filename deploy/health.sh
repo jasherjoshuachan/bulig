@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
-# Is Bulig healthy on this host? Run as root on ths-prod-01. Exit 0 only if all three hold:
-#   1. bulig.service and bulig-worker.service are active
+# Is Bulig healthy on this host? Run as root on ths-prod-01. Exit 0 only if all of these hold:
+#   1. bulig.service and bulig-worker.service are active, and so is what the worker's network stands on: the gateway addresses on lo
+#      (127.74.3.1 and 198.18.74.1, bulig-loopback.service), the worker's network namespace (/run/netns/bulig-worker, bulig-netns.service) and
+#      pasta (bulig-pasta.service), which has given the namespace an address of its own
 #   2. the kernel holds the executor lease and keeps renewing it (two reads 11 s apart, the heartbeat is every 10 s)
 #   3. the Postgres cluster "16 bulig" is online on port 5436
 #   4. the fence holds (fence-check.sh): from inside each Bulig unit's properties, other tenants' services, the docker bridge, tailscale, the
 #      machine's own addresses and unix sockets (other tenants' abstract sockets, tailscaled, docker) cannot be reached, and what the units need can
-#   It also WARNS (does not fail) when the host's addresses no longer match the worker's drop-in, or a new service listens on every address.
+#   It also WARNS (does not fail) when the host's addresses no longer match the worker's or pasta's drop-in, or a new service listens on every
+#   address.
 # usage: health.sh [--wait <seconds>] [--no-fence]   (--wait: how long to give the service to take the lease after a start, default 30)
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -47,9 +50,31 @@ else
 fi
 
 if systemctl is-active --quiet bulig-loopback.service; then
-  ok "bulig-loopback.service active ($BULIG_GATEWAY_ADDR on lo)"
+  ok "bulig-loopback.service active"
 else
   bad "bulig-loopback.service is $(systemctl is-active bulig-loopback.service 2>&1 || true): the worker cannot reach the kernel"
+fi
+lo_addrs="$(ip -o addr show dev lo 2>/dev/null || true)"
+for a in "$BULIG_NETNS_GATEWAY" "$BULIG_GATEWAY_ADDR"; do
+  if grep -q " inet $a/32 " <<<"$lo_addrs"; then ok "$a/32 is on lo"; else bad "$a/32 is not on lo: the gateway cannot listen there (restart bulig-loopback.service)"; fi
+done
+
+# The worker's network: its own namespace, and pasta, its only way out.
+if systemctl is-active --quiet bulig-netns.service && [ -e "$R$BULIG_NETNS_PATH" ]; then
+  ok "bulig-netns.service active ($BULIG_NETNS_PATH exists)"
+else
+  bad "the worker's network namespace is not there (bulig-netns.service is $(systemctl is-active bulig-netns.service 2>&1 || true), $BULIG_NETNS_PATH $([ -e "$R$BULIG_NETNS_PATH" ] && echo exists || echo 'is missing'))"
+fi
+if systemctl is-active --quiet bulig-pasta.service; then
+  ok "bulig-pasta.service active"
+else
+  bad "bulig-pasta.service is $(systemctl is-active bulig-pasta.service 2>&1 || true): the worker has no network"
+fi
+# pasta copies the host's addresses onto the namespace's eth0 when it starts (--config-net). No global address there means it did not.
+if [ -n "$(ip -n "$BULIG_NETNS_NAME" -o addr show scope global 2>/dev/null || true)" ]; then
+  ok "the worker's network namespace has an address of its own (pasta set it up)"
+else
+  bad "the worker's network namespace has no global address: pasta did not set it up (journalctl -u bulig-pasta.service)"
 fi
 
 # The worker is a separate unit under a separate user. It must be up, but a worker problem does not hide the kernel checks below.
@@ -100,9 +125,11 @@ warn() { echo "warn  $*"; }
 # Warnings: the host's own addresses against the worker's drop-in, and services that listen on every address (an allowed address such as
 # 127.74.3.1 reaches all of them, because the IP filter matches addresses and not ports).
 want_addrs="$(host_addresses | tr '\n' ' ')"
-have_addrs="$(unit_list bulig-worker.service IPAddressDeny | tr ' ' '\n' | { grep -E '^[0-9a-f:.]+/(32|128)$' || true; } | sort -u | tr '\n' ' ')"
-for a in $want_addrs; do
-  case " $have_addrs " in *" $a "*) ;; *) warn "the host address $a is not in the worker's IPAddressDeny. Run host-addresses.sh and restart bulig-worker." ;; esac
+for u in $HOST_DROPIN_UNITS; do
+  have_addrs="$(unit_list "$u" IPAddressDeny | tr ' ' '\n' | { grep -E '^[0-9a-f:.]+/(32|128)$' || true; } | sort -u | tr '\n' ' ')"
+  for a in $want_addrs; do
+    case " $have_addrs " in *" $a "*) ;; *) warn "the host address $a is not in $u's IPAddressDeny. Run host-addresses.sh and restart bulig-pasta and bulig-worker." ;; esac
+  done
 done
 baseline="$BULIG_CHECKS_DIR/precheck.snapshot"
 if [ -r "$baseline" ]; then
@@ -113,7 +140,7 @@ if [ -r "$baseline" ]; then
 $known
 " in *"
 $l
-"*) ;; *) warn "a service listens on every address now ($l) and was not there at the precheck. The worker can reach it through 127.74.3.1." ;; esac
+"*) ;; *) warn "a service listens on every address now ($l) and was not there at the precheck. The worker can reach it through $BULIG_NETNS_GATEWAY (pasta)." ;; esac
   done < <(wildcard_listeners)
 else
   warn "no precheck snapshot at $baseline, so new listeners on every address cannot be noticed"

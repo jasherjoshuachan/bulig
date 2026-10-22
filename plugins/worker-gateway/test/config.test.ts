@@ -40,6 +40,15 @@ describe('where the endpoint may listen', () => {
     expect(() => parseGatewayConfig({ listen: [address], workers }, env)).toThrow(/neither this machine nor the Tailscale tunnel/);
   });
 
+  // The deploy kit's gateway address for a worker in its own network namespace (on lo, deploy/systemd/bulig-loopback.service).
+  it('accepts 198.18.74.1, the worker namespace gateway, next to 127.74.3.1', () => {
+    expect(parseGatewayConfig({ listen: ['127.74.3.1', '198.18.74.1'], workers }, env).listen).toEqual(['127.74.3.1', '198.18.74.1']);
+  });
+
+  it.each(['198.18.74.2', '198.18.0.1', '198.19.74.1', '198.17.255.255', '198.20.0.1', '::ffff:198.18.74.1'])('refuses %s: only the one gateway address in 198.18.0.0/15 counts as this machine', (address) => { // scan-forbidden: allow-addresses (refusal boundaries)
+    expect(() => parseGatewayConfig({ listen: [address], workers }, env)).toThrow(/neither this machine nor the Tailscale tunnel/);
+  });
+
   it('refuses a heartbeat timeout under twice the heartbeat, like the lease', () => {
     expect(() => parseGatewayConfig({ heartbeatMs: 10_000, heartbeatTimeoutMs: 15_000, workers }, env)).toThrow(/less than half/);
   });

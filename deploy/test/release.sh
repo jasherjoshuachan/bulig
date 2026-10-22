@@ -23,7 +23,7 @@ mkdir -m 0700 "$r/var/lib/bulig-checks"
 export BULIG_DEPLOY_TEST_ROOT="$r"
 export STUB_LOG="$work/log"
 mkdir -p "$STUB_LOG"
-UNITS="bulig-loopback.service bulig.service bulig-worker.service bulig-backup.service bulig-backup.timer bulig-restore-drill.service bulig-restore-drill.timer"
+UNITS="bulig-loopback.service bulig-netns.service bulig-pasta.service bulig.service bulig-worker.service bulig-backup.service bulig-backup.timer bulig-restore-drill.service bulig-restore-drill.timer"
 
 # The two users' folders, as systemd leaves them. They are given an old date so any later touch shows up.
 mkdir -p "$r/var/lib/bulig/state" "$r/var/lib/bulig/repos/sandbox" "$r/var/lib/bulig-worker/work/sandbox" "$r/var/lib/bulig-worker/.claude"
@@ -326,7 +326,7 @@ extract_call="$(grep -- '--unit=bulig-extract-' "$STUB_LOG/calls" | head -1)"
 for p in DynamicUser=yes PrivateTmp=yes KillMode=control-group ProtectSystem=strict NoNewPrivileges=yes MemoryMax= TasksMax=; do
   case "$build_call" in *"$p"*) ok "the build unit has $p" ;; *) bad "the build unit lacks $p: $build_call" ;; esac
 done
-DENY="127.0.0.0/8 ::1/128 169.254.0.0/16 fe80::/10 224.0.0.0/4 ff00::/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7"
+DENY="127.0.0.0/8 ::1/128 169.254.0.0/16 fe80::/10 224.0.0.0/4 ff00::/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7 198.18.0.0/15"
 case "$build_call" in *"-p IPAddressDeny=$DENY 2001:db8::10/128 203.0.113.10/32 -p "*) ok "the build cannot reach localhost, link-local, multicast, private ranges, Tailscale, the docker bridges or this machine's own public addresses (read from ip at run time)" ;; *) bad "the build's IPAddressDeny: $build_call" ;; esac
 case "$build_call" in *"IPAddressAllow"*) bad "the build allows an address: $build_call" ;; *) ok "and the build allows no address at all (not even the DNS stub)" ;; esac
 case "$build_call" in *"-p RestrictAddressFamilies=AF_INET AF_INET6 -p "*) ok "the build gets IP sockets only: no AF_UNIX, so a tenant's abstract socket is out of reach" ;; *) bad "the build's address families: $build_call" ;; esac
@@ -334,9 +334,13 @@ case "$build_call" in *"-p InaccessiblePaths=-/run/tailscale -/run/snapd.socket 
 case "$build_call" in *"-p BindReadOnlyPaths=/run/systemd/resolve/resolv.conf:/etc/resolv.conf "*) ok "the build resolves names through resolved's upstream list, not the 127.0.0.53 stub" ;; *) bad "the build's resolver: $build_call" ;; esac
 wd="$r/etc/systemd/system/bulig-worker.service.d/10-host-addresses.conf"
 if [ -f "$wd" ] && grep -qx "IPAddressDeny=2001:db8::10/128 203.0.113.10/32" "$wd"; then ok "each release refreshes the worker's drop-in with the machine's current public addresses"; else bad "worker drop-in: $(cat "$wd" 2>&1)"; fi
+pd="$r/etc/systemd/system/bulig-pasta.service.d/10-host-addresses.conf"
+if [ -f "$pd" ] && grep -qx "IPAddressDeny=2001:db8::10/128 203.0.113.10/32" "$pd"; then ok "and pasta's (the worker's packets leave the host as pasta's)"; else bad "pasta drop-in: $(cat "$pd" 2>&1)"; fi
 case "$build_call" in *"--uid="* | *" -p User="*) bad "the build is tied to a named user: $build_call" ;; *) ok "the build runs as a throwaway user, not as bulig or bulig-worker" ;; esac
 case "$build_call" in *"$r"* | *"/var/lib/bulig-checks"* | *"/usr/local/lib/bulig"*) bad "a path of root's trees reached the build's arguments: $build_call" ;; *) ok "no path of root's trees is in the build's arguments (the source goes in on stdin)" ;; esac
-if grep -q "^systemctl enable bulig-loopback.service bulig.service bulig-worker.service" "$STUB_LOG/calls" && grep -q "^systemctl start bulig-loopback.service" "$STUB_LOG/calls"; then ok "the gateway address unit is enabled and started before the services restart"; else bad "systemctl calls: $(grep systemctl "$STUB_LOG/calls" | head -5)"; fi
+seqA="$(grep -E '^systemctl (enable|disable|stop|start|restart) ' "$STUB_LOG/calls" | tr '\n' '|')"
+if [ "$seqA" = "systemctl enable bulig-loopback.service bulig-netns.service bulig-pasta.service bulig.service bulig-worker.service|systemctl stop bulig-worker.service|systemctl restart bulig-loopback.service|systemctl restart bulig-netns.service bulig-pasta.service|systemctl restart bulig.service bulig-worker.service|" ]; then ok "the five units are enabled; the worker is stopped, the gateway addresses restarted (a start would not add 198.18.74.1), the namespace made fresh and pasta started, then the kernel and the worker restarted, in that order"; else bad "systemctl order: $seqA"; fi
+if grep -q "^config: .* already listens on 198.18.74.1" "$work/out"; then ok "the config made from the template already listens on 198.18.74.1, and is left as it is"; else bad "config note: $(grep '^config' "$work/out")"; fi
 for p in "ReadWritePaths=$r/var/lib/bulig-checks/rel." ProtectSystem=strict PrivateNetwork=yes CapabilityBoundingSet= NoNewPrivileges=yes ProtectKernelTunables=yes ProtectControlGroups=yes ProtectKernelModules=yes ProtectKernelLogs=yes ProtectClock=yes; do
   case "$extract_call" in *"$p"*) ok "the unpack unit has $p" ;; *) bad "the unpack unit lacks $p: $extract_call" ;; esac
 done
@@ -437,6 +441,61 @@ echo '{"edited":"by hand"}' >"$r/etc/bulig/config.json"
 incE="$(deliver "eeeeeeeeeeee" 0)"
 expect_ok "a second release runs" run_remote "eeeeeeeeeeee" "$incE"
 if grep -q '"edited"' "$r/etc/bulig/config.json"; then ok "the config edited by hand is kept"; else bad "the config was overwritten"; fi
+if [ "$(cat "$r/etc/bulig/config.json")" = '{"edited":"by hand"}' ] && grep -q "config: WARNING: .* has no pluginConfig.worker-gateway.listen list" "$work/out"; then ok "a config with no listen list is left byte for byte as it was, with a warning that says what to add"; else bad "no-listen config: $(cat "$r/etc/bulig/config.json") $(grep '^config' "$work/out")"; fi
+
+# --- 5b. the kernel's gateway on 198.18.74.1: added to the listen list once, by the release, and put back by a rollback ---
+echo "the gateway address in the config"
+python3 -I -c '
+import json, sys
+c = {"store": {"kind": "postgres"}, "pluginConfig": {"worker-gateway": {"listen": ["127.74.3.1"], "port": 7431, "workers": {"vps": {"credential": "worker-tokens"}}}, "github": {"authorName": "Hand Edited"}}, "enabled": ["worker-gateway"]}
+open(sys.argv[1], "w").write(json.dumps(c, indent=4) + "\n")
+' "$r/etc/bulig/config.json"
+chmod 600 "$r/etc/bulig/config.json"
+cp -p "$r/etc/bulig/config.json" "$work/cfg.old"
+incN="$(deliver "c1c1c1c1c1c1" 0)"
+expect_ok "a release over a config without 198.18.74.1 runs" run_remote "c1c1c1c1c1c1" "$incN"
+if python3 -I -c '
+import json, sys
+old, new = json.load(open(sys.argv[1])), json.load(open(sys.argv[2]))
+assert new["pluginConfig"]["worker-gateway"]["listen"] == ["127.74.3.1", "198.18.74.1"], new
+new["pluginConfig"]["worker-gateway"]["listen"] = ["127.74.3.1"]
+assert new == old, (old, new)
+' "$work/cfg.old" "$r/etc/bulig/config.json" 2>"$work/err"; then ok "it adds 198.18.74.1 after 127.74.3.1 in the listen list and changes nothing else"; else bad "config after the release: $(cat "$work/err")"; fi
+if [ "$(mode "$r/etc/bulig/config.json")" = "600" ] && grep -q "^config: added 198.18.74.1 to pluginConfig.worker-gateway.listen" "$work/out" && [ -z "$(find "$r/etc/bulig" -name '.config.*')" ]; then ok "and keeps it mode 600, says so, and leaves no temp file"; else bad "config mode or note: $(mode "$r/etc/bulig/config.json") $(grep '^config' "$work/out")"; fi
+cp -p "$r/etc/bulig/config.json" "$work/cfg.new"
+incN2="$(deliver "c2c2c2c2c2c2" 0)"
+expect_ok "the next release runs" run_remote "c2c2c2c2c2c2" "$incN2"
+if cmp -s "$work/cfg.new" "$r/etc/bulig/config.json" && grep -q "already listens on 198.18.74.1" "$work/out"; then ok "and leaves the config as it is (the address is there once)"; else bad "config changed again: $(cat "$r/etc/bulig/config.json")"; fi
+cp -p "$work/cfg.old" "$r/etc/bulig/config.json"
+: >"$STUB_LOG/calls"
+incN3="$(deliver "c3c3c3c3c3c3" 1)"
+expect_fail_msg "a release that adds the address and then fails its health check fails" "FAILED" run_remote "c3c3c3c3c3c3" "$incN3"
+if cmp -s "$work/cfg.old" "$r/etc/bulig/config.json" && [ "$(mode "$r/etc/bulig/config.json")" = "600" ]; then ok "the rollback puts the config back byte for byte (the release before refuses 198.18.74.1)"; else bad "config after the rollback: $(cat "$r/etc/bulig/config.json")"; fi
+seqR="$(grep -E '^systemctl (enable|disable|stop|start|restart) ' "$STUB_LOG/calls" | tr '\n' '|')"
+case "$seqR" in *"|systemctl stop bulig-worker.service bulig.service bulig-pasta.service bulig-netns.service bulig-loopback.service|systemctl start bulig-loopback.service|systemctl restart bulig.service bulig-worker.service|") ok "the rollback stops all five units (the new files still loaded), starts the previous gateway addresses, then restarts the kernel and the worker" ;; *) bad "rollback order: $seqR" ;; esac
+case "$seqR" in *"systemctl disable"*) bad "the rollback disabled a unit the previous release has: $seqR" ;; *) ok "and disables nothing the previous release has" ;; esac
+mv "$r/etc/bulig/config.json" "$work/cfg.keep"
+ln -s "$work/cfg.keep" "$r/etc/bulig/config.json"
+incN4="$(deliver "c4c4c4c4c4c4" 0)"
+expect_fail_msg "a link where the config belongs fails the release" "is missing or a link" run_remote "c4c4c4c4c4c4" "$incN4"
+rm -f "$r/etc/bulig/config.json"
+mv "$work/cfg.keep" "$r/etc/bulig/config.json"
+printf '{not json' >"$r/etc/bulig/config.json"
+incN5="$(deliver "c5c5c5c5c5c5" 0)"
+expect_fail_msg "a config that is not JSON fails the release" "could not be read as JSON" run_remote "c5c5c5c5c5c5" "$incN5"
+if [ "$(cat "$r/etc/bulig/config.json")" = "{not json" ] && [ -z "$(find "$r/etc/bulig" -name '.config.*')" ]; then ok "and it is left as it was, with no temp file"; else bad "bad config after: $(cat "$r/etc/bulig/config.json")"; fi
+cp -p "$work/cfg.new" "$r/etc/bulig/config.json"
+
+# --- 5c. a rollback to a release that had no namespace units: the units this release added are stopped, disabled and removed ---
+echo "a rollback to a release without the namespace"
+live_ns="$(readlink "$r/opt/bulig/current")"
+rm -f "$r/etc/systemd/system/bulig-netns.service" "$r/etc/systemd/system/bulig-pasta.service"
+: >"$STUB_LOG/calls"
+incQ="$(deliver "c6c6c6c6c6c6" 1)"
+expect_fail_msg "a release that adds the namespace units and fails its health check fails" "FAILED" run_remote "c6c6c6c6c6c6" "$incQ"
+seqQ="$(grep -E '^systemctl (enable|disable|stop|start|restart) ' "$STUB_LOG/calls" | tr '\n' '|')"
+case "$seqQ" in *"|systemctl stop bulig-worker.service bulig.service bulig-pasta.service bulig-netns.service bulig-loopback.service|systemctl disable bulig-netns.service|systemctl disable bulig-pasta.service|systemctl start bulig-loopback.service|systemctl restart bulig.service bulig-worker.service|") ok "the rollback stops all five, disables the two units the previous release did not have, and only then starts it again" ;; *) bad "rollback without the namespace: $seqQ" ;; esac
+if [ ! -e "$r/etc/systemd/system/bulig-netns.service" ] && [ ! -e "$r/etc/systemd/system/bulig-pasta.service" ] && [ "$(readlink "$r/opt/bulig/current")" = "$live_ns" ]; then ok "and removes their unit files, and the links are back"; else bad "after the rollback: $(ls "$r/etc/systemd/system") $(readlink "$r/opt/bulig/current")"; fi
 
 # --- 6. what the build hands back is checked ---
 echo "hostile build output"
@@ -511,7 +570,8 @@ incF="$(deliver "$F" flag)"
 expect_fail_msg "a first release that fails its health check fails" "no healthy release to go back to" run_remote "$F" "$incF"
 if [ ! -e "$r/opt/bulig/current" ] && [ ! -L "$r/opt/bulig/current" ] && [ ! -e "$r/usr/local/lib/bulig/current" ] && [ ! -L "$r/usr/local/lib/bulig/current" ]; then ok "both current links are removed"; else bad "links left in $r/opt/bulig or $r/usr/local/lib/bulig"; fi
 if [ -z "$(find "$r/etc/systemd/system" -name 'bulig*' ! -name '*.d' | head -1)" ]; then ok "the unit files this release installed are removed"; else bad "unit files left: $(find "$r/etc/systemd/system" -name 'bulig*' ! -name '*.d')"; fi
-if grep -q "^systemctl disable bulig-worker.service bulig.service bulig-loopback.service" "$STUB_LOG/calls" && grep -q "^systemctl stop bulig-worker.service bulig.service" "$STUB_LOG/calls"; then ok "both services (and the gateway address) are stopped and disabled, so a reboot starts nothing"; else bad "systemctl calls: $(grep systemctl "$STUB_LOG/calls")"; fi
+if grep -q "^systemctl disable bulig-loopback.service bulig-netns.service bulig-pasta.service bulig.service bulig-worker.service" "$STUB_LOG/calls" && grep -q "^systemctl stop bulig-worker.service bulig.service bulig-pasta.service bulig-netns.service bulig-loopback.service" "$STUB_LOG/calls"; then ok "both services, the worker's namespace, pasta and the gateway addresses are stopped and disabled, so a reboot starts nothing"; else bad "systemctl calls: $(grep systemctl "$STUB_LOG/calls")"; fi
+if grep -q "^postcheck: no Bulig unit is installed, and Bulig left nothing on the host's network" "$work/out"; then ok "and the postcheck after it checks that nothing of Bulig's is left on the host's network"; else bad "no network leftover check after the failed first release: $(grep -i postcheck "$work/out")"; fi
 if [ ! -e "$r/opt/bulig/.healthy-sha" ]; then ok "no success marker is written"; else bad "a success marker exists"; fi
 if user_folders_untouched; then ok "and the user folders are untouched"; else bad "a user folder changed"; fi
 touch "$work/health-ok"

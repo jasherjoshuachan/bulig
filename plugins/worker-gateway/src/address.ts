@@ -3,6 +3,14 @@ import { isIP } from 'node:net';
 // Which addresses the worker endpoint may be on, and which a worker may reach over plain http. One rule for both ends: this machine,
 // or the Tailscale tunnel (WireGuard encrypts it). Nothing else, so a typo or a public address cannot put a token on an open network.
 
+/**
+ * The one non-loopback address that counts as this machine: the deploy kit puts it on lo for a worker that runs in a network namespace of its
+ * own (deploy/systemd/bulig-loopback.service). There 127.x is the namespace's own loopback, so the worker reaches the kernel at this address,
+ * through pasta, without leaving the machine. It is in 198.18.0.0/15, the range set aside for benchmark tests (RFC 2544), which no real host
+ * has. Only this exact address is accepted, not the range.
+ */
+export const NETNS_GATEWAY = '198.18.74.1';
+
 /** Eight 16-bit groups of an IPv6 address, or undefined. Zone ids and brackets are dropped. */
 function groupsOf(address: string): number[] | undefined {
   const bare = address.replace(/%.*$/, '').replace(/^\[|\]$/g, '');
@@ -31,12 +39,12 @@ export function isWildcard(address: string): boolean {
 }
 
 /**
- * 127.0.0.0/8, ::1, the Tailscale ranges 100.64.0.0/10 and fd7a:115c:a1e0::/48. An IPv4 address written as ::ffff:a.b.c.d is NOT
- * accepted, even for a good a.b.c.d: spell it as IPv4.
+ * 127.0.0.0/8, ::1, the worker namespace's gateway address 198.18.74.1 (NETNS_GATEWAY), the Tailscale ranges 100.64.0.0/10 and
+ * fd7a:115c:a1e0::/48. An IPv4 address written as ::ffff:a.b.c.d is NOT accepted, even for a good a.b.c.d: spell it as IPv4.
  */
 export function isLoopbackOrTailnet(address: string): boolean {
   const v4 = octetsOf(address);
-  if (v4) return v4[0] === 127 || (v4[0] === 100 && v4[1]! >= 64 && v4[1]! <= 127);
+  if (v4) return v4[0] === 127 || v4.join('.') === NETNS_GATEWAY || (v4[0] === 100 && v4[1]! >= 64 && v4[1]! <= 127);
   const g = groupsOf(address);
   if (!g) return false;
   const loopback = g.slice(0, 7).every((x) => x === 0) && g[7] === 1;

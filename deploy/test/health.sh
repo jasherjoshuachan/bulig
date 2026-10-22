@@ -41,9 +41,17 @@ cat >"$stubs/ss" <<'STUB'
 #!/usr/bin/env bash
 cat "$STUB_LOG/ss.txt"
 STUB
+# ip: the host's addresses (scope global), lo's (dev lo: the two gateway addresses unless STUB_LO says otherwise) and the worker namespace's
+# (-n bulig-worker: the copy pasta makes, unless STUB_NS_EMPTY)
 cat >"$stubs/ip" <<'STUB'
 #!/usr/bin/env bash
-case "$*" in *"scope global"*) cat "$STUB_LOG/ip-data" ;; esac
+case "$*" in
+  "-n bulig-worker"*) [ -n "${STUB_NS_EMPTY:-}" ] || echo "2: eth0    inet 203.0.113.10/32 scope global eth0" ;;
+  *"dev lo"*) printf '%s\n' "${STUB_LO-1: lo    inet 127.0.0.1/8 scope host lo
+1: lo    inet 127.74.3.1/32 scope host lo
+1: lo    inet 198.18.74.1/32 scope global lo}" ;;
+  *"scope global"*) cat "$STUB_LOG/ip-data" ;;
+esac
 STUB
 chmod +x "$stubs"/*
 export PATH="$stubs:/usr/bin:/bin:/usr/sbin:/sbin"
@@ -63,11 +71,13 @@ chmod +x "$kit/fence-check.sh"
 
 printf '2: eth0    inet 203.0.113.10/32 metric 100 scope global dynamic eth0\n2: eth0    inet6 2001:db8::10/64 scope global\n' >"$log/ip-data"
 rm -rf "$root"
-mkdir -p "$root/etc/bulig" "$root/etc/systemd/system/bulig-worker.service.d" "$root/var/lib/bulig-checks"
+mkdir -p "$root/etc/bulig" "$root/etc/systemd/system/bulig-worker.service.d" "$root/etc/systemd/system/bulig-pasta.service.d" "$root/var/lib/bulig-checks" "$root/run/netns"
+: >"$root/run/netns/bulig-worker"
 chmod 700 "$root/etc/bulig" "$root/var/lib/bulig-checks"
 printf 'postgres://bulig:pw@%%2Fvar%%2Frun%%2Fpostgresql:5436/bulig' >"$root/etc/bulig/pg-url"
-cp "$deploy/systemd/bulig-worker.service" "$root/etc/systemd/system/"
+cp "$deploy/systemd/bulig-worker.service" "$deploy/systemd/bulig-pasta.service" "$root/etc/systemd/system/"
 printf '[Service]\nIPAddressDeny=2001:db8::10/128 203.0.113.10/32\n' >"$root/etc/systemd/system/bulig-worker.service.d/10-host-addresses.conf"
+cp "$root/etc/systemd/system/bulig-worker.service.d/10-host-addresses.conf" "$root/etc/systemd/system/bulig-pasta.service.d/"
 cat >"$root/var/lib/bulig-checks/precheck.snapshot" <<'DATA'
 ## listening tcp sockets (Bulig's ports 5436 and 7431 left out; pids stripped)
 0.0.0.0:22 users:(("sshd"))
@@ -104,24 +114,44 @@ echo 0 >"$log/psql-n"
 expect_fail_msg "an inactive gateway-address unit fails health" "bulig-loopback.service is" env STUB_INACTIVE=bulig-loopback.service bash "$h" --wait 1
 if [ ! -s "$log/fence" ]; then ok "and the fence is not probed while health is already failing"; else bad "fence ran after a failure"; fi
 
+echo "the worker's network: namespace, pasta and the gateway addresses"
+if grep -q "^ok    198.18.74.1/32 is on lo" "$work/out" && grep -q "^ok    127.74.3.1/32 is on lo" "$work/out" && grep -q "^ok    bulig-netns.service active (/run/netns/bulig-worker exists)" "$work/out" && grep -q "^ok    bulig-pasta.service active" "$work/out" && grep -q "^ok    the worker's network namespace has an address of its own" "$work/out"; then ok "a healthy run shows both addresses on lo, the namespace, pasta and the namespace's own address"; else bad "network lines: $(grep -E 'lo|netns|pasta|namespace' "$work/out")"; fi
+hcase() { # hcase <label> <text the output must have> <env assignments...>: health must fail with that text, before the fence is probed
+  local label="$1" want="$2"
+  shift 2
+  : >"$log/fence"
+  echo 0 >"$log/psql-n"
+  expect_fail_msg "$label" "$want" env "$@" bash "$h" --wait 1
+  if [ ! -s "$log/fence" ]; then ok "  and the fence is not probed"; else bad "  fence ran after: $label"; fi
+}
+hcase "198.18.74.1 missing from lo fails health" "198.18.74.1/32 is not on lo" "STUB_LO=1: lo    inet 127.74.3.1/32 scope host lo"
+hcase "127.74.3.1 missing from lo fails health (it stays for one release)" "127.74.3.1/32 is not on lo" "STUB_LO=1: lo    inet 198.18.74.1/32 scope global lo"
+hcase "an inactive namespace unit fails health" "the worker's network namespace is not there" STUB_INACTIVE=bulig-netns.service
+hcase "an inactive pasta fails health" "bulig-pasta.service is inactive: the worker has no network" STUB_INACTIVE=bulig-pasta.service
+hcase "a namespace pasta did not set up fails health" "the worker's network namespace has no global address" STUB_NS_EMPTY=1
+rm -f "$root/run/netns/bulig-worker"
+hcase "a missing /run/netns/bulig-worker fails health" "/run/netns/bulig-worker is missing" STUB_X=1
+: >"$root/run/netns/bulig-worker"
+
 echo "warnings"
 printf '2: eth0    inet 203.0.113.10/32 scope global\n2: eth0    inet6 2001:db8::10/64 scope global\n2: eth0    inet 203.0.113.9/32 scope global\n' >"$log/ip-data"
 hrun
 rc=$?
 if [ "$rc" -eq 0 ]; then ok "health still passes with a new address on the machine"; else bad "health failed: $(cat "$work/out")"; fi
-if grep -q "^warn  the host address 203.0.113.9/32 is not in the worker's IPAddressDeny" "$work/out"; then ok "a host address missing from the worker's drop-in is a warning that names the fix"; else bad "address warning: $(grep warn "$work/out")"; fi
+if grep -q "^warn  the host address 203.0.113.9/32 is not in bulig-worker.service's IPAddressDeny" "$work/out" && grep -q "^warn  the host address 203.0.113.9/32 is not in bulig-pasta.service's IPAddressDeny" "$work/out" && grep -q "Run host-addresses.sh and restart bulig-pasta and bulig-worker" "$work/out"; then ok "a host address missing from the worker's and pasta's drop-ins is a warning for each, that names the fix"; else bad "address warning: $(grep warn "$work/out")"; fi
 if ! grep -q "warn  the host address 203.0.113.10" "$work/out"; then ok "and one that is there is not"; else bad "false warning"; fi
 rm -f "$root/etc/systemd/system/bulig-worker.service.d/10-host-addresses.conf"
 hrun
-if [ "$(grep -c '^warn  the host address' "$work/out")" -ge 1 ]; then ok "with no drop-in at all every address is a warning"; else bad "no-drop-in: $(grep warn "$work/out")"; fi
+if [ "$(grep -c "^warn  the host address .* bulig-worker.service's" "$work/out")" -ge 1 ]; then ok "with no drop-in at all every address is a warning"; else bad "no-drop-in: $(grep warn "$work/out")"; fi
 printf '[Service]\nIPAddressDeny=203.0.113.9/32\n' >"$root/etc/systemd/system/bulig-worker.service.d/10-host-addresses.conf"
+cp "$root/etc/systemd/system/bulig-worker.service.d/10-host-addresses.conf" "$root/etc/systemd/system/bulig-pasta.service.d/"
 printf '2: eth0    inet 203.0.113.9/32 scope global\n' >"$log/ip-data"
 hrun
 if ! grep -q "^warn  the host address" "$work/out"; then ok "a drop-in that matches the current addresses gives no warning"; else bad "false address warning: $(grep warn "$work/out")"; fi
 printf 'LISTEN 0 128 0.0.0.0:22 0.0.0.0:*\nLISTEN 0 511 0.0.0.0:80 0.0.0.0:*\nLISTEN 0 128 [::]:22 [::]:*\nLISTEN 0 128 *:8081 *:*\nLISTEN 0 128 [::]:8082 [::]:*\nLISTEN 0 128 0.0.0.0:9000 0.0.0.0:*\nLISTEN 0 128 127.0.0.1:41022 0.0.0.0:*\n' >"$log/ss.txt"
 hrun
 rc=$?
-if grep -q "^warn  a service listens on every address now (\*:8081)" "$work/out" && grep -q "^warn  a service listens on every address now (0.0.0.0:9000)" "$work/out" && grep -qF "now ([::]:8082)" "$work/out"; then ok "new listeners on every address (0.0.0.0, * and [::]) are warnings"; else bad "listener warnings: $(grep warn "$work/out")"; fi
+if grep -q "^warn  a service listens on every address now (\*:8081) and was not there at the precheck. The worker can reach it through 198.18.74.1 (pasta)." "$work/out" && grep -q "^warn  a service listens on every address now (0.0.0.0:9000)" "$work/out" && grep -qF "now ([::]:8082)" "$work/out"; then ok "new listeners on every address (0.0.0.0, * and [::]) are warnings"; else bad "listener warnings: $(grep warn "$work/out")"; fi
 if ! grep -q "now (0.0.0.0:22)\|now (0.0.0.0:80)\|now (\[::\]:22)" "$work/out"; then ok "listeners that were there at the precheck are not"; else bad "false listener warning"; fi
 if ! grep -q "41022" "$work/out"; then ok "a listener on 127.0.0.1 is not a wildcard listener"; else bad "41022 reported"; fi
 if [ "$rc" -eq 0 ]; then ok "warnings do not fail health"; else bad "health failed on warnings (rc=$rc)"; fi

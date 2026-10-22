@@ -1,7 +1,7 @@
 import { lstatSync, readFileSync, realpathSync } from 'node:fs';
 import { isIP } from 'node:net';
 import { dirname, isAbsolute } from 'node:path';
-import { isLoopbackOrTailnet, isWildcard } from './address.ts';
+import { isLoopbackOrTailnet, isWildcard, NETNS_GATEWAY } from './address.ts';
 import { readCredential } from '@bulig/worker-claude-code';
 import { z } from 'zod';
 
@@ -28,7 +28,8 @@ export class GatewayConfigError extends Error {
 
 /**
  * Throws for an address the endpoint must not bind. Only the places a token may safely travel are accepted: this machine (127.0.0.0/8,
- * ::1) and the Tailscale tunnel (100.64.0.0/10, fd7a:115c:a1e0::/48). Everything else is refused: "every interface" (0.0.0.0, ::),
+ * ::1, and 198.18.74.1, the gateway address for a worker in its own network namespace) and the Tailscale tunnel (100.64.0.0/10,
+ * fd7a:115c:a1e0::/48). Everything else is refused: "every interface" (0.0.0.0, ::),
  * a public or LAN address, a name. IPv4 written as ::ffff:a.b.c.d is refused too: spell it as IPv4.
  */
 export function assertBindable(address: string): string {
@@ -38,7 +39,7 @@ export function assertBindable(address: string): string {
     throw new GatewayConfigError(`listen address ${JSON.stringify(address)} would accept connections on every interface. Name the address to listen on (127.0.0.1, or the Tailscale address).`);
   }
   if (!isLoopbackOrTailnet(bare)) {
-    throw new GatewayConfigError(`listen address ${JSON.stringify(address)} is neither this machine nor the Tailscale tunnel (127.0.0.0/8, ::1, 100.64.0.0/10, fd7a:115c:a1e0::/48), so a worker token could cross an open network. Use one of those.`);
+    throw new GatewayConfigError(`listen address ${JSON.stringify(address)} is neither this machine nor the Tailscale tunnel (127.0.0.0/8, ::1, ${NETNS_GATEWAY}, 100.64.0.0/10, fd7a:115c:a1e0::/48), so a worker token could cross an open network. Use one of those.`);
   }
   return bare;
 }

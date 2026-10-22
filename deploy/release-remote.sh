@@ -6,7 +6,8 @@
 #
 # THE INVARIANT: root never creates, writes, chmods, chowns or deletes a path whose parent a Bulig user owns or can write. Every path
 # this script writes is under /var/lib/bulig-checks, /opt/bulig, /usr/local/lib/bulig, /etc/bulig, /etc/systemd/system or (one file,
-# bulig-bwrap) /etc/apparmor.d, all root's.
+# bulig-bwrap) /etc/apparmor.d, all root's. The units it starts make the worker's network namespace (/run/netns/bulig-worker) and put two
+# addresses on lo; it writes neither itself.
 # It never goes near /var/lib/bulig or /var/lib/bulig-worker: systemd makes those (StateDirectory=), and the programs fill them.
 #
 # What it does with the delivered tree:
@@ -17,7 +18,9 @@
 #     checked (types, hard links, set-id bits, links that leave the release), and only then are the node_modules folders moved next to a
 #     fresh copy of the delivered code. A build script cannot change a delivered file or keep a handle into the live release.
 #   - both `current` links and the unit files are swapped, bwrap's AppArmor profile (/etc/apparmor.d/bulig-bwrap) installed and loaded if it
-#     differs, the services restarted, health checked; any failure puts all of it back.
+#     differs, the kernel's config given the gateway address 198.18.74.1 in its listen list if it lacks it, the worker's network namespace
+#     (bulig-netns, bulig-pasta) and the gateway addresses (bulig-loopback) started, the services restarted, health checked; any failure puts all
+#     of it back.
 #   - just before the first of those changes, a "before" snapshot of the host (release-<sha>.before.snapshot); after the health check (or
 #     the rollback) postcheck.sh compares the host with it and reports the result. It never fails or rolls back the release.
 #
@@ -48,7 +51,10 @@ rel="$OPT/releases/$short"
 tk_rel="$TK/$short"
 cur="$OPT/current"
 tk_cur="$TK/current"
-units="bulig-loopback.service bulig.service bulig-worker.service bulig-backup.service bulig-backup.timer bulig-restore-drill.service bulig-restore-drill.timer"
+units="bulig-loopback.service bulig-netns.service bulig-pasta.service bulig.service bulig-worker.service bulig-backup.service bulig-backup.timer bulig-restore-drill.service bulig-restore-drill.timer"
+# The units each release enables (the timers are enabled by hand, RUNBOOK step 10), in start order. bulig-netns and bulig-pasta are the
+# worker's own network namespace and its way out (22 Oct 2026).
+enabled_units="bulig-loopback.service bulig-netns.service bulig-pasta.service bulig.service bulig-worker.service"
 # The build gets at most this many bytes of node_modules to hand back.
 MAX_MODULES_BYTES=$((2 * 1024 * 1024 * 1024))
 # (the tests lower it; on the server R is empty and this line does nothing)
@@ -277,6 +283,67 @@ restore_apparmor() {
   fi
 }
 
+# --- 3c. the kernel listens on 198.18.74.1 too (22 Oct 2026) -------------------------------------------------------------------------
+# The worker reaches the kernel from its own network namespace at 198.18.74.1 (through pasta). /etc/bulig/config.json is root's and edited by
+# hand, and never overwritten; this adds that one address to pluginConfig.worker-gateway.listen when the list lacks it, and changes nothing
+# else in the file (127.74.3.1 stays). It has to be done here, not by hand before the release: the release before this one refuses 198.18.74.1
+# as a listen address, so a hand edit would stop the running kernel at its next restart and break a rollback. A rollback puts the file back
+# byte for byte. A config with no listen list (the kernel then listens on 127.0.0.1 only) is left alone with a warning; health decides.
+cfg="$BULIG_CRED_DIR/config.json"
+cfg_backup="$work/config-backup"
+cfg_changed=0
+add_gateway_listen() {
+  local tmp what
+  [ -f "$cfg" ] && [ ! -L "$cfg" ] || { echo "config: $cfg is missing or a link" >&2; return 1; }
+  tmp="$(mktemp "$BULIG_CRED_DIR/.config.XXXXXX")" || return 1
+  chmod 600 "$tmp" || return 1
+  # shellcheck disable=SC2016
+  what="$(python3 -I -c '
+import json, sys
+src, addr, out = sys.argv[1], sys.argv[2], sys.argv[3]
+c = json.load(open(src))
+gw = (c.get("pluginConfig") or {}).get("worker-gateway") if isinstance(c, dict) else None
+listen = gw.get("listen") if isinstance(gw, dict) else None
+if not isinstance(listen, list):
+    print("no-listen")
+elif addr in listen:
+    print("present")
+else:
+    listen.append(addr)
+    with open(out, "w") as f:
+        json.dump(c, f, indent=2)
+        f.write("\n")
+    print("added")
+' "$cfg" "$BULIG_NETNS_GATEWAY" "$tmp")" || { rm -f "$tmp"; echo "config: $cfg could not be read as JSON" >&2; return 1; }
+  case "$what" in
+    added)
+      cp -p "$cfg" "$cfg_backup" || { rm -f "$tmp"; return 1; }
+      if is_root; then chown -h root:root "$tmp"; fi
+      mv "$tmp" "$cfg" || return 1
+      cfg_changed=1
+      echo "config: added $BULIG_NETNS_GATEWAY to pluginConfig.worker-gateway.listen in $cfg (nothing else changed)" ;;
+    present) rm -f "$tmp"; echo "config: $cfg already listens on $BULIG_NETNS_GATEWAY" ;;
+    *) rm -f "$tmp"; echo "config: WARNING: $cfg has no pluginConfig.worker-gateway.listen list, so the kernel does not listen on $BULIG_NETNS_GATEWAY and the worker cannot reach it. Add it by hand (RUNBOOK, release notes)." >&2 ;;
+  esac
+}
+# restore_config: only if this release changed the file.
+restore_config() {
+  [ "$cfg_changed" -eq 1 ] || return 0
+  { cp -p "$cfg_backup" "$cfg.restore.$$" && mv "$cfg.restore.$$" "$cfg"; } || echo "config: could not put the previous $cfg back" >&2
+}
+
+# stop_bulig_units: everything a release starts, stopped while the new unit files are still loaded, so each one's own ExecStop runs (the
+# namespace is deleted, both addresses come off lo). Then the units of the release being gone back to are installed and started.
+stop_bulig_units() {
+  systemctl stop bulig-worker.service bulig.service bulig-pasta.service bulig-netns.service bulig-loopback.service || true
+}
+# disable_new_units: a unit this release added (no copy of it in the backup) is disabled before its file is removed, so no link to it is left.
+disable_new_units() {
+  for u in $enabled_units; do
+    if [ ! -e "$unit_backup/$u" ]; then systemctl disable "$u" >/dev/null 2>&1 || true; fi
+  done
+}
+
 # --- 4. swap both links, install the units of the new release, restart, check --------------------------------------------------------
 # Every step ends in "|| return 1": inside an `if` the shell ignores set -e, so a failed step would otherwise be skipped over and the
 # release would look fine.
@@ -291,11 +358,17 @@ apply_release() {
     install -m 0600 "$tk_rel/bulig.config.vps.json" "$BULIG_CRED_DIR/config.json" || return 1
     echo "config: created $BULIG_CRED_DIR/config.json from the VPS template (Telegram off, no local worker). Edit it as root; it is never overwritten."
   fi
-  write_host_dropin bulig-worker.service || return 1
+  add_gateway_listen || return 1
+  for u in $HOST_DROPIN_UNITS; do write_host_dropin "$u" || return 1; done
   install_apparmor || return 1
   systemctl daemon-reload || return 1
-  systemctl enable bulig-loopback.service bulig.service bulig-worker.service >/dev/null 2>&1 || return 1
-  systemctl start bulig-loopback.service || return 1
+  # shellcheck disable=SC2086
+  systemctl enable $enabled_units >/dev/null 2>&1 || return 1
+  # The worker moves into its own network namespace, so it is stopped first. bulig-loopback is restarted, not started: it is a oneshot that stays
+  # active, so a start would not add 198.18.74.1. The namespace is made fresh, then pasta; then the kernel and the worker.
+  systemctl stop bulig-worker.service || return 1
+  systemctl restart bulig-loopback.service || return 1
+  systemctl restart bulig-netns.service bulig-pasta.service || return 1
   systemctl restart bulig.service bulig-worker.service || return 1
   "$tk_cur/health.sh" --wait 40 || return 1
 }
@@ -322,14 +395,18 @@ if apply_release; then
 fi
 
 echo "release: install, restart or health check FAILED on $short" >&2
-journalctl -u bulig.service -u bulig-worker.service -n 40 --no-pager >&2 || true
+journalctl -u bulig.service -u bulig-worker.service -u bulig-pasta.service -u bulig-netns.service -n 40 --no-pager >&2 || true
 if [ -n "$prev_healthy" ] && [ -d "$prev_healthy" ]; then
-  echo "release: rolling back to $prev_healthy (Node tree, root tools and unit files)" >&2
+  echo "release: rolling back to $prev_healthy (Node tree, root tools, unit files, the config's listen list and the worker's network)" >&2
   swap_link "$prev" "$cur"
   if [ -n "$prev_tk" ] && [ -d "$prev_tk" ]; then swap_link "$prev_tk" "$tk_cur"; fi
+  stop_bulig_units
+  disable_new_units
   restore_units
   restore_apparmor
+  restore_config
   systemctl daemon-reload
+  systemctl start bulig-loopback.service || true
   systemctl restart bulig.service bulig-worker.service
   if [ -x "$tk_cur/health.sh" ] && "$tk_cur/health.sh" --wait 40; then
     echo "release: rolled back, healthy on $(basename "$prev")" >&2
@@ -341,12 +418,13 @@ else
   # A failed FIRST release leaves nothing behind: services stopped and disabled (a reboot starts nothing), both current links and the unit files
   # removed, and no success marker, so the same sha can be released again.
   echo "release: no healthy release to go back to. Stopping and disabling both services and removing what this release installed." >&2
-  systemctl stop bulig-worker.service bulig.service || true
-  systemctl disable bulig-worker.service bulig.service bulig-loopback.service >/dev/null 2>&1 || true
-  systemctl stop bulig-loopback.service || true
+  stop_bulig_units
+  # shellcheck disable=SC2086
+  systemctl disable $enabled_units >/dev/null 2>&1 || true
   rm -f "$cur" "$tk_cur" "$healthy_file"
   restore_units
   restore_apparmor
+  restore_config
   systemctl daemon-reload || true
   release_compare "after removing the failed first release"
 fi

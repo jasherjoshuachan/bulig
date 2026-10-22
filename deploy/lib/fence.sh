@@ -33,8 +33,9 @@ unit_last() {
 
 # Besides the network and path properties, the ones that decide whether Claude Code's sandbox (bwrap) can start: they change what /proc looks like,
 # which system calls work and which capabilities a process can hold, so the bwrap probe has to run with the unit's real values (21 Oct 2026).
+# And NetworkNamespacePath (22 Oct 2026): the worker's probe must run in the worker's own network namespace, or it would test the host's.
 FENCE_LIST_EXTRA="ReadOnlyPaths SystemCallFilter SystemCallArchitectures"
-FENCE_SINGLE_EXTRA="ProtectKernelTunables ProtectKernelLogs ProtectHostname ProcSubset ProtectKernelModules ProtectControlGroups ProtectClock PrivateDevices NoNewPrivileges RestrictSUIDSGID RestrictRealtime LockPersonality MemoryDenyWriteExecute"
+FENCE_SINGLE_EXTRA="ProtectKernelTunables ProtectKernelLogs ProtectHostname ProcSubset ProtectKernelModules ProtectControlGroups ProtectClock PrivateDevices NoNewPrivileges RestrictSUIDSGID RestrictRealtime LockPersonality MemoryDenyWriteExecute NetworkNamespacePath"
 # Passed on even when empty: CapabilityBoundingSet= (empty) is the unit's real value, and leaving it out would give the probe every capability.
 FENCE_KEEP_EMPTY="CapabilityBoundingSet"
 # unit_has <unit> <Key>: is the key set at all in the unit file or a drop-in (an empty assignment counts)?
@@ -96,4 +97,34 @@ unit_loaded_props() {
 # paths are redirected for the tests (BULIG_DEPLOY_TEST_ROOT set). BULIG_FENCE_SOURCE=files|show forces one.
 fence_source() {
   if [ -n "${BULIG_FENCE_SOURCE:-}" ]; then printf '%s' "$BULIG_FENCE_SOURCE"; elif [ -z "$R" ]; then printf show; else printf files; fi
+}
+
+# netns_inode <path>: the inode of the network namespace at that path (/proc/self/ns/net, /run/netns/<name>), which names it. Under the tests
+# (BULIG_DEPLOY_TEST_ROOT set, no /proc) the numbers come from BULIG_TEST_NETNS_HOST and BULIG_TEST_NETNS_WORKER instead.
+netns_inode() {
+  if [ -n "$R" ]; then
+    case "$1" in
+      /proc/self/ns/net) printf '%s' "${BULIG_TEST_NETNS_HOST:-4026531840}" ;;
+      *) [ -e "$R$1" ] || return 1; printf '%s' "${BULIG_TEST_NETNS_WORKER:-4026532300}" ;;
+    esac
+    return 0
+  fi
+  stat -L -c %i "$1" 2>/dev/null
+}
+
+# netns_args <set> <NetworkNamespacePath value>: sets NETNS_ARGS, the --netns guard for the probe. The worker sets must run in the worker's own
+# network namespace: a set with no NetworkNamespacePath, or another one, or one that does not exist or is the host's own, is refused here.
+NETNS_ARGS=()
+netns_args() {
+  local set="$1" path="$2" host want
+  NETNS_ARGS=()
+  case "$set" in worker | cli-worker) ;; *) return 0 ;; esac
+  [ "$path" = "$BULIG_NETNS_PATH" ] || die "the $set set has NetworkNamespacePath='$path', not $BULIG_NETNS_PATH: the worker must run in its own network namespace"
+  host="$(netns_inode /proc/self/ns/net)" || die "cannot read this host's network namespace (/proc/self/ns/net)"
+  want="$(netns_inode "$BULIG_NETNS_PATH")" || die "$BULIG_NETNS_PATH does not exist: start bulig-netns.service and bulig-pasta.service (the worker's network namespace) first"
+  [ -n "$host" ] && [ -n "$want" ] || die "could not read the inodes of the host's and the worker's network namespaces"
+  [ "$host" != "$want" ] || die "$BULIG_NETNS_PATH is the host's own network namespace"
+  NETNS_ARGS=(--netns "$host:$want")
+  # (the tests only: a probe outside Linux has no /proc/self/ns/net, so the run says which namespace it would be in)
+  if [ -n "$R" ] && [ -n "${BULIG_TEST_NETNS_SELF:-$want}" ]; then NETNS_ARGS+=(--self-netns "${BULIG_TEST_NETNS_SELF:-$want}"); fi
 }

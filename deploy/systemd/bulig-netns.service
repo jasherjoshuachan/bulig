@@ -1,0 +1,35 @@
+[Unit]
+Description=Bulig worker network namespace (/run/netns/bulig-worker)
+Documentation=https://github.com/jasherjoshuachan/bulig
+# The worker runs in a network namespace of its own (Jasher, 22 Oct 2026). Its loopback is its own, so Claude Code's sandbox proxy on
+# 127.0.0.1 works, and the host's loopback, where other tenants listen, is not reachable at all. bulig-pasta.service gives the namespace its
+# way out (the public internet, and the kernel's gateway on 198.18.74.1). This unit only makes the namespace and removes it again: one name,
+# bulig-worker, under /run/netns (`ip netns`). Nothing else on the host's network is touched.
+Before=bulig-pasta.service bulig-worker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# A fresh namespace on every start: one left from an unclean stop is removed first ("-": none there is fine). The worker and pasta are bound
+# to this unit (BindsTo=), so neither is running when it starts. /usr/bin/ip on this host (/usr/sbin/ip is a link to it).
+ExecStartPre=-/usr/bin/ip netns delete bulig-worker
+ExecStart=/usr/bin/ip netns add bulig-worker
+ExecStop=/usr/bin/ip netns delete bulig-worker
+# NO MOUNT NAMESPACE, on purpose. `ip netns add` publishes the namespace as a bind mount at /run/netns/bulig-worker. A unit with its own mount
+# namespace (ProtectSystem, ProtectHome, PrivateTmp, PrivateDevices, ReadWritePaths, ProtectKernelTunables, ProtectKernelModules,
+# ProtectKernelLogs, ProtectControlGroups, ProtectProc and the like all make one) would make that mount inside its own copy, where neither pasta
+# nor the worker can see it. So none of those is set; what is set works without one: one capability, no other namespace, no IP traffic.
+CapabilityBoundingSet=CAP_SYS_ADMIN
+NoNewPrivileges=true
+RestrictNamespaces=net
+RestrictAddressFamilies=AF_NETLINK AF_UNIX
+# It sends no IP packets at all.
+IPAddressDeny=any
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

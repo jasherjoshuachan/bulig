@@ -28,7 +28,9 @@ STUB
 chmod +x "$stubs/systemd-run" "$stubs/ip"
 export PATH="$stubs:/usr/bin:/bin:/usr/sbin:/sbin"
 export BULIG_DEPLOY_TEST_ROOT="$work/root" STUB_OUT="$work/argv"
-mkdir -p "$work/root/etc/bulig"
+mkdir -p "$work/root/etc/bulig" "$work/root/run/netns"
+# the worker's network namespace, as bulig-netns.service leaves it (a file at /run/netns/bulig-worker)
+: >"$work/root/run/netns/bulig-worker"
 for f in config.json pg-url gh-token worker-tokens claude-token worker-token github-read-token telegram-token; do : >"$work/root/etc/bulig/$f"; done
 cli="$deploy/bulig-cli.sh"
 has() { grep -qxF -- "$1" "$work/argv"; }
@@ -55,8 +57,9 @@ absent "and no Telegram bot token (a one-off command never runs the Telegram cha
 absent "no ReadWritePaths (StateDirectory is the writable place)" "ReadWritePaths"
 check "capped memory" "MemoryMax=1G"
 check "home hidden" "ProtectHome=yes"
-check "the kernel's one-off commands cannot reach localhost, private ranges, Tailscale or the docker bridges" "IPAddressDeny=127.0.0.0/8 ::1/128 169.254.0.0/16 fe80::/10 224.0.0.0/4 ff00::/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7"
-check "only the gateway address is let through (no DNS stub, no Tailscale range)" "IPAddressAllow=127.74.3.1/32"
+check "the kernel's one-off commands cannot reach localhost, private ranges, Tailscale, the docker bridges or the benchmark range" "IPAddressDeny=127.0.0.0/8 ::1/128 169.254.0.0/16 fe80::/10 224.0.0.0/4 ff00::/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7 198.18.0.0/15"
+check "only the gateway addresses are let through (no DNS stub, no Tailscale range)" "IPAddressAllow=127.74.3.1/32 198.18.74.1/32"
+absent "the kernel's one-off commands stay in the host's network namespace" "^NetworkNamespacePath="
 check "the kernel's one-off commands keep AF_UNIX (Postgres)" "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6"
 check "and cannot see the tailscale, snapd or docker sockets" "InaccessiblePaths=-/run/tailscale -/run/snapd.socket -/run/docker.sock -/var/run/docker.sock"
 check "and resolve names through resolved's upstream list" "BindReadOnlyPaths=/run/systemd/resolve/resolv.conf:/etc/resolv.conf"
@@ -76,8 +79,9 @@ check "and its own worker token" "LoadCredential=worker-token:$work/root/etc/bul
 check "and the read-only GitHub token for its own clone" "LoadCredential=github-read-token:$work/root/etc/bulig/github-read-token"
 absent "none of the kernel's secrets or its config" "pg-url|gh-token|worker-tokens|config.json|telegram-token"
 absent "no ReadWritePaths" "ReadWritePaths"
-check "the worker's one-off commands cannot reach Tailscale or this machine's own public addresses" "IPAddressDeny=127.0.0.0/8 ::1/128 169.254.0.0/16 fe80::/10 224.0.0.0/4 ff00::/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7 2001:db8::10/128 203.0.113.10/32"
-check "only the gateway address is let through" "IPAddressAllow=127.74.3.1/32"
+check "the worker's one-off commands cannot reach Tailscale or this machine's own public addresses" "IPAddressDeny=127.0.0.0/8 ::1/128 169.254.0.0/16 fe80::/10 224.0.0.0/4 ff00::/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7 198.18.0.0/15 2001:db8::10/128 203.0.113.10/32"
+check "they run in the worker's own network namespace" "NetworkNamespacePath=/run/netns/bulig-worker"
+check "where only its own loopback and the gateway through pasta are let through" "IPAddressAllow=127.0.0.0/8 ::1/128 198.18.74.1/32"
 check "the worker's one-off commands get the worker unit's families: AF_UNIX and AF_NETLINK for Claude Code's sandbox, and IP" "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK"
 if [ "$(grep -c '^RestrictAddressFamilies=' "$work/argv")" = "1" ] && ! grep -q 'RestrictAddressFamilies=.*AF_PACKET' "$work/argv"; then ok "and nothing else in the command line changes the family list"; else bad "address-family lines: $(grep Restrict "$work/argv")"; fi
 check "and cannot see the tailscale, snapd or docker sockets, the Postgres socket folder or the system bus" "InaccessiblePaths=-/run/tailscale -/run/snapd.socket -/run/docker.sock -/var/run/docker.sock -/run/postgresql -/var/run/postgresql -/run/dbus -/run/snapd-snap.socket -/run/systemd/userdb -/run/systemd/resolve/io.systemd.Resolve -/run/systemd/resolve/io.systemd.Resolve.Monitor -/run/user"
@@ -99,6 +103,14 @@ check "the other one is still loaded" "LoadCredential=worker-token:$work/root/et
 if grep -q "claude-token does not exist" "$work/out"; then ok "and a note says so"; else bad "no note: $(cat "$work/out")"; fi
 check "an --exec command starts in / (the release may not exist yet)" "--working-directory=/"
 : >"$work/root/etc/bulig/claude-token"
+
+echo "the worker's network namespace"
+rm "$work/root/run/netns/bulig-worker"
+: >"$work/argv"
+expect_fail_msg "a worker command is refused while the worker's network namespace is not there" "/run/netns/bulig-worker does not exist" bash "$cli" --as worker --exec claude setup-token
+if [ ! -s "$work/argv" ]; then ok "and no unit is started"; else bad "systemd-run ran without the namespace"; fi
+expect_ok "a kernel command does not need it" bash "$cli" status
+: >"$work/root/run/netns/bulig-worker"
 
 echo "terminal and refusals"
 expect_ok "a terminal command runs" bash "$cli" --as worker --tty --exec claude setup-token

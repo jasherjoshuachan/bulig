@@ -51,3 +51,18 @@ export function isLoopbackOrTailnet(address: string): boolean {
   const tailnet = g[0] === 0xfd7a && g[1] === 0x115c && g[2] === 0xa1e0;
   return loopback || tailnet;
 }
+
+/**
+ * May a connection from this peer address reach the gateway at all? The same rule as for the listen address, applied to the connection's
+ * SOURCE, before any request is read (and so before the token is checked). A worker on this machine connects from a loopback address or, in
+ * its own network namespace through pasta, from 198.18.74.1 (pasta does not bind its outbound sockets, so the host picks the local address);
+ * a Mac worker connects from its Tailscale address. A machine on the same network segment that sends to 198.18.74.1 connects from its own
+ * address, and is refused here. A forged source in the allowed set cannot finish the TCP handshake: the replies go to lo or the tunnel, not
+ * to the forger, and Linux drops a packet that arrives from outside with a loopback or local source (martian). An IPv4 address that the
+ * socket reports as ::ffff:a.b.c.d is judged as a.b.c.d.
+ */
+export function isAllowedPeer(remoteAddress: string | undefined): boolean {
+  if (!remoteAddress) return false;
+  const mapped = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i.exec(remoteAddress);
+  return isLoopbackOrTailnet(mapped ? mapped[1]! : remoteAddress);
+}

@@ -1,5 +1,6 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
+import { isAllowedPeer } from './address.ts';
 import { definePlugin, type BuligEvent, type Plugin, type PluginContext, type Stage } from '@bulig/plugin-sdk';
 import { isRequest } from '@bulig/worker-claude-code';
 import { TokenAuth, type Compare } from './auth.ts';
@@ -10,8 +11,24 @@ import { applyPatch, diffAgainst, resolveBase, revertPatch, sizeText, WorkspaceE
 
 export { GatewayConfigError, assertBindable, parseGatewayConfig, DEFAULT_PORT, type GatewayConfig } from './config.ts';
 export { TokenAuth } from './auth.ts';
+export { isAllowedPeer } from './address.ts';
 export { Scheduler } from './scheduler.ts';
 export * from './protocol.ts';
+
+/**
+ * The gateway's HTTP server. Every connection is checked by its source address first (isAllowedPeer): one from anywhere but this machine or the
+ * Tailscale tunnel is closed before a byte of it is read, so the token is never even looked at. This is what keeps a machine on the same
+ * network segment away from an address on lo such as 198.18.74.1 (deploy/RUNBOOK.md, Known limits).
+ */
+export function gatewayServer(handler: (req: IncomingMessage, res: ServerResponse) => void, log: { warn(message: string): void }): Server {
+  const server = createServer(handler);
+  server.on('connection', (socket) => {
+    if (isAllowedPeer(socket.remoteAddress)) return;
+    log.warn(`worker-gateway: refused a connection from ${socket.remoteAddress ?? 'an unknown address'}: not this machine or the Tailscale tunnel`);
+    socket.destroy();
+  });
+  return server;
+}
 
 export interface GatewayOptions {
   /** The comparison used for tokens. Default crypto.timingSafeEqual. A test passes a spy to see that every check goes through it. */
@@ -540,12 +557,12 @@ export function createGateway(options: GatewayOptions = {}): Plugin & { addresse
       ticker.unref();
 
       servers = cfg.listen.map(() =>
-        createServer((req, res) => {
+        gatewayServer((req, res) => {
           handle(req, res).catch((err: unknown) => {
             ctx.log.error(`worker-gateway: request failed: ${msg(err)}`);
             send(res, 500, { error: 'internal' });
           });
-        }),
+        }, ctx.log),
       );
       try {
         await Promise.all(

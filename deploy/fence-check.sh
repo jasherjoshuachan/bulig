@@ -98,7 +98,10 @@ ss -H -ltn >"$work/ss-tcp" 2>/dev/null || die "ss -H -ltn failed, so the listene
 ss -H -xl >"$work/ss-unix" 2>/dev/null || die "ss -H -xl failed, so the unix listeners cannot be read (the fence check never connects to find out)"
 systemctl list-sockets --all --no-legend --plain --no-pager >"$work/sockets" 2>/dev/null || die "systemctl list-sockets failed, so socket-activated targets cannot be told apart (the fence check never connects to find out)"
 { ip -o addr 2>/dev/null || true; } >"$work/ip-addr"
-python3 -I "$probe" derive "$work/ss-tcp" "$work/ss-unix" "$work/ip-addr" >"$work/derived"
+if ! python3 -I "$probe" derive "$work/ss-tcp" "$work/ss-unix" "$work/ip-addr" >"$work/derived" 2>"$work/derive-notes"; then
+  cat "$work/derive-notes" >&2
+  die "the probes could not be derived from what this machine listens on (see above)"
+fi
 cat "$static_probes" "$work/derived" "$BULIG_FENCE_EXTRA" >"$work/all-probes"
 
 fail=0
@@ -181,6 +184,10 @@ for i in "${!sets[@]}"; do
   # A set that printed nothing at all did not run.
   if [ -z "$out" ]; then echo "FAIL $s no-output the probe printed nothing"; fail=1; fi
 done
+# A cap that derive hit is said here, in the output, not only on stderr: what it left out was not checked.
+while IFS= read -r note; do
+  if [ -n "$note" ]; then echo "warn fence-check capped: ${note#fence-probe derive: }"; fi
+done <"$work/derive-notes"
 echo "info fence-check ${#sets[@]} set(s) in ${SECONDS}s (blocked probes wait ${deny_timeout}s, ${par} at a time)"
 if [ "$fail" -eq 0 ]; then echo "fence-check: ok"; else echo "fence-check: FAILED"; fi
 exit "$fail"

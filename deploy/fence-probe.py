@@ -210,7 +210,8 @@ GATEWAY = ("127.74.3.1", "7431")  # the kernel's own gateway: the worker is mean
 MAX_DERIVED = 400
 # Path sockets the worker sets could connect to (they have AF_UNIX since 21 Oct 2026). Every listening path socket that ss lists becomes a
 # "reach" line for these sets, judged inside the unit from the file itself (stat and access, never a connection), so what InaccessiblePaths,
-# PrivateTmp, ProtectHome and the folders' modes leave reachable is listed in every health run.
+# PrivateTmp, ProtectHome and the folders' modes leave reachable is listed in every health run: up to MAX_REACH of them, sorted by path. When
+# there are more, derive says so on stderr and fence-check.sh turns that into a "warn fence-check capped" line in its output.
 REACH_SETS = "worker,cli-worker"
 MAX_REACH = 400
 # Bulig's own sockets, which the worker must never be able to reach: the kernel's (anything under its folders or owned by its user, passed as
@@ -338,8 +339,13 @@ def derive(ss_tcp, ss_unix, ip_addr):
         if len(f) >= 5 and f[1] == "LISTEN" and f[4].startswith("/"):
             paths.add(norm_path(f[4]))
     reach = [f"reach {REACH_SETS} path-{n} unix-path {p}" for n, p in enumerate(sorted(paths), 1)]
+    # A cap that is hit is said (fence-check.sh prints it as a warn line): what is left out is not checked at all.
+    if len(lines) > MAX_DERIVED:
+        print(f"fence-probe derive: {len(lines)} probes derived from the listeners, only the first {MAX_DERIVED} (sorted) are run; "
+              f"the other {len(lines) - MAX_DERIVED} are not", file=sys.stderr)
     if len(reach) > MAX_REACH:
-        print(f"fence-probe derive: {len(reach)} listening path sockets, only the first {MAX_REACH} are judged", file=sys.stderr)
+        print(f"fence-probe derive: {len(reach)} listening path sockets, only the first {MAX_REACH} (sorted by path) are judged and listed; "
+              f"the other {len(reach) - MAX_REACH} are not checked", file=sys.stderr)
     return lines[:MAX_DERIVED] + reach[:MAX_REACH]
 
 
@@ -353,9 +359,10 @@ def path_reach(path, self_uid, bulig_uid):
     except OSError as e:
         return "unreachable", (e.strerror or type(e).__name__).lower()
     if not stat.S_ISSOCK(st.st_mode):
-        return "unreachable", "not a socket in this unit's view (hidden by InaccessiblePaths, or another file there)"
+        return "unreachable", "not a socket in this unit's view (another kind of file is there)"
+    # InaccessiblePaths on a socket mounts systemd's mode-0000 socket inode over it, so a hidden socket lands here, not above.
     if not os.access(path, os.W_OK):
-        return "unreachable", "no permission for this user"
+        return "unreachable", "no permission for this user (or hidden by InaccessiblePaths: systemd's mode-0000 socket is in its place)"
     detail = f"{stat.filemode(st.st_mode)} uid {st.st_uid} gid {st.st_gid}"
     if st.st_uid == self_uid:
         return "own", detail

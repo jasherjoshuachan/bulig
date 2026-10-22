@@ -164,6 +164,9 @@ STEP8="$(sed -n '/^8\. \*\*Copy over the old record/,/^9\. \*\*Synthetic/p' "$de
 if grep -q 'bulig-cli.sh --as kernel --exec' <<<"$STEP8" && grep -q 'Never `scp`' <<<"$STEP8"; then ok "step 8 pipes the SQLite file in through bulig-cli.sh --exec and says never to scp it into a user's folder"; else bad "step 8 does not use bulig-cli.sh --exec"; fi
 PC="$(sed -n '/^12\. \*\*Postcheck/,/^## /p' "$deploy/RUNBOOK.md")"
 if grep -q 'the run state of a service a timer starts' <<<"$PC" && grep -q 'a `failed` one is a `warn` line that names the unit' <<<"$PC" && grep -q 'a container whose image no longer runs in any container, or a known container on a new image still fails' <<<"$PC"; then ok "the RUNBOOK's postcheck step says what is reported and not compared, and what still fails"; else bad "RUNBOOK postcheck step does not describe the timer and container rules"; fi
+if grep -q 'newest `release-<sha>.before.snapshot`' <<<"$PC" && grep -q -- '--against <file>' <<<"$PC" && grep -q 'A template instance that is in both and changed state still fails' <<<"$PC" && grep -q 'A socket-activated instance, or one systemd no longer knows' <<<"$PC"; then ok "the RUNBOOK's postcheck step names its baseline (the newest release snapshot), --against, and the transient and instance rules"; else bad "RUNBOOK postcheck step does not describe the baselines or the transient and instance rules"; fi
+REL7="$(sed -n '/^   7\. takes a fresh "before" snapshot/p' "$deploy/RUNBOOK.md")"
+if grep -q 'release-<sha>.before.snapshot' <<<"$REL7" && grep -q 'A postcheck failure does not fail the release or roll it back' <<<"$REL7" && grep -q 'Health decides the release' <<<"$REL7"; then ok "the RUNBOOK's release step says each release takes a before snapshot and that a postcheck failure is reported, not rolled back"; else bad "RUNBOOK release step: no before snapshot or no rollback rule"; fi
 UNINST="$(grep -- '- \*\*Remove Bulig completely' "$deploy/RUNBOOK.md")"
 if [ "${UNINST%%postcheck.sh*}" != "$UNINST" ] && [ "${UNINST%%postcheck.sh*}" != "${UNINST%%/var/lib/bulig-checks*}" ] && [ "${#UNINST}" -gt 0 ]; then
   before_pc="${UNINST%%\`postcheck.sh\`*}"
@@ -248,4 +251,6 @@ assert c['pluginConfig']['gate-evidence']['mode']=='warn' and c['pluginConfig'][
 assert c['dbPath'].startswith('/var/lib/bulig/'), 'dbPath'
 " "$cfg" 2>"$work/err"; then ok "the template: Postgres from the pg-url credential, gateway on 127.74.3.1:7431 for worker vps, gates in warn, Telegram and the local worker off"; else bad "config template: $(cat "$work/err")"; fi
 
+if grep -q -- 'Run `postcheck.sh` with `--against /var/lib/bulig-checks/precheck.snapshot`' <<<"$UNINST"; then ok "the removal check compares against the precheck, not the last release's snapshot"; else bad "the removal step does not use --against precheck.snapshot"; fi
+if grep -q 'up to 400, sorted by path' <<<"$KL" && ! grep -q 'lists each one in every health run' "$deploy/RUNBOOK.md"; then ok "the RUNBOOK says the fence check lists up to 400 path sockets, and that a hit cap is said"; else bad "the RUNBOOK still says every path socket is listed"; fi
 finish

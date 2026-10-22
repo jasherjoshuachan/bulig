@@ -68,7 +68,35 @@ STUB
 cat >"$stubs/systemctl" <<'STUB'
 #!/usr/bin/env bash
 echo "systemctl $*" >>"$STUB_LOG/calls"
+# What the snapshot reads (lib/snapshot.sh): the units, unit files and timers of a small fake host, from STUB_SNAP.
+case "$1" in
+  list-units) if printf '%s ' "$@" | grep -q -- '--state=running'; then awk '$4 == "running"' "$STUB_SNAP/units.txt"; else cat "$STUB_SNAP/units.txt"; fi ;;
+  list-unit-files) cat "$STUB_SNAP/unitfiles.txt" ;;
+  list-timers) cat "$STUB_SNAP/timers.txt" ;;
+esac
 exit 0
+STUB
+# The rest of what the snapshot reads, from the same fake host. STUB_SS_FAIL makes ss fail, as on a host where it cannot run.
+cat >"$stubs/ss" <<'STUB'
+#!/usr/bin/env bash
+if [ -n "${STUB_SS_FAIL:-}" ]; then echo "ss: cannot open netlink socket" >&2; exit 1; fi
+cat "$STUB_SNAP/ss.txt"
+STUB
+cat >"$stubs/getent" <<'STUB'
+#!/usr/bin/env bash
+cat "$STUB_SNAP/$1.txt"
+STUB
+cat >"$stubs/docker" <<'STUB'
+#!/usr/bin/env bash
+cat "$STUB_SNAP/docker.txt"
+STUB
+cat >"$stubs/pg_lsclusters" <<'STUB'
+#!/usr/bin/env bash
+echo "16 main 5432 online postgres /var/lib/postgresql/16/main /var/log/postgresql/postgresql-16-main.log"
+STUB
+cat >"$stubs/crontab" <<'STUB'
+#!/usr/bin/env bash
+echo "0 3 * * * /usr/local/bin/client-backup"
 STUB
 # the machine's addresses, as `ip -o addr show scope global` prints them on ths-prod-01
 cat >"$stubs/ip" <<'STUB'
@@ -115,12 +143,27 @@ for a in "$@"; do if [ "$a" = "-T" ]; then t=1; else args+=("$a"); fi; done
 if [ "$t" -eq 1 ] && [ -L "${args[1]}" ]; then rm -f "${args[1]}"; fi
 exec /bin/mv "${args[@]}"
 STUB
+# install: logged (the unit files, the host drop-in and the AppArmor profile are all written with it), then the real one
+cat >"$stubs/install" <<'STUB'
+#!/usr/bin/env bash
+echo "install $*" >>"$STUB_LOG/calls"
+exec /usr/bin/install "$@"
+STUB
 cat >"$stubs/head" <<'STUB'
 #!/usr/bin/env bash
 echo "head $*" >>"$STUB_LOG/head"
 exec /usr/bin/head "$@"
 STUB
 chmod +x "$stubs"/*
+export STUB_SNAP="$work/snap"
+mkdir -p "$STUB_SNAP"
+printf 'nginx.service loaded active running A web server\nclientapp.service loaded active running Client app\n' >"$STUB_SNAP/units.txt"
+printf 'nginx.service enabled\nclientapp.service enabled\n' >"$STUB_SNAP/unitfiles.txt"
+: >"$STUB_SNAP/timers.txt"
+printf 'LISTEN 0 511 0.0.0.0:80 0.0.0.0:* users:(("nginx",pid=812,fd=6))\n' >"$STUB_SNAP/ss.txt"
+printf 'clientweb ghcr.io/client/web:1.4 running\n' >"$STUB_SNAP/docker.txt"
+printf 'root:x:0:0:root:/root:/bin/bash\nclient:x:1000:1000::/home/client:/bin/bash\n' >"$STUB_SNAP/passwd.txt"
+printf 'root:x:0:\nclient:x:1000:\n' >"$STUB_SNAP/group.txt"
 # The system admin folders (/usr/sbin, /sbin) are reached through a copy of links that leaves out every AppArmor tool: on a Linux machine with
 # AppArmor (CI runners included) the real apparmor_parser lives there, and no test may ever run it (as root it would load a profile into the
 # real kernel). The release finds only the stand-in above, or, when a test removes the stand-in, nothing at all.
@@ -177,7 +220,11 @@ deliver() {
   cp "$deploy/bulig.config.vps.json" "$inc/deploy/"
   cp -R "$deploy/apparmor" "$inc/deploy/"
   if [ -n "${STUB_PROFILE:-}" ]; then printf '%s\n' "$STUB_PROFILE" >"$inc/deploy/apparmor/bulig-bwrap"; fi
-  if [ "$hx" = "flag" ]; then
+  cp "$deploy/postcheck.sh" "$inc/deploy/"
+  if [ "$hx" = "tenant" ]; then
+    # healthy, but while the release ran another tenant started a service listening on loopback
+    printf '#!/usr/bin/env bash\necho "LISTEN 0 4096 127.0.0.1:9999 0.0.0.0:* users:((\\"other\\",pid=4,fd=3))" >>"%s"\n' "$STUB_SNAP/ss.txt" >"$inc/deploy/health.sh"
+  elif [ "$hx" = "flag" ]; then
     # healthy only once the flag file exists (a cause outside the release, such as a missing credential, that is fixed between two runs)
     printf '#!/usr/bin/env bash\n[ -e "%s" ]\n' "$work/health-ok" >"$inc/deploy/health.sh"
   else
@@ -195,7 +242,9 @@ run_remote() { # run_remote <short> <incoming>: what `ssh host bash <incoming>/d
 }
 link_of() { readlink "$1" 2>/dev/null | xargs -I{} basename {}; }
 releases_list() { find "$r/opt/bulig/releases" -mindepth 1 -maxdepth 1 | sort | tr '\n' ' '; }
-leftovers() { find "$r/var/lib/bulig-checks" -mindepth 1 -maxdepth 1 | head -3; }
+# (the release-<sha>.before.snapshot files are meant to stay: section 1c checks them)
+leftovers() { find "$r/var/lib/bulig-checks" -mindepth 1 -maxdepth 1 ! -name 'release-*.before.snapshot' | head -3; }
+snapshots() { (cd "$r/var/lib/bulig-checks" && find . -maxdepth 1 -name 'release-*.before.snapshot' | sed 's#^\./##' | sort | tr '\n' ' '); }
 
 A="aaaaaaaaaaaa"; B="bbbbbbbbbbbb"; C="cccccccccccc"; D="dddddddddddd"
 
@@ -294,6 +343,17 @@ done
 rw_values="$(grep -o 'ReadWritePaths=[^ ]*' <<<"$extract_call")"
 if [ "$(printf '%s\n' "$rw_values" | wc -l | tr -d ' ')" = "1" ] && case "$rw_values" in *"/mods") true ;; *) false ;; esac; then ok "the unpack unit can write one folder only (the empty mods folder)"; else bad "unpack writable paths: $rw_values"; fi
 
+# the before snapshot: taken after the build, before the first change to the host, kept root-only; the comparison after health passes
+snapA="$r/var/lib/bulig-checks/release-$A.before.snapshot"
+first_snap="$(grep -n '^systemctl list-units' "$STUB_LOG/calls" | head -1 | cut -d: -f1)"
+build_line="$(grep -n -- '--unit=bulig-build-' "$STUB_LOG/calls" | head -1 | cut -d: -f1)"
+first_change="$(grep -n '^systemctl daemon-reload' "$STUB_LOG/calls" | head -1 | cut -d: -f1)"
+if [ -f "$snapA" ] && [ "$(mode "$snapA")" = "600" ] && grep -q '^nginx.service enabled$' "$snapA"; then ok "the release saved its before snapshot as release-<sha>.before.snapshot, mode 600"; else bad "before snapshot: $(ls -l "$r/var/lib/bulig-checks")"; fi
+first_write="$(grep -n "^install .*$r/etc/" "$STUB_LOG/calls" | head -1 | cut -d: -f1)"
+if [ -n "$first_snap" ] && [ "$first_snap" -gt "${build_line:-999999}" ] && [ "$first_snap" -lt "${first_write:-0}" ] && [ "$first_snap" -lt "${first_change:-0}" ]; then ok "it is taken after the build and before the first write under /etc (unit files, drop-in, AppArmor) and the reload (calls $build_line < $first_snap < $first_write, $first_change)"; else bad "snapshot order: build $build_line, snapshot $first_snap, first /etc write $first_write, daemon-reload $first_change"; fi
+if grep -q "^release: postcheck after the health check, against $snapA" "$work/out" && grep -q "^release: postcheck ok" "$work/out" && grep -q "^postcheck: the snapshot matches release-$A.before.snapshot" "$work/out"; then ok "after the health check the host is compared with it, and the result is reported"; else bad "release postcheck output: $(grep -i postcheck "$work/out")"; fi
+if [ "$(grep -n '^release: healthy on' "$work/out" | cut -d: -f1)" -lt "$(grep -n '^release: postcheck after' "$work/out" | cut -d: -f1)" ]; then ok "and only once health passed"; else bad "postcheck before health: $(grep -n 'healthy on\|postcheck after' "$work/out")"; fi
+
 if grep -qx "head -c $((2 * 1024 * 1024 * 1024 + 1))" "$STUB_LOG/head"; then ok "the build's output is cut at the cap plus one byte on the stream, before it is written (head -c 2 GiB + 1)"; else bad "head calls: $(cat "$STUB_LOG/head" 2>&1)"; fi
 
 # --- 2. an unhealthy release rolls back ---
@@ -304,6 +364,7 @@ if [ "$(link_of "$r/opt/bulig/current")" = "$A" ] && [ "$(link_of "$r/usr/local/
 if grep -q "version $A" "$r/etc/systemd/system/bulig.service"; then ok "the unit files are back to the previous release's"; else bad "unit file after rollback: $(cat "$r/etc/systemd/system/bulig.service")"; fi
 if user_folders_untouched; then ok "a rollback leaves the user folders alone too"; else bad "a user folder changed during the rollback"; fi
 if [ -z "$(leftovers)" ]; then ok "and leaves nothing behind"; else bad "left: $(leftovers)"; fi
+if grep -q "^release: postcheck after the rollback, against $r/var/lib/bulig-checks/release-$B.before.snapshot" "$work/out" && grep -q "^release: postcheck ok" "$work/out"; then ok "after the rollback the host is compared with the snapshot taken before it, and it matches"; else bad "rollback postcheck: $(grep -i postcheck "$work/out")"; fi
 
 # --- 3. a unit that cannot be installed after the links moved rolls back ---
 echo "release C (a unit file is missing)"
@@ -327,7 +388,48 @@ export STUB_BUILD_FAIL=1
 incBF="$(deliver "cafecafecafe" 0)"
 expect_fail_msg "a build that exits non-zero is reported as failed" "the build failed" run_remote "cafecafecafe" "$incBF"
 unset STUB_BUILD_FAIL
+if [ ! -e "$r/var/lib/bulig-checks/release-cafecafecafe.before.snapshot" ]; then ok "a release refused before it changed anything takes no snapshot"; else bad "a refused release left a before snapshot"; fi
 if [ "$(readlink "$r/opt/bulig/current")" = "$r/opt/bulig/releases/$A" ] && [ ! -e "$r/usr/local/lib/bulig/cafecafecafe" ]; then ok "and nothing was installed"; else bad "state after a failed build"; fi
+
+# --- 4c. the before snapshot and the comparison after health ---
+echo "the before snapshot"
+# another tenant changes something while the release runs: reported loudly, never rolled back for (health decides the release)
+T="7e7e7e7e7e7e"
+incT="$(deliver "$T" tenant)"
+run_remote "$T" "$incT" >"$work/out" 2>&1
+rc=$?
+if [ "$rc" -eq 0 ] && [ "$(link_of "$r/opt/bulig/current")" = "$T" ] && [ "$(cat "$r/opt/bulig/.healthy-sha")" = "$T" ] && ! grep -q "rolling back" "$work/out"; then ok "a change by someone else during the release does not fail it or roll it back (exit 0, live, marked healthy)"; else bad "tenant change rc=$rc: $(cat "$work/out")"; fi
+if grep -q "^release: WARNING: POSTCHECK FAILED after the health check" "$work/out" && grep -qF '+127.0.0.1:9999 users:(("other"))' "$work/out"; then ok "but it is reported loudly, with the diff that names it"; else bad "tenant change report: $(grep -i 'postcheck\|9999' "$work/out")"; fi
+# the snapshot cannot be taken: the release goes on, and says the comparison was skipped
+U="7f7f7f7f7f7f"
+incU="$(deliver "$U" 0)"
+STUB_SS_FAIL=1 run_remote "$U" "$incU" >"$work/out" 2>&1
+rc=$?
+if [ "$rc" -eq 0 ] && [ "$(link_of "$r/opt/bulig/current")" = "$U" ] && grep -q "could not take the before snapshot" "$work/out" && grep -q "^release: postcheck skipped after the health check" "$work/out"; then ok "a snapshot that fails does not stop the release, and the skipped comparison is said"; else bad "failed snapshot rc=$rc: $(cat "$work/out")"; fi
+if [ ! -e "$r/var/lib/bulig-checks/release-$U.before.snapshot" ] && [ -z "$(leftovers)" ]; then ok "and it leaves no partial snapshot and no temp file"; else bad "after a failed snapshot: $(snapshots) $(leftovers)"; fi
+# only the newest five are kept
+for n in 1 2 3 4 5 6; do cp "$r/var/lib/bulig-checks/release-$A.before.snapshot" "$r/var/lib/bulig-checks/release-00000000000$n.before.snapshot"; touch -t "20200101000$n" "$r/var/lib/bulig-checks/release-00000000000$n.before.snapshot"; done
+touch -t 201901010000 "$r/var/lib/bulig-checks/release-$A.before.snapshot" "$r/var/lib/bulig-checks/release-$B.before.snapshot" "$r/var/lib/bulig-checks/release-$C.before.snapshot" "$r/var/lib/bulig-checks/release-$T.before.snapshot"
+V="7d7d7d7d7d7d"
+incV="$(deliver "$V" 0)"
+expect_ok "a release with older snapshots around runs" run_remote "$V" "$incV"
+if [ "$(snapshots)" = "release-000000000003.before.snapshot release-000000000004.before.snapshot release-000000000005.before.snapshot release-000000000006.before.snapshot release-$V.before.snapshot " ]; then ok "it keeps its own and the four newest before it, and removes the older ones"; else bad "snapshots kept: $(snapshots)"; fi
+# files dated ahead of the clock: the new snapshot is still never pruned
+for n in 1 2 3 4 5; do cp "$r/var/lib/bulig-checks/release-$V.before.snapshot" "$r/var/lib/bulig-checks/release-99999999999$n.before.snapshot"; touch -t "20990101000$n" "$r/var/lib/bulig-checks/release-99999999999$n.before.snapshot"; done
+W="7c7c7c7c7c7c"
+incW="$(deliver "$W" 0)"
+expect_ok "a release with five snapshots dated ahead of the clock runs" run_remote "$W" "$incW"
+if [ -f "$r/var/lib/bulig-checks/release-$W.before.snapshot" ] && grep -q "^release: postcheck ok" "$work/out" && [ "$(snapshots)" = "release-$W.before.snapshot release-999999999991.before.snapshot release-999999999992.before.snapshot release-999999999993.before.snapshot release-999999999994.before.snapshot release-999999999995.before.snapshot " ]; then ok "and its own snapshot is kept and used, while the older ones go"; else bad "with future-dated files: $(snapshots)"; fi
+rm -f "$r/var/lib/bulig-checks"/release-99999999999?.before.snapshot
+# a prune that fails is a warning: the new snapshot stays and is compared against
+mkdir -p "$r/var/lib/bulig-checks/release-0000000000aa.before.snapshot/x"
+touch -t 201801010000 "$r/var/lib/bulig-checks/release-0000000000aa.before.snapshot"
+for n in 1 2 3 4 5; do cp "$r/var/lib/bulig-checks/release-$W.before.snapshot" "$r/var/lib/bulig-checks/release-00000000001$n.before.snapshot"; done
+X="7b7b7b7b7b7b"
+incX="$(deliver "$X" 0)"
+expect_ok "a release whose prune fails still runs" run_remote "$X" "$incX"
+if grep -q "could not prune the older before snapshots" "$work/out" && [ -f "$r/var/lib/bulig-checks/release-$X.before.snapshot" ] && grep -q "^release: postcheck after the health check, against $r/var/lib/bulig-checks/release-$X.before.snapshot" "$work/out" && grep -q "^release: postcheck ok" "$work/out"; then ok "a prune that fails is a warning, and the new snapshot is kept and compared against"; else bad "failed prune: $(grep -i 'prune\|postcheck' "$work/out") / $(snapshots)"; fi
+rm -rf "$r/var/lib/bulig-checks/release-0000000000aa.before.snapshot"
 
 # --- 5. a config that is already there is never overwritten ---
 echo "release E (existing config)"

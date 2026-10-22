@@ -9,8 +9,9 @@ root="${SCAN_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
 # --- Built-in checks, always on: no real host detail may be committed to this public repo. ---------------------------------------------------
 # A real address of a server, or a note about what else runs on it, does not belong in a public repository. Allowed addresses: loopback
 # (127.0.0.0/8, which includes the gateway's 127.74.3.1), 0.0.0.0, the private ranges (10/8, 172.16/12, 192.168/16), the Tailscale range
-# written as itself (100.64.0.0/10, the deny-list entry; any other address in 100.64/10 is a hit unless its line carries the marker below)
-# and the documentation ranges (192.0.2/24, 198.51.100/24, 203.0.113/24; for IPv6 2001:db8::/32). Anything else is a hit. The
+# written as itself (100.64.0.0/10, the deny-list entry; any other address in 100.64/10 is a hit unless its line carries the marker below),
+# the documentation ranges (192.0.2/24, 198.51.100/24, 203.0.113/24; for IPv6 2001:db8::/32) and the benchmark range 198.18.0.0/15 (RFC 2544;
+# no real host has one: the worker namespace's gateway 198.18.74.1 is in it). Anything else is a hit. The
 # strings below are the ones that identified a real machine and its other tenants once; they are written in pieces so this file does not
 # contain them. A hit prints file:line and the rule's name, never the text.
 cd "$root" || exit 1
@@ -34,6 +35,7 @@ def allowed4(o):
     if a == 172 and 16 <= b <= 31: return True
     if a == 192 and b == 168: return True
     if (a, b, c) in ((192, 0, 2), (198, 51, 100), (203, 0, 113)): return True
+    if a == 198 and b in (18, 19): return True  # the benchmark range 198.18.0.0/15
     if a == 255: return True  # a netmask
     return False
 for f in files:

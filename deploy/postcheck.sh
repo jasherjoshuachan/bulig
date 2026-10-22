@@ -5,6 +5,8 @@
 # template instances that came or went (a "failed" one of any of those is a warn line that names it), and containers that come and go while
 # their image keeps running. Unit files, enabled state and timers still are.
 # It does NOT prove anything it does not list: files outside the snapshot, data inside other databases, and live behaviour are not checked.
+# When no Bulig unit is installed (after the removal in the RUNBOOK), it also fails if the worker's network namespace or a gateway address on lo
+# is still there.
 #   usage: postcheck.sh                       against the newest release-<sha>.before.snapshot in /var/lib/bulig-checks (each release
 #                                             takes one just before it changes anything), or precheck.snapshot when there is none
 #          postcheck.sh --against <snapshot>  against that file (precheck.snapshot for the removal check in the RUNBOOK)
@@ -40,5 +42,17 @@ else
   echo "postcheck: FAILED. Something the snapshot covers changed since $name, and it is not Bulig's:"
   cat "$after.diff"
   rc=1
+fi
+# Once Bulig's units are gone (it was removed, or a first release failed and took itself back out), nothing of Bulig's may be left on the host's
+# network either: the snapshot leaves Bulig's own things out, so this is checked on its own.
+if [ ! -e "$BULIG_UNIT_DIR/bulig.service" ] && [ ! -e "$BULIG_UNIT_DIR/bulig-worker.service" ]; then
+  left="$(bulig_network_leftovers)"
+  if [ -n "$left" ]; then
+    echo "postcheck: FAILED. No Bulig unit is installed, but Bulig left this on the host's network:"
+    printf '%s\n' "$left"
+    rc=1
+  else
+    echo "postcheck: no Bulig unit is installed, and Bulig left nothing on the host's network (no $BULIG_NETNS_PATH, no gateway address on lo)"
+  fi
 fi
 exit "$rc"

@@ -1,9 +1,13 @@
 [Unit]
 Description=Bulig worker (bulig worker): runs Claude Code for the kernel
 Documentation=https://github.com/jasherjoshuachan/bulig
-# The worker connects to the kernel's gateway on 127.74.3.1:7431. It can start first and retry, but ordering it after the kernel is tidier.
-After=network-online.target bulig.service bulig-loopback.service systemd-resolved.service
-Wants=network-online.target bulig.service bulig-loopback.service systemd-resolved.service
+# The worker runs in a network namespace of its own, /run/netns/bulig-worker (bulig-netns.service, Jasher, 22 Oct 2026), and reaches the
+# host's network only through pasta (bulig-pasta.service). It connects to the kernel's gateway on 198.18.74.1:7431, which pasta carries to the
+# host's lo (bulig-loopback.service). It can start first and retry, but ordering it after the kernel is tidier.
+# BindsTo: the worker never runs outside its namespace. If the namespace goes, the worker stops with it.
+After=network-online.target bulig.service bulig-loopback.service systemd-resolved.service bulig-netns.service bulig-pasta.service
+Wants=network-online.target bulig.service bulig-loopback.service systemd-resolved.service bulig-pasta.service
+BindsTo=bulig-netns.service
 StartLimitIntervalSec=300
 StartLimitBurst=10
 
@@ -35,7 +39,7 @@ Environment=HOME=/var/lib/bulig-worker
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
 # %d is this unit's credentials directory, %S is /var/lib. --slots 2: at most two jobs at once on this machine. $BULIG_WORKER_REPOS is
 # split into words on purpose (one --repo per repository).
-ExecStart=/usr/bin/node /opt/bulig/current/packages/cli/bin/bulig.mjs worker --kernel http://127.74.3.1:7431 --id vps --token-file %d/worker-token --claude-token-file %d/claude-token --work-dir %S/bulig-worker/work --slots 2 $BULIG_WORKER_REPOS
+ExecStart=/usr/bin/node /opt/bulig/current/packages/cli/bin/bulig.mjs worker --kernel http://198.18.74.1:7431 --id vps --token-file %d/worker-token --claude-token-file %d/claude-token --work-dir %S/bulig-worker/work --slots 2 $BULIG_WORKER_REPOS
 Restart=always
 RestartSec=5
 TimeoutStopSec=60
@@ -83,24 +87,30 @@ SystemCallArchitectures=native
 # NETWORK AND SOCKETS. This unit runs Claude (a prompt can steer it) and the commands Claude runs, so it gets the narrowest reach that still
 # lets Claude Code's Bash sandbox start. Other services on this host listen on loopback and on the container bridges with no login of their own,
 # and another tenant's program can listen on an abstract unix socket that no file permission or PrivateTmp hides. So:
+# - NetworkNamespacePath: a network namespace of the worker's own (22 Oct 2026). Its loopback is its own: the host's loopback, where other
+#   tenants listen, does not exist in it, and neither do the host's abstract unix sockets (the abstract namespace belongs to the network
+#   namespace). Its only way out is pasta, whose own unit filters every packet again. fence-check.sh proves the worker set runs in it (it
+#   compares the probe's namespace with the host's before it connects to anything).
 # - RestrictAddressFamilies is AF_UNIX AF_INET AF_INET6 AF_NETLINK (Jasher, 21 Oct 2026). Claude Code runs every Bash command inside bubblewrap
 #   (its sandbox settings: enabled, failIfUnavailable), and on the server, without these two, every Bash call failed: the sandbox listens on a
 #   unix socket of its own in /tmp (EAFNOSUPPORT without AF_UNIX), and bwrap needs a NETLINK_ROUTE socket to bring up loopback in its own network
 #   namespace. bwrap also needs to make a user namespace, which Ubuntu's AppArmor allows only to programs with a profile that says so:
 #   /etc/apparmor.d/bulig-bwrap (deploy/apparmor/bulig-bwrap, installed by release-remote.sh). NoNewPrivileges stays on (bwrap ran with it on the server, 21 Oct).
-#   KNOWN LIMIT: with AF_UNIX this unit can reach other tenants' ABSTRACT unix sockets (the same limit as the kernel; fence-check.sh reports it
-#   from the properties and never connects). The commands Claude runs are inside bwrap's own network namespace, where the host's abstract
-#   sockets do not exist; Claude Code's own process and the worker are not. Netlink reaches the kernel only (no other service): it can read the
-#   host's interfaces and routes, and change nothing, because this unit has no capabilities (CapabilityBoundingSet= is empty).
-#   KNOWN LIMIT: commands inside the sandbox have NO NETWORK. Claude Code's sandbox proxy is reached on the host's loopback (127.0.0.1, ::1),
-#   which the IP filter below denies, so `npm install` from a stage times out. Loopback stays closed on purpose (it reaches every service on
-#   the host's loopback); the planned fix is a network namespace of the worker's own (RUNBOOK, Known limits).
+#   Other tenants' ABSTRACT unix sockets were a known limit here before the namespace (AF_UNIX reaches every abstract socket of the network
+#   namespace it is in). In the worker's own namespace there are none but its own, so fence-check.sh now really tries them (they must fail),
+#   but only after it has proven the probe is in that namespace. Netlink reaches the kernel only (no other service): it can read the
+#   namespace's interfaces and routes, and change nothing, because this unit has no capabilities (CapabilityBoundingSet= is empty).
+#   Claude Code's sandbox proxy listens on 127.0.0.1 and ::1, which are the namespace's own, so commands inside the sandbox have the network
+#   the sandbox's own allowlist gives them (npm's registry, for one). Before the namespace they had none (the proxy was on the host's loopback).
 # - IPAddressDeny/Allow filter every IP packet in both directions (an Allow match wins, then a Deny match, then the packet is let through,
-#   which is the public internet). They match ADDRESSES, NOT PORTS: 127.74.3.1 is allowed for the kernel gateway, so a service listening on
-#   every address is also reachable at 127.74.3.1, with a loopback source (it may treat that as trusted). The host's own public addresses are denied as well; they
+#   which is the public internet). They match ADDRESSES, NOT PORTS. Allowed: 127.0.0.0/8 and ::1/128, which in this namespace are its own
+#   loopback and nothing else (pasta forwards no port), and 198.18.74.1, the kernel gateway on the host's lo, reached through pasta. So a
+#   service on the host listening on every address is also reachable at 198.18.74.1 (it sees the connection come from 198.18.74.1, an address of
+#   this host, and may treat that as trusted). The host's own public addresses are denied as well; they
 #   are read from the machine at setup time into a drop-in (bulig-worker.service.d/10-host-addresses.conf, root-owned), not written here.
-# - DNS: /etc/resolv.conf is the systemd-resolved stub on 127.0.0.53, which would have to be allowed, and an allowed address reaches every
-#   listener on it. So the unit gets resolved's upstream list in its place (public servers, which the deny list does not touch).
+# - DNS: /etc/resolv.conf is the systemd-resolved stub on the host's 127.0.0.53, which is not there in the namespace (and allowing it on the host
+#   would reach every listener on that address). So the unit gets resolved's upstream list in its place (public servers, which the deny list
+#   does not touch; shown to resolve from the namespace on the server, 22 Oct 2026).
 # - InaccessiblePaths hides THESE paths only, not every unix socket: tailscaled, snapd and docker (as for the kernel), and, because this unit has
 #   AF_UNIX: the Postgres socket folder, the system D-Bus folder, snapd's second socket, systemd's userdb folder (users are in /etc/passwd, so
 #   nss "files" answers first), resolved's varlink sockets (DNS goes through the upstream list below) and /run/user (no login session here).
@@ -108,9 +118,10 @@ SystemCallArchitectures=native
 #   fence-check.sh's bwrap probe runs with them. The journal's sockets stay reachable on purpose (logging).
 #   KNOWN LIMIT: every OTHER path socket whose file and folder permissions let bulig-worker in stays connectable (another tenant's service
 #   socket under /run or /var/lib, for example). fence-check.sh lists each one from the file (stat and access, never a connection) in every
-#   run, and fails only if one is Bulig's own. A network namespace of the worker's own would not change this: path sockets are files.
-IPAddressDeny=127.0.0.0/8 ::1/128 169.254.0.0/16 fe80::/10 224.0.0.0/4 ff00::/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7
-IPAddressAllow=127.74.3.1/32
+#   run, and fails only if one is Bulig's own. The network namespace does not change this: path sockets are files, not network.
+NetworkNamespacePath=/run/netns/bulig-worker
+IPAddressDeny=127.0.0.0/8 ::1/128 169.254.0.0/16 fe80::/10 224.0.0.0/4 ff00::/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7 198.18.0.0/15
+IPAddressAllow=127.0.0.0/8 ::1/128 198.18.74.1/32
 BindReadOnlyPaths=/run/systemd/resolve/resolv.conf:/etc/resolv.conf
 InaccessiblePaths=-/run/tailscale -/run/snapd.socket -/run/docker.sock -/var/run/docker.sock -/run/postgresql -/var/run/postgresql -/run/dbus -/run/snapd-snap.socket -/run/systemd/userdb -/run/systemd/resolve/io.systemd.Resolve -/run/systemd/resolve/io.systemd.Resolve.Monitor -/run/user
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK

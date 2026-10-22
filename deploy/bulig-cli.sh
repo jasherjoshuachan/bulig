@@ -7,7 +7,8 @@
 #   --as kernel (default)  user bulig,        credentials config, pg-url, gh-token, worker-tokens   (what bulig.service has)
 #   --as worker            user bulig-worker, credentials claude-token, worker-token, github-read-token  (what bulig-worker.service has)
 #   --exec                 run <program> (for example git clone, for a repo the worker needs) instead of the bulig CLI
-# Same user, same credentials, same hardening, same network and socket fence (lib/common.sh: IP filter, address families, hidden sockets, resolver) and the same style of caps as the matching service (smaller numbers, so a one-off
+# Same user, same credentials, same hardening, same network and socket fence (lib/common.sh: IP filter, address families, hidden sockets, resolver,
+# and for the worker its own network namespace) and the same style of caps as the matching service (smaller numbers, so a one-off
 # command cannot take the room the services need). The kernel reads its secrets from $CREDENTIALS_DIRECTORY, as in the unit.
 # Only one writer may hold the database: stop bulig.service first for commands that write (run, resume, migrate), start it after.
 # Read-only commands (status, history) can run while the service is up.
@@ -55,6 +56,9 @@ case "$role" in
     spec=(--uid=bulig --gid=bulig --unit="bulig-cli-kernel-$$" -p MemoryMax=1G -p CPUQuota=100% -p StateDirectory=bulig
       --setenv=HOME=/var/lib/bulig --setenv=PATH="/usr/local/bin:/usr/bin:/bin") ;;
   worker)
+    # The worker's one-off commands run in the worker's own network namespace, as bulig-worker.service does (cli_fence_props adds
+    # NetworkNamespacePath). Without it they would not start, so say why first.
+    [ -e "$R$BULIG_NETNS_PATH" ] || die "$BULIG_NETNS_PATH does not exist: start the worker's network first (systemctl start bulig-pasta.service, which starts bulig-netns.service; RUNBOOK, step 4)"
     cli_fence_props worker
     cli_harden_props worker
     add_creds claude-token:claude-token worker-token:worker-token github-read-token:github-read-token

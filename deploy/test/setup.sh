@@ -136,7 +136,8 @@ if grep -q '^useradd --system --no-create-home --home-dir /var/lib/bulig --shell
 if grep -q ' -h ' "$log/chown" && ! grep -qv ' -h ' "$log/chown"; then ok "every chown carries -h"; else bad "chown calls: $(cat "$log/chown" 2>&1)"; fi
 if [ ! -e "$log/followed" ]; then ok "no chown followed a link"; else bad "a chown followed a link"; fi
 files="$(cd "$root" && find . -type f | sort | tr '\n' ' ')"
-if [ "$files" = "./etc/systemd/system/bulig-worker.service.d/10-host-addresses.conf " ]; then ok "setup writes one file only, the worker's host-address drop-in (no placeholder secrets, no config)"; else bad "files created: $files"; fi
+if [ "$files" = "./etc/systemd/system/bulig-pasta.service.d/10-host-addresses.conf ./etc/systemd/system/bulig-worker.service.d/10-host-addresses.conf " ]; then ok "setup writes two files only, the worker's and pasta's host-address drop-ins (no placeholder secrets, no config)"; else bad "files created: $files"; fi
+if cmp -s "$root/etc/systemd/system/bulig-worker.service.d/10-host-addresses.conf" "$root/etc/systemd/system/bulig-pasta.service.d/10-host-addresses.conf" || [ "$(grep '^IPAddressDeny=' "$root/etc/systemd/system/bulig-pasta.service.d/10-host-addresses.conf")" = "$(grep '^IPAddressDeny=' "$root/etc/systemd/system/bulig-worker.service.d/10-host-addresses.conf")" ]; then ok "and pasta's denies the same addresses as the worker's (the worker's packets leave the host as pasta's)"; else bad "pasta drop-in: $(cat "$root/etc/systemd/system/bulig-pasta.service.d/10-host-addresses.conf")"; fi
 if grep -qx "IPAddressDeny=2001:db8::10/128 203.0.113.10/32" "$root/etc/systemd/system/bulig-worker.service.d/10-host-addresses.conf"; then ok "and that drop-in denies the machine's own public addresses, read from ip"; else bad "drop-in: $(cat "$root/etc/systemd/system/bulig-worker.service.d/10-host-addresses.conf")"; fi
 
 # --- 3. a second run changes nothing ---

@@ -19,10 +19,20 @@ BULIG_PG_HOST=/var/run/postgresql
 # The kernel's worker gateway (ADR 0011): its own loopback address, plus the Tailscale address for the Mac worker.
 BULIG_GATEWAY_ADDR=127.74.3.1
 BULIG_GATEWAY_PORT=7431
+# The worker's own network namespace (22 Oct 2026): bulig-netns.service makes it, bulig-pasta.service gives it its way out. From inside it the
+# worker reaches the kernel at BULIG_NETNS_GATEWAY, an address on the host's lo (bulig-loopback.service) in 198.18.0.0/15, the benchmark range
+# (RFC 2544) that no real host has. 127.74.3.1 stays for one release, so a rollback to the release before the namespace still works.
+BULIG_NETNS_NAME=bulig-worker
+BULIG_NETNS_PATH=/run/netns/bulig-worker
+BULIG_NETNS_GATEWAY=198.18.74.1
 # What the units that run code Bulig does not control (the worker, the release build, one-off worker commands) may reach. The unit files carry
 # the same values as text and deploy/test/units.sh checks them; the transient units (release build, bulig-cli.sh) take them from here, and
 # fence-check.sh tests the result against the real machine.
 #  - IPAddressDeny: everything local or private (the public internet is what is left), plus the host's own public addresses (host_addresses).
+#    198.18.0.0/15 (the benchmark range) too: the gateway's 198.18.74.1 is in it, and is allowed back as a /32 only where it is needed.
+#  - IPAddressAllow: the kernel and its one-off commands, the gateway addresses (127.74.3.1 and 198.18.74.1). The worker and its one-off commands,
+#    which run in the worker's own network namespace: that namespace's own loopback (127.0.0.0/8, ::1; the host's loopback does not exist there),
+#    so Claude Code's sandbox proxy works, and 198.18.74.1 (through pasta). The build: nothing.
 #  - RestrictAddressFamilies: the build has no AF_UNIX (no unix socket at all, abstract ones included; socketpair() is not affected by it).
 #    The worker and its one-off commands have AF_UNIX and AF_NETLINK (Jasher, 21 Oct 2026): Claude Code runs every Bash command in bubblewrap,
 #    which needs a unix socket of its own (the sandbox's proxy, in the unit's private /tmp) and netlink (to bring up loopback in its own network
@@ -34,7 +44,9 @@ BULIG_GATEWAY_PORT=7431
 #  - BindReadOnlyPaths: resolved's upstream resolver list instead of the 127.0.0.53 stub, so no localhost address has to be allowed for DNS.
 # Numeric prefixes only: systemd-run (systemd 255) refuses a symbolic name such as localhost inside a list
 # ("Failed to parse IP address prefix"), and these go into transient units. Unit files share the same rule.
-BULIG_IP_DENY_PRIVATE="127.0.0.0/8 ::1/128 169.254.0.0/16 fe80::/10 224.0.0.0/4 ff00::/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7"
+BULIG_IP_DENY_PRIVATE="127.0.0.0/8 ::1/128 169.254.0.0/16 fe80::/10 224.0.0.0/4 ff00::/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7 198.18.0.0/15"
+BULIG_IP_ALLOW_KERNEL="127.74.3.1/32 198.18.74.1/32"
+BULIG_IP_ALLOW_WORKER="127.0.0.0/8 ::1/128 198.18.74.1/32"
 BULIG_AF_NO_UNIX="AF_INET AF_INET6"
 BULIG_AF_WITH_UNIX="AF_UNIX AF_INET AF_INET6"
 BULIG_AF_WORKER="AF_UNIX AF_INET AF_INET6 AF_NETLINK"
@@ -193,11 +205,14 @@ host_addresses() {
     a ~ /:/ { if (a ~ /^f[cd]/) next; print a "/128"; next }
     a ~ /^(10\.|192\.168\.)/ { next }
     a ~ /^172\.(1[6-9]|2[0-9]|3[01])\./ { next }
+    a ~ /^198\.1[89]\./ { next }
     a ~ /^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\./ { next }
     { print a "/32" }' | sort -u
 }
 
 # write_host_dropin <unit>: /etc/systemd/system/<unit>.d/10-host-addresses.conf, root-owned, with IPAddressDeny= for those addresses.
+# Written for bulig-worker.service and bulig-pasta.service (HOST_DROPIN_UNITS): the worker's packets leave the host as pasta's.
+HOST_DROPIN_UNITS="bulig-worker.service bulig-pasta.service"
 write_host_dropin() {
   local unit="$1" dir="$BULIG_UNIT_DIR/$1.d" addrs
   addrs="$(host_addresses | tr '\n' ' ')"
@@ -221,19 +236,20 @@ build_fence_props() {
 }
 
 # cli_fence_props <kernel|worker>: sets FENCE_CLI for a one-off bulig-cli.sh command. The kernel keeps AF_UNIX (the Postgres socket). The worker gets
-# exactly bulig-worker.service's fence (AF_UNIX and AF_NETLINK for Claude Code's sandbox, the same hidden paths); deploy/test/fence.sh compares them.
+# exactly bulig-worker.service's fence (AF_UNIX and AF_NETLINK for Claude Code's sandbox, the same hidden paths, and the worker's own network
+# namespace); deploy/test/fence.sh compares them.
 FENCE_CLI=()
 cli_fence_props() {
   local role="$1" deny="$BULIG_IP_DENY_PRIVATE" a
   case "$role" in
     kernel)
-      FENCE_CLI=(-p "RestrictAddressFamilies=$BULIG_AF_WITH_UNIX" -p "IPAddressDeny=$deny" -p "IPAddressAllow=$BULIG_GATEWAY_ADDR/32"
+      FENCE_CLI=(-p "RestrictAddressFamilies=$BULIG_AF_WITH_UNIX" -p "IPAddressDeny=$deny" -p "IPAddressAllow=$BULIG_IP_ALLOW_KERNEL"
         -p "InaccessiblePaths=$BULIG_INACCESSIBLE" -p "BindReadOnlyPaths=$BULIG_RESOLV_BIND") ;;
     worker)
       a="$(host_addresses | tr '\n' ' ')"
       deny="$deny ${a% }"
-      FENCE_CLI=(-p "RestrictAddressFamilies=$BULIG_AF_WORKER" -p "IPAddressDeny=${deny% }" -p "IPAddressAllow=$BULIG_GATEWAY_ADDR/32"
-        -p "InaccessiblePaths=$BULIG_INACCESSIBLE_WORKER" -p "BindReadOnlyPaths=$BULIG_RESOLV_BIND") ;;
+      FENCE_CLI=(-p "RestrictAddressFamilies=$BULIG_AF_WORKER" -p "IPAddressDeny=${deny% }" -p "IPAddressAllow=$BULIG_IP_ALLOW_WORKER"
+        -p "InaccessiblePaths=$BULIG_INACCESSIBLE_WORKER" -p "BindReadOnlyPaths=$BULIG_RESOLV_BIND" -p "NetworkNamespacePath=$BULIG_NETNS_PATH") ;;
     *) die "role must be kernel or worker" ;;
   esac
   FENCE_CLI+=(-p LimitCORE=0) # no core dumps: a crash could leave a credential in /var/crash
@@ -261,7 +277,7 @@ cli_harden_props() {
   esac
 }
 
-# wildcard_listeners: TCP listeners on every address (0.0.0.0, ::, *), as addr:port, one per line. An allowed address such as 127.74.3.1 reaches
+# wildcard_listeners: TCP listeners on every address (0.0.0.0, ::, *), as addr:port, one per line. An allowed address such as 198.18.74.1 reaches
 # every one of them, because the IP filter matches addresses and not ports.
 wildcard_listeners() {
   ss -H -ltn 2>/dev/null | awk '$4 ~ /^(0\.0\.0\.0|\*|\[::\]|::):[0-9]+$/ { print $4 }' | sort -u

@@ -13,8 +13,14 @@ another service: that is exactly why it is a failure, and why the other modes ne
         (Socket activation is not decided here: the fenced run decides it from each target.)
     python3 fence-probe.py fenced  <set> <probes.txt|-> --control "name=open,..." --af "<RestrictAddressFamilies>"
                            --activation-text "<systemctl list-sockets output>" [--ip-deny "..."] [--ip-allow "..."] [--inaccessible "..."] [--host-addrs ...] [--late-only | --no-late]
-                           [--deny-timeout 1.5] [--jobs 32]
+                           [--deny-timeout 1.5] [--jobs 32] [--netns <host netns inode>:<worker netns inode>]
         Inside the unit: run the probes of that set and print "ok|FAIL|warn|info <set> <name> <detail>". Exit 1 if anything FAILed.
+        --netns (fence-check.sh gives it to the worker sets, which run in the worker's own network namespace): THE NETNS GUARD runs first. The
+        probe compares the inode of its own network namespace with the host's (and with the worker namespace's, when given). The same as the
+        host's, or not the worker's, is a FAIL, and then nothing else runs and nothing is connected to. Only once the guard passed are the
+        targets that exist only in the HOST's network namespace (its loopback addresses and its abstract unix sockets) tried for real: in the
+        worker's namespace they are the namespace's own, so a connection can reach nothing of the host's unless the namespace leaks (pasta
+        forwarding a port). Without --netns those targets are judged from the unit's properties, as before.
         Speed (neither changes a verdict): a deny probe is dropped by the IP filter, so a blocked one ends in a timeout, and that wait used to be
         the whole run (about 180 probes x 5 sets x 3 s, one after another). Deny probes now wait --deny-timeout seconds (default 1.5; allow probes keep
         3 s and a timeout is still a FAIL for them) and run --jobs at a time (default 32; --jobs 1 is the plain one-after-another order). Results
@@ -157,6 +163,19 @@ def attempt(kind, target, timeout=TIMEOUT):
             except Exception as e:
                 return False, f"{type(e).__name__}: {e}. " + SANDBOX_HINT
             return True, "bwrap made its namespaces and ran the command"
+        if kind == "tcp-self":
+            # A TCP listener of its own on a loopback address (127.0.0.1 or ::1), and a connection to it. In the worker's network namespace that
+            # loopback is the namespace's own, which is where Claude Code's sandbox proxy listens. It reaches nothing else.
+            fam = socket.AF_INET6 if ":" in target else socket.AF_INET
+            srv = socket.socket(fam, socket.SOCK_STREAM)
+            try:
+                srv.bind((target, 0))
+                srv.listen(1)
+                c = socket.create_connection((target, srv.getsockname()[1]), timeout=timeout)
+                c.close()
+            finally:
+                srv.close()
+            return True, f"listened on and connected to {target} of its own"
         if kind == "unix-self":
             # A unix socket of its own, in a fresh private folder: listen, connect to itself, remove it. It reaches nothing else.
             import shutil
@@ -202,11 +221,17 @@ def attempt(kind, target, timeout=TIMEOUT):
 
 ALL_SETS = "worker,kernel,build,cli-worker,cli-kernel"
 WORKERISH = "worker,build,cli-worker"
-# The sets that keep AF_UNIX: the kernel's (Postgres) and, since 21 Oct 2026, the worker's (Claude Code's sandbox). Another tenant's abstract
-# socket is a known limit there (reported, never connected to); only the build, which has no AF_UNIX, gets a deny probe for it.
-WITH_UNIX = "worker,kernel,cli-worker,cli-kernel"
-NO_UNIX = "build"
-GATEWAY = ("127.74.3.1", "7431")  # the kernel's own gateway: the worker is meant to reach it
+# Another tenant's abstract socket, by set. The build has no AF_UNIX and the worker sets run in their own network namespace (22 Oct 2026),
+# which has none of the host's abstract sockets, so both get a deny probe (the worker sets try it only after the netns guard passed). The
+# kernel sets keep AF_UNIX (Postgres) in the host's namespace: a known limit there (reported, never connected to).
+ABSTRACT_DENY = "worker,build,cli-worker"
+ABSTRACT_KNOWN = "kernel,cli-kernel"
+# The kernel's own gateway addresses: the worker is meant to reach one of them. 127.74.3.1 is the one from before the worker's network namespace
+# (kept for one release); 198.18.74.1 is the one the worker uses from inside it, through pasta.
+GATEWAYS = (("127.74.3.1", "7431"), ("198.18.74.1", "7431"))
+NETNS_GATEWAY = "198.18.74.1"
+# The sets that run in the worker's own network namespace. fence-check.sh hands them --netns, and the probe guards on it before anything else.
+NETNS_SETS = "worker,cli-worker"
 MAX_DERIVED = 400
 # Path sockets the worker sets could connect to (they have AF_UNIX since 21 Oct 2026). Every listening path socket that ss lists becomes a
 # "reach" line for these sets, judged inside the unit from the file itself (stat and access, never a connection), so what InaccessiblePaths,
@@ -255,6 +280,8 @@ def classify(addr):
         return "tailscale"
     if o[0] == 169 and o[1] == 254:
         return "linklocal"
+    if o[0] == 198 and o[1] in (18, 19):
+        return "benchmark"  # 198.18.0.0/15: no real host has one; the gateway's 198.18.74.1 is in it
     return "public"
 
 
@@ -276,7 +303,7 @@ def derive(ss_tcp, ss_unix, ip_addr):
             host, port = split_listener(f[3])
             if port.isdigit():
                 listeners.append((unmap(host), port))
-    own_public, own_local = [], []
+    own_public, own_local, own_bench = [], [], []
     for line in open(ip_addr):
         f = line.split()
         if len(f) < 4 or f[2] not in ("inet", "inet6"):
@@ -287,6 +314,8 @@ def derive(ss_tcp, ss_unix, ip_addr):
             own_public.append(addr)
         elif kind in ("private", "tailscale"):
             own_local.append(addr)
+        elif kind == "benchmark":
+            own_bench.append(addr)
     out = {}
 
     def add(expect, sets, name, kind, target):
@@ -303,8 +332,9 @@ def derive(ss_tcp, ss_unix, ip_addr):
                 wild_v4.add(port)
             if host in ("::", "*"):
                 wild_v6.add(port)
-        elif c == "loopback":
-            if (host, port) != GATEWAY:
+        elif c in ("loopback", "benchmark"):
+            # (another listener on a gateway address is a deny target too: the sets that allow that address FAIL on it from their properties)
+            if (host, port) not in GATEWAYS:
                 add("deny", ALL_SETS, f"listener-{host}-{port}", "tcp", hp(host, port))
         elif c in ("private", "tailscale"):
             add("deny", ALL_SETS, f"listener-{host}-{port}", "tcp", hp(host, port))
@@ -316,6 +346,10 @@ def derive(ss_tcp, ss_unix, ip_addr):
         for a in own_public:
             if ":" not in a:
                 add("deny", WORKERISH, f"wildcard-{a}-{port}", "tcp", hp(a, port))
+        # The worker reaches the gateway address through pasta, so it reaches every listener on all addresses there too: a known limit, reported
+        # in every run from the properties (never connected to).
+        if NETNS_GATEWAY in own_bench:
+            add("known", NETNS_SETS, f"wildcard-{NETNS_GATEWAY}-{port}", "tcp", hp(NETNS_GATEWAY, port))
     for port in sorted(wild_v6, key=int):
         add("deny", ALL_SETS, f"wildcard-::1-{port}", "tcp", hp("::1", port))
         for a in own_local:
@@ -330,8 +364,10 @@ def derive(ss_tcp, ss_unix, ip_addr):
         if len(f) >= 5 and f[4].startswith("@") and len(f[4]) > 1 and "," not in f[4] and "=" not in f[4]:
             names.add(f[4][1:])
     for n, name in enumerate(sorted(names), 1):  # numbered after sorting, so the order ss printed in does not matter
-        add("deny", NO_UNIX, f"abstract-{n}", "abstract", name)
-        add("known", WITH_UNIX, f"abstract-{n}", "abstract", name)
+        # denied for the build (no AF_UNIX) and the worker sets (their own network namespace has its own abstract namespace: tried only after
+        # the netns guard passed); a known limit for the kernel sets, which have AF_UNIX in the host's namespace
+        add("deny", ABSTRACT_DENY, f"abstract-{n}", "abstract", name)
+        add("known", ABSTRACT_KNOWN, f"abstract-{n}", "abstract", name)
     lines = [out[k] for k in sorted(out)]
     paths = set()
     for line in open(ss_unix):
@@ -478,7 +514,9 @@ def control_state(kind, target, tcp_listeners, unix_listeners):
 class UnitProps:
     """What the unit being probed is allowed to do, as systemd reports it. Known limits and activation sockets are judged from this."""
 
-    def __init__(self, af, ip_deny, ip_allow, inaccessible):
+    def __init__(self, af, ip_deny, ip_allow, inaccessible, own_netns=False):
+        # own_netns: the netns guard passed, so this run is inside the worker's own network namespace
+        self.own_netns = own_netns
         self.af = af.split()
         self.deny = self._nets(ip_deny)
         self.allow = self._nets(ip_allow)
@@ -523,8 +561,24 @@ def ss_note(state):
     return {"activation": "an activation socket", "open": "listed by ss", "closed": "not listed by ss"}.get(state, "no ss result")
 
 
+OWN_LOOPBACK = "the set runs in its own network namespace (netns guard passed), where this loopback address is the namespace's own, not the host's"
+OWN_ABSTRACT = "the set runs in its own network namespace (netns guard passed), which has its own abstract unix sockets, not the host's"
+
+
+def in_own_netns_only(kind, target, props):
+    """Does this target exist only in the HOST's network namespace, so that from the worker's own namespace it cannot be reached? True for a
+    loopback address and an abstract socket, once the netns guard passed. (A path socket is a file: the namespace does not change it.)"""
+    if not props.own_netns:
+        return False
+    if kind == "tcp":
+        return classify(split_hostport(target)[0]) == "loopback"
+    return kind == "abstract"
+
+
 def properties_verdict(kind, target, props):
     """(ok, text): is the target out of reach of this unit, judged only from the unit's properties?"""
+    if in_own_netns_only(kind, target, props):
+        return True, OWN_LOOPBACK if kind == "tcp" else OWN_ABSTRACT
     if kind == "tcp":
         host, _ = split_hostport(target)
         if props.address_denied(host):
@@ -537,6 +591,25 @@ def properties_verdict(kind, target, props):
             return True, "the path is hidden by InaccessiblePaths"
         return False, "the unit has AF_UNIX and nothing hides this socket, so it could connect if it listens"
     return False, "cannot be judged from properties"
+
+
+def netns_guard(set_name, spec, self_spec=""):
+    """(ok, line): THE NETNS GUARD. spec is "<host netns inode>:<worker netns inode>" (the second may be empty); the probe's own network
+    namespace must be a different one from the host's, and the worker's when that is given. It reads only /proc/self/ns/net (--self-netns gives
+    the inode instead, for the tests). Nothing is connected to here."""
+    host, _, want = spec.partition(":")
+    try:
+        host_i = int(host)
+        want_i = int(want) if want else None
+        own = int(self_spec) if self_spec else os.stat("/proc/self/ns/net").st_ino
+    except (OSError, ValueError) as e:
+        return False, f"FAIL {set_name} netns-guard cannot tell which network namespace this is ({type(e).__name__}: {e}); nothing was connected to"
+    if own == host_i:
+        return False, (f"FAIL {set_name} netns-guard the probe is in the HOST's network namespace (net:[{own}]), not the worker's own; "
+                       "nothing was connected to")
+    if want_i is not None and own != want_i:
+        return False, f"FAIL {set_name} netns-guard the probe is in network namespace net:[{own}], not the worker's (net:[{want_i}]); nothing was connected to"
+    return True, f"ok {set_name} netns-guard runs in its own network namespace (net:[{own}]; the host's is net:[{host_i}])"
 
 
 def make_job(set_name, expect, name, kind, target, state, deny_timeout):
@@ -598,7 +671,7 @@ def main(argv):
     mode, set_name, probes_file = argv[1], argv[2], argv[3]
     opts = {"--host-addrs": "", "--control": None, "--af": None, "--ip-deny": "", "--ip-allow": "", "--inaccessible": "",
             "--ss-tcp": None, "--ss-unix": None, "--activation-text": None, "--bulig-uid": "", "--self-uid": "",
-            "--deny-timeout": str(DENY_TIMEOUT), "--jobs": str(JOBS)}
+            "--deny-timeout": str(DENY_TIMEOUT), "--jobs": str(JOBS), "--netns": None, "--self-netns": ""}
     late = "both"
     i = 4
     while i < len(argv):
@@ -642,7 +715,14 @@ def main(argv):
                          "(the systemctl list-sockets output): it decides what is socket-activated from each target itself, never by probe name")
     activation = parse_activation(opts["--activation-text"])
     control = dict(kv.split("=", 1) for kv in opts["--control"].split(",") if "=" in kv)
-    props = UnitProps(opts["--af"], opts["--ip-deny"], opts["--ip-allow"], opts["--inaccessible"])
+    own_netns = False
+    if opts["--netns"] is not None:
+        ok, line = netns_guard(set_name, opts["--netns"], opts["--self-netns"])
+        print(line, flush=True)
+        if not ok:
+            return 1  # nothing else runs: a set that is not where it should be connects to nothing
+        own_netns = True
+    props = UnitProps(opts["--af"], opts["--ip-deny"], opts["--ip-allow"], opts["--inaccessible"], own_netns)
     # Every probe gives exactly one result: (line, failed). Judging a probe from text (properties, ss, activation) is instant and never connects;
     # only the probes that really have to attempt something become a job. The results are printed in the probe file's order, whatever order
     # the jobs finish in, so a run reads the same every time and two modes can be compared line by line.
@@ -698,7 +778,7 @@ def main(argv):
                     # The unit's own properties already leave this address open: a connection would simply go through to another service.
                     todo.append((None, f"FAIL {set_name} {name} {kind} {target} is open by the unit's own properties ({why}); not connected to", True))
                     continue
-            if kind != "tcp" and props.has_af_unix() and not (kind == "unix" and props.path_hidden(target)):
+            if kind != "tcp" and props.has_af_unix() and not (kind == "unix" and props.path_hidden(target)) and not in_own_netns_only(kind, target, props):
                 # Nothing fences this: the unit may open a unix socket and the path is not hidden, so a connection would simply succeed.
                 good, why = properties_verdict(kind, target, props)
                 todo.append((None, f"info {set_name} {name} known limit, not tested by connecting: {kind} {target[:60]} ({ss_note(state)}; {why})", False))

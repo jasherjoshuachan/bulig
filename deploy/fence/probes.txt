@@ -23,14 +23,21 @@
 #         | node (run `node -e <target>`; works when it exits 0) | exec (run the command in <target>; works when it exits 0)
 #         | sandbox (run the bwrap command in <target>; works when it exits 0, and a failure names the likely causes)
 #         | unix-self (listen on a unix socket of its own in a fresh temp folder and connect to it; reaches nothing else)
+#         | tcp-self (listen on the loopback address in <target> on a free port and connect to it; reaches nothing else)
 #
 # The build's user lookup is a KNOWN limit: it runs as a DynamicUser, which has no /etc/passwd entry, and libnss_systemd resolves dynamic users
 # only over a varlink unix socket, which needs AF_UNIX, which the build does not have (on purpose). The build does not need the lookup (HOME is
 # set explicitly; node's os.homedir() reads $HOME), and node-homedir proves that.
 #
 # The worker sets have AF_UNIX and AF_NETLINK since 21 Oct 2026 (Claude Code's Bash sandbox, bubblewrap, needs both), so a unix deny probe there
-# runs only when InaccessiblePaths hides its path, and an abstract one is a known limit (as for the kernel). The two sandbox probes below prove
-# the sandbox can start without Claude: a unix socket of its own (what the sandbox's proxy does in /tmp) and bwrap making every namespace.
+# runs only when InaccessiblePaths hides its path. The two sandbox probes below prove the sandbox can start without Claude: a unix socket of its
+# own (what the sandbox's proxy does in /tmp) and bwrap making every namespace.
+# The worker sets run in the worker's own network namespace since 22 Oct 2026. fence-check.sh gives their probe --netns, and THE NETNS GUARD runs
+# before anything else (the probe's namespace must not be the host's, and must be the worker's). Once it passed, a loopback target and an
+# abstract socket are tried for real there: they are the namespace's own, so each must fail (nothing of the worker's listens on them); one
+# that works means the namespace reaches the host (pasta forwarding a port). Their loopback is allowed and their own: the tcp-self probes
+# listen on it, as Claude Code's sandbox proxy does. The gateway is 198.18.74.1 (through pasta); 127.74.3.1, the address from before the
+# namespace, must not be reachable from it.
 
 # --- the systemd-resolved stub: reachable only through resolved's upstream list, never directly
 deny  worker,kernel,build,cli-worker,cli-kernel  resolver-stub-dns-tcp   tcp       127.0.0.53:53
@@ -60,4 +67,8 @@ known worker,cli-worker                          node-network-interfaces node   
 allow worker,cli-worker                          unix-socket-of-its-own  unix-self -
 allow worker,cli-worker                          bwrap-sandbox           sandbox   /usr/bin/bwrap --unshare-all --ro-bind / / --dev /dev --proc /proc /bin/true
 allow worker,cli-worker                          claude-version          exec      claude --version
-allow-late worker,cli-worker                     kernel-gateway-healthz  http      http://127.74.3.1:7431/healthz
+allow worker,cli-worker                          loopback-v4-of-its-own  tcp-self  127.0.0.1
+allow worker,cli-worker                          loopback-v6-of-its-own  tcp-self  ::1
+allow worker,cli-worker                          https-npm-registry      https     registry.npmjs.org
+deny  worker,cli-worker                          old-gateway-loopback    tcp       127.74.3.1:7431
+allow-late worker,cli-worker                     kernel-gateway-healthz  http      http://198.18.74.1:7431/healthz

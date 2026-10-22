@@ -66,7 +66,7 @@ if value bulig-worker.service LoadCredential | grep -qE 'pg-url|gh-token|config|
 if [ "$(value bulig.service Environment | tr '\n' ' ')" = "HOME=/var/lib/bulig PATH=/usr/local/bin:/usr/bin:/bin " ]; then ok "the kernel's environment is only HOME and PATH (no secret in it)"; else bad "kernel environment: $(value bulig.service Environment)"; fi
 
 echo "network and sockets: what each unit can reach"
-DENY="127.0.0.0/8 ::1/128 169.254.0.0/16 fe80::/10 224.0.0.0/4 ff00::/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7"
+DENY="127.0.0.0/8 ::1/128 169.254.0.0/16 fe80::/10 224.0.0.0/4 ff00::/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7 198.18.0.0/15"
 INACC="-/run/tailscale -/run/snapd.socket -/run/docker.sock -/var/run/docker.sock"
 RES="/run/systemd/resolve/resolv.conf:/etc/resolv.conf"
 # the worker: AF_UNIX and AF_NETLINK for Claude Code's Bash sandbox (Jasher, 21 Oct 2026), the gateway address and nothing else local, and
@@ -74,13 +74,14 @@ RES="/run/systemd/resolve/resolv.conf:/etc/resolv.conf"
 INACC_WORKER="$INACC -/run/postgresql -/var/run/postgresql -/run/dbus -/run/snapd-snap.socket -/run/systemd/userdb -/run/systemd/resolve/io.systemd.Resolve -/run/systemd/resolve/io.systemd.Resolve.Monitor -/run/user"
 want bulig-worker.service RestrictAddressFamilies "AF_UNIX AF_INET AF_INET6 AF_NETLINK"
 want bulig-worker.service IPAddressDeny "$DENY"
-want bulig-worker.service IPAddressAllow "127.74.3.1/32"
+want bulig-worker.service IPAddressAllow "127.0.0.0/8 ::1/128 198.18.74.1/32"
+want bulig-worker.service NetworkNamespacePath /run/netns/bulig-worker
 want bulig-worker.service InaccessiblePaths "$INACC_WORKER"
 want bulig-worker.service BindReadOnlyPaths "$RES"
 # the kernel: keeps AF_UNIX for Postgres, the gateway address only; a Mac worker's /32 comes from a drop-in, none by default
 want bulig.service RestrictAddressFamilies "AF_UNIX AF_INET AF_INET6"
 want bulig.service IPAddressDeny "$DENY"
-want bulig.service IPAddressAllow "127.74.3.1/32"
+want bulig.service IPAddressAllow "127.74.3.1/32 198.18.74.1/32"
 want bulig.service InaccessiblePaths "$INACC"
 want bulig.service BindReadOnlyPaths "$RES"
 # backup and drill: private ranges denied, nothing allowed, upstream resolvers, docker's config in a root-owned folder
@@ -91,9 +92,12 @@ for u in bulig-backup.service bulig-restore-drill.service; do
   want "$u" Environment "DOCKER_CONFIG=/var/lib/bulig-checks/docker"
 done
 want bulig-loopback.service IPAddressDeny any
-for u in bulig.service bulig-worker.service bulig-backup.service bulig-restore-drill.service bulig-loopback.service; do
+for u in bulig.service bulig-worker.service bulig-backup.service bulig-restore-drill.service bulig-loopback.service bulig-netns.service bulig-pasta.service; do
   if [ "$(value "$u" IPAddressDeny | wc -l | tr -d ' ')" = "1" ]; then ok "$u has an IPAddressDeny line"; else bad "$u has no (or two) IPAddressDeny lines"; fi
-  case " $(value "$u" IPAddressAllow) " in
+  allow=" $(value "$u" IPAddressAllow) "
+  # The worker's loopback is its own (its own network namespace), so it alone may allow 127.0.0.0/8 and ::1, and only while it has the namespace.
+  if [ "$u" = "bulig-worker.service" ] && [ "$(value "$u" NetworkNamespacePath)" = "/run/netns/bulig-worker" ]; then allow="${allow/ 127.0.0.0\/8 / }"; allow="${allow/ ::1\/128 / }"; fi
+  case "$allow" in
     *" 127.0.0.1/32 "* | *" 127.0.0.0/8 "* | *" localhost "* | *" any "* | *" 0.0.0.0/0 "* | *" 172.16.0.1/32 "* | *" ::1/128 "* | *" 127.0.0.53/32 "* | *" 100.64.0.0/10 "*) bad "$u allows localhost, the DNS stub, a whole range, the docker bridge or everything: $(value "$u" IPAddressAllow)" ;;
     *) ok "$u does not allow 127.0.0.1, localhost, the DNS stub, Tailscale as a range, the docker bridge or everything" ;;
   esac
@@ -122,12 +126,12 @@ if [ "$(value bulig-worker.service SetCredential)" = "github-read-token:none" ];
 for u in bulig.service bulig-worker.service; do
   if [ "$(value "$u" LimitCORE)" = "0" ]; then ok "$u writes no core dump (LimitCORE=0)"; else bad "$u can write a core dump holding a credential"; fi
 done
-for u in bulig.service bulig-worker.service bulig-backup.service bulig-restore-drill.service; do
+for u in bulig.service bulig-worker.service bulig-backup.service bulig-restore-drill.service bulig-pasta.service; do
   missing=""
-  for t in 127.0.0.0/8 ::1/128 169.254.0.0/16 fe80::/10 224.0.0.0/4 ff00::/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7; do
+  for t in 127.0.0.0/8 ::1/128 169.254.0.0/16 fe80::/10 224.0.0.0/4 ff00::/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fc00::/7 198.18.0.0/15; do
     case " $(value "$u" IPAddressDeny) " in *" $t "*) ;; *) missing="$missing $t" ;; esac
   done
-  if [ -z "$missing" ]; then ok "$u denies localhost, link-local, multicast, 10/8, 172.16/12, 192.168/16, 100.64/10 and fc00::/7"; else bad "$u does not deny:$missing"; fi
+  if [ -z "$missing" ]; then ok "$u denies localhost, link-local, multicast, 10/8, 172.16/12, 192.168/16, 100.64/10, fc00::/7 and the benchmark range 198.18/15"; else bad "$u does not deny:$missing"; fi
   if grep -qE '127\.0\.0\.53' <(grep -v '^#' "$sd/$u"); then bad "$u names the DNS stub 127.0.0.53 in a setting"; else ok "$u does not name the DNS stub (DNS goes through resolved's upstream list)"; fi
 done
 # The worker has exactly AF_UNIX, AF_NETLINK and IP (Claude Code's sandbox needs the first two; nothing needs AF_PACKET or any other family).
@@ -135,7 +139,7 @@ wf=" $(value bulig-worker.service RestrictAddressFamilies) "
 case "$wf" in *AF_PACKET* | *"~"*) bad "the worker unit allows a raw or every other socket family: $wf" ;; *) ok "the worker unit allows no raw socket family and is an allow list" ;; esac
 if [ "$(tr ' ' '\n' <<<"$wf" | grep -c '^AF_')" = "4" ]; then ok "the worker unit allows four families only"; else bad "the worker unit's families: $wf"; fi
 WSVC="$(cat "$sd/bulig-worker.service")"
-if grep -q 'KNOWN LIMIT: with AF_UNIX this unit can reach other tenants'"'"' ABSTRACT unix sockets' <<<"$WSVC" && grep -q '/etc/apparmor.d/bulig-bwrap' <<<"$WSVC" && grep -q 'EAFNOSUPPORT' <<<"$WSVC" && grep -q 'NETLINK_ROUTE' <<<"$WSVC"; then ok "the worker unit says why it has AF_UNIX and AF_NETLINK, names the AppArmor profile, and states the abstract-socket limit"; else bad "the worker unit's comment does not explain its families honestly"; fi
+if grep -q "Other tenants' ABSTRACT unix sockets were a known limit here before the namespace" <<<"$WSVC" && grep -q '/etc/apparmor.d/bulig-bwrap' <<<"$WSVC" && grep -q 'EAFNOSUPPORT' <<<"$WSVC" && grep -q 'NETLINK_ROUTE' <<<"$WSVC" && grep -q 'only after it has proven the probe is in that namespace' <<<"$WSVC"; then ok "the worker unit says why it has AF_UNIX and AF_NETLINK, names the AppArmor profile, and says the abstract-socket limit is closed by its own namespace (tried only after the guard)"; else bad "the worker unit's comment does not explain its families honestly"; fi
 if grep -q 'has no AF_UNIX' <<<"$WSVC" || grep -q 'if AF_UNIX were ever allowed' <<<"$WSVC"; then bad "the worker unit still claims it has no AF_UNIX"; else ok "the worker unit no longer claims it has no AF_UNIX"; fi
 case " $(value bulig.service RestrictAddressFamilies) " in *AF_UNIX*) ok "the kernel keeps AF_UNIX (its Postgres socket): a documented limit, see the RUNBOOK" ;; *) bad "the kernel unit lost AF_UNIX, so it cannot reach Postgres" ;; esac
 if grep -q '^## Known limits' "$deploy/RUNBOOK.md" && sed -n '/^## Known limits/,/^## Must be proven/p' "$deploy/RUNBOOK.md" | grep -q 'AppArmor profile for the kernel with `deny unix addr=@\*\*,`' && sed -n '/^## Known limits/,/^## Must be proven/p' "$deploy/RUNBOOK.md" | grep -qi 'abstract'; then ok "the RUNBOOK's Known limits name the kernel's abstract-socket reach and the AppArmor next step"; else bad "RUNBOOK Known limits section is missing the abstract-socket limit"; fi
@@ -189,25 +193,86 @@ ITEM6="$(sed -n '/^## Must be proven on the server first/,/^## Things to know/p'
 if grep -q 'build and test stages ran Bash commands in the sandbox' <<<"$ITEM6" && grep -q "test stage's verdict PASS" <<<"$ITEM6" && grep -q 'bwrap-sandbox' <<<"$ITEM6" && grep -q 'Correction, 21 Oct 2026' <<<"$ITEM6" && grep -q 'wrongly counted' <<<"$ITEM6"; then ok "server-first item 6 needs a job whose build and test stages ran Bash in the sandbox (test verdict PASS) and the bwrap probe, and says it was wrongly counted on 21 Oct"; else bad "server-first item 6: $ITEM6"; fi
 if grep -q 'one real synthetic job\.' <<<"$ITEM6" || grep -q 'runs without `AF_UNIX`' <<<"$ITEM6"; then bad "item 6 still counts any synthetic job, or still says the worker has no AF_UNIX"; else ok "and no longer counts any synthetic job"; fi
 KL="$(sed -n '/^## Known limits/,/^## Must be proven/p' "$deploy/RUNBOOK.md")"
-if grep -q "The worker can reach other tenants' abstract unix sockets too" <<<"$KL"; then ok "the RUNBOOK's Known limits name the worker's abstract-socket reach"; else bad "Known limits do not name the worker's abstract-socket reach"; fi
-if grep -q "Commands in Claude Code's sandbox have no network\*\*" <<<"$KL" && grep -q '\*\*Loopback stays closed\*\*' <<<"$KL" && grep -q 'Planned follow-up: run the worker in its own network namespace' <<<"$KL"; then ok "the RUNBOOK's Known limits say sandboxed commands have no network, that loopback stays closed, and the network-namespace follow-up"; else bad "Known limits miss the sandbox network limit, the closed loopback or the follow-up"; fi
-if grep -q "The worker can connect to other path sockets whose permissions let it in" <<<"$KL" && grep -q 'never a connection' <<<"$KL" && grep -q 'The planned network namespace does \*\*not\*\* fix this' <<<"$KL" && ! grep -q 'Path sockets are hidden' "$deploy/RUNBOOK.md"; then ok "the RUNBOOK says only listed paths are hidden, other path sockets stay connectable (listed by the fence check), and the namespace does not fix it"; else bad "the RUNBOOK's path-socket limit is missing or still claims every path socket is hidden"; fi
+if grep -q "The worker can reach other tenants' abstract unix sockets too" <<<"$KL" || grep -q "Commands in Claude Code's sandbox have no network\*\*" <<<"$KL" || grep -q 'Planned follow-up: run the worker in its own network namespace' <<<"$KL"; then bad "the RUNBOOK's Known limits still list the worker's abstract-socket reach or the sandbox's missing network, which the namespace closed"; else ok "the RUNBOOK's Known limits no longer list the worker's abstract-socket reach or the sandbox's missing network (the namespace closed both)"; fi
+CL="$(sed -n '/^## Known limits/,/^## Must be proven/p' "$deploy/RUNBOOK.md" | sed -n '/^### Closed by the worker.s network namespace/,/^## /p')"
+if grep -q "other tenants' abstract unix sockets" <<<"$CL" && grep -q 'netns guard' <<<"$CL" && grep -q "npm" <<<"$CL" && grep -q "sandbox's own allowlist" <<<"$CL"; then ok "the RUNBOOK says what the namespace closed: the worker's abstract-socket reach (tried only after the netns guard) and the sandbox network (npm through the sandbox's own allowlist)"; else bad "the RUNBOOK does not say what the namespace closed: $CL"; fi
+if grep -q '198.18.74.1.*reaches every listener on the host bound to all addresses' <<<"$KL" && grep -q "pasta's unit" <<<"$KL"; then ok "the RUNBOOK's Known limits say 198.18.74.1 reaches every listener on all addresses through pasta, and that pasta's unit filter is the guard"; else bad "Known limits miss the pasta/198.18.74.1 limit"; fi
+if grep -q "The worker can connect to other path sockets whose permissions let it in" <<<"$KL" && grep -q 'never a connection' <<<"$KL" && grep -q 'The network namespace does \*\*not\*\* change this' <<<"$KL" && ! grep -q 'Path sockets are hidden' "$deploy/RUNBOOK.md"; then ok "the RUNBOOK says only listed paths are hidden, other path sockets stay connectable (listed by the fence check), and the namespace does not change it"; else bad "the RUNBOOK's path-socket limit is missing or still claims every path socket is hidden"; fi
 if grep -q 'InaccessiblePaths hides THESE paths only' <<<"$WSVC" && grep -q 'KNOWN LIMIT: every OTHER path socket' <<<"$WSVC" && ! grep -q 'hides the unix sockets a path connection could reach' <<<"$WSVC"; then ok "the worker unit says which paths are hidden and that other path sockets stay connectable"; else bad "the worker unit's InaccessiblePaths comment overclaims"; fi
-if grep -q 'KNOWN LIMIT: commands inside the sandbox have NO NETWORK' <<<"$WSVC"; then ok "the worker unit states the sandbox network limit"; else bad "the worker unit does not state the sandbox network limit"; fi
+if grep -q 'KNOWN LIMIT: commands inside the sandbox have NO NETWORK' <<<"$WSVC"; then bad "the worker unit still says sandboxed commands have no network"; else ok "the worker unit no longer says sandboxed commands have no network (the proxy is on the namespace's own loopback)"; fi
 if grep -q 'the worker is a different unit with no AF_UNIX' "$sd/bulig.service"; then bad "the kernel unit still says the worker has no AF_UNIX"; else ok "the kernel unit no longer says the worker has no AF_UNIX"; fi
 
-echo "the gateway address"
+echo "the gateway addresses"
 gw="127.74.3.1"
-case "$(value bulig-worker.service ExecStart)" in *"--kernel http://$gw:7431 "*) ok "the worker connects to http://$gw:7431" ;; *) bad "worker URL: $(value bulig-worker.service ExecStart)" ;; esac
-if [ "$(value bulig-loopback.service ExecStart)" = "/usr/bin/ip address replace $gw/32 dev lo" ] && [ "$(value bulig-loopback.service ExecStop)" = "/usr/bin/ip address del $gw/32 dev lo" ]; then ok "bulig-loopback.service puts $gw/32 on lo and takes it off again"; else bad "loopback exec: $(value bulig-loopback.service ExecStart) / $(value bulig-loopback.service ExecStop)"; fi
+ngw="198.18.74.1"
+case "$(value bulig-worker.service ExecStart)" in *"--kernel http://$ngw:7431 "*) ok "the worker connects to http://$ngw:7431 (from its own network namespace, through pasta)" ;; *) bad "worker URL: $(value bulig-worker.service ExecStart)" ;; esac
+if [ "$(value bulig-loopback.service ExecStart | tr '\n' '|')" = "/usr/bin/ip address replace $gw/32 dev lo|/usr/bin/ip address replace $ngw/32 dev lo|" ] && [ "$(value bulig-loopback.service ExecStop | tr '\n' '|')" = "-/usr/bin/ip address del $gw/32 dev lo|-/usr/bin/ip address del $ngw/32 dev lo|" ]; then ok "bulig-loopback.service puts $gw/32 and $ngw/32 on lo and takes both off again (an address already gone is not a failure)"; else bad "loopback exec: $(value bulig-loopback.service ExecStart | tr '\n' '|') / $(value bulig-loopback.service ExecStop | tr '\n' '|')"; fi
 want bulig-loopback.service Type oneshot
 want bulig-loopback.service RemainAfterExit yes
-want bulig-loopback.service Before "bulig.service bulig-worker.service"
+want bulig-loopback.service Before "bulig.service bulig-worker.service bulig-pasta.service"
 want bulig-loopback.service CapabilityBoundingSet CAP_NET_ADMIN
 want bulig-loopback.service RestrictAddressFamilies "AF_NETLINK AF_UNIX"
 want bulig.service Requires bulig-loopback.service
 if value bulig-worker.service Wants | grep -q bulig-loopback.service && value bulig-worker.service After | grep -q bulig-loopback.service; then ok "the worker wants and starts after the gateway address"; else bad "worker ordering"; fi
 if value bulig.service After | grep -q bulig-loopback.service; then ok "the kernel starts after the gateway address"; else bad "kernel ordering"; fi
+
+echo "the worker's own network namespace (bulig-netns.service)"
+NS="$sd/bulig-netns.service"
+want bulig-netns.service Type oneshot
+want bulig-netns.service RemainAfterExit yes
+want bulig-netns.service ExecStartPre "-/usr/bin/ip netns delete bulig-worker"
+want bulig-netns.service ExecStart "/usr/bin/ip netns add bulig-worker"
+want bulig-netns.service ExecStop "/usr/bin/ip netns delete bulig-worker"
+want bulig-netns.service CapabilityBoundingSet CAP_SYS_ADMIN
+want bulig-netns.service RestrictNamespaces net
+want bulig-netns.service IPAddressDeny any
+want bulig-netns.service NoNewPrivileges true
+want bulig-netns.service Before "bulig-pasta.service bulig-worker.service"
+# `ip netns add` publishes the namespace as a bind mount under /run/netns; in a mount namespace of the unit's own nobody else would see it
+mns=""
+for k in ProtectSystem ProtectHome PrivateTmp PrivateDevices PrivateMounts ReadWritePaths ReadOnlyPaths InaccessiblePaths BindPaths BindReadOnlyPaths TemporaryFileSystem ProtectKernelTunables ProtectKernelModules ProtectKernelLogs ProtectControlGroups ProtectProc ProcSubset ProtectHostname RootDirectory MountAPIVFS RuntimeDirectory StateDirectory; do
+  if has bulig-netns.service "$k"; then mns="$mns $k"; fi
+done
+if [ -z "$mns" ]; then ok "bulig-netns.service has no setting that gives it a mount namespace of its own (the namespace's bind mount must land in the host's)"; else bad "bulig-netns.service has a mount-namespace setting:$mns"; fi
+if grep -q 'NO MOUNT NAMESPACE, on purpose' "$NS"; then ok "and says why"; else bad "bulig-netns.service does not say why it has no mount namespace"; fi
+
+echo "pasta, the namespace's way out (bulig-pasta.service)"
+PS="$sd/bulig-pasta.service"
+pexec="$(value bulig-pasta.service ExecStart)"
+if [ "$pexec" = "/usr/bin/pasta -f -e --config-net --netns /run/netns/bulig-worker --runas 0 --netns-only -t none -u none -T none -U none --no-map-gw" ]; then ok "pasta runs in the foreground, logs to stderr, configures the namespace, stays root (--runas 0), joins the netns only, forwards no port either way, and maps no gateway"; else bad "pasta ExecStart: $pexec"; fi
+for f in "-t none" "-u none" "-T none" "-U none" "--no-map-gw"; do
+  case " $pexec " in *" $f "*) ok "pasta has $f" ;; *) bad "pasta lacks $f (a namespace port or the gateway would be mapped to the host)" ;; esac
+done
+want bulig-pasta.service Type simple
+want bulig-pasta.service Restart always
+want bulig-pasta.service BindsTo bulig-netns.service
+if value bulig-pasta.service After | grep -q 'bulig-netns.service'; then ok "pasta starts after the namespace"; else bad "pasta ordering: $(value bulig-pasta.service After)"; fi
+want bulig-pasta.service Before bulig-worker.service
+want bulig-pasta.service CapabilityBoundingSet "CAP_SYS_ADMIN CAP_NET_ADMIN"
+want bulig-pasta.service AmbientCapabilities ""
+want bulig-pasta.service RestrictNamespaces "ipc mnt net uts"
+want bulig-pasta.service RestrictAddressFamilies "AF_INET AF_INET6 AF_NETLINK"
+want bulig-pasta.service DevicePolicy closed
+want bulig-pasta.service DeviceAllow "/dev/net/tun rw"
+want bulig-pasta.service IPAddressDeny "$DENY"
+want bulig-pasta.service IPAddressAllow "198.18.74.1/32"
+for k in NoNewPrivileges PrivateTmp ProtectKernelTunables ProtectKernelModules ProtectKernelLogs ProtectControlGroups ProtectClock ProtectHostname LockPersonality MemoryDenyWriteExecute RestrictRealtime RestrictSUIDSGID; do
+  want bulig-pasta.service "$k" true
+done
+want bulig-pasta.service ProtectSystem strict
+want bulig-pasta.service ProtectHome yes
+want bulig-pasta.service ProtectProc invisible
+want bulig-pasta.service LimitCORE 0
+if has bulig-pasta.service MemoryMax && has bulig-pasta.service TasksMax; then ok "pasta is capped (MemoryMax $(value bulig-pasta.service MemoryMax), TasksMax $(value bulig-pasta.service TasksMax))"; else bad "pasta has no memory or task cap"; fi
+for k in User PrivateNetwork PrivateUsers PrivateDevices NetworkNamespacePath; do
+  if has bulig-pasta.service "$k"; then bad "bulig-pasta.service sets $k=$(value bulig-pasta.service "$k")"; else ok "bulig-pasta.service does not set $k (it runs as root, in the host's network namespace, with /dev/net/tun)"; fi
+done
+if grep -q "Couldn't switch to pasta namespaces: Operation not permitted" "$PS" && grep -q 'KNOWN LIMIT: the filter matches ADDRESSES, NOT PORTS' "$PS" && grep -q 'isolation.c' "$PS"; then ok "the pasta unit says why --runas 0, where its capability list comes from, and the addresses-not-ports limit"; else bad "the pasta unit's comments are missing the reasons"; fi
+
+echo "the worker runs only in its namespace"
+want bulig-worker.service BindsTo bulig-netns.service
+if value bulig-worker.service After | grep -q 'bulig-netns.service' && value bulig-worker.service After | grep -q 'bulig-pasta.service' && value bulig-worker.service Wants | grep -q 'bulig-pasta.service'; then ok "the worker starts after the namespace and pasta, and wants pasta"; else bad "worker namespace ordering: After=$(value bulig-worker.service After) Wants=$(value bulig-worker.service Wants)"; fi
+if ! value bulig-worker.service IPAddressAllow | grep -q '127.74.3.1'; then ok "the worker no longer allows 127.74.3.1 (in its namespace that is its own loopback; the gateway is 198.18.74.1)"; else bad "the worker still allows 127.74.3.1"; fi
 
 echo "caps (ADR 0011)"
 want bulig.service MemoryMax 1G
@@ -246,10 +311,10 @@ assert 'channel-telegram' not in c['enabled'], 'telegram must stay off until cut
 assert 'worker-claude-code' not in c['enabled'], 'the kernel runs no Claude'
 assert 'worker-gateway' in c['enabled']
 w=c['pluginConfig']['worker-gateway']
-assert w['listen']==['127.74.3.1'] and w['port']==7431 and w['workers']['vps']['credential']=='worker-tokens'
+assert w['listen']==['127.74.3.1', '198.18.74.1'] and w['port']==7431 and w['workers']['vps']['credential']=='worker-tokens'
 assert c['pluginConfig']['gate-evidence']['mode']=='warn' and c['pluginConfig']['gate-promise']['mode']=='warn'
 assert c['dbPath'].startswith('/var/lib/bulig/'), 'dbPath'
-" "$cfg" 2>"$work/err"; then ok "the template: Postgres from the pg-url credential, gateway on 127.74.3.1:7431 for worker vps, gates in warn, Telegram and the local worker off"; else bad "config template: $(cat "$work/err")"; fi
+" "$cfg" 2>"$work/err"; then ok "the template: Postgres from the pg-url credential, gateway on 127.74.3.1 and 198.18.74.1, port 7431, for worker vps, gates in warn, Telegram and the local worker off"; else bad "config template: $(cat "$work/err")"; fi
 
 if grep -q -- 'Run `postcheck.sh` with `--against /var/lib/bulig-checks/precheck.snapshot`' <<<"$UNINST"; then ok "the removal check compares against the precheck, not the last release's snapshot"; else bad "the removal step does not use --against precheck.snapshot"; fi
 if grep -q 'up to 400, sorted by path' <<<"$KL" && ! grep -q 'lists each one in every health run' "$deploy/RUNBOOK.md"; then ok "the RUNBOOK says the fence check lists up to 400 path sockets, and that a hit cap is said"; else bad "the RUNBOOK still says every path socket is listed"; fi

@@ -70,9 +70,10 @@ check_tools bulig-worker node git claude || missing=1
 if [ "$missing" -ne 0 ]; then
   echo "Some tools are not visible to those users. Install them under /usr/local or /usr, not under /root or /home." >&2
 fi
-# The worker must not be able to connect to this machine's own public addresses; they are read from the machine, into a root-owned drop-in.
+# The worker must not be able to connect to this machine's own public addresses; they are read from the machine, into a root-owned drop-in
+# for the worker and one for pasta (the worker's packets leave the host as pasta's).
 if [ -z "$(host_addresses)" ]; then echo "WARNING: no public address found in 'ip -o addr show scope global'; the worker's drop-in will name none. Check, then run host-addresses.sh." >&2; fi
-write_host_dropin bulig-worker.service
+for u in $HOST_DROPIN_UNITS; do write_host_dropin "$u"; done
 echo "host addresses denied to the worker: $(host_addresses | tr '\n' ' ')"
 echo "for the backup: $(command -v aws >/dev/null 2>&1 && echo 'aws cli found' || (command -v docker >/dev/null 2>&1 && echo 'no aws cli, docker found (the pinned aws-cli image will be used)') || echo 'NEITHER aws nor docker found: install one before enabling the backup timer')"
 echo "setup-user: done"

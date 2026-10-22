@@ -13,7 +13,7 @@ mkrepo() { # mkrepo <dir>: a tiny git repo with one clean file
   git -C "$1" init -q
   git -C "$1" config user.email t@example.invalid
   git -C "$1" config user.name t
-  printf 'listen 127.74.3.1:7431 and 127.0.0.1, 0.0.0.0, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 192.0.2.7, 198.51.100.7, 203.0.113.10, 2001:db8::10, version 1.2.3, mask 255.255.255.0\n' >"$1/clean.txt"
+  printf 'listen 127.74.3.1:7431 and 127.0.0.1, 0.0.0.0, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 192.0.2.7, 198.51.100.7, 203.0.113.10, 2001:db8::10, version 1.2.3, mask 255.255.255.0, gateway 198.18.74.1, range 198.18.0.0/15, 198.19.255.255\n' >"$1/clean.txt"
   git -C "$1" add clean.txt
 }
 run_scan() { env -u BULIG_FORBIDDEN_TERMS XDG_CONFIG_HOME="$work/none" SCAN_ROOT="$1" bash "$scan"; }
@@ -21,7 +21,7 @@ run_scan() { env -u BULIG_FORBIDDEN_TERMS XDG_CONFIG_HOME="$work/none" SCAN_ROOT
 echo "scan-forbidden.sh built-in checks"
 repo="$work/repo"
 mkrepo "$repo"
-expect_ok "allowed addresses (loopback, the gateway, private, the Tailscale deny-list entry 100.64.0.0/10, documentation) pass" run_scan "$repo"
+expect_ok "allowed addresses (loopback, the gateway, private, the Tailscale deny-list entry 100.64.0.0/10, documentation, the benchmark range 198.18.0.0/15) pass" run_scan "$repo"
 # (only inside a git checkout: the mutation runner copies the kit to a plain folder, where this check would fail for every mutation alike)
 if git -C "$deploy/.." rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   expect_ok "the real tree passes" env -u BULIG_FORBIDDEN_TERMS XDG_CONFIG_HOME="$work/none" bash "$scan"
@@ -57,6 +57,9 @@ offends "a Tailscale host written with /10" ipv4-outside-allowed-ranges "deny $t
 offends "the Tailscale range base with a longer number after /10" ipv4-outside-allowed-ranges "deny $tbase/10$((0 + 4))" "$tbase"
 offends "an IPv4-mapped Tailscale address" ipv4-outside-allowed-ranges "peer ::ffff:$ts4" "$ts4"
 offends "172.32 (just outside 172.16/12)" ipv4-outside-allowed-ranges "bridge 172.$((31 + 1)).0.1" "172.32"
+# the benchmark range 198.18.0.0/15 (the worker namespace's gateway is in it): only that range, not its neighbours (built from parts)
+offends "just below the benchmark range" ipv4-outside-allowed-ranges "gw 198.$((18 - 1)).255.255" "198.17"
+offends "just above the benchmark range" ipv4-outside-allowed-ranges "gw 198.$((19 + 1)).0.1" "198.20"
 mkrepo "$repo"
 printf 'deny 169.254.0.0/16 224.0.0.0/4\n' >"$repo/ranges.txt"
 git -C "$repo" add ranges.txt

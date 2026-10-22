@@ -257,3 +257,15 @@ snapshot_drop() {
     sec == "uf" && index(ufs, " " $1 " ") { next }
     { print }' "$1"
 }
+
+# ---- after Bulig is removed --------------------------------------------------------------------------------------------------------
+# bulig_network_leftovers: what Bulig puts on the host's network that is not a file the snapshot covers, one line each, if it is still there:
+# the worker's network namespace (/run/netns/bulig-worker) and the gateway addresses on lo (127.74.3.1, 198.18.74.1). postcheck.sh asks once no
+# Bulig unit is installed any more (the removal in the RUNBOOK, or a failed first release), when there must be none.
+bulig_network_leftovers() {
+  local a
+  if [ -e "$R$BULIG_NETNS_PATH" ]; then echo "the worker's network namespace $BULIG_NETNS_PATH (ip netns delete $BULIG_NETNS_NAME)"; fi
+  for a in "$BULIG_GATEWAY_ADDR" "$BULIG_NETNS_GATEWAY"; do
+    if { ip -o addr show dev lo 2>/dev/null || true; } | grep -q " inet $a/32 "; then echo "the address $a/32 on lo (ip address del $a/32 dev lo)"; fi
+  done
+}

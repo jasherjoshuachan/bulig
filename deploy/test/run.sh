@@ -168,6 +168,12 @@ cat >"$stubs/stat" <<'STUB'
 #!/usr/bin/env bash
 cat "$STUB_DATA/stat.txt"
 STUB
+# ip: the addresses on lo (what postcheck looks at once Bulig is removed), from STUB_DATA/lo.txt
+cat >"$stubs/ip" <<'STUB'
+#!/usr/bin/env bash
+case "$*" in *"dev lo"*) cat "$STUB_DATA/lo.txt" 2>/dev/null ;; esac
+exit 0
+STUB
 # A fast stand-in for sha256sum (it only has to change when the content changes): "<cksum> <size>  <name>", same shape as the real output.
 cat >"$stubs/sha256sum" <<'STUB'
 #!/usr/bin/env bash
@@ -295,6 +301,20 @@ if [ -f "$checks/precheck.snapshot" ] && [ "$(mode "$checks")" = "700" ]; then o
 # The same fixture that makes the no-argument run succeed must make the run with an argument fail, and for the stated reason.
 expect_fail_msg "precheck.sh with an argument is refused" "takes no arguments" bash "$deploy/precheck.sh" "$w/root/tmp-elsewhere"
 expect_ok "postcheck.sh passes when nothing changed" bash "$deploy/postcheck.sh"
+# No Bulig unit is installed in this world (as after the removal in the RUNBOOK): nothing of Bulig's may be left on the host's network.
+if grep -q "^postcheck: no Bulig unit is installed, and Bulig left nothing on the host's network" "$work/out"; then ok "with no Bulig unit installed, postcheck also checks the host's network for Bulig's leftovers, and says so"; else bad "removal check line: $(cat "$work/out")"; fi
+mkdir -p "$w/root/run/netns"
+: >"$w/root/run/netns/bulig-worker"
+expect_fail_msg "a worker network namespace left after removal fails postcheck" "the worker's network namespace /run/netns/bulig-worker (ip netns delete bulig-worker)" bash "$deploy/postcheck.sh"
+rm -f "$w/root/run/netns/bulig-worker"
+printf '1: lo    inet 127.0.0.1/8 scope host lo\n1: lo    inet 198.18.74.1/32 scope global lo\n' >"$w/data/lo.txt"
+expect_fail_msg "a gateway address left on lo fails postcheck" "the address 198.18.74.1/32 on lo (ip address del 198.18.74.1/32 dev lo)" bash "$deploy/postcheck.sh"
+printf '1: lo    inet 127.0.0.1/8 scope host lo\n1: lo    inet 127.74.3.1/32 scope host lo\n' >"$w/data/lo.txt"
+expect_fail_msg "and so does the old one" "the address 127.74.3.1/32 on lo" bash "$deploy/postcheck.sh"
+echo "[Unit]" >"$w/root/etc/systemd/system/bulig.service"
+expect_ok "while Bulig is installed, its own addresses and namespace are not leftovers" bash "$deploy/postcheck.sh"
+if ! grep -q "left nothing on the host's network\|left this on the host's network" "$work/out"; then ok "  and the check is not run"; else bad "  leftover check ran with Bulig installed: $(cat "$work/out")"; fi
+rm -f "$w/root/etc/systemd/system/bulig.service" "$w/data/lo.txt"
 cp -p "$checks/precheck.snapshot" "$work/precheck.keep"
 expect_fail "precheck.sh fails when a command in the snapshot fails (ss here)" env STUB_SS_FAIL=1 bash "$deploy/precheck.sh"
 if cmp -s "$checks/precheck.snapshot" "$work/precheck.keep" && [ "$(find "$checks" -type f | wc -l | tr -d ' ')" = "1" ]; then ok "and it leaves the old precheck as it was, and no temp file"; else bad "after a failed precheck: $(ls "$checks")"; fi

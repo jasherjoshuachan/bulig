@@ -245,6 +245,7 @@ for f in "-t none" "-u none" "-T none" "-U none" "--no-map-gw"; do
 done
 want bulig-pasta.service Type simple
 want bulig-pasta.service Restart always
+if [ "$(value bulig-pasta.service ExecStartPost)" = "+/usr/bin/timeout 10 /bin/sh -c 'until /usr/bin/ip -n bulig-worker -o addr show scope global | /usr/bin/grep -q .; do /usr/bin/sleep 0.1; done'" ]; then ok "pasta is ready only once the namespace has a global address (10 s, then the start fails)"; else bad "pasta has no readiness wait (Type=simple is ready before the namespace is configured): $(value bulig-pasta.service ExecStartPost)"; fi
 want bulig-pasta.service BindsTo bulig-netns.service
 if value bulig-pasta.service After | grep -q 'bulig-netns.service'; then ok "pasta starts after the namespace"; else bad "pasta ordering: $(value bulig-pasta.service After)"; fi
 want bulig-pasta.service Before bulig-worker.service

@@ -22,6 +22,12 @@ Type=simple
 # the syslog socket. --runas 0: run as root ALSO after start. As root, pasta otherwise switches to nobody, and then cannot enter the namespace
 # ("Couldn't switch to pasta namespaces: Operation not permitted", seen on the server). --netns-only: join the namespace only, no user namespace.
 ExecStart=/usr/bin/pasta -f -e --config-net --netns /run/netns/bulig-worker --runas 0 --netns-only -t none -u none -T none -U none --no-map-gw
+# READY ONLY ONCE THE NAMESPACE HAS AN ADDRESS. Type=simple counts pasta as started the moment it is forked, before it has configured the
+# namespace: on the first release of this unit (24 Oct 2026) systemd started the worker 33 ms after pasta, pasta printed its first line 100 ms
+# later, and health found the namespace with no global address and rolled the release back. This wait holds the unit in "activating" until
+# eth0 has an address, so the worker (After=, Before= here) and health only run once the worker has a network. 10 s and it fails the start.
+# "+": run as plain root, outside this unit's sandbox, because `ip -n` remounts /sys in a mount namespace of its own (read only, no network).
+ExecStartPost=+/usr/bin/timeout 10 /bin/sh -c 'until /usr/bin/ip -n bulig-worker -o addr show scope global | /usr/bin/grep -q .; do /usr/bin/sleep 0.1; done'
 Restart=always
 RestartSec=2
 

@@ -649,6 +649,7 @@ M = [
     ("netns: pasta forwards the namespace's loopback to the host", "units.sh", "systemd/bulig-pasta.service", " -T none -U none --no-map-gw", " -T auto -U none --no-map-gw"),
     ("netns: pasta maps the gateway to the host", "units.sh", "systemd/bulig-pasta.service", " --no-map-gw\n", "\n"),
     ("netns: pasta keeps a raw-socket capability", "units.sh", "systemd/bulig-pasta.service", "CapabilityBoundingSet=CAP_SYS_ADMIN CAP_NET_ADMIN\n", "CapabilityBoundingSet=CAP_SYS_ADMIN CAP_NET_ADMIN CAP_NET_RAW\n"),
+    ("netns: pasta is ready before the namespace has an address", "units.sh", "systemd/bulig-pasta.service", "ExecStartPost=+/usr/bin/timeout 10 ", "#ExecStartPost=+/usr/bin/timeout 10 "),
     ("netns: pasta's filter allows the host's loopback", "units.sh", "systemd/bulig-pasta.service", "IPAddressAllow=198.18.74.1/32\n", "IPAddressAllow=127.0.0.0/8 198.18.74.1/32\n"),
     ("netns: pasta's filter lets the benchmark range through", "units.sh", "systemd/bulig-pasta.service", " fc00::/7 198.18.0.0/15\n", " fc00::/7\n"),
     ("netns: pasta gets unix sockets", "units.sh", "systemd/bulig-pasta.service", "RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK\n", "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK\n"),

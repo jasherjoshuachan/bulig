@@ -8,6 +8,14 @@ Documentation=https://github.com/jasherjoshuachan/bulig
 After=network-online.target bulig.service bulig-loopback.service systemd-resolved.service bulig-netns.service bulig-pasta.service
 Wants=network-online.target bulig.service bulig-loopback.service systemd-resolved.service bulig-pasta.service
 BindsTo=bulig-netns.service
+# BindsTo pasta as well, not only Requires= (reviewer note on #68): the worker never runs without its way out. pasta is ready only once the
+# namespace has an address (10 s, then its start fails). Requires= would keep the worker from starting when that fails and stop it when pasta
+# is stopped; BindsTo= with After= also stops it whenever pasta is inactive or failed for any other reason, so a running worker always has a
+# running pasta. A worker without pasta has no network, so stopping it loses nothing. pasta's Restart=always: in systemd 255 (Ubuntu 24.04)
+# an automatic restart of pasta is passed on as a restart to the running units that bind to or require it, so a pasta crash restarts the
+# worker (its jobs too) once pasta is ready again; Requires= would do the same, and the worker's connections went with pasta's sockets anyway.
+# The worker's own Restart=always does not undo a stop by a dependency: if pasta does not come back, the worker stays stopped until started.
+BindsTo=bulig-pasta.service
 StartLimitIntervalSec=300
 StartLimitBurst=10
 

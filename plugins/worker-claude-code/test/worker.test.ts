@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -25,7 +25,10 @@ import worker, {
   NPM_CACHE_PREFIX,
   withNpmCache,
   withRunWritable,
+  removeRunDir,
+  run,
 } from '../src/index.ts';
+import type { ChildProcess } from 'node:child_process';
 
 const FAKE = fileURLToPath(new URL('./fixtures/fake-claude.mjs', import.meta.url));
 const dirs: string[] = [];
@@ -224,6 +227,71 @@ describe("npm's cache inside the sandbox (job 9628d02c)", () => {
   it('withNpmCache names the cache for npm and drops any other spelling of it', () => {
     const env = withNpmCache({ PATH: '/bin', HOME: '/h', NPM_CONFIG_CACHE: '/h/.npm', Npm_Config_Cache: '/elsewhere' }, '/tmp/bulig-npm-abc');
     expect(env).toEqual({ PATH: '/bin', HOME: '/h', npm_config_cache: '/tmp/bulig-npm-abc' });
+  });
+});
+
+describe('a run cleans up after itself whatever the sandboxed command left (review of #71)', () => {
+  /** One run of the fake claude through run(), with its env dumped so the test knows the run's folders. */
+  async function once(prompt: string, untrack: () => void = () => {}) {
+    const dump = join(tmp(), 'env.json');
+    const warnings: string[] = [];
+    const out = await run(
+      FAKE,
+      buildArgs({ stage: 'build', prompt, model: 'm', mode: 'edit', cwd: tmp() }),
+      tmp(),
+      10_000,
+      { PATH: process.env.PATH, HOME: process.env.HOME, FAKE_CLAUDE_ENV_DUMP: dump },
+      new Set<ChildProcess>(),
+      () => untrack,
+      (line) => void warnings.push(line),
+    );
+    const env = JSON.parse(readFileSync(dump, 'utf8')) as Record<string, string>;
+    return { out, warnings, npmDir: env.npm_config_cache!, ghDir: env.GH_CONFIG_DIR! };
+  }
+
+  it('a 0500 folder with a file in it, inside the npm cache: the run resolves, the cache is gone, nothing to report', async () => {
+    const r = await once('FAKE:lockcache');
+    expect(r.out.ok).toBe(true);
+    expect(existsSync(r.npmDir)).toBe(false);
+    expect(existsSync(r.ghDir)).toBe(false);
+    expect(r.warnings).toEqual([]);
+  });
+
+  it('the npm cache folder itself made 0500 with a file in it: the same', async () => {
+    const r = await once('FAKE:lockcacheroot');
+    expect(r.out.ok).toBe(true);
+    expect(existsSync(r.npmDir)).toBe(false);
+    expect(r.warnings).toEqual([]);
+  });
+
+  it('the gh folder locked the same way: the same', async () => {
+    const r = await once('FAKE:lockgh');
+    expect(r.out.ok).toBe(true);
+    expect(existsSync(r.ghDir)).toBe(false);
+    expect(r.warnings).toEqual([]);
+  });
+
+  it('bookkeeping that throws after the run cannot leave it hanging: it resolves, cleans up, and says what happened', async () => {
+    const r = await once('plain', () => {
+      throw new Error('untrack broke');
+    });
+    expect(r.out.ok).toBe(true);
+    expect(existsSync(r.npmDir)).toBe(false);
+    expect(r.warnings).toEqual(['worker-claude-code: after a run: untrack broke']);
+  });
+
+  it('removeRunDir never follows a symlink out of the folder: the target keeps its mode and stays', () => {
+    const outside = join(tmp(), 'outside');
+    writeFileSync(outside, 'keep\n');
+    chmodSync(outside, 0o400);
+    const dir = join(tmp(), 'run');
+    mkdirSync(join(dir, 'x'), { recursive: true });
+    symlinkSync(outside, join(dir, 'x', 'link'));
+    chmodSync(join(dir, 'x'), 0o500);
+    removeRunDir(dir, () => {});
+    expect(existsSync(dir)).toBe(false);
+    expect(readFileSync(outside, 'utf8')).toBe('keep\n');
+    expect(statSync(outside).mode & 0o777).toBe(0o400);
   });
 });
 

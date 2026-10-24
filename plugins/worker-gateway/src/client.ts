@@ -207,6 +207,7 @@ export function startRemoteWorker(opts: RemoteWorkerOptions): RemoteWorker {
             if (current === child) current = undefined;
           };
         },
+        log,
       );
       // A stage the kernel took back, or a worker being stopped, says nothing: the kernel has already moved on, or will.
       if (aborted) return;

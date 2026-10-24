@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from 'node:child_process';
-import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { chmodSync, lstatSync, mkdtempSync, readdirSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { definePlugin, type BuligEvent } from '@bulig/plugin-sdk';
@@ -517,6 +517,69 @@ export function parseClaudeOutput(stdout: string): RunResult {
   return p.finish();
 }
 
+/** Where `run` says what it could not clean up, when the caller gives no logger. */
+const stderrWarn = (line: string) => void process.stderr.write(`${line}\n`);
+
+/**
+ * Give the owner back read, write and search on every folder under `root`, and read and write on every file, so the tree can be
+ * removed. A sandboxed command can write in the run's npm cache, so it can leave a folder there that the worker cannot empty
+ * (`chmod 500` on a folder with a file in it makes rmSync throw EACCES). Symlinks are never followed (lstat, and a link is skipped):
+ * chmod would change the target, which can be anywhere. Only owner bits are ever added, and only on what this user owns, so a
+ * link swapped in between the lstat and the chmod gains nothing this user could not already do. Errors are ignored: the retried
+ * rmSync says what is left.
+ */
+export function unlockTree(root: string): void {
+  const stack = [root];
+  while (stack.length > 0) {
+    const path = stack.pop()!;
+    let st;
+    try {
+      st = lstatSync(path);
+    } catch {
+      continue;
+    }
+    if (st.isSymbolicLink()) continue;
+    try {
+      chmodSync(path, (st.mode & 0o7777) | (st.isDirectory() ? 0o700 : 0o600));
+    } catch {
+      // fall through: the retry reports what could not go
+    }
+    if (!st.isDirectory()) continue;
+    let names: string[] = [];
+    try {
+      names = readdirSync(path);
+    } catch {
+      continue;
+    }
+    for (const name of names) stack.push(join(path, name));
+  }
+}
+
+/**
+ * Remove a per-run folder and never throw. If the first try fails (a sandboxed command locked part of it), unlock the tree and try
+ * once more; if that fails too, say so in one line (the path and the error code) and move on. A cleanup that threw would escape the
+ * child's 'close' listener and end the whole worker process, taking every other slot's run with it (review of #71, 24 Oct 2026).
+ */
+export function removeRunDir(dir: string, warn: (line: string) => void = stderrWarn): void {
+  try {
+    rmSync(dir, { recursive: true, force: true });
+    return;
+  } catch {
+    // locked by the run: unlock and try once more
+  }
+  try {
+    unlockTree(dir);
+    rmSync(dir, { recursive: true, force: true });
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code ?? (err instanceof Error ? err.message : String(err));
+    try {
+      warn(`worker-claude-code: could not remove ${dir}: ${code}`);
+    } catch {
+      // a logger that throws must not undo the point of this function
+    }
+  }
+}
+
 /** Start one Claude run and wait for it. Exported so `bulig worker` runs exactly the same process, in the same sandbox, as the in-process worker. */
 export function run(
   bin: string,
@@ -526,6 +589,8 @@ export function run(
   env: NodeJS.ProcessEnv,
   children: Set<ChildProcess>,
   onSpawn: (child: ChildProcess) => () => void,
+  /** Where a folder that could not be removed is reported, one line each. Defaults to stderr. */
+  warn: (line: string) => void = stderrWarn,
 ): Promise<RunResult> {
   return new Promise((resolve) => {
     // A fresh, empty gh config dir for this one run, so no signed-in gh state can be found under HOME.
@@ -539,9 +604,10 @@ export function run(
       resolve({ ok: false, result: '', error: `could not make a temp dir: ${(err as Error).message}` });
       return;
     }
+    // Never throws (removeRunDir), so no caller below needs to guard it.
     const cleanup = () => {
-      rmSync(ghDir, { recursive: true, force: true });
-      if (npmDir) rmSync(npmDir, { recursive: true, force: true });
+      removeRunDir(ghDir, warn);
+      if (npmDir) removeRunDir(npmDir, warn);
     };
     try {
       npmDir = mkdtempSync(join(tmpdir(), NPM_CACHE_PREFIX));
@@ -565,14 +631,27 @@ export function run(
     let stderr = '';
     let timedOut = false;
     let settled = false;
+    // The run always resolves, whatever the bookkeeping or the cleanup does: `settled` is set first, so a run whose resolve was
+    // skipped would hang for good. And nothing may escape: this runs in the child's 'close' listener, where a throw ends the process.
     const done = (r: RunResult) => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
-      children.delete(child);
-      untrack();
-      cleanup();
-      resolve(r);
+      try {
+        try {
+          clearTimeout(timer);
+          children.delete(child);
+          cleanup();
+          untrack();
+        } finally {
+          resolve(r);
+        }
+      } catch (err) {
+        try {
+          warn(`worker-claude-code: after a run: ${err instanceof Error ? err.message : String(err)}`);
+        } catch {
+          // nothing more to do
+        }
+      }
     };
     const timer = setTimeout(() => {
       timedOut = true;
@@ -759,7 +838,7 @@ export function createWorker() {
               set.delete(child);
               if (set.size === 0 && byJob.get(jobId) === set) byJob.delete(jobId);
             };
-          });
+          }, (line) => ctx.log.warn(line));
           // A run that was ended by stop() says nothing. The stage stays running, and the next start marks it interrupted.
           if (stopping) return;
           if (spawned && ended.has(spawned)) {

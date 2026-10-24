@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // A stand-in for the claude CLI. It records how it was called and prints canned JSON.
 import { spawn } from 'node:child_process';
-import { appendFileSync, mkdirSync, readdirSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, mkdirSync, readdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 const mark = (text) => process.env.FAKE_CLAUDE_MARK && appendFileSync(process.env.FAKE_CLAUDE_MARK, text + '\n');
@@ -21,6 +21,22 @@ if (process.env.FAKE_CLAUDE_ENV_DUMP) {
   const allowWrite = at === -1 ? null : (JSON.parse(args[at + 1]).sandbox?.filesystem?.allowWrite ?? null);
   writeFileSync(process.env.FAKE_CLAUDE_ENV_DUMP, JSON.stringify({ ...process.env, __GH_DIR_ENTRIES: ghEntries, __NPM_DIR_ENTRIES: npmEntries, __ALLOW_WRITE: allowWrite }));
 }
+
+// What a sandboxed command can do to the run's own folders: leave something the worker cannot simply remove (review of #71).
+// lockcache: a 0500 folder with a file in it, inside npm's cache. lockcacheroot: a file in the cache, then the cache itself 0500.
+// lockgh: the same as lockcache, in the gh folder. Then the run finishes normally.
+const lockIn = (dir) => {
+  mkdirSync(join(dir, 'x'), { recursive: true });
+  writeFileSync(join(dir, 'x', 'f'), 'locked\n');
+  chmodSync(join(dir, 'x'), 0o500);
+};
+if (prompt.includes('FAKE:lockcacheroot')) {
+  writeFileSync(join(process.env.npm_config_cache, 'f'), 'locked\n');
+  chmodSync(process.env.npm_config_cache, 0o500);
+} else if (prompt.includes('FAKE:lockcache')) {
+  lockIn(process.env.npm_config_cache);
+}
+if (prompt.includes('FAKE:lockgh')) lockIn(process.env.GH_CONFIG_DIR);
 
 if (prompt.includes('FAKE:grandchild')) {
   // Like a Bash tool child: a grandchild that ignores SIGTERM. The leader exits on SIGTERM and leaves it behind.

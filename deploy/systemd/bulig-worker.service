@@ -8,6 +8,16 @@ Documentation=https://github.com/jasherjoshuachan/bulig
 After=network-online.target bulig.service bulig-loopback.service systemd-resolved.service bulig-netns.service bulig-pasta.service
 Wants=network-online.target bulig.service bulig-loopback.service systemd-resolved.service bulig-pasta.service
 BindsTo=bulig-netns.service
+# Requires pasta, not BindsTo (reviewer note on #68, measured 24 Oct 2026 on Ubuntu 24.04, systemd 255.4-1ubuntu8.18, the server's, with
+# stand-in units: a sleep with Restart=always RestartSec=2, and workers with Restart=always bound, required or only wanted). pasta is ready
+# only once the namespace has an address (10 s, then its start fails). With Requires= and After=, a failed pasta start (ExecStartPost failing)
+# fails the worker's start too ("A dependency job ... failed"), so the worker never runs without a ready pasta; with only Wants= it ran anyway.
+# A pasta crash (kill -9 of its main process, three times): pasta came back on its own each time, and the Requires= worker stayed active (so
+# did the Wants= one). The BindsTo= worker went inactive and STAYED DOWN, so BindsTo= would turn every pasta crash into a lasting outage.
+# `systemctl stop bulig-pasta` stops the worker with either, and starting pasta again brings it back with neither.
+# REMAINING GAP: after a failed start at boot, the worker is not tried again when pasta recovers later (pasta's Restart=always); it stays
+# down until started by hand or by a release. Upholds= on pasta or a timer could close it; left for later.
+Requires=bulig-pasta.service
 StartLimitIntervalSec=300
 StartLimitBurst=10
 

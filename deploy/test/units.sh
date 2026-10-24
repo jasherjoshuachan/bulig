@@ -272,6 +272,9 @@ if grep -q "Couldn't switch to pasta namespaces: Operation not permitted" "$PS" 
 
 echo "the worker runs only in its namespace"
 want bulig-worker.service BindsTo bulig-netns.service
+# Requires= pasta, not BindsTo= (measured on systemd 255.4: a BindsTo= worker stays down after a pasta crash; a Requires= one stays up)
+want bulig-worker.service Requires bulig-pasta.service
+if grep -q 'Requires pasta, not BindsTo' "$sd/bulig-worker.service" && grep -q 'STAYED DOWN' "$sd/bulig-worker.service" && grep -q 'REMAINING GAP' "$sd/bulig-worker.service"; then ok "and says why Requires, not BindsTo (the measured crash test), and the gap after a failed boot start"; else bad "the worker unit does not explain Requires=bulig-pasta.service"; fi
 if value bulig-worker.service After | grep -q 'bulig-netns.service' && value bulig-worker.service After | grep -q 'bulig-pasta.service' && value bulig-worker.service Wants | grep -q 'bulig-pasta.service'; then ok "the worker starts after the namespace and pasta, and wants pasta"; else bad "worker namespace ordering: After=$(value bulig-worker.service After) Wants=$(value bulig-worker.service Wants)"; fi
 if ! value bulig-worker.service IPAddressAllow | grep -q '127.74.3.1'; then ok "the worker no longer allows 127.74.3.1 (in its namespace that is its own loopback; the gateway is 198.18.74.1)"; else bad "the worker still allows 127.74.3.1"; fi
 

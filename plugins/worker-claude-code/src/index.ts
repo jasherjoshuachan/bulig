@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { chmodSync, lstatSync, mkdtempSync, readdirSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { definePlugin, type BuligEvent } from '@bulig/plugin-sdk';
@@ -191,9 +191,55 @@ export function sandboxSettings(extraDomains: readonly string[] = []): Record<st
       autoAllowBashIfSandboxed: false,
       excludedCommands: [],
       network: { allowedDomains: allowed, deniedDomains: GITHUB_HOSTS, strictAllowlist: true },
+      // No allowWrite here: `run` adds the one run's own npm cache to it (withRunWritable, NPM_CACHE_PREFIX).
       filesystem: { denyRead: DENY_READ },
     },
   };
+}
+
+/**
+ * NPM'S CACHE INSIDE CLAUDE'S SANDBOX (found on the server, job 9628d02c, 24 Oct 2026). On the server (Linux, bubblewrap) Claude Code's
+ * Bash sandbox lets a command write only to the stage's folder and to Claude's own temp folder, so npm's default cache (~/.npm, under
+ * the worker's HOME) is read-only there, and every stage that used npm wasted 4 to 6 commands: `npm install` with the default cache failed, `echo $TMPDIR` showed
+ * nothing the agent could use, `mkdir -p /tmp/claude/npm-cache` failed, and only `--cache /tmp/claude-<uid>/npm-cache` (Claude's own
+ * temp folder, whose name is Claude Code's business, not ours) worked.
+ *
+ * So each run gets a cache of its own: an empty folder made by `run` next to the gh one, named to the child as `npm_config_cache` and
+ * added to the sandbox's allowWrite for that run only, then removed with the run. It is the only path added, it lives where the worker
+ * already keeps its per-run folders (on the server, the unit's private /tmp; never HOME or a host path), and it is per run on purpose:
+ * one cache shared by every job would let a prompt in one job plant a package that npm hands to the next. npm keeps its own temp files
+ * and logs under the cache (`_cacache/tmp`, `_logs`), so this is enough for npm with no flags. TMPDIR is left alone: Claude Code sets
+ * it for every sandboxed command itself, and on Linux it also uses TMPDIR as its own temp root, which this must not move.
+ */
+export const NPM_CACHE_PREFIX = 'bulig-npm-';
+
+/** The child's environment with npm's cache set to `cacheDir`. Any other spelling of the variable (npm reads it in any case) goes. */
+export function withNpmCache(env: NodeJS.ProcessEnv, cacheDir: string): NodeJS.ProcessEnv {
+  const out: NodeJS.ProcessEnv = {};
+  for (const [name, value] of Object.entries(env)) if (name.toLowerCase() !== 'npm_config_cache') out[name] = value;
+  return { ...out, npm_config_cache: cacheDir };
+}
+
+/**
+ * The argument list with `dir` added to the sandbox's allowWrite in the --settings that buildArgs put in (the first one). Nothing
+ * else in the settings changes. A list with no --settings, or one whose value is not sandbox settings, is returned as it is.
+ */
+export function withRunWritable(args: readonly string[], dir: string): string[] {
+  const at = args.indexOf('--settings');
+  if (at === -1 || at + 1 >= args.length) return [...args];
+  let settings: { sandbox?: { filesystem?: { allowWrite?: unknown } } };
+  try {
+    settings = JSON.parse(args[at + 1]!) as typeof settings;
+  } catch {
+    return [...args];
+  }
+  const fs = settings?.sandbox?.filesystem;
+  if (typeof fs !== 'object' || fs === null) return [...args];
+  const before = Array.isArray(fs.allowWrite) ? (fs.allowWrite as unknown[]).filter((p): p is string => typeof p === 'string') : [];
+  fs.allowWrite = [...new Set([...before, dir])];
+  const out = [...args];
+  out[at + 1] = JSON.stringify(settings);
+  return out;
 }
 
 /**
@@ -471,6 +517,69 @@ export function parseClaudeOutput(stdout: string): RunResult {
   return p.finish();
 }
 
+/** Where `run` says what it could not clean up, when the caller gives no logger. */
+const stderrWarn = (line: string) => void process.stderr.write(`${line}\n`);
+
+/**
+ * Give the owner back read, write and search on every folder under `root`, and read and write on every file, so the tree can be
+ * removed. A sandboxed command can write in the run's npm cache, so it can leave a folder there that the worker cannot empty
+ * (`chmod 500` on a folder with a file in it makes rmSync throw EACCES). Symlinks are never followed (lstat, and a link is skipped):
+ * chmod would change the target, which can be anywhere. Only owner bits are ever added, and only on what this user owns, so a
+ * link swapped in between the lstat and the chmod gains nothing this user could not already do. Errors are ignored: the retried
+ * rmSync says what is left.
+ */
+export function unlockTree(root: string): void {
+  const stack = [root];
+  while (stack.length > 0) {
+    const path = stack.pop()!;
+    let st;
+    try {
+      st = lstatSync(path);
+    } catch {
+      continue;
+    }
+    if (st.isSymbolicLink()) continue;
+    try {
+      chmodSync(path, (st.mode & 0o7777) | (st.isDirectory() ? 0o700 : 0o600));
+    } catch {
+      // fall through: the retry reports what could not go
+    }
+    if (!st.isDirectory()) continue;
+    let names: string[] = [];
+    try {
+      names = readdirSync(path);
+    } catch {
+      continue;
+    }
+    for (const name of names) stack.push(join(path, name));
+  }
+}
+
+/**
+ * Remove a per-run folder and never throw. If the first try fails (a sandboxed command locked part of it), unlock the tree and try
+ * once more; if that fails too, say so in one line (the path and the error code) and move on. A cleanup that threw would escape the
+ * child's 'close' listener and end the whole worker process, taking every other slot's run with it (review of #71, 24 Oct 2026).
+ */
+export function removeRunDir(dir: string, warn: (line: string) => void = stderrWarn): void {
+  try {
+    rmSync(dir, { recursive: true, force: true });
+    return;
+  } catch {
+    // locked by the run: unlock and try once more
+  }
+  try {
+    unlockTree(dir);
+    rmSync(dir, { recursive: true, force: true });
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code ?? (err instanceof Error ? err.message : String(err));
+    try {
+      warn(`worker-claude-code: could not remove ${dir}: ${code}`);
+    } catch {
+      // a logger that throws must not undo the point of this function
+    }
+  }
+}
+
 /** Start one Claude run and wait for it. Exported so `bulig worker` runs exactly the same process, in the same sandbox, as the in-process worker. */
 export function run(
   bin: string,
@@ -480,21 +589,39 @@ export function run(
   env: NodeJS.ProcessEnv,
   children: Set<ChildProcess>,
   onSpawn: (child: ChildProcess) => () => void,
+  /** Where a folder that could not be removed is reported, one line each. Defaults to stderr. */
+  warn: (line: string) => void = stderrWarn,
 ): Promise<RunResult> {
   return new Promise((resolve) => {
     // A fresh, empty gh config dir for this one run, so no signed-in gh state can be found under HOME.
+    // And npm's cache for this one run, writable inside the sandbox (see NPM_CACHE_PREFIX for why). The real path, because the
+    // sandbox matches paths after symlinks are resolved (macOS's temp folder is a symlink).
     let ghDir: string;
+    let npmDir = '';
     try {
       ghDir = mkdtempSync(join(tmpdir(), 'bulig-gh-'));
     } catch (err) {
       resolve({ ok: false, result: '', error: `could not make a temp dir: ${(err as Error).message}` });
       return;
     }
+    // Never throws (removeRunDir), so no caller below needs to guard it.
+    const cleanup = () => {
+      removeRunDir(ghDir, warn);
+      if (npmDir) removeRunDir(npmDir, warn);
+    };
+    try {
+      npmDir = mkdtempSync(join(tmpdir(), NPM_CACHE_PREFIX));
+      npmDir = realpathSync(npmDir);
+    } catch (err) {
+      cleanup();
+      resolve({ ok: false, result: '', error: `could not make a temp dir: ${(err as Error).message}` });
+      return;
+    }
     let child: ChildProcess;
     try {
-      child = spawn(bin, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'], env: hardenEnv(env, ghDir), detached: true });
+      child = spawn(bin, withRunWritable(args, npmDir), { cwd, stdio: ['ignore', 'pipe', 'pipe'], env: withNpmCache(hardenEnv(env, ghDir), npmDir), detached: true });
     } catch (err) {
-      rmSync(ghDir, { recursive: true, force: true });
+      cleanup();
       resolve({ ok: false, result: '', error: `could not start ${bin}: ${(err as Error).message}` });
       return;
     }
@@ -504,14 +631,27 @@ export function run(
     let stderr = '';
     let timedOut = false;
     let settled = false;
+    // The run always resolves, whatever the bookkeeping or the cleanup does: `settled` is set first, so a run whose resolve was
+    // skipped would hang for good. And nothing may escape: this runs in the child's 'close' listener, where a throw ends the process.
     const done = (r: RunResult) => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
-      children.delete(child);
-      untrack();
-      rmSync(ghDir, { recursive: true, force: true });
-      resolve(r);
+      try {
+        try {
+          clearTimeout(timer);
+          children.delete(child);
+          cleanup();
+          untrack();
+        } finally {
+          resolve(r);
+        }
+      } catch (err) {
+        try {
+          warn(`worker-claude-code: after a run: ${err instanceof Error ? err.message : String(err)}`);
+        } catch {
+          // nothing more to do
+        }
+      }
     };
     const timer = setTimeout(() => {
       timedOut = true;
@@ -698,7 +838,7 @@ export function createWorker() {
               set.delete(child);
               if (set.size === 0 && byJob.get(jobId) === set) byJob.delete(jobId);
             };
-          });
+          }, (line) => ctx.log.warn(line));
           // A run that was ended by stop() says nothing. The stage stays running, and the next start marks it interrupted.
           if (stopping) return;
           if (spawned && ended.has(spawned)) {

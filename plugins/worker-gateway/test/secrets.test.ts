@@ -53,5 +53,9 @@ describe.each(ADAPTERS.filter((a) => !a.skip).slice(0, 1))('a remote worker, $na
     expect(raw).not.toContain(TOKENS.mac);
     expect(env.PATH).toBeTruthy();
     expect(env.HOME).toBeTruthy();
+    // The server's worker runs this path: npm's cache is the run's own folder, the one the sandbox may write, never under HOME.
+    expect(env.npm_config_cache).toMatch(/\/bulig-npm-[^/]+$/);
+    expect(env.npm_config_cache!.startsWith(env.HOME!)).toBe(false);
+    expect((env as unknown as { __ALLOW_WRITE: string[] }).__ALLOW_WRITE).toEqual([env.npm_config_cache]);
   });
 });

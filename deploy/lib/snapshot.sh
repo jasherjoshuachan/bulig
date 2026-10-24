@@ -33,6 +33,10 @@ snapshot() {
     | awk -v p=":($BULIG_PG_PORT|$BULIG_GATEWAY_PORT)\$" '{ addr = $4; proc = ($NF ~ /^users:/) ? $NF : "-"; if (addr !~ p) print addr, proc }' \
     | sed -E 's/pid=[0-9]+,?//g; s/,?fd=[0-9]+//g' | sort -u
 
+  # Read by snapshot_compare: a loopback listener on a port in this range can be a short-lived one (snapshot_ephemeral_listeners).
+  echo "## ephemeral port range (net.ipv4.ip_local_port_range)"
+  awk '{ print $1, $2; exit }' "$R/proc/sys/net/ipv4/ip_local_port_range" 2>/dev/null || echo "(unreadable)"
+
   echo "## docker containers (name, image, state)"
   if command -v docker >/dev/null 2>&1; then
     docker ps -a --format '{{.Names}} {{.Image}} {{.State}}' 2>/dev/null | sort || true
@@ -119,11 +123,19 @@ snapshot_prune_releases() {
 #   - a new container from an image that was already running before (a per-session agent container), and a container that is gone or
 #     stopped while its image still runs in another container. A new image, a container whose image no longer runs anywhere, or a known
 #     container on a new image still fails.
+#   - a listener on a loopback address and a port in the kernel's ephemeral range that appeared or went away, while a listener of the same
+#     process on a fixed port is there in both snapshots (a local server's per-job runner port). Both snapshots must show the same valid range;
+#     a snapshot without one (an older kit, an unreadable /proc) makes no listener ephemeral. A change on a fixed port, on an address that is
+#     not loopback, or of a process with no lasting fixed-port listener still fails. (snapshot_ephemeral_listeners)
+#   - the run state of a unit named in the host's own ignore list (BULIG_POSTCHECK_IGNORE, root's, never in git), only when no socket can
+#     start it (instance_not_socket_started, fail closed). Its unit file and enabled state are still compared. (snapshot_ignore_load)
 # Bulig's own units are never in a snapshot (SNAPSHOT_OWN), and they are never counted as churn either.
 SNAPSHOT_RUNSTATE_SECTIONS='^## (running services|every service unit and its state)'
 SNAPSHOT_TIMER_SECTION='^## timers and what they start'
 SNAPSHOT_DOCKER_SECTION='^## docker containers'
 SNAPSHOT_UNITFILE_SECTION='^## service unit files'
+SNAPSHOT_LISTEN_SECTION='^## listening tcp sockets'
+SNAPSHOT_PORTRANGE_SECTION='^## ephemeral port range'
 SNAPSHOT_TRANSIENT='^run-[up][0-9][^ ]*\.service$'
 SNAPSHOT_INSTANCE='^[^@ ]+@[^@ ]+\.service$'
 
@@ -155,8 +167,10 @@ timer_started() {
 # the copies is the verdict, and print one info line per change left out (a warn line when a timer's service, a transient unit or an
 # instance is failed now).
 snapshot_compare() {
-  local before="$1" after="$2" u b a what timed="" churn="" uf_churn="" new_ctrs=""
-  # Services whose run-state lines differ: the ones a timer starts, then transient units, then template instances that came or went.
+  local before="$1" after="$2" u b a what timed="" churn="" uf_churn="" new_ctrs="" ignored=""
+  snapshot_ignore_load
+  # Services whose run-state lines differ: the ones a timer starts, then transient units, then template instances that came or went, then
+  # the ones in the host's ignore list.
   for u in $(comm -3 <(snapshot_section "$before" "$SNAPSHOT_RUNSTATE_SECTIONS" | sort) <(snapshot_section "$after" "$SNAPSHOT_RUNSTATE_SECTIONS" | sort) | awk '{print $1}' | sort -u); do
     if grep -Eq "$SNAPSHOT_OWN" <<<"$u"; then continue; fi
     if timer_started "$u" "$before" "$after"; then
@@ -165,7 +179,17 @@ snapshot_compare() {
       churn="$churn $u"
     elif grep -Eq "$SNAPSHOT_INSTANCE" <<<"$u" && ! { snapshot_has_unit "$before" "$u" && snapshot_has_unit "$after" "$u"; } && instance_not_socket_started "$u"; then
       churn="$churn $u"
+    elif host_ignores "$u" && instance_not_socket_started "$u"; then
+      ignored="$ignored $u"
     fi
+  done
+  for u in $ignored; do
+    b="$(snapshot_unit_state "$before" "$u")"
+    a="$(snapshot_unit_state "$after" "$u")"
+    case " $a " in
+      *" failed "*) echo "warn  $u is failed now (${b:-not loaded} before). It is in the host's ignore list ($BULIG_POSTCHECK_IGNORE), so its run state is not compared, but its own run failed: look at it (systemctl status $u)." ;;
+      *) echo "info  $u: ${b:-not loaded} -> ${a:-not loaded} (in the host's ignore list, and no socket starts it; its run state is not compared)" ;;
+    esac
   done
   for u in $timed; do
     b="$(snapshot_unit_state "$before" "$u")"
@@ -217,9 +241,106 @@ snapshot_compare() {
           else if (aimg[n] == bimg[n] && astate[n] != "running") print "stopped", n, bimg[n]
         }
       }' "$before" "$after")
+  # Short-lived loopback listeners on an ephemeral port, next to a lasting one of the same process.
+  local verb line eph_lines="" no_range=""
+  while IFS=$'\t' read -r verb line; do
+    [ -n "$line" ] || continue
+    eph_lines="$eph_lines$line"$'\n'
+    echo "info  listener $line $verb (a loopback address and a port in the ephemeral range, next to a lasting listener of the same process on a fixed port; not compared)"
+  done < <(snapshot_ephemeral_listeners "$before" "$after")
+  # A before snapshot from an older kit has no port range section: leave it out of both copies (and then no listener is ephemeral).
+  if ! grep -Eq "$SNAPSHOT_PORTRANGE_SECTION" "$before" || ! grep -Eq "$SNAPSHOT_PORTRANGE_SECTION" "$after"; then
+    no_range=1
+    echo "info  one snapshot has no ephemeral port range (an older kit took it): the range is not compared, and every listener change is"
+  fi
   # The copies: the same lines minus those.
-  snapshot_drop "$before" "$timed $churn" "$new_ctrs" "$uf_churn" >"$3"
-  snapshot_drop "$after" "$timed $churn" "$new_ctrs" "$uf_churn" >"$4"
+  snapshot_drop "$before" "$timed $churn $ignored" "$new_ctrs" "$uf_churn" "$eph_lines" "$no_range" >"$3"
+  snapshot_drop "$after" "$timed $churn $ignored" "$new_ctrs" "$uf_churn" "$eph_lines" "$no_range" >"$4"
+}
+
+# snapshot_ephemeral_listeners <before> <after>: one line per listener that is in one snapshot and not the other, "appeared<TAB><line>" or
+# "went away<TAB><line>", when all of these hold: its address is loopback (127.x.x.x or [::1]); its port is in the ephemeral range, which both
+# snapshots show the same and valid (two numbers, the low one 1024 or more); its process is named (not "-"); and a listener of that same
+# process on a port outside the range is in both snapshots. Anything else is not printed, so it is compared.
+snapshot_ephemeral_listeners() {
+  awk -v ls="$SNAPSHOT_LISTEN_SECTION" -v pr="$SNAPSHOT_PORTRANGE_SECTION" '
+    function eph(p) { return same && p >= lo && p <= hi }
+    function port(a) { return match(a, /:[0-9]+$/) ? substr(a, RSTART + 1) + 0 : -1 }
+    function loopback(a, h) { h = a; sub(/:[0-9]+$/, "", h); return h ~ /^127\.[0-9]+\.[0-9]+\.[0-9]+$/ || h == "[::1]" }
+    FNR == 1 { f++ }
+    /^## / { sec = ($0 ~ ls) ? "ls" : ($0 ~ pr) ? "pr" : ""; next }
+    sec == "pr" && NF == 2 && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && $1 + 0 >= 1024 { rng[f] = $1 " " $2; next }
+    sec == "ls" && NF >= 2 { has[f, $0] = 1; if (!($0 in seen)) { seen[$0] = 1; order[++n] = $0 } }
+    END {
+      same = (rng[1] != "" && rng[1] == rng[2])
+      split(rng[2], r, " "); lo = r[1] + 0; hi = r[2] + 0
+      for (i = 1; i <= n; i++) {
+        l = order[i]; a = l; sub(/ .*/, "", a); p = substr(l, length(a) + 2)
+        if (has[1, l] && has[2, l]) { if (!eph(port(a))) lasting[p] = 1 }
+      }
+      for (i = 1; i <= n; i++) {
+        l = order[i]; a = l; sub(/ .*/, "", a); p = substr(l, length(a) + 2)
+        if (has[1, l] && has[2, l]) continue
+        if (p == "-" || !(p in lasting)) continue
+        if (!loopback(a) || !eph(port(a))) continue
+        print (has[1, l] ? "went away" : "appeared") "\t" l
+      }
+    }' "$1" "$2"
+}
+
+# ---- the host's own ignore list --------------------------------------------------------------------------------------------------
+# BULIG_POSTCHECK_IGNORE (/etc/bulig/postcheck-ignore.txt): units whose run state other tenants or the OS change on their own, named on the
+# host and never in git (the repository is public; RUNBOOK step 12). One unit name per line, "#" starts a comment. Missing: nothing is
+# ignored. Used only when it is a plain file (not a link), owned by root, and not writable by its group or by others, and when every line is
+# one service name that is not Bulig's. Anything else: a warn line says why, and nothing in it is ignored (fail closed).
+# snapshot_ignore_load sets SNAPSHOT_IGNORED to the names, space-separated with a space at each end.
+SNAPSHOT_IGNORED=""
+snapshot_ignore_load() {
+  local f="$BULIG_POSTCHECK_IGNORE" owner=0 n=0 name rest names=" "
+  SNAPSHOT_IGNORED=""
+  if [ ! -e "$f" ] && [ ! -L "$f" ]; then return 0; fi
+  if [ -L "$f" ] || [ ! -f "$f" ]; then
+    echo "warn  the host's ignore list $f is a link or not a plain file, so it is not used: every unit is compared"
+    return 0
+  fi
+  # (the tests own their files: there the owner is the test user)
+  if [ -n "$R" ]; then owner="${BULIG_TEST_OWNER_UID:-$(id -u)}"; fi
+  if [ -z "$(find "$f" -prune -user "$owner" 2>/dev/null)" ]; then
+    echo "warn  the host's ignore list $f is not owned by root, so it is not used: every unit is compared"
+    return 0
+  fi
+  if [ -n "$(find "$f" -prune -perm -0020 2>/dev/null)" ]; then
+    echo "warn  the host's ignore list $f is writable by its group, so it is not used: every unit is compared"
+    return 0
+  fi
+  if [ -n "$(find "$f" -prune -perm -0002 2>/dev/null)" ]; then
+    echo "warn  the host's ignore list $f is writable by anyone, so it is not used: every unit is compared"
+    return 0
+  fi
+  while read -r name rest || [ -n "$name" ]; do
+    n=$((n + 1))
+    case "$name" in "" | "#"*) continue ;; esac
+    if [ -n "$rest" ] && [ "${rest#"#"}" = "$rest" ]; then
+      echo "warn  the host's ignore list $f: line $n holds more than one name, so the list is not used: every unit is compared"
+      return 0
+    fi
+    if ! [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9:_.@-]*\.service$ ]]; then
+      echo "warn  the host's ignore list $f: line $n is not one service name (no patterns), so the list is not used: every unit is compared"
+      return 0
+    fi
+    if grep -Eq "$SNAPSHOT_OWN" <<<"$name"; then
+      echo "warn  the host's ignore list $f: line $n names a Bulig unit, so the list is not used: every unit is compared"
+      return 0
+    fi
+    names="$names$name "
+  done <"$f"
+  SNAPSHOT_IGNORED="$names"
+}
+
+# host_ignores <unit>: true if the host's ignore list (as loaded) names that unit.
+host_ignores() {
+  case "$SNAPSHOT_IGNORED" in *" $1 "*) return 0 ;; esac
+  return 1
 }
 
 # instance_not_socket_started <unit>: true only when systemd knows the unit now (LoadState=loaded), nothing in its TriggeredBy is a .socket,
@@ -247,14 +368,19 @@ snapshot_unit_state() {
   snapshot_section "$1" '^## every service unit and its state' | awk -v u="$2" '$1 == u { print $2, $3; exit }'
 }
 
-# snapshot_drop <file> <services> <containers> <unit files>: the file without those services' run-state lines, those containers' lines
-# and those unit files' lines.
+# snapshot_drop <file> <services> <containers> <unit files> [<listener lines> [<no range>]]: the file without those services' run-state lines,
+# those containers' lines, those unit files' lines and those listener lines (whole lines, one per line), and, when <no range> is not empty,
+# without the ephemeral port range section (header too).
 snapshot_drop() {
-  awk -v units=" $2 " -v ctrs=" $3 " -v ufs=" ${4:-} " -v rs="$SNAPSHOT_RUNSTATE_SECTIONS" -v dk="$SNAPSHOT_DOCKER_SECTION" -v uf="$SNAPSHOT_UNITFILE_SECTION" '
-    /^## / { sec = ($0 ~ rs) ? "rs" : ($0 ~ dk) ? "dk" : ($0 ~ uf) ? "uf" : ""; print; next }
+  SNAPSHOT_DROP_LISTENERS="${5:-}" awk -v units=" $2 " -v ctrs=" $3 " -v ufs=" ${4:-} " -v norange="${6:-}" -v rs="$SNAPSHOT_RUNSTATE_SECTIONS" -v dk="$SNAPSHOT_DOCKER_SECTION" -v uf="$SNAPSHOT_UNITFILE_SECTION" -v ls="$SNAPSHOT_LISTEN_SECTION" -v pr="$SNAPSHOT_PORTRANGE_SECTION" '
+    BEGIN { n = split(ENVIRON["SNAPSHOT_DROP_LISTENERS"], d, "\n"); for (i = 1; i <= n; i++) if (d[i] != "") dropls[d[i]] = 1 }
+    /^## / && norange != "" && $0 ~ pr { sec = "pr"; next }
+    /^## / { sec = ($0 ~ rs) ? "rs" : ($0 ~ dk) ? "dk" : ($0 ~ uf) ? "uf" : ($0 ~ ls) ? "ls" : ""; print; next }
+    sec == "pr" { next }
     sec == "rs" && index(units, " " $1 " ") { next }
     sec == "dk" && index(ctrs, " " $1 " ") { next }
     sec == "uf" && index(ufs, " " $1 " ") { next }
+    sec == "ls" && ($0 in dropls) { next }
     { print }' "$1"
 }
 

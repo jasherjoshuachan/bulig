@@ -61,6 +61,8 @@ BULIG_CRED_DIR="$R/etc/bulig"
 BULIG_BACKUP_ENV_FILE="$R/etc/bulig/backup.env"
 # The machine-specific fence probes: root-owned, 0600, written on the server, never in git (RUNBOOK, "The extra probes").
 BULIG_FENCE_EXTRA="$R/etc/bulig/fence-extra-probes.txt"
+# The units whose run state postcheck.sh does not compare: root-owned, written on the server, never in git (RUNBOOK step 12). Missing: none.
+BULIG_POSTCHECK_IGNORE="$R/etc/bulig/postcheck-ignore.txt"
 BULIG_OPT_DIR="$R/opt/bulig"
 BULIG_TOOLS_DIR="$R/usr/local/lib/bulig"
 BULIG_UNIT_DIR="$R/etc/systemd/system"

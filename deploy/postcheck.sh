@@ -2,8 +2,10 @@
 # The "after" picture: compare ths-prod-01 to a "before" snapshot and fail on any difference in what the snapshot covers (see lib/snapshot.sh),
 # apart from Bulig's own users, units, cluster and folders. Read-only except for temp files in /var/lib/bulig-checks.
 # Not compared, only reported (see snapshot_compare in lib/snapshot.sh): the run state of services a timer starts, transient systemd-run units,
-# template instances that came or went (a "failed" one of any of those is a warn line that names it), and containers that come and go while
-# their image keeps running. Unit files, enabled state and timers still are.
+# template instances that came or went (a "failed" one of any of those is a warn line that names it), containers that come and go while
+# their image keeps running, loopback listeners on an ephemeral port next to a lasting fixed-port one of the same process, and the run state
+# of units in the host's own ignore list (/etc/bulig/postcheck-ignore.txt) that no socket can start. Unit files, enabled state and timers
+# still are.
 # It does NOT prove anything it does not list: files outside the snapshot, data inside other databases, and live behaviour are not checked.
 # When no Bulig unit is installed (after the removal in the RUNBOOK), it also fails if the worker's network namespace or a gateway address on lo
 # is still there.

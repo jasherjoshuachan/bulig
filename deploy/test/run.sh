@@ -207,7 +207,11 @@ DATA
   cat >"$w/data/ss.txt" <<'DATA'
 LISTEN 0 511 0.0.0.0:80 0.0.0.0:* users:(("nginx",pid=812,fd=6))
 LISTEN 0 200 127.0.0.1:5432 0.0.0.0:* users:(("postgres",pid=900,fd=5))
+LISTEN 0 4096 127.0.0.1:7070 0.0.0.0:* users:(("modelsrv",pid=60,fd=3))
 DATA
+  # The kernel's ephemeral port range (Linux's default)
+  mkdir -p "$w/root/proc/sys/net/ipv4"
+  printf '32768\t60999\n' >"$w/root/proc/sys/net/ipv4/ip_local_port_range"
   printf 'clientweb ghcr.io/client/web:1.4 running\nncl-a1-sess-1-k3j agent-session:latest running\nold-migrate client/migrate:2 exited\n' >"$w/data/docker.txt"
   printf '16 main 5432 online postgres /var/lib/postgresql/16/main /var/log/postgresql/postgresql-16-main.log\n' >"$w/data/clusters.txt"
   printf 'root:x:0:0:root:/root:/bin/bash\nclient:x:1000:1000::/home/client:/bin/bash\n' >"$w/data/passwd.txt"
@@ -290,6 +294,7 @@ check_change "a new unit file under /etc/systemd/system" "echo x >root/etc/syste
 check_change "a new enable link under /etc/systemd/system" "ln -s /etc/systemd/system/evil.service root/etc/systemd/system/multi-user.target.wants/evil.service"
 check_change "an edited postgresql config of another cluster" "echo 'fsync = off' >>root/etc/postgresql/16/main/postgresql.conf"
 check_change "/tmp changed mode" "sed -i.bak 's#^1777 root root /tmp#700 root root /tmp#' data/stat.txt"
+check_change "the ephemeral port range changed" "printf '1024\\t65000\\n' >root/proc/sys/net/ipv4/ip_local_port_range"
 check_change "/etc changed mode" "sed -i.bak 's#^755 root root /etc\$#700 root root /etc#' data/stat.txt"
 
 # precheck.sh then postcheck.sh, end to end.
@@ -426,6 +431,55 @@ post_case "a template instance that was there before and changed state still fai
 post_case "a new template unit file still fails" fail "+worker@.service enabled" "echo 'worker@.service enabled' >>data/unitfiles.txt"
 post_case "an enabled instance in the unit files list still fails" fail "+worker@job-1.service enabled" "echo 'worker@job-1.service enabled' >>data/unitfiles.txt"
 post_case "transient and instance lines do not hide a real change elsewhere" fail "8080" "$(unit run-u5.service 'active running'); $(unit worker@j.service 'failed failed'); echo 'LISTEN 0 1 0.0.0.0:8080 0.0.0.0:* users:((\"python3\",pid=7,fd=3))' >>data/ss.txt"
+# Other tenants' short-lived loopback listeners (24 Oct 2026: a local model server opens a runner on a random loopback port while a model is
+# loaded, next to its own fixed port). Info only on a loopback address, in the ephemeral range both snapshots show, next to a lasting
+# fixed-port listener of the same process. Everything else about listeners still fails.
+lsn() { echo "echo 'LISTEN 0 4096 $1 0.0.0.0:* users:((\"$2\",pid=77,fd=9))' >>data/ss.txt"; } # lsn <address:port> <process>
+unlsn() { echo "awk '\$4 != \"$1\"' data/ss.txt >data/ss.new && mv data/ss.new data/ss.txt"; } # unlsn <address:port>
+range() { echo "printf '$1\\t$2\\n' >root/proc/sys/net/ipv4/ip_local_port_range"; } # range <low> <high>
+old_kit() { echo "awk '/^## / { skip = (\$0 ~ /^## ephemeral port range/) } !skip' root/var/lib/bulig-checks/precheck.snapshot >pc.new && mv pc.new root/var/lib/bulig-checks/precheck.snapshot"; }
+post_case "an ephemeral loopback listener that appeared next to its process's fixed-port one is info" pass 'info  listener 127.0.0.1:41234 users:(("modelsrv")) appeared' "$(lsn 127.0.0.1:41234 modelsrv)"
+post_case "an ephemeral loopback listener that went away while its process's fixed-port one stayed is info" pass 'info  listener 127.0.0.1:41234 users:(("modelsrv")) went away' "$(unlsn 127.0.0.1:41234)" "$(lsn 127.0.0.1:41234 modelsrv)"
+post_case "an ephemeral listener on the IPv6 loopback is info too" pass 'info  listener [::1]:40001 users:(("modelsrv")) appeared' "$(lsn '[::1]:40001' modelsrv)"
+post_case "a loopback listener on a fixed port below the range still fails" fail '+127.0.0.1:9999 users:(("modelsrv"))' "$(lsn 127.0.0.1:9999 modelsrv)"
+post_case "a loopback listener on a port above the range still fails" fail '+127.0.0.1:61000 users:(("modelsrv"))' "$(lsn 127.0.0.1:61000 modelsrv)"
+post_case "an ephemeral port on all addresses still fails" fail '+0.0.0.0:41234 users:(("modelsrv"))' "$(lsn 0.0.0.0:41234 modelsrv)"
+post_case "an ephemeral port on a private address still fails" fail '+10.0.0.5:41234 users:(("modelsrv"))' "$(lsn 10.0.0.5:41234 modelsrv)"
+post_case "an ephemeral port on all IPv6 addresses still fails" fail '+[::]:41234 users:(("modelsrv"))' "$(lsn '[::]:41234' modelsrv)"
+post_case "an ephemeral loopback listener of a process with no lasting listener still fails" fail '+127.0.0.1:41234 users:(("newtool"))' "$(lsn 127.0.0.1:41234 newtool)"
+post_case "an ephemeral loopback listener whose process's only lasting listener is ephemeral too still fails" fail '+127.0.0.1:45001 users:(("other"))' "$(lsn 127.0.0.1:45001 other)" "$(lsn 127.0.0.1:45000 other)"
+post_case "an ephemeral listener that went away with its process's fixed-port one still fails" fail '-127.0.0.1:41234 users:(("modelsrv"))' "$(unlsn 127.0.0.1:41234); $(unlsn 127.0.0.1:7070)" "$(lsn 127.0.0.1:41234 modelsrv)"
+post_case "an ephemeral loopback listener of an unnamed process still fails" fail '+127.0.0.1:43999 -' "echo 'LISTEN 0 5 127.0.0.1:43999 0.0.0.0:*' >>data/ss.txt" "echo 'LISTEN 0 5 127.0.0.1:8000 0.0.0.0:*' >>data/ss.txt"
+post_case "with no readable port range, an ephemeral loopback listener still fails (fail closed)" fail '+127.0.0.1:41234 users:(("modelsrv"))' "$(lsn 127.0.0.1:41234 modelsrv)" "rm root/proc/sys/net/ipv4/ip_local_port_range"
+post_case "a port range that reaches below 1024 counts as none (fail closed)" fail '+127.0.0.1:5000 users:(("modelsrv"))' "$(lsn 127.0.0.1:5000 modelsrv)" "$(range 1000 11000)"
+post_case "a port range that changed makes no listener ephemeral" fail '+127.0.0.1:31000 users:(("modelsrv"))' "$(range 30000 60999); $(lsn 127.0.0.1:31000 modelsrv)"
+post_case "a port range that changed still fails on its own" fail '+30000 60999' "$(range 30000 60999)"
+post_case "a before snapshot from an older kit (no port range) still compares" pass "info  one snapshot has no ephemeral port range" "$(old_kit)"
+post_case "and then an ephemeral loopback listener still fails (fail closed)" fail '+127.0.0.1:41234 users:(("modelsrv"))' "$(old_kit); $(lsn 127.0.0.1:41234 modelsrv)"
+post_case "ephemeral listeners do not hide a real change elsewhere" fail "8080" "$(lsn 127.0.0.1:41234 modelsrv); echo 'LISTEN 0 1 0.0.0.0:8080 0.0.0.0:* users:((\"python3\",pid=7,fd=3))' >>data/ss.txt"
+# The host's own ignore list (/etc/bulig/postcheck-ignore.txt, never in git): units another tenant or the OS starts on its own (24 Oct 2026: the
+# OS's daily apt job woke a bus-activated daemon). Only their run state, only when no socket can start them, only from a root-owned file.
+ign() { printf "mkdir -p root/etc/bulig && printf '%s' >root/etc/bulig/postcheck-ignore.txt" "$1"; } # ign <file content, printf escapes>
+# busd: a bus-activated daemon whose unit file is there all along, and that systemd knows now and no socket starts.
+busd() { echo "$(unit busd.service "$1"); $(shw busd.service 'LoadState=loaded\nTriggeredBy=')"; } # busd <active and sub state>
+busd_pre="echo 'busd.service static' >>data/unitfiles.txt"
+post_case "a unit in the host's ignore list that started is info" pass "info  busd.service: not loaded -> active running (in the host's ignore list" "$(busd 'active running'); $(ign 'busd.service\n')" "$busd_pre"
+post_case "a unit in the host's ignore list that stopped is info" pass "info  busd.service: active running -> inactive dead (in the host's ignore list" "sed -i.bak 's/^busd.service loaded active running/busd.service loaded inactive dead/' data/units.txt; $(shw busd.service 'LoadState=loaded\nTriggeredBy='); $(ign 'busd.service\n')" "$busd_pre; $(unit busd.service 'active running')"
+post_case "a unit in the host's ignore list that failed is a warn that names it" pass "warn  busd.service is failed now (not loaded before). It is in the host's ignore list" "$(busd 'failed failed'); $(ign 'busd.service\n')" "$busd_pre"
+post_case "the list takes comments, blank lines and a comment after a name" pass "info  busd.service: not loaded -> active running" "$(busd 'active running'); $(ign '# woken by the daily package job\n\nother.service\n  busd.service   # bus-activated\n')" "$busd_pre"
+post_case "a unit not in the host's ignore list still fails" fail "+busd.service active running" "$(busd 'active running'); $(ign 'other.service\n')" "$busd_pre"
+post_case "with no ignore list, a unit that started still fails" fail "+busd.service active running" "$(busd 'active running')" "$busd_pre"
+post_case "a unit in the ignore list that a .socket triggers still fails" fail "+busd.service active running" "$(unit busd.service 'active running'); $(shw busd.service 'LoadState=loaded\nTriggeredBy=busd.socket'); $(ign 'busd.service\n')" "$busd_pre"
+post_case "a unit in the ignore list that systemd does not know still fails (fail closed)" fail "+busd.service active running" "$(unit busd.service 'active running'); $(ign 'busd.service\n')" "$busd_pre"
+post_case "a unit in the ignore list: its unit file state is still compared" fail "+busd.service masked" "$(busd 'active running'); sed -i.bak 's/^busd.service static/busd.service masked/' data/unitfiles.txt; $(ign 'busd.service\n')" "$busd_pre"
+post_case "an ignore list that is a link is not used" fail "is a link or not a plain file, so it is not used" "$(busd 'active running'); $(ign 'busd.service\n'); mv root/etc/bulig/postcheck-ignore.txt root/etc/bulig/real.txt; ln -s real.txt root/etc/bulig/postcheck-ignore.txt" "$busd_pre"
+post_case "an ignore list writable by its group is not used" fail "is writable by its group, so it is not used" "$(busd 'active running'); $(ign 'busd.service\n'); chmod 620 root/etc/bulig/postcheck-ignore.txt" "$busd_pre"
+post_case "an ignore list writable by anyone is not used" fail "is writable by anyone, so it is not used" "$(busd 'active running'); $(ign 'busd.service\n'); chmod 602 root/etc/bulig/postcheck-ignore.txt" "$busd_pre"
+post_case "an ignore list owned by someone else is not used" fail "is not owned by root, so it is not used" "$(busd 'active running'); $(ign 'busd.service\n'); export BULIG_TEST_OWNER_UID=\$((\$(id -u) + 1))" "$busd_pre"
+post_case "an ignore list with a pattern in it is not used at all" fail "line 2 is not one service name (no patterns)" "$(busd 'active running'); $(ign 'busd.service\n*.service\n')" "$busd_pre"
+post_case "an ignore list that names a Bulig unit is not used at all" fail "line 2 names a Bulig unit" "$(busd 'active running'); $(ign 'busd.service\nbulig-worker.service\n')" "$busd_pre"
+post_case "an ignore list with two names on a line is not used at all" fail "line 1 holds more than one name" "$(busd 'active running'); $(ign 'busd.service other.service\n')" "$busd_pre"
+post_case "an ignored unit does not hide a real change elsewhere" fail "8080" "$(busd 'active running'); $(ign 'busd.service\n'); echo 'LISTEN 0 1 0.0.0.0:8080 0.0.0.0:* users:((\"python3\",pid=7,fd=3))' >>data/ss.txt" "$busd_pre"
 # Bulig's own units are filtered out of every snapshot; even in a hand-made one, a Bulig instance or a Bulig transient-looking name is never churn.
 printf '## every service unit and its state (x)\nnginx.service active running\n## service unit files (state)\nnginx.service enabled\n' >"$work/own-b"
 printf '## every service unit and its state (x)\nbulig-cli@w1.service active running\nnginx.service active running\nrun-u3.service active running\n## service unit files (state)\nnginx.service enabled\n' >"$work/own-a"

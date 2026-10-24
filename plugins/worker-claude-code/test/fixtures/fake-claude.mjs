@@ -15,7 +15,11 @@ if (process.env.FAKE_CLAUDE_LOG) {
 // Dump the whole environment this process was given, so a test can see exactly what reached it.
 if (process.env.FAKE_CLAUDE_ENV_DUMP) {
   const ghEntries = process.env.GH_CONFIG_DIR ? readdirSync(process.env.GH_CONFIG_DIR) : null;
-  writeFileSync(process.env.FAKE_CLAUDE_ENV_DUMP, JSON.stringify({ ...process.env, __GH_DIR_ENTRIES: ghEntries }));
+  // npm's cache for this run, and what the sandbox settings let a command write, as this process was given them.
+  const npmEntries = process.env.npm_config_cache ? readdirSync(process.env.npm_config_cache) : null;
+  const at = args.indexOf('--settings');
+  const allowWrite = at === -1 ? null : (JSON.parse(args[at + 1]).sandbox?.filesystem?.allowWrite ?? null);
+  writeFileSync(process.env.FAKE_CLAUDE_ENV_DUMP, JSON.stringify({ ...process.env, __GH_DIR_ENTRIES: ghEntries, __NPM_DIR_ENTRIES: npmEntries, __ALLOW_WRITE: allowWrite }));
 }
 
 if (prompt.includes('FAKE:grandchild')) {

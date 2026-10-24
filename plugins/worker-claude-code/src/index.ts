@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { definePlugin, type BuligEvent } from '@bulig/plugin-sdk';
@@ -191,9 +191,55 @@ export function sandboxSettings(extraDomains: readonly string[] = []): Record<st
       autoAllowBashIfSandboxed: false,
       excludedCommands: [],
       network: { allowedDomains: allowed, deniedDomains: GITHUB_HOSTS, strictAllowlist: true },
+      // No allowWrite here: `run` adds the one run's own npm cache to it (withRunWritable, NPM_CACHE_PREFIX).
       filesystem: { denyRead: DENY_READ },
     },
   };
+}
+
+/**
+ * NPM'S CACHE INSIDE CLAUDE'S SANDBOX (found on the server, job 9628d02c, 24 Oct 2026). On the server (Linux, bubblewrap) Claude Code's
+ * Bash sandbox lets a command write only to the stage's folder and to Claude's own temp folder, so npm's default cache (~/.npm, under
+ * the worker's HOME) is read-only there, and every stage that used npm wasted 4 to 6 commands: `npm install` with the default cache failed, `echo $TMPDIR` showed
+ * nothing the agent could use, `mkdir -p /tmp/claude/npm-cache` failed, and only `--cache /tmp/claude-<uid>/npm-cache` (Claude's own
+ * temp folder, whose name is Claude Code's business, not ours) worked.
+ *
+ * So each run gets a cache of its own: an empty folder made by `run` next to the gh one, named to the child as `npm_config_cache` and
+ * added to the sandbox's allowWrite for that run only, then removed with the run. It is the only path added, it lives where the worker
+ * already keeps its per-run folders (on the server, the unit's private /tmp; never HOME or a host path), and it is per run on purpose:
+ * one cache shared by every job would let a prompt in one job plant a package that npm hands to the next. npm keeps its own temp files
+ * and logs under the cache (`_cacache/tmp`, `_logs`), so this is enough for npm with no flags. TMPDIR is left alone: Claude Code sets
+ * it for every sandboxed command itself, and on Linux it also uses TMPDIR as its own temp root, which this must not move.
+ */
+export const NPM_CACHE_PREFIX = 'bulig-npm-';
+
+/** The child's environment with npm's cache set to `cacheDir`. Any other spelling of the variable (npm reads it in any case) goes. */
+export function withNpmCache(env: NodeJS.ProcessEnv, cacheDir: string): NodeJS.ProcessEnv {
+  const out: NodeJS.ProcessEnv = {};
+  for (const [name, value] of Object.entries(env)) if (name.toLowerCase() !== 'npm_config_cache') out[name] = value;
+  return { ...out, npm_config_cache: cacheDir };
+}
+
+/**
+ * The argument list with `dir` added to the sandbox's allowWrite in the --settings that buildArgs put in (the first one). Nothing
+ * else in the settings changes. A list with no --settings, or one whose value is not sandbox settings, is returned as it is.
+ */
+export function withRunWritable(args: readonly string[], dir: string): string[] {
+  const at = args.indexOf('--settings');
+  if (at === -1 || at + 1 >= args.length) return [...args];
+  let settings: { sandbox?: { filesystem?: { allowWrite?: unknown } } };
+  try {
+    settings = JSON.parse(args[at + 1]!) as typeof settings;
+  } catch {
+    return [...args];
+  }
+  const fs = settings?.sandbox?.filesystem;
+  if (typeof fs !== 'object' || fs === null) return [...args];
+  const before = Array.isArray(fs.allowWrite) ? (fs.allowWrite as unknown[]).filter((p): p is string => typeof p === 'string') : [];
+  fs.allowWrite = [...new Set([...before, dir])];
+  const out = [...args];
+  out[at + 1] = JSON.stringify(settings);
+  return out;
 }
 
 /**
@@ -483,18 +529,33 @@ export function run(
 ): Promise<RunResult> {
   return new Promise((resolve) => {
     // A fresh, empty gh config dir for this one run, so no signed-in gh state can be found under HOME.
+    // And npm's cache for this one run, writable inside the sandbox (see NPM_CACHE_PREFIX for why). The real path, because the
+    // sandbox matches paths after symlinks are resolved (macOS's temp folder is a symlink).
     let ghDir: string;
+    let npmDir = '';
     try {
       ghDir = mkdtempSync(join(tmpdir(), 'bulig-gh-'));
     } catch (err) {
       resolve({ ok: false, result: '', error: `could not make a temp dir: ${(err as Error).message}` });
       return;
     }
+    const cleanup = () => {
+      rmSync(ghDir, { recursive: true, force: true });
+      if (npmDir) rmSync(npmDir, { recursive: true, force: true });
+    };
+    try {
+      npmDir = mkdtempSync(join(tmpdir(), NPM_CACHE_PREFIX));
+      npmDir = realpathSync(npmDir);
+    } catch (err) {
+      cleanup();
+      resolve({ ok: false, result: '', error: `could not make a temp dir: ${(err as Error).message}` });
+      return;
+    }
     let child: ChildProcess;
     try {
-      child = spawn(bin, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'], env: hardenEnv(env, ghDir), detached: true });
+      child = spawn(bin, withRunWritable(args, npmDir), { cwd, stdio: ['ignore', 'pipe', 'pipe'], env: withNpmCache(hardenEnv(env, ghDir), npmDir), detached: true });
     } catch (err) {
-      rmSync(ghDir, { recursive: true, force: true });
+      cleanup();
       resolve({ ok: false, result: '', error: `could not start ${bin}: ${(err as Error).message}` });
       return;
     }
@@ -510,7 +571,7 @@ export function run(
       clearTimeout(timer);
       children.delete(child);
       untrack();
-      rmSync(ghDir, { recursive: true, force: true });
+      cleanup();
       resolve(r);
     };
     const timer = setTimeout(() => {

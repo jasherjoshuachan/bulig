@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -7,6 +7,7 @@ import { createKernel } from '@bulig/core';
 import { definePlugin, type BuligEvent, type Plugin, type PluginContext } from '@bulig/plugin-sdk';
 import worker, {
   BASE_ALLOWED_DOMAINS,
+  DENY_READ,
   GITHUB_HOSTS,
   createWorker,
   EDIT_DENIED_TOOLS,
@@ -21,6 +22,9 @@ import worker, {
   MAX_LINE_BYTES,
   MAX_SINGLE_OBJECT_BYTES,
   sandboxSettings,
+  NPM_CACHE_PREFIX,
+  withNpmCache,
+  withRunWritable,
 } from '../src/index.ts';
 
 const FAKE = fileURLToPath(new URL('./fixtures/fake-claude.mjs', import.meta.url));
@@ -177,6 +181,49 @@ describe('the OS sandbox (layer 1)', () => {
   it('hides the places gh and git keep their logins from sandboxed reads', () => {
     const { sandbox } = sandboxSettings() as { sandbox: Record<string, any> };
     expect(sandbox.filesystem.denyRead).toEqual(expect.arrayContaining(['~/.config/gh', '~/.ssh', '~/.git-credentials']));
+  });
+});
+
+describe("npm's cache inside the sandbox (job 9628d02c)", () => {
+  const settingsOf = (args: string[]) => JSON.parse(args[args.indexOf('--settings') + 1]!) as { sandbox: Record<string, any> };
+  const edit = () => buildArgs({ stage: 's', prompt: 'p', model: 'm', mode: 'edit', cwd: '/x' }, ['--setting-sources', 'project'], ['pypi.org']);
+
+  it('the settings on their own let nothing extra be written', () => {
+    const { sandbox } = sandboxSettings() as { sandbox: Record<string, any> };
+    expect(sandbox.filesystem).toEqual({ denyRead: expect.any(Array) });
+    expect(sandbox.filesystem).not.toHaveProperty('allowWrite');
+  });
+
+  it('withRunWritable adds the one folder to allowWrite and changes nothing else', () => {
+    const args = edit();
+    const out = withRunWritable(args, '/tmp/bulig-npm-abc');
+    expect(out).toHaveLength(args.length);
+    const before = settingsOf(args);
+    const after = settingsOf(out);
+    expect(after.sandbox.filesystem.allowWrite).toEqual(['/tmp/bulig-npm-abc']);
+    expect(after.sandbox.filesystem.denyRead).toEqual(DENY_READ); // the read denials are untouched
+    delete after.sandbox.filesystem.allowWrite;
+    expect(after).toEqual(before); // network, denyRead, failIfUnavailable and the rest are as they were
+    out.forEach((a, i) => i !== args.indexOf('--settings') + 1 && expect(a).toBe(args[i]));
+    expect(args).toEqual(edit()); // the list it was given is not changed
+  });
+
+  it('withRunWritable keeps what was already writable and does not repeat a folder', () => {
+    const once = withRunWritable(withRunWritable(edit(), '/a'), '/b');
+    expect(settingsOf(once).sandbox.filesystem.allowWrite).toEqual(['/a', '/b']);
+    expect(settingsOf(withRunWritable(once, '/a')).sandbox.filesystem.allowWrite).toEqual(['/a', '/b']);
+  });
+
+  it('withRunWritable leaves a list with no sandbox settings alone', () => {
+    expect(withRunWritable(['-p', 'x'], '/a')).toEqual(['-p', 'x']);
+    expect(withRunWritable(['--settings'], '/a')).toEqual(['--settings']);
+    expect(withRunWritable(['--settings', 'not json'], '/a')).toEqual(['--settings', 'not json']);
+    expect(withRunWritable(['--settings', '{"x":1}'], '/a')).toEqual(['--settings', '{"x":1}']);
+  });
+
+  it('withNpmCache names the cache for npm and drops any other spelling of it', () => {
+    const env = withNpmCache({ PATH: '/bin', HOME: '/h', NPM_CONFIG_CACHE: '/h/.npm', Npm_Config_Cache: '/elsewhere' }, '/tmp/bulig-npm-abc');
+    expect(env).toEqual({ PATH: '/bin', HOME: '/h', npm_config_cache: '/tmp/bulig-npm-abc' });
   });
 });
 
@@ -559,6 +606,36 @@ describe('worker-claude-code plugin', () => {
         dirsSeen.push(env.GH_CONFIG_DIR!);
       }
       expect(dirsSeen[0]).not.toBe(dirsSeen[1]); // one per stage
+    } finally {
+      for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k];
+      Object.assign(process.env, saved);
+    }
+  });
+
+  it("each run gets npm's cache in a fresh empty folder of its own, writable in the sandbox, outside HOME, removed afterwards", async () => {
+    const saved = { ...process.env };
+    process.env.NPM_CONFIG_CACHE = '/somewhere/else'; // passEnv cannot point npm back at a folder the sandbox will not let it write
+    try {
+      const seenDirs: string[] = [];
+      for (const mode of ['edit', 'readonly'] as const) {
+        const dump = join(tmp(), `${mode}.json`);
+        process.env.FAKE_CLAUDE_ENV_DUMP = dump;
+        const { fire, seen } = await setup({ passEnv: ['FAKE_CLAUDE_ENV_DUMP', 'NPM_CONFIG_CACHE'] });
+        fire(req({ mode, stage: mode }));
+        await waitFor(() => seen.length > 0);
+        expect(seen[0]!.type).toBe('stage.completed');
+        const env = JSON.parse(readFileSync(dump, 'utf8')) as Record<string, unknown>;
+        const cache = env.npm_config_cache as string;
+        expect(cache.startsWith(join(realpathSync(tmpdir()), NPM_CACHE_PREFIX))).toBe(true); // the real path, next to the gh folder
+        expect(cache.startsWith(String(saved.HOME))).toBe(false);
+        expect(env).not.toHaveProperty('NPM_CONFIG_CACHE');
+        expect(env.__NPM_DIR_ENTRIES).toEqual([]); // there and empty while the child ran
+        expect(env.__ALLOW_WRITE).toEqual([cache]); // the one folder the sandbox may write on top of its own
+        expect(env.TMPDIR).toBe(saved.TMPDIR); // TMPDIR is left alone
+        expect(existsSync(cache)).toBe(false); // gone once the run ended
+        seenDirs.push(cache);
+      }
+      expect(seenDirs[0]).not.toBe(seenDirs[1]); // one per run, never shared between jobs
     } finally {
       for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k];
       Object.assign(process.env, saved);

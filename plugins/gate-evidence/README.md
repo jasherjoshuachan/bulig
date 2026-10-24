@@ -4,7 +4,7 @@ A stage that says "tests pass" or "`src/a.ts` exports multiply" must have a reco
 
 ## What it checks
 
-The worker (`worker-claude-code`) runs Claude with `--output-format stream-json` and builds a list of tool-use records from the stream: each `Read`, `Glob`, `Grep`, `Edit`, `Write` and `Bash` call, its file or command, and whether the tool reported success. That list travels on `stage.completed` as `evidence`. The model's own text is never used to build it.
+The worker (`worker-claude-code`) runs Claude with `--output-format stream-json` and builds a list of tool-use records from the stream: each `Read`, `Glob`, `Grep`, `Edit`, `Write` and `Bash` call, its file or command, and whether the tool reported success. That list travels on `stage.completed` as `evidence`. The model's own text is never used to build it. Of a tool's output only two things are kept: whether it was an error, and for a successful `Bash` call the paths in its `diff --git` header lines (`diffPaths`). The gate counts those paths only when every shell segment of the command is git (with `head` or `tail` allowed as a filter) and one of them is `git diff` or `git show`, so `cat notes.md` or `echo ...` cannot print a header that counts.
 
 This plugin reads the stage text, finds claims, and looks for a record of that run behind each one:
 
@@ -12,7 +12,7 @@ This plugin reads the stage text, finds claims, and looks for a record of that r
 |---|---|
 | tests pass: "all tests pass", "the suite is green", "12 passed", `verify.sh` passes, or `VERDICT: PASS` on the test stage | a successful `Bash` run that starts with a test runner (`pnpm test`, `npm run test`, `vitest`, `jest`, `pytest`, `go test`, `cargo test`, `node --test`, `scripts/verify.sh`) |
 | build is clean: "the typecheck passes", "lint is clean", "compiles without errors", "no type errors" | a successful run of `build`, `typecheck`, `lint`, `check`, `tsc`, `eslint`, `cargo build`, `go build` or `scripts/verify.sh` |
-| a file says something: "`src/a.ts` exports X", "`b.json` contains Y", "I read `c.md`" | a `Read` or `Edit` of that file in this run, or a successful command that names it (`cat src/a.ts`) |
+| a file says something: "`src/a.ts` exports X", "`b.json` contains Y", "I read `c.md`" | a `Read` or `Edit` of that file in this run, a successful command that names it (`cat src/a.ts`), or a successful `git diff` or `git show` whose output printed a `diff --git a/<path> b/<path>` header for it (`git diff --stat` prints none, so it does not count) |
 | a change was made: "I fixed", "I added", "I edited README.md", "has been implemented" | a successful `Edit` or `Write` in this run |
 | `VERDICT: PASS` on the review stage | a successful `Read`, or a successful `git diff`, `git show` or `git log` |
 
@@ -68,6 +68,7 @@ worker-claude-code  --stage.completed {result, evidence}-->  gate-evidence  --st
 
 - **Meaning.** It matches phrases. "Everything checks out" or "the suite looks healthy" is a claim it does not see. A claim in other words, or in another language, passes as no claim.
 - **A real record with the wrong content.** It checks that a test command ran and succeeded, not that it ran the right tests or that the output says what the model says. A passing `pnpm test` backs "the new feature works" only because nothing checks that claim at all.
+- **A diff too large to read.** A tool result line over 1 MiB is skimmed, not parsed, so a huge `git diff` keeps its ok value but no `diffPaths`, and a claim about a file only that diff showed is still flagged. Headers that git quotes (paths with odd characters) or prints without the `a/` and `b/` prefixes are skipped the same way.
 - **What a file contains.** A file claim is backed by a read of that file, not by what the read returned. "`a.ts` exports foo" passes if `a.ts` was read, even when it does not export foo.
 - **Other claims.** Anything not on the list above: "no other callers", "the PR is open", "the API returns 200", claims about git history, numbers, who wrote what.
 - **A command that hides the real work.** `node -e "..."` or `pnpm exec x` wrapping a script that fakes success is not a test run, but `pnpm test` that runs a script that exits 0 is. The gate trusts the exit status the tool reported.

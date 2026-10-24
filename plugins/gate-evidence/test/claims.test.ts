@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { parseClaudeOutput } from '../../worker-claude-code/src/index.ts';
 import { checkClaims, clean, evidenceLines, evidenceSummary, findClaims, isBuildCommand, isTestCommand, parseRecords, type EvidenceRecord } from '../src/claims.ts';
 
 const run = (target: string, ok = true): EvidenceRecord => ({ tool: 'Bash', kind: 'run', target, ok });
@@ -280,5 +281,96 @@ describe('what is shown', () => {
   it('parseRecords keeps only well-formed records', () => {
     expect(parseRecords('nope')).toEqual([]);
     expect(parseRecords([read('a'), { tool: 'Bash', kind: 'run', target: 'x' }, null, 7, { tool: 'T', kind: 'bogus', target: '', ok: true }, { ...run('ls'), extra: 1 }])).toEqual([read('a'), run('ls')]);
+  });
+});
+
+// A reviewer that runs `git diff <base> HEAD` has seen every file the diff prints. The worker keeps the
+// `diff --git a/<path> b/<path>` headers of a successful Bash result as `diffPaths`; the gate counts them
+// only when the command itself is a git diff or show.
+describe('a file shown by a git diff counts as read', () => {
+  const claims = (t: string, stage = 'build') => findClaims(t, stage);
+  const diff = (target: string, diffPaths: string[], ok = true): EvidenceRecord => ({ ...run(target, ok), diffPaths });
+  // What the review stage of job 9628d02c ran: the full diff, then the log and the stat.
+  const REVIEW = [
+    diff('git diff 0f9c2565 HEAD', ['package-lock.json', 'src/chunk.js', 'test/chunk.test.js']),
+    run('git log --oneline 0f9c2565..HEAD && git diff --stat 0f9c2565..HEAD'),
+  ];
+
+  it('job 9628d02c review: src/chunk.js, shown by the full diff, is not "no record of reading"', () => {
+    const c = claims('`src/chunk.js` exports chunk and throws on a size below 1.\nVERDICT: PASS', 'review');
+    expect(c.map((x) => x.kind)).toEqual(['file', 'looked']);
+    expect(checkClaims(c, REVIEW)).toEqual([]);
+  });
+
+  it('job 9628d02c review: package-lock.json, shown by the full diff, is not "no record of reading"', () => {
+    const c = claims('package-lock.json contains only the lockfile entries for chunk.\nVERDICT: PASS', 'review');
+    expect(c.map((x) => x.kind)).toEqual(['file', 'looked']);
+    expect(checkClaims(c, REVIEW)).toEqual([]);
+  });
+
+  it('a git diff --stat alone does not count as reading a file, so the claim still warns', () => {
+    const c = claims('`src/chunk.js` exports chunk.', 'review');
+    expect(checkClaims(c, [run('git diff --stat 0f9c2565 HEAD')]).map((f) => f.reason)).toEqual(['no record of reading src/chunk.js this turn']);
+    expect(checkClaims(c, [run('git log --oneline 0f9c2565..HEAD && git diff --stat 0f9c2565..HEAD')])).toHaveLength(1);
+    // the stat prints no diff headers, so the worker gives it no diffPaths
+    expect(checkClaims(c, [diff('git diff --stat 0f9c2565 HEAD', [])])).toHaveLength(1);
+  });
+
+  it('only a successful git diff or show that printed that file counts', () => {
+    const c = claims('`src/chunk.js` exports chunk.', 'review');
+    expect(checkClaims(c, [diff('git diff 0f9c2565 HEAD', ['src/chunk.js'], false)])).toHaveLength(1); // failed
+    expect(checkClaims(c, [diff('git diff 0f9c2565 HEAD', ['src/other.js'])])).toHaveLength(1); // another file
+    expect(checkClaims(c, [diff('git diff 0f9c2565 HEAD', ['xsrc/chunk.js'])])).toHaveLength(1); // same ending, other folder
+    expect(checkClaims(c, [diff('cat notes.md', ['src/chunk.js'])])).toHaveLength(1); // headers printed by something that is not git
+    expect(checkClaims(c, [diff('echo x; git diff --stat', ['src/chunk.js'])])).toHaveLength(1); // a non-git segment could have printed them
+    expect(checkClaims(c, [diff('git diff --stat && cat review.md', ['src/chunk.js'])])).toHaveLength(1);
+    expect(checkClaims(c, [diff('git status', ['src/chunk.js'])])).toHaveLength(1); // git, but not a diff or show
+    expect(checkClaims(c, [{ ...read('notes.md'), diffPaths: ['src/chunk.js'] }])).toHaveLength(1); // only a command's output counts
+    expect(checkClaims(c, [diff('git show HEAD', ['src/chunk.js'])])).toEqual([]);
+    expect(checkClaims(c, [diff('cd /work/wt && git --no-pager diff main...HEAD | head -400', ['src/chunk.js'])])).toEqual([]);
+    expect(checkClaims(c, [diff('git -C /work/wt diff HEAD~1', ['/work/wt/src/chunk.js'])])).toEqual([]);
+    expect(checkClaims(claims('`chunk.js` exports chunk.', 'review'), [diff('git diff HEAD~1', ['src/chunk.js'])])).toEqual([]);
+  });
+
+  it('build attempt 2 of the same job: divide.js was never read, shown or edited, so that warning is true', () => {
+    const records = [
+      read('/work/wt/src/chunk.js'),
+      read('/work/wt/test/chunk.test.js'),
+      read('/work/wt/package-lock.json'),
+      read('/work/wt/src/multiply.js'),
+      read('/work/wt/test/multiply.test.js'),
+      run('cat package.json'),
+      run('cat .github/workflows/ci.yml'),
+    ];
+    const c = claims('Like multiply.js, divide.js exports one function and its test lives next to it.', 'build');
+    expect(checkClaims(c, records).map((f) => f.reason)).toEqual(['no record of reading divide.js this turn']);
+  });
+
+  it('parseRecords keeps diffPaths only as a list of strings, and drops a bad one without dropping the record', () => {
+    expect(parseRecords([diff('git diff', ['a.ts', 'b.ts'])])).toEqual([diff('git diff', ['a.ts', 'b.ts'])]);
+    expect(parseRecords([{ ...run('git diff'), diffPaths: 'a.ts' }, { ...run('git show'), diffPaths: ['a.ts', 7] }])).toEqual([run('git diff'), run('git show')]);
+    expect(parseRecords([diff('git diff', Array.from({ length: 300 }, (_, n) => `f${n}.ts`))])[0]!.diffPaths).toHaveLength(200);
+  });
+});
+
+describe('from the real worker stream to the gate', () => {
+  it('job 9628d02c review: the full git diff backs src/chunk.js and package-lock.json, the stat alone does not', () => {
+    const line = (o: unknown) => JSON.stringify(o);
+    const use = (id: string, command: string) => line({ type: 'assistant', message: { content: [{ type: 'tool_use', id, name: 'Bash', input: { command } }] } });
+    const answer = (id: string, content: string) => line({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: id, content, is_error: false }] } });
+    const diffOut = 'diff --git a/package-lock.json b/package-lock.json\n--- a/package-lock.json\n+++ b/package-lock.json\ndiff --git a/src/chunk.js b/src/chunk.js\n+export function chunk() {}';
+    const statOut = 'abc123 add chunk\n src/chunk.js      | 12 ++++++\n package-lock.json |  4 ++';
+    const text = '`src/chunk.js` exports chunk. package-lock.json contains only the lockfile entries for chunk.\nVERDICT: PASS';
+    const stream = (...lines: string[]) => [...lines, line({ type: 'result', is_error: false, result: text, session_id: 's' })].join('\n');
+    const stat = [use('t2', 'git log --oneline 0f9c2565..HEAD && git diff --stat 0f9c2565..HEAD'), answer('t2', statOut)];
+
+    const full = parseRecords(parseClaudeOutput(stream(use('t1', 'git diff 0f9c2565 HEAD'), answer('t1', diffOut), ...stat)).evidence);
+    expect(checkClaims(findClaims(text, 'review'), full)).toEqual([]);
+
+    const statOnly = parseRecords(parseClaudeOutput(stream(...stat)).evidence);
+    expect(checkClaims(findClaims(text, 'review'), statOnly).map((f) => f.reason)).toEqual([
+      'no record of reading src/chunk.js this turn',
+      'no record of reading package-lock.json this turn',
+    ]);
   });
 });

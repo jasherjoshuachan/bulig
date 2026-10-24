@@ -220,10 +220,15 @@ export interface EvidenceRecord {
   /** The file path, search pattern or shell command, flattened and cut at 300 characters. */
   target: string;
   ok: boolean;
+  /** For a successful Bash call: the files named by `diff --git a/<path> b/<path>` headers in its output, so a `git diff` counts as reading them. */
+  diffPaths?: string[];
 }
 
 const MAX_RECORDS = 300;
 const MAX_TARGET = 300;
+const MAX_DIFF_PATHS = 200;
+/** Most diff paths kept from a whole run, so the records stay small however many diffs Claude prints. */
+const MAX_DIFF_PATHS_RUN = 1000;
 const KINDS: Record<string, EvidenceRecord['kind']> = {
   Read: 'read',
   Glob: 'search',
@@ -252,10 +257,40 @@ function recordOf(tool: string, input: unknown): EvidenceRecord {
   return { tool: clipText(flat(tool), 60), kind, target, ok: false };
 }
 
+/** The text of a tool_result: a string, or a list of blocks of which only the text ones are read. */
+const resultText = (content: unknown): string =>
+  typeof content === 'string'
+    ? content
+    : Array.isArray(content)
+      ? content.map((b) => (typeof b === 'object' && b !== null && (b as { type?: unknown }).type === 'text' && typeof (b as { text?: unknown }).text === 'string' ? (b as { text: string }).text : '')).join('\n')
+      : '';
+
+const DIFF_HEADER = /^diff --git (a\/.+ b\/.+)$/gm;
+
+/**
+ * The files a diff showed, from its `diff --git a/<path> b/<path>` header lines. A quoted header (a path with odd
+ * characters) or one without the a/ and b/ prefixes is left out: a missed file only costs a warning. A rename names both.
+ * `git diff --stat` and `--name-only` print no headers, so they give nothing.
+ */
+export function diffPathsOf(output: string): string[] {
+  const out = new Set<string>();
+  for (const m of output.matchAll(DIFF_HEADER)) {
+    if (out.size >= MAX_DIFF_PATHS) break;
+    const rest = m[1]!;
+    const n = (rest.length - 5) / 2;
+    const same = rest.slice(2, 2 + n);
+    if (Number.isInteger(n) && rest === `a/${same} b/${same}`) out.add(same);
+    else if (rest.split(' b/').length === 2) for (const p of [rest.slice(2, rest.indexOf(' b/')), rest.slice(rest.indexOf(' b/') + 3)]) out.add(p);
+  }
+  return [...out].map(flat).filter(Boolean);
+}
+
 /**
  * Every tool call in a stream-json run, paired with its result. Only `assistant` messages can start a record
  * (a tool_use block) and only `user` messages can settle one (a tool_result block with the same id). The text
- * the model wrote, and the content of any tool result, are never read, so nothing the model says can add a record.
+ * the model wrote is never read, so nothing the model says can add a record. Of a tool result only two things are
+ * read: whether it is an error, and for a successful Bash call the `diff --git` header lines (see diffPathsOf). The
+ * gate counts those only when the command was a git diff or show.
  */
 export function evidenceFrom(lines: readonly unknown[]): EvidenceRecord[] {
   const c = new EvidenceCollector();
@@ -267,6 +302,7 @@ export function evidenceFrom(lines: readonly unknown[]): EvidenceRecord[] {
 class EvidenceCollector {
   readonly records: EvidenceRecord[] = [];
   private readonly open = new Map<string, EvidenceRecord>();
+  private diffBudget = MAX_DIFF_PATHS_RUN;
 
   /** Settle calls from a line that was too long to parse: `failed` is true if the line said any of its results was an error. */
   settleSkipped(ids: Iterable<string>, failed: boolean): void {
@@ -294,6 +330,11 @@ class EvidenceCollector {
         const rec = this.open.get(block.tool_use_id);
         if (rec) {
           rec.ok = block.is_error !== true;
+          if (rec.ok && rec.kind === 'run') {
+            const shown = this.diffBudget > 0 ? diffPathsOf(resultText(block.content)).slice(0, this.diffBudget) : [];
+            this.diffBudget -= shown.length;
+            if (shown.length) rec.diffPaths = shown;
+          }
           this.open.delete(block.tool_use_id);
         }
       }

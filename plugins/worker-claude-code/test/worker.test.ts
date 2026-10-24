@@ -15,6 +15,7 @@ import worker, {
   buildArgs,
   buildEnv,
   hardenEnv,
+  diffPathsOf,
   evidenceFrom,
   parseClaudeOutput,
   OutputParser,
@@ -356,6 +357,79 @@ describe('tool-use records', () => {
     fire(req());
     await waitFor(() => seen.length > 0);
     expect((seen[0]!.payload as { evidence: unknown }).evidence).toEqual([]);
+  });
+});
+
+// A `git diff` result names the files it showed in its headers. Only those headers are kept, and only for a Bash call that worked.
+const DIFF_OUT = [
+  'diff --git a/package-lock.json b/package-lock.json',
+  'index 1111111..2222222 100644',
+  '--- a/package-lock.json',
+  '+++ b/package-lock.json',
+  '@@ -1 +1 @@',
+  '-x',
+  '+diff --git a/not/a/header.js b/not/a/header.js',
+  'diff --git a/src/chunk.js b/src/chunk.js',
+  'new file mode 100644',
+].join('\n');
+
+describe('diff paths from a Bash result', () => {
+  it('reads the a/ b/ headers, once each, and a rename names both sides', () => {
+    expect(diffPathsOf(DIFF_OUT)).toEqual(['package-lock.json', 'src/chunk.js']);
+    expect(diffPathsOf('diff --git a/src/old.js b/src/new.js\nsimilarity index 90%')).toEqual(['src/old.js', 'src/new.js']);
+    expect(diffPathsOf('diff --git a/my file.js b/my file.js')).toEqual(['my file.js']);
+  });
+
+  it('a stat, a name list, a quoted or prefix-less header, or a header inside a line gives nothing', () => {
+    expect(diffPathsOf(' src/chunk.js      | 12 ++++++\n package-lock.json |  4 ++\n 2 files changed')).toEqual([]);
+    expect(diffPathsOf('src/chunk.js\npackage-lock.json')).toEqual([]);
+    expect(diffPathsOf('diff --git "a/odd\\tname.js" "b/odd\\tname.js"')).toEqual([]);
+    expect(diffPathsOf('diff --git src/chunk.js src/chunk.js')).toEqual([]);
+    expect(diffPathsOf('see: diff --git a/src/chunk.js b/src/chunk.js')).toEqual([]);
+  });
+
+  it('keeps at most 200 paths, flattened and clipped', () => {
+    const many = Array.from({ length: 250 }, (_, n) => `diff --git a/f${n}.js b/f${n}.js`).join('\n');
+    expect(diffPathsOf(many)).toHaveLength(200);
+    const [long] = diffPathsOf(`diff --git a/${'x'.repeat(400)}.js b/${'x'.repeat(400)}.js`);
+    expect(long!.length).toBeLessThanOrEqual(300);
+    expect(diffPathsOf('diff --git a/\u202eevil.js b/\u202eevil.js')).toEqual(['evil.js']);
+  });
+
+  it('keeps at most 1000 paths across a whole run', () => {
+    const big = Array.from({ length: 200 }, (_, n) => `diff --git a/f${n}.js b/f${n}.js`).join('\n');
+    const lines = Array.from({ length: 7 }, (_, n) => [use(`d${n}`, 'Bash', { command: 'git diff' }), answer(`d${n}`, false, big)]).flat();
+    const ev = evidenceFrom(lines);
+    expect(ev.map((r) => r.diffPaths?.length ?? 0)).toEqual([200, 200, 200, 200, 200, 0, 0]);
+  });
+
+  it('a successful Bash result carries them, as a string or as text blocks; a failed one, a Read or a Grep does not', () => {
+    const blocks = [{ type: 'text', text: DIFF_OUT }, { type: 'image', text: 'diff --git a/img.js b/img.js' }];
+    const out = parseClaudeOutput(
+      ndjson(
+        use('b1', 'Bash', { command: 'git diff 0f9c2565 HEAD' }),
+        answer('b1', false, DIFF_OUT),
+        use('b2', 'Bash', { command: 'git show HEAD' }),
+        answer('b2', undefined, blocks as unknown as string),
+        use('b3', 'Bash', { command: 'git diff main' }),
+        answer('b3', true, DIFF_OUT),
+        use('b4', 'Bash', { command: 'git diff --stat 0f9c2565 HEAD' }),
+        answer('b4', false, ' src/chunk.js | 12 ++++++'),
+        use('r1', 'Read', { file_path: 'notes.md' }),
+        answer('r1', false, DIFF_OUT),
+        use('g1', 'Grep', { pattern: 'diff' }),
+        answer('g1', false, DIFF_OUT),
+        done('ok'),
+      ),
+    );
+    expect(out.evidence).toEqual([
+      { tool: 'Bash', kind: 'run', target: 'git diff 0f9c2565 HEAD', ok: true, diffPaths: ['package-lock.json', 'src/chunk.js'] },
+      { tool: 'Bash', kind: 'run', target: 'git show HEAD', ok: true, diffPaths: ['package-lock.json', 'src/chunk.js'] },
+      { tool: 'Bash', kind: 'run', target: 'git diff main', ok: false },
+      { tool: 'Bash', kind: 'run', target: 'git diff --stat 0f9c2565 HEAD', ok: true },
+      { tool: 'Read', kind: 'read', target: 'notes.md', ok: true },
+      { tool: 'Grep', kind: 'search', target: 'diff', ok: true },
+    ]);
   });
 });
 

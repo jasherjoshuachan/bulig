@@ -271,9 +271,10 @@ done
 if grep -q "Couldn't switch to pasta namespaces: Operation not permitted" "$PS" && grep -q 'KNOWN LIMIT: the filter matches ADDRESSES, NOT PORTS' "$PS" && grep -q 'isolation.c' "$PS"; then ok "the pasta unit says why --runas 0, where its capability list comes from, and the addresses-not-ports limit"; else bad "the pasta unit's comments are missing the reasons"; fi
 
 echo "the worker runs only in its namespace"
-# two BindsTo= lines: the namespace, and pasta (a worker without pasta has no network; #68's readiness wait can fail its start)
-if [ "$(value bulig-worker.service BindsTo | tr '\n' ' ')" = "bulig-netns.service bulig-pasta.service " ]; then ok "bulig-worker.service: BindsTo=bulig-netns.service and BindsTo=bulig-pasta.service (it never runs without its namespace or its way out)"; else bad "bulig-worker.service: BindsTo is '$(value bulig-worker.service BindsTo | tr '\n' ' ')', wanted 'bulig-netns.service bulig-pasta.service '"; fi
-if grep -q 'BindsTo pasta as well, not only Requires=' "$sd/bulig-worker.service" && grep -q "pasta's Restart=always" "$sd/bulig-worker.service"; then ok "and says why BindsTo, not Requires, and what pasta's restarts do to the worker"; else bad "the worker unit does not explain BindsTo=bulig-pasta.service"; fi
+want bulig-worker.service BindsTo bulig-netns.service
+# Requires= pasta, not BindsTo= (measured on systemd 255.4: a BindsTo= worker stays down after a pasta crash; a Requires= one stays up)
+want bulig-worker.service Requires bulig-pasta.service
+if grep -q 'Requires pasta, not BindsTo' "$sd/bulig-worker.service" && grep -q 'STAYED DOWN' "$sd/bulig-worker.service" && grep -q 'REMAINING GAP' "$sd/bulig-worker.service"; then ok "and says why Requires, not BindsTo (the measured crash test), and the gap after a failed boot start"; else bad "the worker unit does not explain Requires=bulig-pasta.service"; fi
 if value bulig-worker.service After | grep -q 'bulig-netns.service' && value bulig-worker.service After | grep -q 'bulig-pasta.service' && value bulig-worker.service Wants | grep -q 'bulig-pasta.service'; then ok "the worker starts after the namespace and pasta, and wants pasta"; else bad "worker namespace ordering: After=$(value bulig-worker.service After) Wants=$(value bulig-worker.service Wants)"; fi
 if ! value bulig-worker.service IPAddressAllow | grep -q '127.74.3.1'; then ok "the worker no longer allows 127.74.3.1 (in its namespace that is its own loopback; the gateway is 198.18.74.1)"; else bad "the worker still allows 127.74.3.1"; fi
 

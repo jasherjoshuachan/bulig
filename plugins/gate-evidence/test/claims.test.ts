@@ -332,6 +332,44 @@ describe('a file shown by a git diff counts as read', () => {
     expect(checkClaims(claims('`chunk.js` exports chunk.', 'review'), [diff('git diff HEAD~1', ['src/chunk.js'])])).toEqual([]);
   });
 
+  it('a git command that can print file or message text at the start of a line counts for nothing', () => {
+    const c = claims('`src/chunk.js` exports chunk.', 'review');
+    const counts = (cmd: string) => checkClaims(c, [diff(cmd, ['src/chunk.js'])]).length === 0;
+    for (const cmd of [
+      'git diff --word-diff HEAD~1', // context lines are not prefixed
+      'git diff --word-diff=plain HEAD~1',
+      'git diff --color-words HEAD~1',
+      "git diff --output-indicator-context='' HEAD~1",
+      'git diff --output=/tmp/d HEAD~1',
+      "git diff --line-prefix='' HEAD~1",
+      'git diff --src-prefix=a/ --dst-prefix=b/ HEAD~1',
+      'git diff --ext-diff HEAD~1',
+      'git diff --textconv HEAD~1',
+      'git show HEAD:notes.md', // the file itself
+      "git show 'HEAD:notes.md'",
+      'git diff HEAD:a.md HEAD:b.md',
+      'git show --format=%B HEAD', // the commit message, not indented
+      'git show --pretty=format:%B HEAD',
+      'git cat-file -p HEAD:notes.md',
+      'git log --format=%B -1',
+      'git log -p -1',
+      'git status && git diff HEAD~1', // any other git command in the chain
+      "git -c alias.x='!cat notes.md' x",
+      'git -c diff.external=cat diff HEAD~1',
+      'GIT_EXTERNAL_DIFF=cat git diff HEAD~1',
+      'cd /work/wt && GIT_EXTERNAL_DIFF=cat git diff HEAD~1',
+      'cat notes.md & git diff HEAD~1', // a lone & is not split by segments()
+      'git diff $(cat notes.md)',
+      'git diff `cat notes.md`',
+      'git diff HEAD~1 <(cat notes.md)',
+      `git diff ${'x'.repeat(290)} ; cat notes.md`.slice(0, 300), // cut by the worker: the end is unknown
+      `git diff ${'x'.repeat(295)}`,
+    ]) expect(counts(cmd), cmd).toBe(false);
+    for (const cmd of ['git diff HEAD~1', 'git diff 0f9c2565 HEAD 2>&1 | head -400', 'git diff --stat -p HEAD~1', 'git show --stat -p HEAD', 'git diff --no-textconv HEAD~1', 'git diff -- src/chunk.js']) {
+      expect(counts(cmd), cmd).toBe(true);
+    }
+  });
+
   it('build attempt 2 of the same job: divide.js was never read, shown or edited, so that warning is true', () => {
     const records = [
       read('/work/wt/src/chunk.js'),

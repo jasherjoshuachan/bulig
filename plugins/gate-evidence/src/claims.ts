@@ -239,20 +239,41 @@ const isDiffCommand = (command: string) => segments(command).some((seg) => /^git
 
 const normal = (p: string) => p.replace(/^(?:\.\/)+/, '').replace(/\\/g, '/');
 
-/** `git diff` or `git show`, after git's own options (`-C <dir>`, `--no-pager`, ...). */
-const GIT_DIFF = /^git(?:\s+(?:-[Cc]\s+\S+|--no-pager|--git-dir=\S+|--work-tree=\S+))*\s+(?:diff|show)\b/;
-const GIT_ANY = /^git(?:\s|$)/;
+/** `git diff` or `git show`, after git's own options. `-c` is left out: it can set an alias or an external diff program. */
+const GIT_DIFF = /^git(?:\s+(?:-C\s+\S+|--no-pager|--git-dir=\S+|--work-tree=\S+))*\s+(?:diff|show)\b/;
 /** A pager-like filter with options only (`head -200`, `tail -n 50`): it can cut git's output, not add to it. */
 const FILTER = /^(?:head|tail)(?:\s+-[\w-]+)*(?:\s+\d+)?$/;
+/**
+ * Options that print lines without the diff's own prefix, so file or message text can start a line with `diff --git`:
+ * word diffs, changed indicators or prefixes, an output file, an external diff or textconv, and a commit format (`%B`).
+ */
+const UNPREFIXED = /^(?:--word-diff|--color-words|--output|--line-prefix|--src-prefix|--dst-prefix|--ext-diff|--textconv|--format|--pretty)/;
+/** The worker cuts a command at 300 characters (one less before an emoji), so a target this long may have lost its end. */
+const CUT_AT = 299;
+
+/** Is this shell text one that segments() reads as written? A lone `&`, `$(..)`, backticks or `<(..)` hide a second command. */
+const plainShell = (command: string) => {
+  const rest = command.replace(/\d*>&\d+|&>/g, ' ').replace(/&&/g, ' ');
+  return !/[&`]|\$\(|[<>]\(/.test(rest);
+};
 
 /**
- * Was all the output of this command written by git, with at least one git diff or show? Only then are its diff
- * headers taken as files the person saw. `cat notes.md` or `echo ...; git diff --stat` could print a header that
- * shows nothing.
+ * Was all the output of this command a diff printed by git? Only then are its diff headers taken as files the person
+ * saw. Every segment must be `git diff` or `git show` (or a head/tail filter), with no option that prints lines
+ * without a prefix and no `<rev>:<path>` (which prints the file itself). `cat notes.md`, `echo ...; git diff --stat`,
+ * `git show HEAD:notes.md`, `git log --format=%B` and `git -c alias.x='!cat f' x` all count for nothing.
  */
 const printedByGitDiff = (command: string) => {
+  if (command.length >= CUT_AT || !plainShell(command)) return false;
+  // segments() drops `VAR=...` in front of a command, and GIT_EXTERNAL_DIFF=cat would print the file as is.
+  if (command.split(/&&|\|\||;|\||\n/).some((seg) => /^\s*\w+=/.test(seg))) return false;
   const segs = segments(command);
-  return segs.some((seg) => GIT_DIFF.test(seg)) && segs.every((seg) => GIT_ANY.test(seg) || FILTER.test(seg));
+  const gitDiff = (seg: string) =>
+    GIT_DIFF.test(seg) && words(seg).every((w) => {
+      const word = w.replace(/^["']+|["']+$/g, '');
+      return !UNPREFIXED.test(word) && (word.startsWith('-') || !word.includes(':'));
+    });
+  return segs.some(gitDiff) && segs.every((seg) => gitDiff(seg) || FILTER.test(seg));
 };
 
 const samePath = (have: string, want: string) => have === want || have.endsWith(`/${want}`);

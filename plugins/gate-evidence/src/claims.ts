@@ -11,6 +11,8 @@ export interface EvidenceRecord {
   kind: 'read' | 'search' | 'edit' | 'run' | 'other';
   target: string;
   ok: boolean;
+  /** For a Bash run: the files its output showed in full, from the `diff --git a/<path> b/<path>` headers. Counted only for a git diff or show (see touches). */
+  diffPaths?: string[];
 }
 
 export type ClaimKind = 'test' | 'build' | 'file' | 'changed' | 'looked';
@@ -237,13 +239,54 @@ const isDiffCommand = (command: string) => segments(command).some((seg) => /^git
 
 const normal = (p: string) => p.replace(/^(?:\.\/)+/, '').replace(/\\/g, '/');
 
+/** `git diff` or `git show`, after git's own options. `-c` is left out: it can set an alias or an external diff program. */
+const GIT_DIFF = /^git(?:\s+(?:-C\s+\S+|--no-pager|--git-dir=\S+|--work-tree=\S+))*\s+(?:diff|show)\b/;
+/** A pager-like filter with options only (`head -200`, `tail -n 50`): it can cut git's output, not add to it. */
+const FILTER = /^(?:head|tail)(?:\s+-[\w-]+)*(?:\s+\d+)?$/;
+/**
+ * Options that print lines without the diff's own prefix, so file or message text can start a line with `diff --git`:
+ * word diffs, changed indicators or prefixes, an output file, an external diff or textconv, and a commit format (`%B`).
+ */
+const UNPREFIXED = /^(?:--word-diff|--color-words|--output|--line-prefix|--src-prefix|--dst-prefix|--ext-diff|--textconv|--format|--pretty)/;
+/** The worker cuts a command at 300 characters (one less before an emoji), so a target this long may have lost its end. */
+const CUT_AT = 299;
+
+/** Is this shell text one that segments() reads as written? A lone `&`, `$(..)`, backticks or `<(..)` hide a second command. */
+const plainShell = (command: string) => {
+  const rest = command.replace(/\d*>&\d+|&>/g, ' ').replace(/&&/g, ' ');
+  return !/[&`]|\$\(|[<>]\(/.test(rest);
+};
+
+/**
+ * Was all the output of this command a diff printed by git? Only then are its diff headers taken as files the person
+ * saw. Every segment must be `git diff` or `git show` (or a head/tail filter), with no option that prints lines
+ * without a prefix and no `<rev>:<path>` (which prints the file itself). `cat notes.md`, `echo ...; git diff --stat`,
+ * `git show HEAD:notes.md`, `git log --format=%B` and `git -c alias.x='!cat f' x` all count for nothing.
+ */
+const printedByGitDiff = (command: string) => {
+  if (command.length >= CUT_AT || !plainShell(command)) return false;
+  // segments() drops `VAR=...` in front of a command, and GIT_EXTERNAL_DIFF=cat would print the file as is.
+  if (command.split(/&&|\|\||;|\||\n/).some((seg) => /^\s*\w+=/.test(seg))) return false;
+  const segs = segments(command);
+  const gitDiff = (seg: string) =>
+    GIT_DIFF.test(seg) && words(seg).every((w) => {
+      const word = w.replace(/^["']+|["']+$/g, '');
+      return !UNPREFIXED.test(word) && (word.startsWith('-') || !word.includes(':'));
+    });
+  return segs.some(gitDiff) && segs.every((seg) => gitDiff(seg) || FILTER.test(seg));
+};
+
+const samePath = (have: string, want: string) => have === want || have.endsWith(`/${want}`);
+
 /** Is `path` the file of this record, or named by the command of a run/search record? */
 function touches(rec: EvidenceRecord, path: string): boolean {
   const want = normal(path);
   const have = normal(rec.target);
-  if (rec.kind === 'read' || rec.kind === 'edit') return have === want || have.endsWith(`/${want}`);
-  if (rec.kind === 'run') return rec.ok && words(have).some((w) => normal(w.replace(/^["'`]|["'`]$/g, '')) === want || normal(w).endsWith(`/${want}`));
-  return false;
+  if (rec.kind === 'read' || rec.kind === 'edit') return samePath(have, want);
+  if (rec.kind !== 'run' || !rec.ok) return false;
+  if (words(have).some((w) => normal(w.replace(/^["'`]|["'`]$/g, '')) === want || normal(w).endsWith(`/${want}`))) return true;
+  // A successful `git diff <base> HEAD` showed every file it printed a header for. A `--stat` prints no headers, so it shows none.
+  return !!rec.diffPaths?.length && printedByGitDiff(rec.target) && rec.diffPaths.some((p) => samePath(normal(p), want));
 }
 
 /** Which claims have no record behind them. A claim with a record is not listed. */
@@ -286,6 +329,9 @@ export function checkClaims(claims: readonly Claim[], records: readonly Evidence
 
 // ---------- what the person sees ----------
 
+/** Most diff paths kept from one record. The worker keeps the same number. */
+const MAX_DIFF_PATHS = 200;
+
 /** Check the shape of what arrived as records. Anything that is not exactly a record is dropped. */
 export function parseRecords(raw: unknown): EvidenceRecord[] {
   if (!Array.isArray(raw)) return [];
@@ -294,7 +340,10 @@ export function parseRecords(raw: unknown): EvidenceRecord[] {
   for (const r of raw.slice(0, 300) as Record<string, unknown>[]) {
     if (typeof r !== 'object' || r === null) continue;
     if (typeof r.tool !== 'string' || typeof r.kind !== 'string' || !kinds.has(r.kind) || typeof r.target !== 'string' || typeof r.ok !== 'boolean') continue;
-    out.push({ tool: r.tool, kind: r.kind as EvidenceRecord['kind'], target: r.target, ok: r.ok });
+    const rec: EvidenceRecord = { tool: r.tool, kind: r.kind as EvidenceRecord['kind'], target: r.target, ok: r.ok };
+    // A list that is not all strings is dropped, not the record: the record still counts for what it is, and the list for nothing.
+    if (Array.isArray(r.diffPaths) && r.diffPaths.length && r.diffPaths.every((p) => typeof p === 'string')) rec.diffPaths = (r.diffPaths as string[]).slice(0, MAX_DIFF_PATHS);
+    out.push(rec);
   }
   return out;
 }

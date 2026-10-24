@@ -53,6 +53,8 @@ const Evidence = z.strictObject({
   kind: z.enum(['read', 'search', 'edit', 'run', 'other']),
   target: z.string().max(1000),
   ok: z.boolean(),
+  /** The files a successful `git diff` or `git show` printed (worker-claude-code's diffPathsOf). */
+  diffPaths: z.array(z.string().max(1000)).max(200).optional(),
 });
 
 export const ResultRequest = z.strictObject({

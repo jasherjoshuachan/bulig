@@ -93,10 +93,13 @@ for (const adapter of ADAPTERS) {
       const ids = { stageId, attempt: got.json.attempt, generation: got.json.generation };
 
       expect((await post(r.url, '/heartbeat', TOKENS.mac, ids)).status).toBe(200);
-      const done = await post(r.url, '/result', TOKENS.mac, { ...ids, outcome: 'completed', output: { result: 'A plan', costUsd: 0.5, sessionId: 's-1', evidence: [{ tool: 'Read', kind: 'read', target: 'a.md', ok: true }] } });
+      // A git diff record carries the files it showed, so the evidence gate can count them as read on a remote run too.
+      const evidence = [{ tool: 'Read', kind: 'read', target: 'a.md', ok: true }, { tool: 'Bash', kind: 'run', target: 'git diff main', ok: true, diffPaths: ['src/a.ts'] }];
+      const done = await post(r.url, '/result', TOKENS.mac, { ...ids, outcome: 'completed', output: { result: 'A plan', costUsd: 0.5, sessionId: 's-1', evidence } });
       expect(done.status).toBe(200);
       const completed = r.types('stage.completed');
       expect(completed).toHaveLength(1);
+      expect((completed[0]!.payload as { evidence: unknown }).evidence).toEqual(evidence);
       expect(completed[0]!.jobId).toBe(job.id);
       expect(completed[0]!.source).toBe('worker-gateway');
       expect(completed[0]!.payload).toMatchObject({ stage: 'plan', ok: true, result: 'A plan', costUsd: 0.5, sessionId: 's-1', workerId: 'mac' });

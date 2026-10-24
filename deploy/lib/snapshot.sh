@@ -8,6 +8,20 @@ SNAPSHOT_NOISE='^(apt-daily|apt-daily-upgrade|fwupd-refresh|motd-news|man-db|e2s
 # Names that are Bulig's: units, users, groups, files.
 SNAPSHOT_OWN='^(bulig|postgresql@16-bulig)'
 
+# snapshot_listener_fields: ss -H -ltnpe lines on stdin, "<address> <process> <uid>" out (pids and fds stripped; uid "-" when ss gives
+# none). Bulig's own ports are left out. The process is the field just before the first "uid:" or "ino:" one (the last field without -e).
+snapshot_listener_fields() {
+  awk -v p=":($BULIG_PG_PORT|$BULIG_GATEWAY_PORT)\$" '
+    NF < 5 { next }
+    {
+      k = NF; uid = "-"
+      for (i = 5; i <= NF; i++) if ($i ~ /^(uid|ino):[0-9]+$/) { k = i - 1; break }
+      for (i = k + 1; i <= NF; i++) if ($i ~ /^uid:[0-9]+$/) { uid = substr($i, 5); break }
+      addr = $4; proc = ($k ~ /^users:/) ? $k : "-"
+      if (addr !~ p) print addr, proc, uid
+    }' | sed -E 's/pid=[0-9]+,?//g; s/,?fd=[0-9]+//g'
+}
+
 snapshot() {
   echo "## pg_lsclusters (the bulig cluster is left out)"
   if command -v pg_lsclusters >/dev/null 2>&1; then
@@ -28,10 +42,14 @@ snapshot() {
   systemctl list-timers --all --no-legend --plain --no-pager \
     | grep -Eo '[^ ]+\.timer +[^ ]+\.service' | grep -Ev "$SNAPSHOT_OWN" | sort || true
 
+  # One ss call feeds this section and the owners section below, so the two always describe the same sockets. -e adds "uid:<n> ino:<n> sk:..."
+  # after the process (ss prints no uid for root); this section stops before those, so it reads exactly as the -ltnp one older kits wrote.
+  local listeners
+  listeners="$(ss -H -ltnpe 2>/dev/null)"
   echo "## listening tcp sockets (Bulig's ports $BULIG_PG_PORT and $BULIG_GATEWAY_PORT left out; pids stripped)"
-  ss -H -ltnp 2>/dev/null \
-    | awk -v p=":($BULIG_PG_PORT|$BULIG_GATEWAY_PORT)\$" '{ addr = $4; proc = ($NF ~ /^users:/) ? $NF : "-"; if (addr !~ p) print addr, proc }' \
-    | sed -E 's/pid=[0-9]+,?//g; s/,?fd=[0-9]+//g' | sort -u
+  printf '%s\n' "$listeners" | snapshot_listener_fields | awk '{ print $1, $2 }' | sort -u
+  echo "## listener owners (address, process, uid; - when ss gives none, as for root)"
+  printf '%s\n' "$listeners" | snapshot_listener_fields | sort -u
 
   # Read by snapshot_compare: a loopback listener on a port in this range can be a short-lived one (snapshot_ephemeral_listeners).
   echo "## ephemeral port range (net.ipv4.ip_local_port_range)"
@@ -124,9 +142,11 @@ snapshot_prune_releases() {
 #     stopped while its image still runs in another container. A new image, a container whose image no longer runs anywhere, or a known
 #     container on a new image still fails.
 #   - a listener on a loopback address and a port in the kernel's ephemeral range that appeared or went away, while a listener of the same
-#     process on a fixed port is there in both snapshots (a local server's per-job runner port). Both snapshots must show the same valid range;
-#     a snapshot without one (an older kit, an unreadable /proc) makes no listener ephemeral. A change on a fixed port, on an address that is
-#     not loopback, or of a process with no lasting fixed-port listener still fails. (snapshot_ephemeral_listeners)
+#     process and the same uid on a fixed port is there in both snapshots (a local server's per-job runner port). Both snapshots must show the
+#     same valid range and the owners section; one without (an older kit, an unreadable /proc) makes no listener ephemeral. Never for a uid
+#     that is unknown, root, Bulig's (its users, or systemd's dynamic-user range the build runs in), nor on Bulig's 127.74.x.x addresses. A
+#     change on a fixed port, on an address that is not loopback, or of a process with no lasting fixed-port listener of its uid still fails.
+#     (snapshot_ephemeral_listeners)
 #   - the run state of a unit named in the host's own ignore list (BULIG_POSTCHECK_IGNORE, root's, never in git), only when no socket can
 #     start it (instance_not_socket_started, fail closed). Its unit file and enabled state are still compared. (snapshot_ignore_load)
 # Bulig's own units are never in a snapshot (SNAPSHOT_OWN), and they are never counted as churn either.
@@ -136,6 +156,7 @@ SNAPSHOT_DOCKER_SECTION='^## docker containers'
 SNAPSHOT_UNITFILE_SECTION='^## service unit files'
 SNAPSHOT_LISTEN_SECTION='^## listening tcp sockets'
 SNAPSHOT_PORTRANGE_SECTION='^## ephemeral port range'
+SNAPSHOT_OWNER_SECTION='^## listener owners'
 SNAPSHOT_TRANSIENT='^run-[up][0-9][^ ]*\.service$'
 SNAPSHOT_INSTANCE='^[^@ ]+@[^@ ]+\.service$'
 
@@ -242,48 +263,69 @@ snapshot_compare() {
         }
       }' "$before" "$after")
   # Short-lived loopback listeners on an ephemeral port, next to a lasting one of the same process.
-  local verb line eph_lines="" no_range=""
-  while IFS=$'\t' read -r verb line; do
+  local verb line uid eph_lines="" own_lines="" no_meta=""
+  while IFS=$'\t' read -r verb line uid; do
     [ -n "$line" ] || continue
     eph_lines="$eph_lines$line"$'\n'
-    echo "info  listener $line $verb (a loopback address and a port in the ephemeral range, next to a lasting listener of the same process on a fixed port; not compared)"
+    own_lines="$own_lines$line $uid"$'\n'
+    echo "info  listener $line (uid $uid) $verb (a loopback address and a port in the ephemeral range, next to a lasting listener of the same process and uid on a fixed port; not compared)"
   done < <(snapshot_ephemeral_listeners "$before" "$after")
-  # A before snapshot from an older kit has no port range section: leave it out of both copies (and then no listener is ephemeral).
-  if ! grep -Eq "$SNAPSHOT_PORTRANGE_SECTION" "$before" || ! grep -Eq "$SNAPSHOT_PORTRANGE_SECTION" "$after"; then
-    no_range=1
-    echo "info  one snapshot has no ephemeral port range (an older kit took it): the range is not compared, and every listener change is"
+  # A before snapshot from an older kit has no port range and no owners section: leave both out of both copies (and then no listener is
+  # ephemeral, since there is no range and no uid to go by).
+  if ! grep -Eq "$SNAPSHOT_PORTRANGE_SECTION" "$before" || ! grep -Eq "$SNAPSHOT_PORTRANGE_SECTION" "$after" \
+    || ! grep -Eq "$SNAPSHOT_OWNER_SECTION" "$before" || ! grep -Eq "$SNAPSHOT_OWNER_SECTION" "$after"; then
+    no_meta=1
+    echo "info  one snapshot has no ephemeral port range or listener owners (an older kit took it): those are not compared, and every listener change is"
   fi
   # The copies: the same lines minus those.
-  snapshot_drop "$before" "$timed $churn $ignored" "$new_ctrs" "$uf_churn" "$eph_lines" "$no_range" >"$3"
-  snapshot_drop "$after" "$timed $churn $ignored" "$new_ctrs" "$uf_churn" "$eph_lines" "$no_range" >"$4"
+  snapshot_drop "$before" "$timed $churn $ignored" "$new_ctrs" "$uf_churn" "$eph_lines" "$no_meta" "$own_lines" >"$3"
+  snapshot_drop "$after" "$timed $churn $ignored" "$new_ctrs" "$uf_churn" "$eph_lines" "$no_meta" "$own_lines" >"$4"
 }
 
-# snapshot_ephemeral_listeners <before> <after>: one line per listener that is in one snapshot and not the other, "appeared<TAB><line>" or
-# "went away<TAB><line>", when all of these hold: its address is loopback (127.x.x.x or [::1]); its port is in the ephemeral range, which both
-# snapshots show the same and valid (two numbers, the low one 1024 or more); its process is named (not "-"); and a listener of that same
-# process on a port outside the range is in both snapshots. Anything else is not printed, so it is compared.
+# snapshot_bulig_uids: Bulig's users' uids, space-separated with a space at each end (the users that do not exist are left out).
+snapshot_bulig_uids() {
+  local u ids=" "
+  for u in $BULIG_USERS; do
+    ids="$ids$({ getent passwd "$u" 2>/dev/null || true; } | awk -F: -v n="$u" '$1 == n { print $3; exit }') "
+  done
+  echo "$ids"
+}
+
+# snapshot_ephemeral_listeners <before> <after>: one line per listener that is in one snapshot and not the other, "appeared<TAB><line><TAB><uid>"
+# or "went away<TAB><line><TAB><uid>", when all of these hold:
+#   - its address is loopback (127.x.x.x or [::1]) and not Bulig's (127.74.x.x; Bulig's 198.18.74.1 is not loopback);
+#   - its port is in the ephemeral range, which both snapshots show the same and valid (two numbers, the low one 1024 or more);
+#   - its process is named (not "-"), and its uid (from the owners section of the snapshot it is in, one uid only) is a number that is not
+#     root (0), not one of Bulig's users, and not in systemd's dynamic-user range 61184-65519 (the build is a DynamicUser);
+#   - a listener of the same process AND the same uid, on a port outside the range, is in both snapshots with that uid in both.
+# Anything else is not printed, so it is compared.
+SNAPSHOT_DYNAMIC_UIDS="61184 65519"
 snapshot_ephemeral_listeners() {
-  awk -v ls="$SNAPSHOT_LISTEN_SECTION" -v pr="$SNAPSHOT_PORTRANGE_SECTION" '
+  awk -v ls="$SNAPSHOT_LISTEN_SECTION" -v pr="$SNAPSHOT_PORTRANGE_SECTION" -v ow="$SNAPSHOT_OWNER_SECTION" -v buids="$(snapshot_bulig_uids)" -v dyn="$SNAPSHOT_DYNAMIC_UIDS" '
     function eph(p) { return same && p >= lo && p <= hi }
     function port(a) { return match(a, /:[0-9]+$/) ? substr(a, RSTART + 1) + 0 : -1 }
     function loopback(a, h) { h = a; sub(/:[0-9]+$/, "", h); return h ~ /^127\.[0-9]+\.[0-9]+\.[0-9]+$/ || h == "[::1]" }
+    function tenant(u) { return u ~ /^[1-9][0-9]*$/ && !index(buids, " " u " ") && !(u + 0 >= dl && u + 0 <= dh) }
+    BEGIN { split(dyn, dr, " "); dl = dr[1] + 0; dh = dr[2] + 0 }
     FNR == 1 { f++ }
-    /^## / { sec = ($0 ~ ls) ? "ls" : ($0 ~ pr) ? "pr" : ""; next }
+    /^## / { sec = ($0 ~ ls) ? "ls" : ($0 ~ pr) ? "pr" : ($0 ~ ow) ? "ow" : ""; next }
     sec == "pr" && NF == 2 && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && $1 + 0 >= 1024 { rng[f] = $1 " " $2; next }
     sec == "ls" && NF >= 2 { has[f, $0] = 1; if (!($0 in seen)) { seen[$0] = 1; order[++n] = $0 } }
+    sec == "ow" && NF >= 3 { u = $NF; k = substr($0, 1, length($0) - length(u) - 1); if ((f, k) in uid) { if (uid[f, k] != u) uid[f, k] = "?" } else uid[f, k] = u }
     END {
       same = (rng[1] != "" && rng[1] == rng[2])
       split(rng[2], r, " "); lo = r[1] + 0; hi = r[2] + 0
       for (i = 1; i <= n; i++) {
         l = order[i]; a = l; sub(/ .*/, "", a); p = substr(l, length(a) + 2)
-        if (has[1, l] && has[2, l]) { if (!eph(port(a))) lasting[p] = 1 }
+        if (has[1, l] && has[2, l] && uid[1, l] == uid[2, l] && tenant(uid[2, l])) { if (!eph(port(a))) lasting[p] = lasting[p] " " uid[2, l] " " }
       }
       for (i = 1; i <= n; i++) {
         l = order[i]; a = l; sub(/ .*/, "", a); p = substr(l, length(a) + 2)
         if (has[1, l] && has[2, l]) continue
-        if (p == "-" || !(p in lasting)) continue
-        if (!loopback(a) || !eph(port(a))) continue
-        print (has[1, l] ? "went away" : "appeared") "\t" l
+        u = has[1, l] ? uid[1, l] : uid[2, l]
+        if (p == "-" || !tenant(u) || !index(lasting[p], " " u " ")) continue
+        if (!loopback(a) || a ~ /^127\.74\./ || !eph(port(a))) continue
+        print (has[1, l] ? "went away" : "appeared") "\t" l "\t" u
       }
     }' "$1" "$2"
 }
@@ -291,50 +333,59 @@ snapshot_ephemeral_listeners() {
 # ---- the host's own ignore list --------------------------------------------------------------------------------------------------
 # BULIG_POSTCHECK_IGNORE (/etc/bulig/postcheck-ignore.txt): units whose run state other tenants or the OS change on their own, named on the
 # host and never in git (the repository is public; RUNBOOK step 12). One unit name per line, "#" starts a comment. Missing: nothing is
-# ignored. Used only when it is a plain file (not a link), owned by root, and not writable by its group or by others, and when every line is
-# one service name that is not Bulig's. Anything else: a warn line says why, and nothing in it is ignored (fail closed).
+# ignored. Used only when it is a plain file (not a link) that can be read, it and its folder are owned by root and not writable by their group
+# or by others, and every line is one service name that is not Bulig's. Anything else: a warn line says why, and nothing in it is ignored (fail closed).
 # snapshot_ignore_load sets SNAPSHOT_IGNORED to the names, space-separated with a space at each end.
 SNAPSHOT_IGNORED=""
 snapshot_ignore_load() {
-  local f="$BULIG_POSTCHECK_IGNORE" owner=0 n=0 name rest names=" "
+  local f="$BULIG_POSTCHECK_IGNORE" n=0 name rest names=" " why
   SNAPSHOT_IGNORED=""
   if [ ! -e "$f" ] && [ ! -L "$f" ]; then return 0; fi
   if [ -L "$f" ] || [ ! -f "$f" ]; then
-    echo "warn  the host's ignore list $f is a link or not a plain file, so it is not used: every unit is compared"
+    ignore_refused "it is a link or not a plain file"
     return 0
   fi
-  # (the tests own their files: there the owner is the test user)
-  if [ -n "$R" ]; then owner="${BULIG_TEST_OWNER_UID:-$(id -u)}"; fi
-  if [ -z "$(find "$f" -prune -user "$owner" 2>/dev/null)" ]; then
-    echo "warn  the host's ignore list $f is not owned by root, so it is not used: every unit is compared"
-    return 0
-  fi
-  if [ -n "$(find "$f" -prune -perm -0020 2>/dev/null)" ]; then
-    echo "warn  the host's ignore list $f is writable by its group, so it is not used: every unit is compared"
-    return 0
-  fi
-  if [ -n "$(find "$f" -prune -perm -0002 2>/dev/null)" ]; then
-    echo "warn  the host's ignore list $f is writable by anyone, so it is not used: every unit is compared"
+  why="$(ignore_path_problem "$(dirname "$f")")"
+  if [ -n "$why" ]; then ignore_refused "$why"; return 0; fi
+  why="$(ignore_path_problem "$f")"
+  if [ -n "$why" ]; then ignore_refused "$why"; return 0; fi
+  if [ ! -r "$f" ]; then
+    ignore_refused "it cannot be read"
     return 0
   fi
   while read -r name rest || [ -n "$name" ]; do
     n=$((n + 1))
     case "$name" in "" | "#"*) continue ;; esac
     if [ -n "$rest" ] && [ "${rest#"#"}" = "$rest" ]; then
-      echo "warn  the host's ignore list $f: line $n holds more than one name, so the list is not used: every unit is compared"
+      ignore_refused "line $n holds more than one name"
       return 0
     fi
     if ! [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9:_.@-]*\.service$ ]]; then
-      echo "warn  the host's ignore list $f: line $n is not one service name (no patterns), so the list is not used: every unit is compared"
+      ignore_refused "line $n is not one service name (no patterns)"
       return 0
     fi
     if grep -Eq "$SNAPSHOT_OWN" <<<"$name"; then
-      echo "warn  the host's ignore list $f: line $n names a Bulig unit, so the list is not used: every unit is compared"
+      ignore_refused "line $n names a Bulig unit"
       return 0
     fi
     names="$names$name "
   done <"$f"
   SNAPSHOT_IGNORED="$names"
+}
+
+# ignore_refused <why>: the warn line for an ignore list that is not used.
+ignore_refused() {
+  echo "warn  the host's ignore list $BULIG_POSTCHECK_IGNORE is not used, so every unit is compared: $1"
+}
+
+# ignore_path_problem <path>: why root must not trust that file or folder (not owned by root, or writable by its group or by others: 0755 or
+# stricter is fine), or nothing. In the tests the owner is the test user (BULIG_TEST_OWNER_UID to pretend otherwise).
+ignore_path_problem() {
+  local p="$1" owner=0
+  if [ -n "$R" ]; then owner="${BULIG_TEST_OWNER_UID:-$(id -u)}"; fi
+  if [ -z "$(find "$p" -prune -user "$owner" 2>/dev/null)" ]; then echo "$p is not owned by root"; return 0; fi
+  if [ -n "$(find "$p" -prune -perm -0020 2>/dev/null)" ]; then echo "$p is writable by its group"; return 0; fi
+  if [ -n "$(find "$p" -prune -perm -0002 2>/dev/null)" ]; then echo "$p is writable by anyone"; return 0; fi
 }
 
 # host_ignores <unit>: true if the host's ignore list (as loaded) names that unit.
@@ -368,19 +419,23 @@ snapshot_unit_state() {
   snapshot_section "$1" '^## every service unit and its state' | awk -v u="$2" '$1 == u { print $2, $3; exit }'
 }
 
-# snapshot_drop <file> <services> <containers> <unit files> [<listener lines> [<no range>]]: the file without those services' run-state lines,
-# those containers' lines, those unit files' lines and those listener lines (whole lines, one per line), and, when <no range> is not empty,
-# without the ephemeral port range section (header too).
+# snapshot_drop <file> <services> <containers> <unit files> [<listener lines> [<no meta> [<owner lines>]]]: the file without those services'
+# run-state lines, those containers' lines, those unit files' lines, those listener lines and those owner lines (whole lines, one per line),
+# and, when <no meta> is not empty, without the ephemeral port range and listener owners sections (headers too).
 snapshot_drop() {
-  SNAPSHOT_DROP_LISTENERS="${5:-}" awk -v units=" $2 " -v ctrs=" $3 " -v ufs=" ${4:-} " -v norange="${6:-}" -v rs="$SNAPSHOT_RUNSTATE_SECTIONS" -v dk="$SNAPSHOT_DOCKER_SECTION" -v uf="$SNAPSHOT_UNITFILE_SECTION" -v ls="$SNAPSHOT_LISTEN_SECTION" -v pr="$SNAPSHOT_PORTRANGE_SECTION" '
-    BEGIN { n = split(ENVIRON["SNAPSHOT_DROP_LISTENERS"], d, "\n"); for (i = 1; i <= n; i++) if (d[i] != "") dropls[d[i]] = 1 }
-    /^## / && norange != "" && $0 ~ pr { sec = "pr"; next }
-    /^## / { sec = ($0 ~ rs) ? "rs" : ($0 ~ dk) ? "dk" : ($0 ~ uf) ? "uf" : ($0 ~ ls) ? "ls" : ""; print; next }
-    sec == "pr" { next }
+  SNAPSHOT_DROP_LISTENERS="${5:-}" SNAPSHOT_DROP_OWNERS="${7:-}" awk -v units=" $2 " -v ctrs=" $3 " -v ufs=" ${4:-} " -v norange="${6:-}" -v rs="$SNAPSHOT_RUNSTATE_SECTIONS" -v dk="$SNAPSHOT_DOCKER_SECTION" -v uf="$SNAPSHOT_UNITFILE_SECTION" -v ls="$SNAPSHOT_LISTEN_SECTION" -v pr="$SNAPSHOT_PORTRANGE_SECTION" -v ow="$SNAPSHOT_OWNER_SECTION" '
+    BEGIN {
+      n = split(ENVIRON["SNAPSHOT_DROP_LISTENERS"], d, "\n"); for (i = 1; i <= n; i++) if (d[i] != "") dropls[d[i]] = 1
+      n = split(ENVIRON["SNAPSHOT_DROP_OWNERS"], d, "\n"); for (i = 1; i <= n; i++) if (d[i] != "") dropow[d[i]] = 1
+    }
+    /^## / && norange != "" && ($0 ~ pr || $0 ~ ow) { sec = "meta"; next }
+    /^## / { sec = ($0 ~ rs) ? "rs" : ($0 ~ dk) ? "dk" : ($0 ~ uf) ? "uf" : ($0 ~ ls) ? "ls" : ($0 ~ ow) ? "ow" : ""; print; next }
+    sec == "meta" { next }
     sec == "rs" && index(units, " " $1 " ") { next }
     sec == "dk" && index(ctrs, " " $1 " ") { next }
     sec == "uf" && index(ufs, " " $1 " ") { next }
     sec == "ls" && ($0 in dropls) { next }
+    sec == "ow" && ($0 in dropow) { next }
     { print }' "$1"
 }
 

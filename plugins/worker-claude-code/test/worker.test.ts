@@ -28,9 +28,11 @@ import worker, {
   withRunWritable,
   removeRunDir,
   repoFactsOf,
+  readWorktreeFile,
+  MAX_PACKAGE_JSON_BYTES,
   run,
 } from '../src/index.ts';
-import type { ChildProcess } from 'node:child_process';
+import { execFileSync, type ChildProcess } from 'node:child_process';
 
 const FAKE = fileURLToPath(new URL('./fixtures/fake-claude.mjs', import.meta.url));
 const dirs: string[] = [];
@@ -1195,9 +1197,85 @@ describe('repoFactsOf', () => {
     expect(await repoFactsOf(join(wt, 'missing'))).toBeUndefined();
   });
 
+  it('a single folder with more entries than the walk looks at gives nothing', async () => {
+    const wt = tmp();
+    for (let n = 0; n < 50_001; n++) writeFileSync(join(wt, `f${n}`), '');
+    expect(await repoFactsOf(wt)).toBeUndefined();
+  }, 60_000);
+
   it('a worktree with more names than it keeps gives nothing, so the gate falls back to asking for a record', async () => {
     const wt = tmp();
     for (let n = 0; n < 2001; n++) mkdirSync(join(wt, `d${n}`));
     expect(await repoFactsOf(wt)).toBeUndefined();
   });
+});
+
+// The stage can leave package.json as anything. The reviewer of #76 made it a FIFO and repoFactsOf never returned (a libuv thread
+// stuck in open), and a committed symlink to /dev/zero buffers until it fails. Each case must end fast: the short timeouts make a
+// regression fail here instead of hanging the run.
+describe('package.json that is not a small regular file', () => {
+  const FAST = 5000;
+  const worktree = () => {
+    const wt = tmp();
+    mkdirSync(join(wt, 'src'));
+    return wt;
+  };
+  const pkg = (deps: Record<string, string>, pad = 0) => JSON.stringify({ name: 'x', dependencies: deps }) + ' '.repeat(pad);
+  // The answer in a few characters: a failed assertion on a 2 MiB text makes vitest diff the whole string, which never ends.
+  const why = async (file: string) => {
+    const r = await readWorktreeFile(file, MAX_PACKAGE_JSON_BYTES);
+    return r.ok ? `ok, ${r.text.length} characters` : r.why;
+  };
+
+  it('a FIFO is refused without blocking, and the facts keep the folders but no dependencies', async () => {
+    const wt = worktree();
+    execFileSync('mkfifo', [join(wt, 'package.json')]);
+    expect(await why(join(wt, 'package.json'))).toBe('not-a-file');
+    expect(await repoFactsOf(wt)).toEqual({ dirs: ['src'] });
+  }, FAST);
+
+  it('a symlink is never followed: to /dev/zero, to a big file, or to a good package.json outside the worktree', async () => {
+    const outside = tmp();
+    const big = join(outside, 'big.json');
+    writeFileSync(big, pkg({ lodash: '1' }, 2 * 1024 * 1024));
+    const good = join(outside, 'package.json');
+    writeFileSync(good, pkg({ lodash: '1' }));
+    for (const target of ['/dev/zero', big, good]) {
+      const wt = worktree();
+      symlinkSync(target, join(wt, 'package.json'));
+      expect(await why(join(wt, 'package.json')), target).toBe('symlink');
+      // The link's own name is in dirs (a symlink name counts, see repoFactsOf); its target is never read.
+      expect(await repoFactsOf(wt), target).toEqual({ dirs: ['package.json', 'src'] });
+    }
+  }, FAST);
+
+  it('a folder named package.json gives no dependencies', async () => {
+    const wt = worktree();
+    mkdirSync(join(wt, 'package.json'));
+    expect(await why(join(wt, 'package.json'))).toBe('not-a-file');
+    expect(await repoFactsOf(wt)).toEqual({ dirs: ['package.json', 'src'] });
+  }, FAST);
+
+  it('a 2 MiB package.json is too large and gives no dependencies; one of exactly 1 MiB is read', async () => {
+    const wt = worktree();
+    const small = pkg({ lodash: '1' });
+    writeFileSync(join(wt, 'package.json'), pkg({ lodash: '1' }, 2 * 1024 * 1024));
+    expect(await why(join(wt, 'package.json'))).toBe('too-large');
+    expect(await repoFactsOf(wt)).toEqual({ dirs: ['src'] });
+    writeFileSync(join(wt, 'package.json'), pkg({ lodash: '1' }, MAX_PACKAGE_JSON_BYTES - small.length));
+    expect(await why(join(wt, 'package.json'))).toBe(`ok, ${MAX_PACKAGE_JSON_BYTES} characters`);
+    expect(await repoFactsOf(wt)).toEqual({ dirs: ['src'], deps: ['lodash'] });
+    writeFileSync(join(wt, 'package.json'), pkg({ lodash: '1' }, MAX_PACKAGE_JSON_BYTES - small.length + 1));
+    expect(await why(join(wt, 'package.json'))).toBe('too-large');
+    expect(await repoFactsOf(wt)).toEqual({ dirs: ['src'] });
+  }, FAST);
+
+  it('a normal package.json still works, and a missing one is no dependencies', async () => {
+    const wt = worktree();
+    expect(await why(join(wt, 'package.json'))).toBe('missing');
+    expect(await repoFactsOf(wt)).toEqual({ dirs: ['src'], deps: [] });
+    writeFileSync(join(wt, 'package.json'), pkg({ lodash: '1', '@scope/pkg': '2' }));
+    expect(await why(join(wt, 'package.json'))).toBe(`ok, ${pkg({ lodash: '1', '@scope/pkg': '2' }).length} characters`);
+    expect(await repoFactsOf(wt)).toEqual({ dirs: ['src'], deps: ['@scope/pkg', 'lodash'] });
+  }, FAST);
 });

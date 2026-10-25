@@ -1,6 +1,22 @@
 import { describe, expect, it } from 'vitest';
-import { parseClaudeOutput } from '../../worker-claude-code/src/index.ts';
-import { checkClaims, clean, evidenceLines, evidenceSummary, findClaims, isBuildCommand, isTestCommand, parseRecords, type EvidenceRecord } from '../src/claims.ts';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { parseClaudeOutput, repoFactsOf } from '../../worker-claude-code/src/index.ts';
+import {
+  checkClaims,
+  clean,
+  evidenceLines,
+  evidenceSummary,
+  findClaims,
+  isBuildCommand,
+  isTestCommand,
+  packageOf,
+  parseRecords,
+  parseRepoFacts,
+  type EvidenceRecord,
+  type RepoFacts,
+} from '../src/claims.ts';
 
 const run = (target: string, ok = true): EvidenceRecord => ({ tool: 'Bash', kind: 'run', target, ok });
 const read = (target: string, ok = true): EvidenceRecord => ({ tool: 'Read', kind: 'read', target, ok });
@@ -410,5 +426,148 @@ describe('from the real worker stream to the gate', () => {
       'no record of reading src/chunk.js this turn',
       'no record of reading package-lock.json this turn',
     ]);
+  });
+});
+
+// Job 99507748 (a lodash-based chunk helper): three stages named `lodash/chunk.js`, a package import specifier that resolves
+// into node_modules. It is not a file in the repo and no stage said it read it, yet each got "no record of reading".
+describe('a package import specifier is not a file claim', () => {
+  const claims = (t: string, stage = 'build') => findClaims(t, stage);
+  const reasons = (t: string, records: EvidenceRecord[], repo?: RepoFacts, stage = 'build') => checkClaims(claims(t, stage), records, repo).map((f) => f.reason);
+  const CRITIQUE = "**Change before building:** Specify the lodash import style (prefer `import chunk from 'lodash/chunk.js'` over a named import).";
+  const BUILD = '- `src/chunk.js` — `chunk` helper re-exporting `lodash/chunk.js` (avoids the ESM/CJS named-export interop problem).';
+  const REVIEW = '- `src/chunk.js` — delegates to `lodash/chunk.js`, matching the one-function-per-file export style of lodash.';
+  const BUILT = [run('npm install lodash'), edit('package.json'), edit('src/chunk.js')];
+  const REVIEWED = [{ ...run('git diff 0f9c2565 HEAD'), diffPaths: ['package.json', 'src/chunk.js'] }];
+  // What the worker read from that worktree: lodash in package.json, no `lodash` folder outside node_modules.
+  const REPO: RepoFacts = { dirs: ['src', 'test'], deps: ['lodash'] };
+  const LODASH = 'no record of reading lodash/chunk.js this turn';
+
+  it('without worktree facts the three sentences warn, as before (fail closed)', () => {
+    expect(reasons(CRITIQUE, [], undefined, 'critique')).toEqual([LODASH]);
+    expect(reasons(BUILD, BUILT)).toEqual([LODASH]);
+    expect(reasons(REVIEW, REVIEWED, undefined, 'review')).toEqual([LODASH]);
+  });
+
+  it('job 99507748: with lodash a dependency and no lodash folder in the repo, none of the three warns', () => {
+    expect(reasons(CRITIQUE, [], REPO, 'critique')).toEqual([]);
+    expect(reasons(BUILD, BUILT, REPO)).toEqual([]);
+    expect(reasons(REVIEW, REVIEWED, REPO, 'review')).toEqual([]);
+  });
+
+  it('a quoted import in the sentence is enough when lodash is not (yet) a dependency; a bare mention is not', () => {
+    const noDeps: RepoFacts = { dirs: ['src', 'test'], deps: [] };
+    expect(reasons(CRITIQUE, [], noDeps, 'critique')).toEqual([]);
+    expect(reasons(CRITIQUE, [], { dirs: ['src'] }, 'critique')).toEqual([]); // package.json unreadable: the quote still counts
+    expect(reasons(BUILD, BUILT, noDeps)).toEqual([LODASH]);
+    expect(reasons(BUILD, BUILT, { dirs: ['src'] })).toEqual([LODASH]);
+    expect(reasons("`src/chunk.js` imports `lodash/chunk.js` via `require('lodash/chunk.js')`.", [edit('src/chunk.js')], noDeps)).toEqual([]);
+    expect(reasons("`src/chunk.js` contains `export { default } from 'lodash/chunk.js'`.", [edit('src/chunk.js')], noDeps)).toEqual([]);
+    // A quote of something else does not make this path a specifier.
+    expect(reasons("`src/chunk.js` contains `import x from 'lodash'` and `lodash/chunk.js`.", [edit('src/chunk.js')], noDeps)).toEqual([LODASH]);
+  });
+
+  it('a repo file still needs a record, whatever the dependencies or quotes say', () => {
+    const t = "`src/chunk.js` exports chunk, as in `import chunk from 'src/chunk.js'`.";
+    expect(reasons(t, [], { dirs: ['src'], deps: ['src'] })).toEqual(['no record of reading src/chunk.js this turn']);
+    expect(reasons(BUILD, [], REPO)).toEqual(['no record of reading src/chunk.js this turn']);
+  });
+
+  it('a path written with ./, ../ or / is a path, not a specifier', () => {
+    const imp = (p: string) => `\`src/chunk.js\` contains \`import chunk from '${p}'\`.`;
+    expect(reasons(imp('./lodash/chunk.js'), [edit('src/chunk.js')], REPO)).toEqual([LODASH]);
+    expect(reasons('`./lodash/chunk.js` exports chunk.', [], REPO)).toEqual([LODASH]);
+    expect(reasons(imp('../lodash/chunk.js'), [edit('src/chunk.js')], REPO)).toEqual(['no record of reading ../lodash/chunk.js this turn']);
+    expect(reasons('`/lodash/chunk.js` exports chunk.', [], REPO)).toEqual(['no record of reading /lodash/chunk.js this turn']);
+    // The same path once with ./ and once bare: the ./ wins.
+    expect(reasons('`./lodash/chunk.js` exports chunk, like `lodash/chunk.js`.', [], REPO)).toEqual([LODASH]);
+    expect(reasons('`lodash/../src/a.js` exports a.', [], REPO)).toEqual(['no record of reading lodash/../src/a.js this turn']);
+  });
+
+  it('a folder in the repo with the package name makes it a repo path, so it still warns', () => {
+    const t = '`lib/util.js` exports util.';
+    expect(reasons(t, [], { dirs: ['lib', 'src'], deps: [] })).toEqual(['no record of reading lib/util.js this turn']);
+    expect(reasons(t, [], { dirs: ['lib', 'src'], deps: ['lib'] })).toEqual(['no record of reading lib/util.js this turn']);
+    expect(reasons("`lib/util.js` contains `import u from 'lib/util.js'`.", [], { dirs: ['lib'], deps: [] })).toEqual(['no record of reading lib/util.js this turn']);
+    expect(reasons(t, [], { dirs: ['src'], deps: [] })).toEqual(['no record of reading lib/util.js this turn']); // no folder, but no signal either
+    expect(reasons(t, [read('lib/util.js')], { dirs: ['lib'], deps: [] })).toEqual([]);
+    expect(reasons(REVIEW, REVIEWED, { dirs: ['lodash', 'src'], deps: ['lodash'] }, 'review')).toEqual([LODASH]); // a lodash/ folder of the repo's own
+    expect(reasons(REVIEW, REVIEWED, { dirs: ['Lodash', 'src'], deps: ['lodash'] }, 'review')).toEqual([LODASH]); // in any case, for a case-insensitive disk
+  });
+
+  it('a scoped package is handled like lodash', () => {
+    const t = '`src/a.js` re-exports `@scope/pkg/file.js` (the named-export path).';
+    const S = 'no record of reading @scope/pkg/file.js this turn';
+    expect(reasons(t, [edit('src/a.js')], { dirs: ['src'], deps: ['@scope/pkg'] })).toEqual([]);
+    expect(reasons("`src/a.js` contains `import f from '@scope/pkg/file.js'`.", [edit('src/a.js')], { dirs: ['src'], deps: [] })).toEqual([]);
+    expect(reasons(t, [edit('src/a.js')], { dirs: ['src'], deps: ['@scope/other'] })).toEqual([S]);
+    expect(reasons(t, [edit('src/a.js')], { dirs: ['src', '@scope'], deps: ['@scope/pkg'] })).toEqual([S]);
+    expect(reasons(t, [edit('src/a.js')])).toEqual([S]);
+  });
+
+  it('node_modules/ written out stays a file path, and a read of it still backs the claim', () => {
+    const t = '`node_modules/lodash/chunk.js` exports chunk.';
+    expect(reasons(t, [], REPO)).toEqual(['no record of reading node_modules/lodash/chunk.js this turn']);
+    expect(reasons(t, [read('/work/wt/node_modules/lodash/chunk.js')], REPO)).toEqual([]);
+  });
+
+  it('a sentence that says it read or opened the file still needs the read', () => {
+    expect(reasons('I read `lodash/chunk.js` and it exports chunk.', [], REPO)).toEqual([LODASH]);
+    expect(reasons("I opened `lodash/chunk.js`, which `import chunk from 'lodash/chunk.js'` loads.", [], REPO)).toEqual([LODASH]);
+    expect(reasons('I read `lodash/chunk.js`.', [read('node_modules/lodash/chunk.js')], REPO)).toEqual([]);
+  });
+
+  it('a package name with no file after it is not a specifier: the gate cannot tell it from a repo file', () => {
+    expect(packageOf('lodash/chunk.js')).toBe('lodash');
+    expect(packageOf('@scope/pkg/file.js')).toBe('@scope/pkg');
+    for (const p of ['chunk.js', 'Lodash/chunk.js', '_x/a.js', '.bin/a.js', 'node_modules/lodash/chunk.js', 'a/node_modules/b.js', 'a/./b.js', 'a//b.js', '@scope/pkg.js']) expect(packageOf(p)).toBeUndefined();
+    expect(reasons("`chart.js` is what `import Chart from 'chart.js'` loads, and it exports Chart.", [], { dirs: [], deps: ['chart.js'] })).toEqual(['no record of reading chart.js this turn']);
+  });
+
+  it('stays fast on 1 MB of import, require and from built to keep the specifier scan busy', () => {
+    const repo: RepoFacts = { dirs: [], deps: [] };
+    for (const t of [
+      `\`a.ts\` imports ${'import '.repeat(1)}${' '.repeat(1_000_000)}x`,
+      `\`a.ts\` imports ${'import {a, '.repeat(90_000)}`,
+      `\`a.ts\` imports ${'require ( '.repeat(100_000)}`,
+      `\`a.ts\` imports ${'import x from '.repeat(70_000)}`,
+    ]) {
+      const t0 = performance.now();
+      checkClaims(findClaims(t, 'build'), [], repo);
+      expect(performance.now() - t0).toBeLessThan(2000);
+    }
+  });
+
+  it('parseRepoFacts takes only the exact shape, and a bad one is no facts', () => {
+    expect(parseRepoFacts({ dirs: ['src'], deps: ['lodash'] })).toEqual({ dirs: ['src'], deps: ['lodash'] });
+    expect(parseRepoFacts({ dirs: ['src'] })).toEqual({ dirs: ['src'] });
+    for (const bad of [undefined, null, 'src', [], { deps: ['lodash'] }, { dirs: 'src' }, { dirs: ['src', 1] }, { dirs: ['src'], deps: 'lodash' }, { dirs: ['src'], deps: [null] }, { dirs: [''] }, { dirs: ['a'.repeat(215)] }, { dirs: ['src'], deps: ['a'.repeat(215)] }, { dirs: Array.from({ length: 2001 }, (_, n) => `d${n}`) }]) {
+      expect(parseRepoFacts(bad)).toBeUndefined();
+    }
+  });
+});
+
+describe('from the real worktree facts to the gate', () => {
+  it('job 99507748: a worktree with lodash installed and src/chunk.js importing it', async () => {
+    const wt = mkdtempSync(join(tmpdir(), 'bulig-facts-'));
+    try {
+      mkdirSync(join(wt, 'src'));
+      mkdirSync(join(wt, 'node_modules', 'lodash'), { recursive: true });
+      writeFileSync(join(wt, 'node_modules', 'lodash', 'chunk.js'), 'module.exports = function chunk() {};\n');
+      writeFileSync(join(wt, 'src', 'chunk.js'), "import chunk from 'lodash/chunk.js';\nexport default chunk;\n");
+      writeFileSync(join(wt, 'package.json'), JSON.stringify({ name: 'chunky', dependencies: { lodash: '^4.17.21' } }));
+      const repo = parseRepoFacts(await repoFactsOf(wt));
+      expect(repo).toEqual({ dirs: ['src'], deps: ['lodash'] });
+      const review = '- `src/chunk.js` — delegates to `lodash/chunk.js`, matching the one-function-per-file export style of lodash.';
+      expect(checkClaims(findClaims(review, 'review'), [read('src/chunk.js')], repo)).toEqual([]);
+      expect(checkClaims(findClaims(review, 'review'), [], repo).map((f) => f.reason)).toEqual(['no record of reading src/chunk.js this turn']);
+      // A lodash folder of the repo's own, or a symlink with that name, makes lodash/chunk.js a repo path again.
+      symlinkSync(join(wt, 'node_modules', 'lodash'), join(wt, 'src', 'lodash'));
+      const linked = parseRepoFacts(await repoFactsOf(wt));
+      expect(linked?.dirs).toEqual(['lodash', 'src']);
+      expect(checkClaims(findClaims(review, 'review'), [read('src/chunk.js')], linked).map((f) => f.reason)).toEqual(['no record of reading lodash/chunk.js this turn']);
+    } finally {
+      rmSync(wt, { recursive: true, force: true });
+    }
   });
 });

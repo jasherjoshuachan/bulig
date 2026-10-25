@@ -1,5 +1,5 @@
 import { definePlugin, type BuligEvent, type PluginContext } from '@bulig/plugin-sdk';
-import { checkClaims, clean, evidenceLines, evidenceSummary, findClaims, parseRecords, type EvidenceRecord, type Finding } from './claims.ts';
+import { checkClaims, clean, evidenceLines, evidenceSummary, findClaims, parseRecords, parseRepoFacts, type EvidenceRecord, type Finding } from './claims.ts';
 
 export {
   CLAIM_PATTERNS,
@@ -9,11 +9,15 @@ export {
   evidenceSummary,
   findClaims,
   isBuildCommand,
+  isModuleRef,
   isTestCommand,
+  packageOf,
   parseRecords,
+  parseRepoFacts,
   type Claim,
   type EvidenceRecord,
   type Finding,
+  type RepoFacts,
 } from './claims.ts';
 
 export interface GateEvidenceConfig {
@@ -61,7 +65,7 @@ export default definePlugin({
     const sources = new Set(cfg.evidenceSources ?? ['worker-claude-code']);
 
     ctx.on('stage.completed', (e: BuligEvent) => {
-      const p = (e.payload ?? {}) as { stage?: unknown; result?: unknown; sessionId?: unknown; costUsd?: unknown; evidence?: unknown };
+      const p = (e.payload ?? {}) as { stage?: unknown; result?: unknown; sessionId?: unknown; costUsd?: unknown; evidence?: unknown; repoFacts?: unknown };
       const stage = String(p.stage ?? '');
       const result = typeof p.result === 'string' ? p.result : '';
       // The same fields the pipeline reads from stage.completed, and nothing it does not need.
@@ -72,7 +76,9 @@ export default definePlugin({
       const trusted = sources.has(e.source);
       if (!trusted) ctx.log.warn(`gate-evidence: stage.completed from "${e.source}" is not an evidence source, so its records are ignored`);
       const records: EvidenceRecord[] = trusted ? parseRecords(p.evidence) : [];
-      const findings = checkClaims(findClaims(result, stage), records);
+      // The worktree facts are believed only from a trusted source, the same rule as the records: the in-process worker, or the gateway,
+      // which emits a remote worker's result only after its token and the stage's lease check out. Without facts every path needs a record.
+      const findings = checkClaims(findClaims(result, stage), records, trusted ? parseRepoFacts(p.repoFacts) : undefined);
       const shown = findings.slice(0, MAX_SHOWN).map(line);
       if (findings.length > MAX_SHOWN) shown.push(`Unverified: ... and ${findings.length - MAX_SHOWN} more claims with no record`);
       const summary = evidenceSummary(records);

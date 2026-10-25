@@ -497,7 +497,11 @@ export function createGateway(options: GatewayOptions = {}): Plugin & { addresse
               await options.afterApply?.(r.stageId);
             }
             const o = r.output;
-            await ctx.emitCommitted('stage.completed', { stage: p.stage, ok: true, result: o.result ?? '', costUsd: o.costUsd, sessionId: o.sessionId, evidence: o.evidence ?? [], workerId }, p.jobId);
+            await ctx.emitCommitted(
+              'stage.completed',
+              { stage: p.stage, ok: true, result: o.result ?? '', costUsd: o.costUsd, sessionId: o.sessionId, evidence: o.evidence ?? [], ...(o.repoFacts && { repoFacts: o.repoFacts }), workerId },
+              p.jobId,
+            );
           } else {
             await ctx.emitCommitted('stage.failed', { stage: p.stage, error: r.output.error || 'unknown failure', workerId }, p.jobId);
           }

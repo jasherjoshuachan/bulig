@@ -1,7 +1,7 @@
 import type { ChildProcess } from 'node:child_process';
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { buildArgs, buildClaudeEnv, DEFAULT_TIMEOUT_MS, run, terminate, type StageRequest } from '@bulig/worker-claude-code';
+import { buildArgs, buildClaudeEnv, DEFAULT_TIMEOUT_MS, repoFactsOf, run, terminate, type StageRequest } from '@bulig/worker-claude-code';
 import { isLoopbackOrTailnet } from './address.ts';
 import { CLIENT_CLAIM_TIMEOUT_MS } from './config.ts';
 import { CLAIM_PATH, HEARTBEAT_PATH, RESULT_PATH, type Assignment, type ClaimRequest, type HeartbeatRequest, type ResultRequest } from './protocol.ts';
@@ -155,21 +155,22 @@ export function startRemoteWorker(opts: RemoteWorkerOptions): RemoteWorker {
         });
     }, a.heartbeatMs);
 
-    const post = async (body: ResultRequest): Promise<void> => {
+    /** Send a result until the kernel answers it. Gives the final answer's status, or undefined when there was none. */
+    const post = async (body: ResultRequest): Promise<number | undefined> => {
       const since = Date.now();
       for (;;) {
-        if (aborted) return;
+        if (aborted) return undefined;
         try {
           const r = await call(RESULT_PATH, body, 120_000);
-          if (r.status === 200) return;
+          if (r.status === 200) return 200;
           if (r.status === 409 || r.status === 401 || r.status === 400 || r.status === 413) {
             log(`the kernel did not take the result of ${a.request.stage} (${r.status})`);
-            return;
+            return r.status;
           }
         } catch {
           // fall through and try again
         }
-        if (Date.now() - since > lossMs) return;
+        if (Date.now() - since > lossMs) return undefined;
         await sleep(Math.min(1000, retryMs));
       }
     };
@@ -215,6 +216,8 @@ export function startRemoteWorker(opts: RemoteWorkerOptions): RemoteWorker {
         await post(failed(out.error ?? 'unknown failure'));
         return;
       }
+      // Read before the changes are collected, from the same folder the run used. Undefined when it cannot be read: the gate then asks for a record of every path.
+      const repoFacts = await repoFactsOf(dir);
       let patch: Buffer = Buffer.alloc(0);
       if (a.request.mode === 'edit') {
         try {
@@ -224,12 +227,16 @@ export function startRemoteWorker(opts: RemoteWorkerOptions): RemoteWorker {
           return;
         }
       }
-      await post({
+      const output = { result: out.result, ...(out.costUsd !== undefined && { costUsd: out.costUsd }), ...(out.sessionId && { sessionId: out.sessionId }), ...(out.evidence && { evidence: out.evidence }) };
+      const completed = (withFacts: boolean): ResultRequest => ({
         ...ids,
         outcome: 'completed',
-        output: { result: out.result, ...(out.costUsd !== undefined && { costUsd: out.costUsd }), ...(out.sessionId && { sessionId: out.sessionId }), ...(out.evidence && { evidence: out.evidence }) },
+        output: { ...output, ...(withFacts && repoFacts && { repoFacts }) },
         ...(patch.length > 0 && { patch: patch.toString('base64') }),
       });
+      // A kernel from before repoFacts refuses the whole result (its schema is strict) with a 400. Send it once more without them, so a
+      // worker that is newer than its kernel still delivers its work; the gate there asks for a record of every path, as it always did.
+      if ((await post(completed(true))) === 400 && repoFacts && !aborted) await post(completed(false));
     } finally {
       clearInterval(beat);
       aborts.delete(abort);

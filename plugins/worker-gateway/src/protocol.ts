@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { REPO_FACT_LIMITS } from '@bulig/worker-claude-code';
 
 // The wire format between a worker and the kernel (ADR 0011). JSON over HTTP. The worker never sees the database: it is told what
 // to run, says it is alive, and hands back what Claude said. Every message about a running stage names the stage, its attempt
@@ -57,6 +58,15 @@ const Evidence = z.strictObject({
   diffPaths: z.array(z.string().max(1000)).max(200).optional(),
 });
 
+const factNames = z.array(z.string().min(1).max(REPO_FACT_LIMITS.nameLength)).max(REPO_FACT_LIMITS.names);
+
+/**
+ * What the worker read from its stage folder after the run (worker-claude-code's repoFactsOf): folder names and package.json
+ * dependency names, for the evidence gate. The same caps the worker applies. Named `repoFacts`, not `repo`: `workspace.repo` is the
+ * repository's path on the kernel's machine.
+ */
+const RepoFacts = z.strictObject({ dirs: factNames, deps: factNames.optional() });
+
 export const ResultRequest = z.strictObject({
   stageId: id,
   attempt: z.number().int().min(1),
@@ -68,6 +78,7 @@ export const ResultRequest = z.strictObject({
     costUsd: z.number().optional(),
     sessionId: z.string().max(200).optional(),
     evidence: z.array(Evidence).max(300).optional(),
+    repoFacts: RepoFacts.optional(),
   }),
   /** What an edit stage changed in the worker's folder, as a git patch, base64. */
   patch: z.string().optional(),

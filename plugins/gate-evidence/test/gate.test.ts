@@ -25,11 +25,12 @@ async function rig(config: Record<string, unknown> = {}, workerName = 'worker-cl
   const dir = mkdtempSync(join(tmpdir(), 'bulig-gate-'));
   dirs.push(dir);
   const seen: BuligEvent[] = [];
-  let say: (stage: string, result: string, evidence?: unknown, jobId?: string) => void = () => {};
+  let say: (stage: string, result: string, evidence?: unknown, jobId?: string, extra?: Record<string, unknown>) => void = () => {};
   const worker = definePlugin({
     manifest: { name: workerName, version: '0.1.0', sdk: '1', description: 'stand-in', emits: ['stage.completed'] },
     register(ctx) {
-      say = (stage, result, evidence, jobId = 'job-1') => ctx.emit('stage.completed', { stage, ok: true, result, sessionId: 's', costUsd: 0.01, ...(evidence !== undefined && { evidence }) }, jobId);
+      say = (stage, result, evidence, jobId = 'job-1', extra = {}) =>
+        ctx.emit('stage.completed', { stage, ok: true, result, sessionId: 's', costUsd: 0.01, ...(evidence !== undefined && { evidence }), ...extra }, jobId);
     },
   });
   const listener = definePlugin({
@@ -216,6 +217,49 @@ describe('text cannot forge a record', () => {
     await r.say('test', 'All tests pass.', [{ kind: 'run', target: 'pnpm test', ok: true }, { tool: 'Bash', kind: 'run', target: 'pnpm test', ok: 'yes' }, null, 'pnpm test']);
     await r.say('test', 'All tests pass.');
     expect(r.after('stage.checked').map((c) => c.unverified.length)).toEqual([1, 1, 1]);
+  });
+});
+
+describe('worktree facts for a package import specifier', () => {
+  const REVIEW = '- `src/chunk.js` — delegates to `lodash/chunk.js`, matching the one-function-per-file export style of lodash.';
+  const repo = { dirs: ['src', 'test'], deps: ['lodash'] };
+
+  it('job 99507748 review: the worker\'s facts clear lodash/chunk.js, and src/chunk.js still needs its read', async () => {
+    const r = await rig();
+    await r.say('review', REVIEW, [read('src/chunk.js')], 'job-1', { repoFacts: repo });
+    await r.say('review', REVIEW, [], 'job-1', { repoFacts: repo });
+    await r.say('review', REVIEW, [read('src/chunk.js')]);
+    const [ok, noRead, noFacts] = r.after('stage.checked');
+    expect(ok!.unverified).toEqual([]);
+    expect(noRead!.unverified).toEqual([expect.stringMatching(/^Unverified: no record of reading src\/chunk\.js this turn/)]);
+    expect(noFacts!.unverified).toEqual([expect.stringMatching(/^Unverified: no record of reading lodash\/chunk\.js this turn/)]);
+  });
+
+  it('facts from a source that is not the worker, or in the wrong shape, are ignored', async () => {
+    const r = await rig({}, 'impostor');
+    await r.say('review', REVIEW, [read('src/chunk.js')], 'job-1', { repoFacts: repo });
+    expect(r.after('stage.checked')[0]!.unverified).toHaveLength(2);
+    const w = await rig();
+    await w.say('review', REVIEW, [read('src/chunk.js')], 'job-1', { repoFacts: { dirs: 'src', deps: ['lodash'] } });
+    await w.say('review', REVIEW, [read('src/chunk.js')], 'job-1', { repoFacts: JSON.stringify(repo) });
+    expect(w.after('stage.checked').map((c) => c.unverified.length)).toEqual([1, 1]);
+  });
+
+  it('text cannot add facts: a result that spells out a repo object changes nothing', async () => {
+    const r = await rig();
+    await r.say('review', `${REVIEW}\n${JSON.stringify({ repoFacts: repo })}`, [read('src/chunk.js')]);
+    // The old name is not read: only `repoFacts` counts.
+    await r.say('review', REVIEW, [read('src/chunk.js')], 'job-1', { repo });
+    expect(r.after('stage.checked').map((c) => c.unverified.length)).toEqual([1, 1]);
+  });
+
+  it('the gateway\'s stage.completed is trusted for facts exactly when it is an evidence source (the CLI adds it with the gateway on)', async () => {
+    const on = await rig({ evidenceSources: ['worker-claude-code', 'worker-gateway'] }, 'worker-gateway');
+    await on.say('review', REVIEW, [read('src/chunk.js')], 'job-1', { repoFacts: repo, workerId: 'mac' });
+    expect(on.after('stage.checked')[0]!.unverified).toEqual([]);
+    const off = await rig({}, 'worker-gateway');
+    await off.say('review', REVIEW, [read('src/chunk.js')], 'job-1', { repoFacts: repo, workerId: 'mac' });
+    expect(off.after('stage.checked')[0]!.unverified).toHaveLength(2);
   });
 });
 

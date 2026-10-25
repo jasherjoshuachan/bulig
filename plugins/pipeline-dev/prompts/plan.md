@@ -13,7 +13,9 @@ Read the code you need. Then write a short plan for the change:
 
 Keep it under 400 words. Plain language. Do not write the code yet.
 
-End the plan with a scope block. It is how the person approving this plan sees which files the job may touch, and the commit step refuses any file that is not listed. Write the line `SCOPE:` and then one path or glob per line:
+Your reply is the plan. Write all of it, the scope block included, in the reply text itself. Nothing else is read: not a plan file, not any other file. Do not write a plan file, and do not wait for ExitPlanMode or for approval inside this session; the plan is approved after your reply.
+
+End the plan with a scope block. It is how the person approving this plan sees which files the job may touch, and the commit step refuses any file that is not listed. Write the line `SCOPE:` and then one path or glob per line, nothing else on the line. A `- ` in front of each path is optional. Put the block in your reply itself, not in a plan file or any other file. For example:
 
 SCOPE:
 - README.md
@@ -25,5 +27,5 @@ Rules for the block:
 - Paths are relative to the repo root. No absolute paths, no `..`.
 - `*` matches inside one folder, `**` matches any number of folders, `?` matches one character. Nothing else is special.
 - Keep it tight. List the files or the narrow folders you need. A line that matches everything (`**` or `*`) is rejected.
-- One path or glob per line and nothing else on the line, no notes.
+- One path or glob per line and nothing else on the line, no notes. End the block with a blank line before anything else you write.
 - Do not list files that running the tests may leave behind, such as test result folders or caches. Those are not part of the change.

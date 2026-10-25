@@ -2,7 +2,9 @@ import { createRequire } from 'node:module';
 import { describe, expect, it } from 'vitest';
 import type { Stage } from '@bulig/plugin-sdk';
 import { SqliteStore, type Store, type StoreTx } from '@bulig/core';
+import { SCOPE_BLOCK_EXAMPLE, SCOPE_BLOCK_IN_REPLY, SCOPE_BLOCK_RULE } from '@bulig/scope';
 import { decide, parseVerdict, renderPrompt } from '../src/index.ts';
+import { planRetryFeedback } from '../src/decide.ts';
 import { boot, fakeGithub, fakeHuman, fakeWorker, newDb, openApproval, raw, stageNames, types, type Script, type Sent, settle } from './harness.ts';
 
 // better-sqlite3 belongs to @bulig/core, not to this plugin: load it the way core does.
@@ -1257,5 +1259,89 @@ describe('scope guard: the commit step refuses files outside the scope', () => {
     const bad = stage('plan', 'failed', { result: 'p', scopeError: 'no SCOPE block' });
     expect(decide({ status: 'running' }, [wt, bad], 2)).toMatchObject({ kind: 'stage', name: 'plan' });
     expect(decide({ status: 'running' }, [wt, bad, stage('plan', 'failed', { scopeError: 'still none' })], 2)).toMatchObject({ kind: 'fail' });
+  });
+});
+
+describe('scope guard: the SCOPE block as real plans write it (job 3c70469d)', () => {
+  // The two plan replies of job 3c70469d ("Add a range(start, end, step) helper", 25 Oct 2026), as the server got them.
+  const ATTEMPT_1 = [
+    'I read src/ and test/ and wrote the plan.',
+    '',
+    "The plan is written to the plan file and presented above. Note: `ExitPlanMode` isn't available as a tool in this environment, so I could not hand it over that way; the scope block lists exactly the three files",
+  ].join('\n');
+  const ATTEMPT_2 = [
+    '1. Add `src/range.js` exporting `range(start, end, step)`.',
+    '2. Add `test/range.test.js` covering a positive, a negative and a zero step.',
+    '',
+    '```',
+    'SCOPE:',
+    'src/range.js',
+    'test/range.test.js',
+    '```',
+  ].join('\n');
+  const planPrompts = (r: ReturnType<typeof rig>) => r.worker.filter((s) => s.stage === 'plan').map((s) => s.prompt);
+
+  it('attempt 2 alone (bare paths in a fence) is a usable plan, and its scope goes on the approval', async () => {
+    const r = rig({ plan: raw(ATTEMPT_2) });
+    await r.k.start();
+    await settle(r.k);
+    const job = await jobOf(r.k);
+    await settle(r.k);
+    expect(r.worker.map((s) => s.stage)).toEqual(['plan', 'critique']);
+    expect((await r.k.jobs.get(job.id))!.status).toBe('awaiting_approval');
+    expect(r.human.requests.at(-1)!.payload).toMatchObject({ kind: 'plan', scope: ['src/range.js', 'test/range.test.js'] });
+  });
+
+  it('attempt 1 is retried with a message that says the block goes in the reply, not a plan file; then attempt 2 is approved', async () => {
+    const r = rig({ plan: [raw(ATTEMPT_1), raw(ATTEMPT_2)] });
+    await r.k.start();
+    await settle(r.k);
+    const job = await jobOf(r.k);
+    await settle(r.k);
+    expect(r.worker.map((s) => s.stage)).toEqual(['plan', 'plan', 'critique']);
+    const second = planPrompts(r)[1]!;
+    expect(second).toMatch(/no SCOPE block/);
+    expect(second).toMatch(/in your reply itself, not in a plan file or any other file/);
+    expect(second).toMatch(/Do not write a plan file/);
+    expect(second).toContain(SCOPE_BLOCK_EXAMPLE);
+    expect(r.human.requests.at(-1)!.payload).toMatchObject({ scope: ['src/range.js', 'test/range.test.js'] });
+    expect((await r.k.jobs.get(job.id))!.status).toBe('awaiting_approval');
+  });
+
+  it('two replies like attempt 1 fail the job, and the reason says the block belongs in the reply', async () => {
+    const r = rig({ plan: raw(ATTEMPT_1) });
+    await r.k.start();
+    await settle(r.k);
+    const job = await jobOf(r.k);
+    await settle(r.k);
+    expect((await r.k.jobs.get(job.id))!.status).toBe('failed');
+    const reason = ((await r.k.history(job.id)).find((e) => e.type === 'pipeline.failed')!.payload as { reason: string }).reason;
+    expect(reason).toMatch(/after 2 tries: the reply has no SCOPE block/);
+    expect(reason).toMatch(/not in a plan file/);
+  });
+
+  it('prose straight after a bare block is not taken into the scope', async () => {
+    const r = rig({ plan: raw('Plan.\n\nSCOPE:\nsrc/range.js\ntest/range.test.js\nThe `ExitPlanMode` tool is not here, so this reply is the plan.') });
+    await r.k.start();
+    await settle(r.k);
+    await jobOf(r.k);
+    await settle(r.k);
+    expect(r.human.requests.at(-1)!.payload).toMatchObject({ scope: ['src/range.js', 'test/range.test.js'] });
+  });
+
+  it('the retry feedback and the plan prompt use the shared rule and example, and both say: the reply, not a plan file', () => {
+    const fb = planRetryFeedback('the SCOPE block is empty: it has no paths');
+    const prompt = renderPrompt('plan', { title: 't', issue: 'i', feedback: '' });
+    for (const [name, text] of [['feedback', fb], ['prompt', prompt]] as const) {
+      expect(text.toLowerCase(), name).toContain(SCOPE_BLOCK_RULE.toLowerCase());
+      expect(text, name).toContain(SCOPE_BLOCK_IN_REPLY);
+      expect(text, name).toContain(SCOPE_BLOCK_EXAMPLE);
+      expect(text, name).toMatch(/Do not write a plan file/);
+      expect(text, name).not.toMatch(/—/);
+    }
+    expect(fb).toMatch(/^Your last plan was rejected: the SCOPE block is empty: it has no paths\.\n/);
+    expect(fb).toMatch(/as your reply/);
+    // The feedback sits above the scope instructions in the prompt, so it must not point "above".
+    expect(fb).not.toMatch(/described above/);
   });
 });

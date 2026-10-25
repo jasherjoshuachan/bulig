@@ -16,6 +16,16 @@ This plugin reads the stage text, finds claims, and looks for a record of that r
 | a change was made: "I fixed", "I added", "I edited README.md", "has been implemented" | a successful `Edit` or `Write` in this run |
 | `VERDICT: PASS` on the review stage | a successful `Read`, or a successful `git diff`, `git show` or `git log` |
 
+A package import specifier is not a file claim. "`src/chunk.js` re-exports `lodash/chunk.js`" names `src/chunk.js`, a repo file that needs a record, and `lodash/chunk.js`, which an import resolves into `node_modules` and which nobody claimed to have read. The gate cannot see the repo itself, so the worker sends what it read from the worktree's disk after the run, as `repo` on `stage.completed`: the name of every folder and symlink at any depth (outside `node_modules` and `.git`, lowercased) and the `dependencies` and `devDependencies` names of the worktree's own `package.json`. A path in a file claim is skipped as a specifier only when all of these hold:
+
+- it is written bare every time it appears (`lodash/chunk.js`, `@scope/pkg/file.js`); a path with `./`, `../` or `/` in front, or with a `.`, `..` or `node_modules` part, is a path;
+- the sentence does not say it read, opened, checked, inspected, reviewed, examined or verified a file ("I read `lodash/chunk.js`" still needs that read);
+- its first part is a package name by npm's rules (lowercase, or `@scope/name`) with a file after it (a bare `chart.js` is never skipped: the gate cannot tell it from a repo file);
+- no folder or symlink with that first name (`lodash`, or `@scope`) exists anywhere in the worktree, so the path cannot be a repo file (`src/chunk.js` always needs its record, whatever `package.json` says);
+- and either the same sentence quotes it in code as `import ... from '<path>'`, `export ... from '<path>'`, `import('<path>')` or `require('<path>')`, or the package is a dependency or devDependency in `package.json`.
+
+The facts count only from a trusted evidence source and only in the exact shape. A stage with no facts (an older worker, a remote worker through `worker-gateway`, a worktree with more than 50,000 entries or 2,000 folder names, a folder it cannot read) is checked as before: every path needs a record. An unreadable `package.json` drops only the dependency signal.
+
 A command counts only when the runner is the first word of a shell segment (after `cd`, `VAR=1` and `time`). `echo pnpm test`, `cat test.md` and `grep vitest .` are not test runs. A failed run does not back a "pass" claim.
 
 Sentences with a modal, a condition or a purpose (`should`, `will`, `must`, `if`, `make sure`, `ensure`, `to make`, `once`, ...) are skipped, as are sentences that talk about creating a new file, sentences that say something does not pass, and anything inside a code fence. A plan that says "the tests should pass" makes no claim.
@@ -70,6 +80,7 @@ worker-claude-code  --stage.completed {result, evidence}-->  gate-evidence  --st
 - **A real record with the wrong content.** It checks that a test command ran and succeeded, not that it ran the right tests or that the output says what the model says. A passing `pnpm test` backs "the new feature works" only because nothing checks that claim at all.
 - **A diff too large to read.** A tool result line over 1 MiB is skimmed, not parsed, so a huge `git diff` keeps its ok value but no `diffPaths`, and a claim about a file only that diff showed is still flagged. Headers that git quotes (paths with odd characters) or prints without the `a/` and `b/` prefixes are skipped the same way.
 - **A git object that is not a commit.** `git show <blob id>` prints the file as it is, and `git show <tag>` prints an annotated tag's message without indenting it. Neither can be told from a commit by the command alone, so a header-shaped line in that text would count. The model would have to write that line into the file or tag itself.
+- **A specifier that is also a file somewhere else.** A path skipped as a specifier is one whose first folder exists nowhere in the worktree, so it cannot name a repo file. It could still name a file outside the worktree, or a package file the stage never opened: "`lodash/chunk.js` exports chunk" passes when lodash is a dependency, read or not. The same holds for a package the stage added to `package.json` itself.
 - **What a file contains.** A file claim is backed by a read of that file, not by what the read returned. "`a.ts` exports foo" passes if `a.ts` was read, even when it does not export foo.
 - **Other claims.** Anything not on the list above: "no other callers", "the PR is open", "the API returns 200", claims about git history, numbers, who wrote what.
 - **A command that hides the real work.** `node -e "..."` or `pnpm exec x` wrapping a script that fakes success is not a test run, but `pnpm test` that runs a script that exits 0 is. The gate trusts the exit status the tool reported.

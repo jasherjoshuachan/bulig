@@ -23,6 +23,24 @@ export interface Claim {
   text: string;
   /** For a file claim: the paths the sentence names. */
   paths: string[];
+  /**
+   * For a file claim: the paths written bare every time (no `./`, `../` or `/` in front), so they could be a package import
+   * specifier rather than a file. Always empty when the sentence says it read, opened or checked a file.
+   */
+  bare?: string[];
+  /** For a file claim: the bare paths that sit, quoted, in an `import ... from`, `export ... from`, `import(...)` or `require(...)` in the sentence. */
+  imported?: string[];
+}
+
+/**
+ * What the worktree looked like when the run ended. Built by the worker from the disk, never from the model's text, and
+ * used only from a trusted evidence source. See RepoFacts in worker-claude-code.
+ */
+export interface RepoFacts {
+  /** Every folder and symlink name in the worktree (outside node_modules and .git), lowercased. */
+  dirs: readonly string[];
+  /** The worktree package.json's dependency and devDependency names. Missing when they could not be read. */
+  deps?: readonly string[];
 }
 
 export interface Finding {
@@ -171,6 +189,14 @@ export function sentences(text: string): string[] {
 
 const stripPath = (p: string) => p.replace(/^(?:\.\/)+/, '').replace(/[.,;:)]+$/, '');
 
+/**
+ * A quoted module specifier in code the sentence quotes: `import chunk from 'lodash/chunk.js'`, `import 'x'`,
+ * `export { a } from 'x'`, `import('x')`, `require('x')`. The second, fourth or sixth group is the specifier. Every repeat is
+ * bounded and none is nested, so a long sentence costs time in proportion to its length.
+ */
+const SPECIFIER =
+  /\b(?:import|export)\s+(?:[\w$*{},\s]{0,200}?\s)?from\s*(['"])([^'"\s]{1,300})\1|\bimport\s*(['"])([^'"\s]{1,300})\3|\b(?:require|import)\s*\(\s*(['"])([^'"\s]{1,300})\5\s*\)/g;
+
 /** Every claim in a piece of stage text. `stage` matters only for the VERDICT line, which means different things in test and review. */
 export function findClaims(text: string, stage: string): Claim[] {
   const found: Claim[] = [];
@@ -193,9 +219,16 @@ export function findClaims(text: string, stage: string): Claim[] {
       found.push({ kind: p.kind, text: show, paths: [] });
     }
     if (claimsChange(s, CHANGE_PATTERNS)) found.push({ kind: 'changed', text: show, paths: [] });
-    if (!NEW_FILE.test(s) && (FILE_VERB.test(s) || READ_SAID.test(s))) {
-      const paths = [...new Set([...s.matchAll(PATH)].map((m) => stripPath(m[0])).filter((p) => !/^https?:/i.test(p)))].slice(0, 5);
-      if (paths.length) found.push({ kind: 'file', text: show, paths });
+    const saysRead = READ_SAID.test(s);
+    if (!NEW_FILE.test(s) && (FILE_VERB.test(s) || saysRead)) {
+      const raw = [...s.matchAll(PATH)].map((m) => m[0]).filter((p) => !/^https?:/i.test(p));
+      const paths = [...new Set(raw.map(stripPath))].slice(0, 5);
+      if (paths.length) {
+        // A path counts as bare only if no mention of it had a ./ in front (stripPath drops that, so look at the raw text).
+        const bare = saysRead ? [] : paths.filter((p) => raw.every((r) => stripPath(r) !== p || !/^[./]/.test(r)));
+        const quoted = new Set([...s.matchAll(SPECIFIER)].map((m) => m[2] ?? m[4] ?? m[6] ?? ''));
+        found.push({ kind: 'file', text: show, paths, bare, imported: bare.filter((p) => quoted.has(p)) });
+      }
     }
   }
   return found;
@@ -278,6 +311,32 @@ const printedByGitDiff = (command: string) => {
 
 const samePath = (have: string, want: string) => have === want || have.endsWith(`/${want}`);
 
+/** `lodash` from `lodash/chunk.js`, `@scope/pkg` from `@scope/pkg/file.js`, by npm's rules for names. A path with no file after the package name gives nothing. */
+export function packageOf(path: string): string | undefined {
+  const m = /^((?:@[a-z0-9~-][a-z0-9._~-]*\/)?[a-z0-9~-][a-z0-9._~-]*)\/(.+)$/.exec(path);
+  if (!m || m[1]!.length > 214) return undefined;
+  // `lodash/../src/a.js` and `x/node_modules/y.js` are paths into the tree, not a specifier.
+  if (path.split('/').some((seg) => seg === '.' || seg === '..' || seg === '' || seg === 'node_modules')) return undefined;
+  return m[1];
+}
+
+/**
+ * Is this path of a file claim a package import specifier, not a file? Only when all of these hold:
+ * - it was written bare in the sentence, and the sentence does not say it read or opened a file (Claim.bare);
+ * - its first part is a package name (`lodash`, `@scope/pkg`) followed by a file;
+ * - no folder or symlink with that first name exists anywhere in the worktree, so the path cannot be a repo file;
+ * - and either the sentence quotes it in an import, export-from or require, or the package is in the worktree's package.json.
+ * With no facts from the worker, nothing is a specifier and every path needs a record, as before.
+ */
+export function isModuleRef(path: string, claim: Claim, repo: RepoFacts | undefined): boolean {
+  if (!repo || !claim.bare?.includes(path)) return false;
+  const pkg = packageOf(path);
+  if (!pkg) return false;
+  const first = pkg.split('/')[0]!;
+  if (repo.dirs.some((d) => d.toLowerCase() === first)) return false;
+  return !!claim.imported?.includes(path) || !!repo.deps?.includes(pkg);
+}
+
 /** Is `path` the file of this record, or named by the command of a run/search record? */
 function touches(rec: EvidenceRecord, path: string): boolean {
   const want = normal(path);
@@ -289,8 +348,8 @@ function touches(rec: EvidenceRecord, path: string): boolean {
   return !!rec.diffPaths?.length && printedByGitDiff(rec.target) && rec.diffPaths.some((p) => samePath(normal(p), want));
 }
 
-/** Which claims have no record behind them. A claim with a record is not listed. */
-export function checkClaims(claims: readonly Claim[], records: readonly EvidenceRecord[]): Finding[] {
+/** Which claims have no record behind them. A claim with a record is not listed. `repo` is what the worker read from the worktree, if anything. */
+export function checkClaims(claims: readonly Claim[], records: readonly EvidenceRecord[], repo?: RepoFacts): Finding[] {
   const runs = records.filter((r) => r.kind === 'run');
   const all: Finding[] = [];
   const out = { push: (f: Finding) => void (all.some((x) => x.reason === f.reason) || all.push(f)) };
@@ -318,6 +377,7 @@ export function checkClaims(claims: readonly Claim[], records: readonly Evidence
         break;
       case 'file':
         for (const path of claim.paths) {
+          if (isModuleRef(path, claim, repo)) continue;
           if (!records.some((r) => touches(r, path))) out.push({ claim: { ...claim, paths: [path] }, reason: `no record of reading ${clean(path, 80)} this turn` });
         }
         break;
@@ -346,6 +406,21 @@ export function parseRecords(raw: unknown): EvidenceRecord[] {
     out.push(rec);
   }
   return out;
+}
+
+/** Most names believed from one fact list. The worker sends no more than this. */
+const MAX_FACT_NAMES = 2000;
+
+/** Check the shape of the worker's worktree facts. Anything that is not exactly that shape gives undefined, and the gate then works without them. */
+export function parseRepoFacts(raw: unknown): RepoFacts | undefined {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return undefined;
+  const r = raw as Record<string, unknown>;
+  const names = (v: unknown) => (Array.isArray(v) && v.length <= MAX_FACT_NAMES && v.every((x) => typeof x === 'string') ? (v as string[]) : undefined);
+  const dirs = names(r.dirs);
+  if (!dirs) return undefined;
+  if (r.deps === undefined) return { dirs };
+  const deps = names(r.deps);
+  return deps ? { dirs, deps } : undefined;
 }
 
 const VERB: Record<EvidenceRecord['kind'], string> = { read: 'read', search: 'searched', edit: 'edited', run: 'ran', other: 'used' };

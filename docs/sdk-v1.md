@@ -143,7 +143,7 @@ The three capabilities the kernel enforces are frozen. The other names are conve
 | Event | Emitted by | Payload | Status |
 |---|---|---|---|
 | `stage.requested` | pipeline | `{ stage, prompt, model, mode: "readonly"\|"edit", cwd, stageId? }` | stable (`stageId` is experimental) |
-| `stage.completed` | worker | `{ stage, ok: true, result: string, costUsd?, sessionId?, evidence?: EvidenceRecord[] }` | `stage`, `ok`, `result` stable. `costUsd`, `sessionId` experimental. `evidence` experimental: the record shape is gate-evidence's input and has one producer. |
+| `stage.completed` | worker | `{ stage, ok: true, result: string, costUsd?, sessionId?, evidence?: EvidenceRecord[], repo?: { dirs: string[], deps?: string[] } }` | `stage`, `ok`, `result` stable. `costUsd`, `sessionId` experimental. `evidence` and `repo` experimental: they are gate-evidence's input and have one producer (`repo` is the worktree's folder names and package.json dependencies, read from disk after the run). |
 | `stage.checked` | gate-evidence | the `stage.completed` fields, plus `{ checked, mode?, evidenceSummary?, evidenceLines?, unverified? }` | name and the forwarded fields stable. The gate fields are experimental. |
 | `stage.screened` | gate-promise | the `stage.checked` or `stage.completed` fields minus raw `evidence`, plus `{ promiseChecked, promiseMode?, promises? }` | name and forwarded fields stable. The gate fields are experimental. |
 | `stage.failed` | worker, gates | `{ stage, error: string }`, and from a gate `{ blocked: true, unverified?, promises?, evidenceSummary? }` | `stage`, `error` stable. The rest experimental. |

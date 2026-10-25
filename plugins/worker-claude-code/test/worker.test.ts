@@ -27,6 +27,7 @@ import worker, {
   withNpmCache,
   withRunWritable,
   removeRunDir,
+  repoFactsOf,
   run,
 } from '../src/index.ts';
 import type { ChildProcess } from 'node:child_process';
@@ -465,6 +466,16 @@ describe('tool-use records', () => {
       result: 'streamed',
       evidence: [{ tool: 'Read', kind: 'read', target: 'src/a.ts', ok: true }, { tool: 'Bash', kind: 'run', target: 'pnpm test', ok: true }],
     });
+  });
+
+  it('the plugin puts the worktree facts on stage.completed, read from the disk after the run', async () => {
+    const { fire, seen } = await setup();
+    const cwd = tmp();
+    mkdirSync(join(cwd, 'src'));
+    writeFileSync(join(cwd, 'package.json'), JSON.stringify({ dependencies: { lodash: '^4' } }));
+    fire(req({ prompt: 'FAKE:stream', cwd }));
+    await waitFor(() => seen.length > 0);
+    expect((seen[0]!.payload as { repo: unknown }).repo).toEqual({ dirs: ['src'], deps: ['lodash'] });
   });
 
   it('a run with no stream still emits an empty list', async () => {
@@ -1161,3 +1172,32 @@ function realpathOf(p: string): string {
   // macOS tmp dirs resolve through /private
   return existsSync(`/private${p}`) ? `/private${p}` : p;
 }
+
+describe('repoFactsOf', () => {
+  it('lists folder and symlink names at any depth, outside node_modules and .git, and the package.json dependencies', async () => {
+    const wt = tmp();
+    for (const d of ['src/util', 'Lib', '.git/objects', 'node_modules/lodash', 'node_modules/@scope/pkg', '.github/workflows', '@types']) mkdirSync(join(wt, d), { recursive: true });
+    writeFileSync(join(wt, 'src', 'a.js'), '');
+    symlinkSync(join(wt, 'src'), join(wt, 'linked'));
+    writeFileSync(join(wt, 'package.json'), JSON.stringify({ dependencies: { lodash: '1', '@scope/pkg': '1', 'Not-Valid': '1' }, devDependencies: { vitest: '1' } }));
+    // `.github` cannot be a package name, so it is left out; `Lib` is lowercased; `workflows` is found inside `.github`.
+    expect(await repoFactsOf(wt)).toEqual({ dirs: ['@types', 'lib', 'linked', 'src', 'util', 'workflows'], deps: ['@scope/pkg', 'lodash', 'vitest'] });
+  });
+
+  it('no package.json is no dependencies; one it cannot read leaves deps out; a worktree it cannot walk gives nothing', async () => {
+    const wt = tmp();
+    mkdirSync(join(wt, 'src'));
+    expect(await repoFactsOf(wt)).toEqual({ dirs: ['src'], deps: [] });
+    for (const bad of ['{not json', '[]', '"x"', JSON.stringify({ dependencies: ['lodash'] }), JSON.stringify({ devDependencies: null })]) {
+      writeFileSync(join(wt, 'package.json'), bad);
+      expect(await repoFactsOf(wt)).toEqual({ dirs: ['src'] });
+    }
+    expect(await repoFactsOf(join(wt, 'missing'))).toBeUndefined();
+  });
+
+  it('a worktree with more names than it keeps gives nothing, so the gate falls back to asking for a record', async () => {
+    const wt = tmp();
+    for (let n = 0; n < 2001; n++) mkdirSync(join(wt, `d${n}`));
+    expect(await repoFactsOf(wt)).toBeUndefined();
+  });
+});

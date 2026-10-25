@@ -191,11 +191,11 @@ const stripPath = (p: string) => p.replace(/^(?:\.\/)+/, '').replace(/[.,;:)]+$/
 
 /**
  * A quoted module specifier in code the sentence quotes: `import chunk from 'lodash/chunk.js'`, `import 'x'`,
- * `export { a } from 'x'`, `import('x')`, `require('x')`. The second, fourth or sixth group is the specifier. Every repeat is
- * bounded and none is nested, so a long sentence costs time in proportion to its length.
+ * `export { a } from 'x'`, `import('x')`, `require('x')`. The second, fourth or sixth group is the specifier. Every repeat has a
+ * small fixed bound, so a run of a million spaces after `import` costs a few hundred steps, not a scan per space.
  */
 const SPECIFIER =
-  /\b(?:import|export)\s+(?:[\w$*{},\s]{0,200}?\s)?from\s*(['"])([^'"\s]{1,300})\1|\bimport\s*(['"])([^'"\s]{1,300})\3|\b(?:require|import)\s*\(\s*(['"])([^'"\s]{1,300})\5\s*\)/g;
+  /\b(?:import|export)\s(?:[\w$*{},\s]{0,200}?\s)?from\s{0,10}(['"])([^'"\s]{1,300})\1|\bimport\s{0,10}(['"])([^'"\s]{1,300})\3|\b(?:require|import)\s{0,10}\(\s{0,10}(['"])([^'"\s]{1,300})\5\s{0,10}\)/g;
 
 /** Every claim in a piece of stage text. `stage` matters only for the VERDICT line, which means different things in test and review. */
 export function findClaims(text: string, stage: string): Claim[] {

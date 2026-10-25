@@ -524,6 +524,20 @@ describe('a package import specifier is not a file claim', () => {
     expect(reasons("`chart.js` is what `import Chart from 'chart.js'` loads, and it exports Chart.", [], { dirs: [], deps: ['chart.js'] })).toEqual(['no record of reading chart.js this turn']);
   });
 
+  it('stays fast on 1 MB of import, require and from built to keep the specifier scan busy', () => {
+    const repo: RepoFacts = { dirs: [], deps: [] };
+    for (const t of [
+      `\`a.ts\` imports ${'import '.repeat(1)}${' '.repeat(1_000_000)}x`,
+      `\`a.ts\` imports ${'import {a, '.repeat(90_000)}`,
+      `\`a.ts\` imports ${'require ( '.repeat(100_000)}`,
+      `\`a.ts\` imports ${'import x from '.repeat(70_000)}`,
+    ]) {
+      const t0 = performance.now();
+      checkClaims(findClaims(t, 'build'), [], repo);
+      expect(performance.now() - t0).toBeLessThan(2000);
+    }
+  });
+
   it('parseRepoFacts takes only the exact shape, and a bad one is no facts', () => {
     expect(parseRepoFacts({ dirs: ['src'], deps: ['lodash'] })).toEqual({ dirs: ['src'], deps: ['lodash'] });
     expect(parseRepoFacts({ dirs: ['src'] })).toEqual({ dirs: ['src'] });

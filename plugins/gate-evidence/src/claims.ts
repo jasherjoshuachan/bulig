@@ -408,14 +408,16 @@ export function parseRecords(raw: unknown): EvidenceRecord[] {
   return out;
 }
 
-/** Most names believed from one fact list. The worker sends no more than this. */
+/** Most names believed from one fact list, and the longest name: the worker's REPO_FACT_LIMITS, which the gateway's schema also enforces. */
 const MAX_FACT_NAMES = 2000;
+const MAX_FACT_NAME_LENGTH = 214;
 
 /** Check the shape of the worker's worktree facts. Anything that is not exactly that shape gives undefined, and the gate then works without them. */
 export function parseRepoFacts(raw: unknown): RepoFacts | undefined {
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return undefined;
   const r = raw as Record<string, unknown>;
-  const names = (v: unknown) => (Array.isArray(v) && v.length <= MAX_FACT_NAMES && v.every((x) => typeof x === 'string') ? (v as string[]) : undefined);
+  const names = (v: unknown) =>
+    Array.isArray(v) && v.length <= MAX_FACT_NAMES && v.every((x) => typeof x === 'string' && x.length > 0 && x.length <= MAX_FACT_NAME_LENGTH) ? (v as string[]) : undefined;
   const dirs = names(r.dirs);
   if (!dirs) return undefined;
   if (r.deps === undefined) return { dirs };

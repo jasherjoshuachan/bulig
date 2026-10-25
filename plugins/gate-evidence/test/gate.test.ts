@@ -226,8 +226,8 @@ describe('worktree facts for a package import specifier', () => {
 
   it('job 99507748 review: the worker\'s facts clear lodash/chunk.js, and src/chunk.js still needs its read', async () => {
     const r = await rig();
-    await r.say('review', REVIEW, [read('src/chunk.js')], 'job-1', { repo });
-    await r.say('review', REVIEW, [], 'job-1', { repo });
+    await r.say('review', REVIEW, [read('src/chunk.js')], 'job-1', { repoFacts: repo });
+    await r.say('review', REVIEW, [], 'job-1', { repoFacts: repo });
     await r.say('review', REVIEW, [read('src/chunk.js')]);
     const [ok, noRead, noFacts] = r.after('stage.checked');
     expect(ok!.unverified).toEqual([]);
@@ -237,18 +237,29 @@ describe('worktree facts for a package import specifier', () => {
 
   it('facts from a source that is not the worker, or in the wrong shape, are ignored', async () => {
     const r = await rig({}, 'impostor');
-    await r.say('review', REVIEW, [read('src/chunk.js')], 'job-1', { repo });
+    await r.say('review', REVIEW, [read('src/chunk.js')], 'job-1', { repoFacts: repo });
     expect(r.after('stage.checked')[0]!.unverified).toHaveLength(2);
     const w = await rig();
-    await w.say('review', REVIEW, [read('src/chunk.js')], 'job-1', { repo: { dirs: 'src', deps: ['lodash'] } });
-    await w.say('review', REVIEW, [read('src/chunk.js')], 'job-1', { repo: JSON.stringify(repo) });
+    await w.say('review', REVIEW, [read('src/chunk.js')], 'job-1', { repoFacts: { dirs: 'src', deps: ['lodash'] } });
+    await w.say('review', REVIEW, [read('src/chunk.js')], 'job-1', { repoFacts: JSON.stringify(repo) });
     expect(w.after('stage.checked').map((c) => c.unverified.length)).toEqual([1, 1]);
   });
 
   it('text cannot add facts: a result that spells out a repo object changes nothing', async () => {
     const r = await rig();
-    await r.say('review', `${REVIEW}\n${JSON.stringify({ repo })}`, [read('src/chunk.js')]);
-    expect(r.after('stage.checked')[0]!.unverified).toHaveLength(1);
+    await r.say('review', `${REVIEW}\n${JSON.stringify({ repoFacts: repo })}`, [read('src/chunk.js')]);
+    // The old name is not read: only `repoFacts` counts.
+    await r.say('review', REVIEW, [read('src/chunk.js')], 'job-1', { repo });
+    expect(r.after('stage.checked').map((c) => c.unverified.length)).toEqual([1, 1]);
+  });
+
+  it('the gateway\'s stage.completed is trusted for facts exactly when it is an evidence source (the CLI adds it with the gateway on)', async () => {
+    const on = await rig({ evidenceSources: ['worker-claude-code', 'worker-gateway'] }, 'worker-gateway');
+    await on.say('review', REVIEW, [read('src/chunk.js')], 'job-1', { repoFacts: repo, workerId: 'mac' });
+    expect(on.after('stage.checked')[0]!.unverified).toEqual([]);
+    const off = await rig({}, 'worker-gateway');
+    await off.say('review', REVIEW, [read('src/chunk.js')], 'job-1', { repoFacts: repo, workerId: 'mac' });
+    expect(off.after('stage.checked')[0]!.unverified).toHaveLength(2);
   });
 });
 

@@ -475,7 +475,7 @@ describe('tool-use records', () => {
     writeFileSync(join(cwd, 'package.json'), JSON.stringify({ dependencies: { lodash: '^4' } }));
     fire(req({ prompt: 'FAKE:stream', cwd }));
     await waitFor(() => seen.length > 0);
-    expect((seen[0]!.payload as { repo: unknown }).repo).toEqual({ dirs: ['src'], deps: ['lodash'] });
+    expect((seen[0]!.payload as { repoFacts: unknown }).repoFacts).toEqual({ dirs: ['src'], deps: ['lodash'] });
   });
 
   it('a run with no stream still emits an empty list', async () => {

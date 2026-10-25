@@ -404,11 +404,15 @@ export interface RepoFacts {
   deps?: string[];
 }
 
-/** Most entries looked at, and most distinct names kept. A worktree bigger than this gets no facts, so the gate behaves as it did before it had any. */
-const MAX_WALK_ENTRIES = 50_000;
-const MAX_FACT_NAMES = 2000;
-/** A name an npm package or an npm scope can have: lowercase, not starting with `.` or `_`, at most 214 characters. */
-const NPM_NAME = /^@?[a-z0-9~-][a-z0-9._~-]{0,213}$/;
+/**
+ * The caps on worktree facts, shared with worker-gateway's wire schema so a remote worker's facts pass exactly when the in-process
+ * worker's would. `entries`: most folder entries walked (a bigger worktree gets no facts, and the gate behaves as it did before it had
+ * any). `names`: most names in each list. `nameLength`: longest name, npm's own limit.
+ */
+export const REPO_FACT_LIMITS = { entries: 50_000, names: 2000, nameLength: 214 } as const;
+/** A name an npm package or an npm scope can have: lowercase, not starting with `.` or `_`. */
+const NPM_NAME = /^@?[a-z0-9~-][a-z0-9._~-]*$/;
+const factName = (name: string) => name.length <= REPO_FACT_LIMITS.nameLength && NPM_NAME.test(name);
 
 /** The facts for one worktree. Never throws: anything that goes wrong (a folder it cannot read, too many entries) gives undefined. */
 export async function repoFactsOf(cwd: string): Promise<RepoFacts | undefined> {
@@ -419,14 +423,14 @@ export async function repoFactsOf(cwd: string): Promise<RepoFacts | undefined> {
     while (todo.length) {
       const dir = todo.pop()!;
       for (const ent of await readdir(dir, { withFileTypes: true })) {
-        if (++seen > MAX_WALK_ENTRIES) return undefined;
+        if (++seen > REPO_FACT_LIMITS.entries) return undefined;
         if (ent.name === 'node_modules' || ent.name === '.git') continue;
         // A symlink is never followed, but its name counts: `lodash -> ../x` makes `lodash/chunk.js` a real path.
         if (!ent.isDirectory() && !ent.isSymbolicLink()) continue;
         // Lowercased, so a `Lodash` folder on a case-insensitive disk still counts as `lodash`.
         const name = ent.name.toLowerCase();
-        if (NPM_NAME.test(name)) dirs.add(name);
-        if (dirs.size > MAX_FACT_NAMES) return undefined;
+        if (factName(name)) dirs.add(name);
+        if (dirs.size > REPO_FACT_LIMITS.names) return undefined;
         if (ent.isDirectory()) todo.push(join(dir, ent.name));
       }
     }
@@ -457,14 +461,14 @@ async function depsOf(file: string): Promise<string[] | undefined> {
       if (typeof list !== 'object' || list === null || Array.isArray(list)) return undefined;
       for (const name of Object.keys(list)) if (isPackageName(name)) names.add(name);
     }
-    return names.size > MAX_FACT_NAMES ? undefined : [...names].sort();
+    return names.size > REPO_FACT_LIMITS.names ? undefined : [...names].sort();
   } catch {
     return undefined;
   }
 }
 
 /** `lodash` or `@scope/name`, by npm's rules for new packages. */
-const isPackageName = (name: string) => name.length <= 214 && /^(?:@[a-z0-9~-][a-z0-9._~-]*\/)?[a-z0-9~-][a-z0-9._~-]*$/.test(name);
+const isPackageName = (name: string) => name.length <= REPO_FACT_LIMITS.nameLength && /^(?:@[a-z0-9~-][a-z0-9._~-]*\/)?[a-z0-9~-][a-z0-9._~-]*$/.test(name);
 
 export interface RunResult {
   ok: boolean;
@@ -960,7 +964,7 @@ export function createWorker() {
           }, (line) => ctx.log.warn(line));
           // Read after the run, so a package the stage installed counts, and before the checks below, so nothing waits between them and the emit.
           // Left out when it cannot be read: the evidence gate then works as it did without it.
-          const repo = out.ok ? await repoFactsOf(req.cwd) : undefined;
+          const repoFacts = out.ok ? await repoFactsOf(req.cwd) : undefined;
           // A run that was ended by stop() says nothing. The stage stays running, and the next start marks it interrupted.
           if (stopping) return;
           if (spawned && ended.has(spawned)) {
@@ -971,7 +975,7 @@ export function createWorker() {
           if (out.ok) {
             ctx.emit(
               'stage.completed',
-              { stage: req.stage, ok: true, result: out.result, costUsd: out.costUsd, sessionId: out.sessionId, evidence: out.evidence ?? [], ...(repo && { repo }) },
+              { stage: req.stage, ok: true, result: out.result, costUsd: out.costUsd, sessionId: out.sessionId, evidence: out.evidence ?? [], ...(repoFacts && { repoFacts }) },
               event.jobId,
             );
           } else {

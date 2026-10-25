@@ -170,6 +170,75 @@ describe('the worker, against a kernel that is just a script', () => {
     }
   });
 
+  describe('worktree facts', () => {
+    /** A kernel that answers each result with what `answer` says, and records every one it is sent. */
+    function kernelAnswering(assignmentBody: Record<string, unknown>, answer: (body: { output: Record<string, unknown> }) => number) {
+      const results: { output: Record<string, unknown> }[] = [];
+      let handed = false;
+      const fetchImpl = (async (url: URL, init: { body: string }) => {
+        const path = new URL(url).pathname;
+        if (path === '/claim') {
+          if (!handed) {
+            handed = true;
+            return new Response(JSON.stringify(assignmentBody), { status: 200 });
+          }
+          await sleep(100);
+          return new Response(null, { status: 204 });
+        }
+        if (path !== '/result') return new Response(JSON.stringify({ ok: true }), { status: 200 });
+        const body = JSON.parse(init.body) as { output: Record<string, unknown> };
+        results.push(body);
+        const status = answer(body);
+        return new Response(JSON.stringify(status === 200 ? { ok: true } : { error: 'bad request' }), { status });
+      }) as unknown as typeof fetch;
+      return { fetchImpl, results };
+    }
+    const start = (w: ReturnType<typeof makeWorld>, fetchImpl: typeof fetch) =>
+      startRemoteWorker({ kernelUrl: 'http://127.0.0.1:1', workerId: 'mac', token: 'mac-token-0123456789abcdef', slots: 1, repos: { [w.repo]: w.clone }, workdir: w.workdir, claudeBin: FAKE, retryMs: 50, fetch: fetchImpl });
+
+    it('the result carries the facts the worker read from its stage folder', async () => {
+      const w = makeWorld();
+      const k = kernelAnswering(assignment(w), () => 200);
+      const worker = start(w, k.fetchImpl);
+      try {
+        await waitFor(() => k.results.length === 1 && worker.running() === 0, 30_000, 'the result');
+        // The build stand-in writes src/multiply.js; the clone has no package.json, so no dependencies.
+        expect(k.results[0]!.output.repoFacts).toEqual({ dirs: ['src'], deps: [] });
+        expect(k.results).toHaveLength(1);
+      } finally {
+        await worker.stop();
+      }
+    });
+
+    it('a kernel from before repoFacts (400 on the unknown field) gets the result once more without them, and takes it', async () => {
+      const w = makeWorld();
+      const k = kernelAnswering(assignment(w), (body) => ('repoFacts' in body.output ? 400 : 200));
+      const worker = start(w, k.fetchImpl);
+      try {
+        await waitFor(() => k.results.length === 2 && worker.running() === 0, 30_000, 'the second result');
+        expect(k.results[0]!.output).toHaveProperty('repoFacts');
+        expect(k.results[1]!.output).not.toHaveProperty('repoFacts');
+        expect(k.results[1]).toMatchObject({ outcome: 'completed', output: { result: 'Added src/multiply.js' } });
+        expect(k.results[1]).toHaveProperty('patch');
+      } finally {
+        await worker.stop();
+      }
+    });
+
+    it('a 400 for a result with no facts in it is not sent again', async () => {
+      const w = makeWorld();
+      const k = kernelAnswering(assignment(w), () => 400);
+      const worker = start(w, k.fetchImpl);
+      try {
+        await waitFor(() => k.results.length === 2 && worker.running() === 0, 30_000, 'both tries');
+        await sleep(300);
+        expect(k.results).toHaveLength(2); // with facts, then without, then nothing more
+      } finally {
+        await worker.stop();
+      }
+    });
+  });
+
   it('does not send a patch larger than the kernel said it would take: the stage is reported failed with that reason', async () => {
     const w = makeWorld();
     const k = fakeKernel(assignment(w, { maxPatchBytes: 100 }));

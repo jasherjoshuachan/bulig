@@ -95,11 +95,14 @@ for (const adapter of ADAPTERS) {
       expect((await post(r.url, '/heartbeat', TOKENS.mac, ids)).status).toBe(200);
       // A git diff record carries the files it showed, so the evidence gate can count them as read on a remote run too.
       const evidence = [{ tool: 'Read', kind: 'read', target: 'a.md', ok: true }, { tool: 'Bash', kind: 'run', target: 'git diff main', ok: true, diffPaths: ['src/a.ts'] }];
-      const done = await post(r.url, '/result', TOKENS.mac, { ...ids, outcome: 'completed', output: { result: 'A plan', costUsd: 0.5, sessionId: 's-1', evidence } });
+      // And the worktree facts the evidence gate uses to tell a package import specifier from a repo file.
+      const repoFacts = { dirs: ['src', '@types'], deps: ['lodash', '@scope/pkg'] };
+      const done = await post(r.url, '/result', TOKENS.mac, { ...ids, outcome: 'completed', output: { result: 'A plan', costUsd: 0.5, sessionId: 's-1', evidence, repoFacts } });
       expect(done.status).toBe(200);
       const completed = r.types('stage.completed');
       expect(completed).toHaveLength(1);
       expect((completed[0]!.payload as { evidence: unknown }).evidence).toEqual(evidence);
+      expect((completed[0]!.payload as { repoFacts: unknown }).repoFacts).toEqual(repoFacts);
       expect(completed[0]!.jobId).toBe(job.id);
       expect(completed[0]!.source).toBe('worker-gateway');
       expect(completed[0]!.payload).toMatchObject({ stage: 'plan', ok: true, result: 'A plan', costUsd: 0.5, sessionId: 's-1', workerId: 'mac' });
@@ -108,6 +111,44 @@ for (const adapter of ADAPTERS) {
       expect(r.types('stage.completed')).toHaveLength(1);
       // and the heartbeat of a stage that is no longer held is stale
       expect((await post(r.url, '/heartbeat', TOKENS.mac, ids)).status).toBe(409);
+    });
+
+    it('worktree facts in any shape but the exact one, or over the caps, refuse the result; a result without them carries none', async () => {
+      const r = await rig();
+      const { job, cwd } = await r.newJob();
+      await r.driver.ask(job, cwd, 'plan');
+      const first = await r.take(TOKENS.mac);
+      expect(first.status).toBe(200);
+      const ids = { stageId: first.json.stageId, attempt: first.json.attempt, generation: first.json.generation };
+      const result = (repoFacts: unknown) => post(r.url, '/result', TOKENS.mac, { ...ids, outcome: 'completed', output: { result: 'A plan', repoFacts } });
+      const names = (n: number) => Array.from({ length: n }, (_, i) => `d${i}`);
+      for (const bad of [
+        'src',
+        ['src'],
+        { deps: ['lodash'] },
+        { dirs: ['src'], deps: ['lodash'], extra: true },
+        { dirs: [1] },
+        { dirs: [''] },
+        { dirs: ['a'.repeat(215)] },
+        { dirs: ['src'], deps: ['a'.repeat(215)] },
+        { dirs: names(2001) },
+        { dirs: ['src'], deps: names(2001) },
+      ]) {
+        expect((await result(bad)).status, JSON.stringify(bad).slice(0, 80)).toBe(400);
+      }
+      // `repo` is not another name for them: an unknown field in the output is refused too.
+      expect((await post(r.url, '/result', TOKENS.mac, { ...ids, outcome: 'completed', output: { result: 'A plan', repo: { dirs: ['src'] } } })).status).toBe(400);
+      expect(r.types('stage.completed')).toHaveLength(0);
+      // At the caps exactly, it is taken.
+      expect((await result({ dirs: names(2000), deps: ['a'.repeat(214)] })).status).toBe(200);
+      expect((r.types('stage.completed')[0]!.payload as { repoFacts: { dirs: string[] } }).repoFacts.dirs).toHaveLength(2000);
+
+      // An older worker sends no facts, and the stage.completed carries none.
+      const next = await r.newJob('Another job');
+      await r.driver.ask(next.job, next.cwd, 'plan');
+      const second = await r.take(TOKENS.mac);
+      await post(r.url, '/result', TOKENS.mac, { stageId: second.json.stageId, attempt: second.json.attempt, generation: second.json.generation, outcome: 'completed', output: { result: 'A plan' } });
+      expect(r.types('stage.completed')[1]!.payload).not.toHaveProperty('repoFacts');
     });
 
     it('a failed run becomes stage.failed', async () => {

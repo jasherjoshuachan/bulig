@@ -541,7 +541,7 @@ describe('a package import specifier is not a file claim', () => {
   it('parseRepoFacts takes only the exact shape, and a bad one is no facts', () => {
     expect(parseRepoFacts({ dirs: ['src'], deps: ['lodash'] })).toEqual({ dirs: ['src'], deps: ['lodash'] });
     expect(parseRepoFacts({ dirs: ['src'] })).toEqual({ dirs: ['src'] });
-    for (const bad of [undefined, null, 'src', [], { deps: ['lodash'] }, { dirs: 'src' }, { dirs: ['src', 1] }, { dirs: ['src'], deps: 'lodash' }, { dirs: ['src'], deps: [null] }, { dirs: Array.from({ length: 2001 }, (_, n) => `d${n}`) }]) {
+    for (const bad of [undefined, null, 'src', [], { deps: ['lodash'] }, { dirs: 'src' }, { dirs: ['src', 1] }, { dirs: ['src'], deps: 'lodash' }, { dirs: ['src'], deps: [null] }, { dirs: [''] }, { dirs: ['a'.repeat(215)] }, { dirs: ['src'], deps: ['a'.repeat(215)] }, { dirs: Array.from({ length: 2001 }, (_, n) => `d${n}`) }]) {
       expect(parseRepoFacts(bad)).toBeUndefined();
     }
   });

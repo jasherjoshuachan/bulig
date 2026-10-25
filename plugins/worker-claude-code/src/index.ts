@@ -1,7 +1,7 @@
 import { spawn, type ChildProcess } from 'node:child_process';
-import { chmodSync, lstatSync, mkdtempSync, readdirSync, realpathSync, rmSync } from 'node:fs';
+import { chmodSync, constants as fsConstants, lstatSync, mkdtempSync, readdirSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { readFile, readdir } from 'node:fs/promises';
+import { open, opendir, type FileHandle } from 'node:fs/promises';
 import { join } from 'node:path';
 import { definePlugin, type BuligEvent } from '@bulig/plugin-sdk';
 import { clipText } from '@bulig/text';
@@ -422,7 +422,8 @@ export async function repoFactsOf(cwd: string): Promise<RepoFacts | undefined> {
     let seen = 0;
     while (todo.length) {
       const dir = todo.pop()!;
-      for (const ent of await readdir(dir, { withFileTypes: true })) {
+      // One entry at a time, so the entry cap holds inside a single huge folder too. Leaving the loop early closes the folder.
+      for await (const ent of await opendir(dir)) {
         if (++seen > REPO_FACT_LIMITS.entries) return undefined;
         if (ent.name === 'node_modules' || ent.name === '.git') continue;
         // A symlink is never followed, but its name counts: `lodash -> ../x` makes `lodash/chunk.js` a real path.
@@ -443,16 +444,60 @@ export async function repoFactsOf(cwd: string): Promise<RepoFacts | undefined> {
   }
 }
 
-/** The dependency and devDependency names of one package.json: [] when the file is not there, undefined when it is there but is not a readable object. */
-async function depsOf(file: string): Promise<string[] | undefined> {
-  let text: string;
+/** The largest package.json read. A bigger one gives no dependencies. */
+export const MAX_PACKAGE_JSON_BYTES = 1024 * 1024;
+
+export type WorktreeFile = { ok: true; text: string } | { ok: false; why: 'missing' | 'symlink' | 'not-a-file' | 'too-large' | 'unreadable' };
+
+/**
+ * Read one file from a worktree, which the stage could have made into anything: a FIFO (open would block a libuv thread for good),
+ * a symlink to /dev/zero or to a huge file, a folder. Only a regular file, never through a symlink, at most `max` bytes:
+ * open with O_NOFOLLOW and O_NONBLOCK, fstat the open descriptor (so what is checked is what is read), and read at most max + 1
+ * bytes from it. Never throws. Any new code that reads a worktree file must go through this.
+ */
+export async function readWorktreeFile(file: string, max: number): Promise<WorktreeFile> {
+  const { O_RDONLY, O_NOFOLLOW, O_NONBLOCK } = fsConstants;
+  // Without both flags (Windows) the guards cannot hold, so nothing is read.
+  if (typeof O_NOFOLLOW !== 'number' || typeof O_NONBLOCK !== 'number') return { ok: false, why: 'unreadable' };
+  let fh: FileHandle | undefined;
   try {
-    text = await readFile(file, 'utf8');
-  } catch (err) {
-    return (err as NodeJS.ErrnoException)?.code === 'ENOENT' ? [] : undefined;
+    try {
+      fh = await open(file, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException)?.code;
+      // O_NOFOLLOW on a symlink: ELOOP on Linux and macOS, EMLINK on FreeBSD.
+      return { ok: false, why: code === 'ENOENT' ? 'missing' : code === 'ELOOP' || code === 'EMLINK' ? 'symlink' : 'unreadable' };
+    }
+    const st = await fh.stat();
+    if (!st.isFile()) return { ok: false, why: 'not-a-file' };
+    if (st.size > max) return { ok: false, why: 'too-large' };
+    // The file can grow after the fstat, so the read itself is capped too: one byte past the cap means too large.
+    const buf = Buffer.alloc(max + 1);
+    let n = 0;
+    while (n < buf.length) {
+      const { bytesRead } = await fh.read(buf, n, buf.length - n, n);
+      if (bytesRead === 0) break;
+      n += bytesRead;
+    }
+    if (n > max) return { ok: false, why: 'too-large' };
+    return { ok: true, text: buf.subarray(0, n).toString('utf8') };
+  } catch {
+    return { ok: false, why: 'unreadable' };
+  } finally {
+    await fh?.close().catch(() => {});
   }
+}
+
+/**
+ * The dependency and devDependency names of one package.json: [] when the file is not there, undefined when it is anything but a
+ * small regular file holding an object. Undefined leaves `deps` out of the facts and keeps `dirs`: that only turns the dependency
+ * signal off, so the gate asks for more records, never fewer (the folder list, which keeps repo files in, does not depend on it).
+ */
+async function depsOf(file: string): Promise<string[] | undefined> {
+  const read = await readWorktreeFile(file, MAX_PACKAGE_JSON_BYTES);
+  if (!read.ok) return read.why === 'missing' ? [] : undefined;
   try {
-    const pkg = JSON.parse(text) as unknown;
+    const pkg = JSON.parse(read.text) as unknown;
     if (typeof pkg !== 'object' || pkg === null || Array.isArray(pkg)) return undefined;
     const names = new Set<string>();
     for (const field of ['dependencies', 'devDependencies'] as const) {

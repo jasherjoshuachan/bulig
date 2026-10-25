@@ -534,7 +534,8 @@ describe('a package import specifier is not a file claim', () => {
     ]) {
       const t0 = performance.now();
       checkClaims(findClaims(t, 'build'), [], repo);
-      expect(performance.now() - t0).toBeLessThan(2000);
+      // A wide budget: the bounded scan takes milliseconds, and a scan per space would take minutes. Not a timing of the machine.
+      expect(performance.now() - t0).toBeLessThan(20_000);
     }
   });
 

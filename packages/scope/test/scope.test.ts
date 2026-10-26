@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { isRepoPath, matchesGlob, matchesScope, normalizeScopeEntry, parseScopeBlock } from '../src/index.ts';
+import { readFileSync } from 'node:fs';
+import { isRepoPath, matchesGlob, matchesScope, normalizeScopeEntry, parseScopeBlock, SCOPE_BLOCK_EXAMPLE, SCOPE_BLOCK_IN_REPLY, SCOPE_BLOCK_RULE } from '../src/index.ts';
 
 describe('path depth cap', () => {
   const deep = (n: number) => `${Array.from({ length: n - 1 }, (_, i) => `d${i}`).join('/')}/f.txt`;
@@ -267,5 +268,184 @@ describe('parseScopeBlock', () => {
     const r = parseScopeBlock(many);
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.error).toMatch(/too many/i);
+  });
+});
+
+// Job 3c70469d ("Add a range(start, end, step) helper", 25 Oct 2026). Its two plan replies, as the server got them.
+const ATTEMPT_1 = [
+  'I read src/ and test/ and wrote the plan.',
+  '',
+  'The plan is written to the plan file and presented above. Note: `ExitPlanMode` isn\'t available as a tool in this environment, so I could not hand it over that way; the scope block lists exactly the three files',
+].join('\n');
+const ATTEMPT_2 = [
+  '1. Add `src/range.js` exporting `range(start, end, step)`.',
+  '2. Add `test/range.test.js` covering a positive step, a negative step and a zero step.',
+  '3. Risk: floating point steps. Not handled beyond what the tests cover.',
+  '',
+  '```',
+  'SCOPE:',
+  'src/range.js',
+  'test/range.test.js',
+  '```',
+].join('\n');
+
+describe('parseScopeBlock: bare path lines', () => {
+  it('reads job 3c70469d attempt 2: bare paths inside a code fence', () => {
+    expect(parseScopeBlock(ATTEMPT_2)).toEqual({ ok: true, scope: ['src/range.js', 'test/range.test.js'] });
+  });
+
+  it('still fails job 3c70469d attempt 1, and tells the model to put the block in its reply', () => {
+    const r = parseScopeBlock(ATTEMPT_1);
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error).toMatch(/no SCOPE block/);
+      expect(r.error).toMatch(/in your reply itself, not in a plan file/);
+    }
+  });
+
+  it('an empty block says where the paths go and that the block belongs in the reply', () => {
+    const r = parseScopeBlock('SCOPE:\n\nsrc/a.js');
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error).toMatch(/empty/);
+      expect(r.error).toMatch(/right after "SCOPE:"/);
+      expect(r.error).toMatch(/not in a plan file/);
+    }
+  });
+
+  it('bullets still work, and bullets and bare lines can be mixed', () => {
+    expect(parseScopeBlock('SCOPE:\n- README.md\n* src/lib/*.ts')).toEqual({ ok: true, scope: ['README.md', 'src/lib/*.ts'] });
+    expect(parseScopeBlock('SCOPE:\n- README.md\nsrc/a.js\n  * `docs/**`\ntest/a.test.js')).toEqual({ ok: true, scope: ['README.md', 'src/a.js', 'docs/**', 'test/a.test.js'] });
+  });
+
+  it('takes bare lines wrapped in backticks, and indented bare lines', () => {
+    expect(parseScopeBlock('SCOPE:\n`src/a.js`\n  `docs/**`\n  test/a.test.js  ')).toEqual({ ok: true, scope: ['src/a.js', 'docs/**', 'test/a.test.js'] });
+  });
+
+  it('a code fence line closes the block', () => {
+    expect(parseScopeBlock('```\nSCOPE:\nsrc/a.js\n```\nsrc/after-the-fence.js')).toEqual({ ok: true, scope: ['src/a.js'] });
+    expect(parseScopeBlock('~~~\nSCOPE:\nsrc/a.js\n~~~\nsrc/b.js')).toEqual({ ok: true, scope: ['src/a.js'] });
+    // A fence that opens the next code block, language and all, ends the block too. Without the fence rule ~~~sh would be read as a path.
+    expect(parseScopeBlock('SCOPE:\nsrc/a.js\n~~~sh\nnpm test\n~~~')).toEqual({ ok: true, scope: ['src/a.js'] });
+  });
+
+  it('a blank line ends the block', () => {
+    expect(parseScopeBlock('SCOPE:\nsrc/a.js\n\nsrc/b.js')).toEqual({ ok: true, scope: ['src/a.js'] });
+  });
+
+  it('prose straight after a bare block, with no blank line, ends the block and is never read as a path', () => {
+    const text = "SCOPE:\nsrc/range.js\ntest/range.test.js\nThe `ExitPlanMode` tool isn't available here, so this reply is the plan.";
+    expect(parseScopeBlock(text)).toEqual({ ok: true, scope: ['src/range.js', 'test/range.test.js'] });
+  });
+
+  it('a one-word line after a bare block ends it too: a colon, a final dot, emphasis, a rule, a lone dash', () => {
+    for (const after of ['Notes:', 'Done.', '...', '**Notes**', '*note*', '__Notes__', '_note_', '---', '***', '___', '-', '/', 'src/a.js:12', 'a,b', 'x;y', '"src/b.js"', "it's", '<details>', '|', '1.']) {
+      expect(parseScopeBlock(`SCOPE:\nsrc/a.js\n${after}\nsrc/b.js`), after).toEqual({ ok: true, scope: ['src/a.js'] });
+    }
+  });
+
+  it('reads the ordinary path characters on a bare line, in any script', () => {
+    const paths = ['Makefile', '.gitignore', '.github/workflows/ci.yml', 'app/[id]/page.tsx', 'app/(group)/@slot/+page.svelte', 'src/{a}/b-c_d.ts', 'docs/', 'src/lib/?.ts', '*.md', 'docs/café.md', 'docs/日本語.md', '_config.yml'];
+    const r = parseScopeBlock(`SCOPE:\n${paths.join('\n')}`);
+    expect(r).toEqual({ ok: true, scope: ['Makefile', '.gitignore', '.github/workflows/ci.yml', 'app/[id]/page.tsx', 'app/(group)/@slot/+page.svelte', 'src/{a}/b-c_d.ts', 'docs/**', 'src/lib/?.ts', '*.md', 'docs/café.md', 'docs/日本語.md', '_config.yml'] });
+  });
+
+  it('a bad bare line fails the whole block, it does not just end it', () => {
+    // **/docs/** looks like emphasis at both ends, but it has a slash, so it is a path line and fails as too broad.
+    for (const bad of ['../x', '.git/x', '**', '*', '/etc/passwd', '~/x', 'src/../../x', '**/*.md', '**/docs/**', `docs/${'a'.repeat(200)}`]) {
+      const r = parseScopeBlock(`SCOPE:\nsrc/a.js\n${bad}`);
+      expect(r.ok, bad).toBe(false);
+      if (!r.ok) expect(r.error, bad).toMatch(/bad SCOPE lines/);
+    }
+    expect(parseScopeBlock('SCOPE:\nsrc/a.js\n`../x`').ok).toBe(false);
+    expect(parseScopeBlock('SCOPE:\n**', { allowBroad: true })).toEqual({ ok: true, scope: ['**'] });
+  });
+
+  it('an empty bullet ends the block', () => {
+    expect(parseScopeBlock('SCOPE:\n- a.txt\n- \n- b.txt')).toEqual({ ok: true, scope: ['a.txt'] });
+  });
+
+  it('the last block still wins with bare lines', () => {
+    expect(parseScopeBlock('SCOPE:\nold.txt\n\nChanged my mind.\n\nSCOPE:\nnew.txt\n')).toEqual({ ok: true, scope: ['new.txt'] });
+  });
+
+  it('the 100-entry cap counts bare lines', () => {
+    const lines = (n: number) => `SCOPE:\n${Array.from({ length: n }, (_, i) => `f${i}.txt`).join('\n')}`;
+    expect(parseScopeBlock(lines(100)).ok).toBe(true);
+    expect(parseScopeBlock(lines(101)).ok).toBe(false);
+  });
+
+  it('NFC still applies to bare lines', () => {
+    expect(parseScopeBlock('SCOPE:\ndocs/café.md')).toEqual({ ok: true, scope: ['docs/café.md'] });
+  });
+});
+
+describe('parseScopeBlock on large model text', () => {
+  const MB = 1 << 20;
+  const fast = (text: string) => {
+    const t = performance.now();
+    const r = parseScopeBlock(text);
+    return { r, ms: performance.now() - t };
+  };
+  // Each case was quadratic or worse before (a 64 KB bullet line with spaces took 3.6 s), so 1 MB would take minutes.
+  // The bound is loose so a loaded machine does not fail it.
+  it('reads a block after 1 MB of plan text quickly', () => {
+    const { r, ms } = fast(`${'word '.repeat(MB / 5)}\n${'line\n'.repeat(MB / 5)}SCOPE:\nsrc/a.js\n- src/b.js\n`);
+    expect(r).toEqual({ ok: true, scope: ['src/a.js', 'src/b.js'] });
+    expect(ms).toBeLessThan(3000);
+  });
+
+  it('a 1 MB bullet line full of spaces fails quickly', () => {
+    const { r, ms } = fast(`SCOPE:\n- a${' '.repeat(MB)}b`);
+    expect(r.ok).toBe(false);
+    expect(ms).toBeLessThan(3000);
+  });
+
+  it('a 1 MB bullet line of " (" fails quickly (the note check sees only short lines)', () => {
+    const { r, ms } = fast(`SCOPE:\n- ${' ('.repeat(MB / 2)}x`);
+    expect(r.ok).toBe(false);
+    expect(ms).toBeLessThan(3000);
+  });
+
+  it('a 1 MB bare line fails quickly, and so does a 1 MB line of stars before the head', () => {
+    const bare = fast(`SCOPE:\nsrc/a.js\n${'a/'.repeat(MB / 2)}`);
+    expect(bare.r.ok).toBe(false);
+    expect(bare.ms).toBeLessThan(3000);
+    const stars = fast(`${'*'.repeat(MB)}x\nno block`);
+    expect(stars.r.ok).toBe(false);
+    expect(stars.ms).toBeLessThan(3000);
+  });
+
+  it('a 1 MB backtick-wrapped bare line and a 1 MB emphasis-looking line end or fail quickly', () => {
+    for (const line of [`\`${'a'.repeat(MB)}\``, `**${'a'.repeat(MB)}`, `${'_'.repeat(MB)}a_`]) {
+      const { ms } = fast(`SCOPE:\nsrc/a.js\n${line}`);
+      expect(ms).toBeLessThan(3000);
+    }
+  });
+});
+
+describe('one description of the SCOPE block', () => {
+  const read = (rel: string) => readFileSync(new URL(rel, import.meta.url), 'utf8');
+  const sources = {
+    header: read('../src/index.ts').split('*/')[0]!.replace(/^ \* ?/gm, ''),
+    planPrompt: read('../../../plugins/pipeline-dev/prompts/plan.md'),
+    adr: read('../../../docs/adr/0005-scope-guard.md'),
+  };
+
+  it('the header comment, the plan prompt and ADR 0005 use the same rule, the same example, and say the block goes in the reply', () => {
+    const example = SCOPE_BLOCK_EXAMPLE.split('\n');
+    for (const [name, text] of Object.entries(sources)) {
+      const flat = text.replace(/\s+/g, ' ').toLowerCase();
+      expect(flat, name).toContain(SCOPE_BLOCK_RULE.toLowerCase());
+      expect(flat, name).toContain(SCOPE_BLOCK_IN_REPLY.replace(/^Put the block in your /, '').toLowerCase());
+      const lines = text.split('\n').map((l) => l.trim());
+      const at = lines.indexOf(example[0]!);
+      expect(at, name).toBeGreaterThanOrEqual(0);
+      expect(lines.slice(at, at + example.length), name).toEqual(example);
+    }
+  });
+
+  it('the example parses', () => {
+    expect(parseScopeBlock(SCOPE_BLOCK_EXAMPLE)).toEqual({ ok: true, scope: ['README.md', 'src/lib/*.ts'] });
   });
 });

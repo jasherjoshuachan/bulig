@@ -1,4 +1,5 @@
 import type { Job, Stage } from '@bulig/plugin-sdk';
+import { SCOPE_BLOCK_EXAMPLE, SCOPE_BLOCK_IN_REPLY, SCOPE_BLOCK_RULE } from '@bulig/scope';
 
 /** The stages that run Claude, in graph order. */
 export const CLAUDE_STAGES = ['plan', 'critique', 'build', 'test', 'review', 'docs'] as const;
@@ -44,6 +45,22 @@ export interface StageOutput {
 export const MAX_PLAN_TRIES = 2;
 const MAX_NAMED = 8;
 const MAX_FEEDBACK_FILES = 60;
+
+/**
+ * What a plan is told when its SCOPE block was missing or bad. Same wording and example as the plan prompt, and it says the
+ * block goes in the reply: a plan stage runs in Claude Code's plan mode, which tells the model to write its plan to a plan file,
+ * and the pipeline only ever reads the reply (job 3c70469d's first plan put its block there and said so).
+ */
+export function planRetryFeedback(why: string): string {
+  const rule = SCOPE_BLOCK_RULE.charAt(0).toUpperCase() + SCOPE_BLOCK_RULE.slice(1);
+  return [
+    `Your last plan was rejected: ${why}.`,
+    'Write the whole plan again, as your reply. It must end with the scope block described below.',
+    `${rule}. ${SCOPE_BLOCK_IN_REPLY}. Do not write a plan file. For example:`,
+    '',
+    SCOPE_BLOCK_EXAMPLE,
+  ].join('\n');
+}
 
 /** A list of files for a short message: the first few, then how many more. */
 export function namedFiles(files: string[], n = MAX_NAMED): string {
@@ -98,7 +115,7 @@ export function decide(job: Pick<Job, 'status'>, allStages: Stage[], maxBuilds: 
           return {
             kind: 'stage',
             name: 'plan',
-            feedback: `Your last plan was rejected: ${why}.\nWrite the whole plan again. It must end with the block described above: the line "SCOPE:" and then one path or glob per line, nothing else on the line.`,
+            feedback: planRetryFeedback(why),
           };
         }
         return { kind: 'fail', reason: `the plan still had no usable SCOPE block after ${tries} tries: ${why}` };

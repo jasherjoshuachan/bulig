@@ -1,9 +1,18 @@
 /**
  * Scope: the list of repo paths a job is allowed to change.
  *
- * A plan ends with a SCOPE block, one path or glob per line. The pipeline stores the approved list, and the
- * github plugin refuses to commit a file that no line covers. Both sides use the code in this file, so a line
- * means the same thing when it is read and when it is enforced.
+ * A plan ends with a SCOPE block: the line `SCOPE:` and then one path or glob per line, nothing else on the line.
+ * A `- ` in front of each path is optional. The block goes in the reply itself, not in a plan file or any other
+ * file. For example:
+ *
+ *   SCOPE:
+ *   - README.md
+ *   - src/lib/*.ts
+ *
+ * The pipeline stores the approved list, and the github plugin refuses to commit a file that no line covers. Both
+ * sides use the code in this file, so a line means the same thing when it is read and when it is enforced. The
+ * plan prompt, the retry message and ADR 0005 use the same wording and example (SCOPE_BLOCK_RULE and
+ * SCOPE_BLOCK_EXAMPLE below; a test checks they agree).
  *
  * The glob syntax is small on purpose. Only three characters are special:
  *   *   any run of characters inside one folder name (never a slash)
@@ -20,6 +29,13 @@
  * name (no * or ?). So docs/** and src/**\/*.ts pass; **, *?, **\/?*, **\/*.md, *\/docs/** and .*\/** do not.
  */
 import { clipText } from '@bulig/text';
+
+/** How a SCOPE block is written, in the words the plan prompt, the retry message and ADR 0005 all use. */
+export const SCOPE_BLOCK_RULE = 'the line `SCOPE:` and then one path or glob per line, nothing else on the line. A `- ` in front of each path is optional';
+/** Where the block goes. A plan stage runs in Claude Code's plan mode, which asks for a plan file; the pipeline only reads the reply. */
+export const SCOPE_BLOCK_IN_REPLY = 'Put the block in your reply itself, not in a plan file or any other file';
+/** The one example every description of the block shows. */
+export const SCOPE_BLOCK_EXAMPLE = 'SCOPE:\n- README.md\n- src/lib/*.ts';
 
 /** The most entries a SCOPE block may have. */
 export const MAX_SCOPE_ENTRIES = 100;
@@ -45,9 +61,10 @@ export function normalizeScopeEntry(raw: string, opts: { allowBroad?: boolean } 
   if (CONTROL.test(p)) return bad('contains a control character');
   if (p.includes('\\')) return bad('uses a backslash; write paths with /');
   if (p.startsWith('/') || p.startsWith('~') || /^[A-Za-z]:/.test(p)) return bad('absolute paths are not allowed; use a path relative to the repo root');
+  // The length check comes before the note check: that regex is quadratic on a long line, so it only ever sees 200 characters.
+  if (p.length > MAX_PATTERN_LENGTH) return bad(`too long (${p.length} characters, the most is ${MAX_PATTERN_LENGTH})`);
   if (/\s\([^)]*\)$/.test(p)) return bad('put only the path on the line, with no note after it');
 
-  if (p.length > MAX_PATTERN_LENGTH) return bad(`too long (${p.length} characters, the most is ${MAX_PATTERN_LENGTH})`);
   const folder = p.endsWith('/');
   const parts = collapseStars(nfc(p).split('/').filter((part) => part !== '' && part !== '.'));
   if (parts.includes('..')) return bad('".." is not allowed; paths stay inside the repo');
@@ -74,27 +91,81 @@ function isBroad(parts: string[]): boolean {
   return /[*?]/.test(parts[0]!);
 }
 
+/** A bullet: optional indent, `-` or `*`, then at least one space. What follows is the entry. */
+const BULLET = /^\s*[-*]\s+/;
+/** The characters a bare path line may use: letters, marks and digits of any script, and . _ - / * ? @ + ~ ( ) [ ] { }. */
+const PATH_CHARS = /^[\p{L}\p{M}\p{N}._\-/*?@+~()[\]{}]+$/u;
+/** At least one letter, mark, digit or wildcard, so a line of only dots, dashes or slashes is not a path. */
+const PATH_SUBSTANCE = /[\p{L}\p{M}\p{N}*?]/u;
+/** A Markdown rule written with no spaces: ---, *** or ___. */
+const RULE_LINE = /^(?:-{3,}|\*{3,}|_{3,})$/;
+/** A code fence line, which closes a block that sits inside one. */
+const FENCE = /^\s*(?:```|~~~)/;
+const BACKTICKED = /^`([^`]+)`$/;
+
+/** A word in Markdown emphasis, like **Notes** or _note_: the same * or _ marker at both ends, a letter or digit, and no slash. */
+function isEmphasis(s: string): boolean {
+  const mark = /^(?:\*\*|__|\*|_)/.exec(s)?.[0];
+  if (!mark) return false;
+  return s.length > 2 * mark.length && s.endsWith(mark) && !s.includes('/') && /[\p{L}\p{N}]/u.test(s);
+}
+
+/** The entry on a bare (unbulleted) line, or undefined when the line is not a path line. See parseScopeBlock. */
+function bareEntry(line: string): string | undefined {
+  let s = line.trim();
+  const wrapped = BACKTICKED.exec(s);
+  if (wrapped) s = wrapped[1]!;
+  if (!PATH_CHARS.test(s) || !PATH_SUBSTANCE.test(s)) return undefined;
+  if (s.endsWith('.') || RULE_LINE.test(s) || isEmphasis(s)) return undefined;
+  return s;
+}
+
 /**
- * Read the SCOPE block at the end of a plan. The block is a line that says `SCOPE:` (bold, bulleted or fenced
- * is fine) followed by bullet lines, one path or glob each. The last such block wins. It ends at the first line
- * that is not a bullet. Any bad line fails the whole block, so the plan is asked for again.
+ * Read the SCOPE block at the end of a plan.
+ *
+ * The block starts at a line that says `SCOPE:` (bold, bulleted, quoted or inside a code fence is fine). The last
+ * such line wins. The lines right after it are its entries, one path or glob each, written either way:
+ *  - a bullet line: `-` or `*`, a space, then the entry (anything; a bad one fails the block below), or
+ *  - a bare path line. After trimming and taking off one pair of backticks around the whole line, it counts as a
+ *    path only when (1) it is one token: no spaces, tabs or backticks inside; (2) every character is a letter, mark
+ *    or digit of any script, or one of . _ - / * ? @ + ~ ( ) [ ] { }; (3) it has at least one letter, digit or
+ *    wildcard; (4) it does not end with a dot; and (5) it is not Markdown decoration (a rule like --- or ***, or a
+ *    word in emphasis like **Notes**).
+ * Bullet and bare lines can be mixed, and either may be wrapped in backticks.
+ *
+ * The block ends at the first blank line, at a code fence line (```), or at any line that is neither a bullet nor
+ * a path line. So prose written straight after a bare block, with no blank line between, ends the block: a
+ * sentence has spaces in it, and a one-word line such as "Notes:", "Done." or **Notes** breaks rule 2, 4 or 5.
+ * The rules lean towards ending the block: a path they do not recognise is left out of the scope, so a commit that
+ * needs it is refused and names the file. They never let a sentence in as a path.
+ *
+ * Every entry then goes through normalizeScopeEntry, and any bad entry (`..`, `.git`, absolute, too broad, too
+ * long) fails the whole block, so the plan is asked for again. A bare `../x`, `.git/x` or `**` is a path line by
+ * the rules above, so it fails the block rather than ending it.
+ *
+ * The text is model output and can be large. Every regex here is anchored and linear, and normalizeScopeEntry
+ * checks the length before anything else that could cost more.
  */
 export function parseScopeBlock(text: string, opts: { allowBroad?: boolean } = {}): ScopeParse {
   const lines = text.split(/\r?\n/);
   let head = -1;
   for (let i = 0; i < lines.length; i++) if (/^[\s>#*_`-]*SCOPE:[\s*_`]*$/.test(lines[i]!)) head = i;
-  if (head < 0) return { ok: false, error: 'the plan has no SCOPE block (a line "SCOPE:" followed by one path or glob per line)' };
+  if (head < 0) return { ok: false, error: `the reply has no SCOPE block (${SCOPE_BLOCK_RULE}). ${SCOPE_BLOCK_IN_REPLY}` };
 
   const entries: string[] = [];
   for (let i = head + 1; i < lines.length; i++) {
-    const m = /^\s*[-*]\s+(.+?)\s*$/.exec(lines[i]!);
-    if (!m) break;
-    let entry = m[1]!;
-    const wrapped = /^`([^`]+)`$/.exec(entry);
-    if (wrapped) entry = wrapped[1]!;
+    const line = lines[i]!;
+    if (!line.trim() || FENCE.test(line)) break;
+    const bullet = BULLET.exec(line);
+    let entry = bullet ? line.slice(bullet[0].length).trim() : bareEntry(line);
+    if (!entry) break;
+    if (bullet) {
+      const wrapped = BACKTICKED.exec(entry);
+      if (wrapped) entry = wrapped[1]!;
+    }
     entries.push(entry);
   }
-  if (entries.length === 0) return { ok: false, error: 'the SCOPE block is empty: it has no paths' };
+  if (entries.length === 0) return { ok: false, error: `the SCOPE block is empty: it has no paths. Put one path or glob on each line right after "SCOPE:", with no blank line between. ${SCOPE_BLOCK_IN_REPLY}` };
 
   const scope: string[] = [];
   const problems: string[] = [];

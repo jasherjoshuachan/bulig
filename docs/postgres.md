@@ -70,6 +70,6 @@ What runs on Postgres: the shared store contract suite, the Postgres-specific te
 ## Not done yet
 
 - No data migration from SQLite. A Postgres record starts empty.
-- No server setup: no cluster, role, port, limits or backups on ths-prod-01. Nothing live depends on this adapter, and nothing should until a restore has been tested (ADR 0007).
+- No server setup: no cluster, role, port, limits or backups on the server. Nothing live depends on this adapter, and nothing should until a restore has been tested (ADR 0007).
 - No standby or second kernel. One kernel writes; a second is refused, not queued. The lease and its generation number are what a standby will use (ADR 0010); the writer lock above still keeps a second one out until then.
 - No reconnect, no pool, no TLS settings beyond what the connection string carries.

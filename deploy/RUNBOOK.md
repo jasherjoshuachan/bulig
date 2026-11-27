@@ -1,6 +1,6 @@
 # Running Bulig on bulig-host (ADR 0011)
 
-`bulig-host` in this file stands for your ssh alias for the server. `deploy/release.sh` takes it from `BULIG_DEPLOY_HOST` and has no default. If you log in as a normal user instead of root, also set `BULIG_DEPLOY_SUDO='sudo -n'` and the root steps run through sudo. The commands below that say `ssh bulig-host '...'` assume a root login; with a normal user put `sudo -n` in front of the remote command.
+`bulig-host` in this file stands for your ssh alias for the server. `deploy/release.sh` takes it from `BULIG_DEPLOY_HOST` and has no default. If you log in as a normal user instead of root, also set `BULIG_DEPLOY_SUDO='sudo -n'` and the root steps run through sudo. The commands below that say `ssh bulig-host '...'` assume a root login; with a normal user put `sudo -n` in front of the remote command, and give rsync `--rsync-path='sudo -n rsync'` (it writes into a root-only folder).
 
 ## The invariant
 

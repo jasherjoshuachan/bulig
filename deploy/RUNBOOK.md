@@ -363,9 +363,11 @@ Everything above was checked as text, with `systemd-analyze verify` (which reads
 
 The worker, the release build and one-off commands may not reach private addresses (`IPAddressDeny=`), and `IPAddressAllow=` works per address, not per port. On a VM the resolver is usually the VM's gateway, which is the host machine: allowing it would let the sandbox reach every port on that machine (checked 27 Nov 2026: ssh and local services answered). So do not allow the gateway. Run a forwarder on an address the fence already allows instead:
 
-1. Two small root units (`socat`, UDP and TCP, `bind=198.18.74.1`, port 53, target the VM's resolver, `IPAddressDeny=any` with only those two addresses allowed, `After=bulig-loopback.service`).
+1. Two small root units (`socat`, UDP and TCP, `bind=198.18.74.1`, port 53, target the VM's resolver, `IPAddressDeny=any` with only `198.18.74.1` and the VM's resolver allowed, `After=bulig-loopback.service`).
 2. `/etc/bulig/resolv.conf` (root, not a link): `nameserver 198.18.74.1`. The release build and one-off commands use it in place of resolved's list, and `fence-check.sh` then expects the forwarder's listener. Give the worker unit the same file with a drop-in: `BindReadOnlyPaths=` (empty, to reset) then `BindReadOnlyPaths=/etc/bulig/resolv.conf:/etc/resolv.conf`.
 3. `/etc/bulig/extra-allow` (root, one plain address per line): `198.18.74.1`, so the release build (which otherwise allows nothing) can reach the forwarder.
 
-`health.sh` must pass with the fence afterwards: from inside the worker's namespace, names resolve and no port on the gateway answers.
+4. Put a standing deny probe for the VM gateway in `/etc/bulig/fence-extra-probes.txt` (a few lines such as `deny  worker,kernel,build,cli-worker,cli-kernel  gw-22  tcp  <gateway>:22`, one per port the host machine really serves). The fence only sees listeners on the server itself, so without these nothing notices if the gateway is ever allowed again.
+
+`health.sh` must pass with the fence afterwards: from inside the worker's namespace, names resolve, and the gateway's ports stay closed (the probes in step 4 check that on every run).
 

@@ -58,6 +58,22 @@ BULIG_RESOLV_BIND="/run/systemd/resolve/resolv.conf:/etc/resolv.conf"
 # root check. On the server it is never set.
 R="${BULIG_DEPLOY_TEST_ROOT:-}"
 BULIG_CRED_DIR="$R/etc/bulig"
+# extra_allow: the addresses in the root-owned file /etc/bulig/extra-allow (one IPv4 or IPv6 address per line, "#" comments) that the
+# release build and the one-off commands may reach in addition to the lists above. For a server whose resolver sits on a private address the
+# deny list blocks (a VM's host-side DNS). The units get the same address as a drop-in by hand (IPAddressAllow=). A line that is not a plain
+# address is refused, so the file cannot widen the fence by a range. Prints the addresses as /32 (/128 for IPv6), space separated.
+extra_allow() {
+  local f="$BULIG_CRED_DIR/extra-allow" line out=""
+  [ -f "$f" ] && [ ! -L "$f" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%%#*}"; line="${line//[[:space:]]/}"
+    [ -n "$line" ] || continue
+    if [[ "$line" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then out="$out $line/32"
+    elif [[ "$line" =~ ^[0-9A-Fa-f:]+:[0-9A-Fa-f:]*$ ]]; then out="$out $line/128"
+    else die "$f: '$line' is not a plain IP address"; fi
+  done <"$f"
+  printf '%s' "${out# }"
+}
 BULIG_BACKUP_ENV_FILE="$R/etc/bulig/backup.env"
 # The machine-specific fence probes: root-owned, 0600, written on the server, never in git (RUNBOOK, "The extra probes").
 BULIG_FENCE_EXTRA="$R/etc/bulig/fence-extra-probes.txt"
@@ -235,6 +251,8 @@ build_fence_props() {
   deny="$deny ${a% }"
   FENCE_BUILD=(-p DynamicUser=yes -p "RestrictAddressFamilies=$BULIG_AF_NO_UNIX" -p "IPAddressDeny=${deny% }" \
     -p "InaccessiblePaths=$BULIG_INACCESSIBLE" -p "BindReadOnlyPaths=$BULIG_RESOLV_BIND")
+  a="$(extra_allow)"
+  if [ -n "$a" ]; then FENCE_BUILD+=(-p "IPAddressAllow=$a"); fi
 }
 
 # cli_fence_props <kernel|worker>: sets FENCE_CLI for a one-off bulig-cli.sh command. The kernel keeps AF_UNIX (the Postgres socket). The worker gets
@@ -242,15 +260,16 @@ build_fence_props() {
 # namespace); deploy/test/fence.sh compares them.
 FENCE_CLI=()
 cli_fence_props() {
-  local role="$1" deny="$BULIG_IP_DENY_PRIVATE" a
+  local role="$1" deny="$BULIG_IP_DENY_PRIVATE" a extra
+  extra="$(extra_allow)"
   case "$role" in
     kernel)
-      FENCE_CLI=(-p "RestrictAddressFamilies=$BULIG_AF_WITH_UNIX" -p "IPAddressDeny=$deny" -p "IPAddressAllow=$BULIG_IP_ALLOW_KERNEL"
+      FENCE_CLI=(-p "RestrictAddressFamilies=$BULIG_AF_WITH_UNIX" -p "IPAddressDeny=$deny" -p "IPAddressAllow=$BULIG_IP_ALLOW_KERNEL${extra:+ $extra}"
         -p "InaccessiblePaths=$BULIG_INACCESSIBLE" -p "BindReadOnlyPaths=$BULIG_RESOLV_BIND") ;;
     worker)
       a="$(host_addresses | tr '\n' ' ')"
       deny="$deny ${a% }"
-      FENCE_CLI=(-p "RestrictAddressFamilies=$BULIG_AF_WORKER" -p "IPAddressDeny=${deny% }" -p "IPAddressAllow=$BULIG_IP_ALLOW_WORKER"
+      FENCE_CLI=(-p "RestrictAddressFamilies=$BULIG_AF_WORKER" -p "IPAddressDeny=${deny% }" -p "IPAddressAllow=$BULIG_IP_ALLOW_WORKER${extra:+ $extra}"
         -p "InaccessiblePaths=$BULIG_INACCESSIBLE_WORKER" -p "BindReadOnlyPaths=$BULIG_RESOLV_BIND" -p "NetworkNamespacePath=$BULIG_NETNS_PATH") ;;
     *) die "role must be kernel or worker" ;;
   esac
@@ -433,6 +452,20 @@ cred_path() {
 # One field of a PGPASSFILE line: backslash and colon are escaped.
 pgpass_escape() {
   printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/:/\\:/g'
+}
+
+# pg_url_port <file holding a postgres:// URL>: the port in that URL, or nothing if the file is unreadable or has none. health.sh uses it
+# to check the Postgres the kernel really points at, not the one the kit would have made.
+pg_url_port() {
+  local url rest hostport port
+  url="$(cat "$1" 2>/dev/null)" || return 0
+  case "$url" in postgres://*) ;; *) return 0 ;; esac
+  rest="${url#postgres://}"
+  rest="${rest#*@}"
+  hostport="${rest%%/*}"
+  port="${hostport##*:}"
+  case "$port" in '' | *[!0-9]*) return 0 ;; esac
+  echo "$port"
 }
 
 # pg_passfile <url-credential-file> <dir>: build a PGPASSFILE (0600) in a private folder from a postgres://user:password@host:port/db

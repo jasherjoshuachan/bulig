@@ -31,6 +31,16 @@ fail=0
 bad() { echo "FAIL  $*"; fail=1; }
 ok() { echo "ok    $*"; }
 
+# Where the record lives is whatever the kernel's own pg-url says. On a server that runs it somewhere other than the kit's own cluster
+# (16 bulig on port 5436), look for the online cluster on that port and check that one.
+url_port="$(pg_url_port "$(cred_path pg-url)")"
+if [ -n "$url_port" ] && [ "$url_port" != "$BULIG_PG_PORT" ]; then
+  BULIG_PG_PORT="$url_port"
+  if found="$(pg_lsclusters -h | awk -v p="$url_port" '$3 == p && $4 == "online" {print $1, $2; exit}')" && [ -n "$found" ]; then
+    read -r BULIG_PG_VERSION BULIG_PG_CLUSTER <<<"$found"
+  fi
+fi
+
 # 3 first: the other two need the database.
 if pg_lsclusters -h | awk -v v="$BULIG_PG_VERSION" -v c="$BULIG_PG_CLUSTER" -v p="$BULIG_PG_PORT" '$1 == v && $2 == c && $3 == p && $4 == "online" {found = 1} END {exit !found}'; then
   ok "cluster $BULIG_PG_VERSION $BULIG_PG_CLUSTER online on port $BULIG_PG_PORT"
@@ -84,14 +94,22 @@ else
   bad "bulig-worker.service is $(systemctl is-active bulig-worker.service 2>&1 || true)"
 fi
 
-# 2. Read the lease row twice, as the bulig role over the unix socket, port 5436 (password through a private PGPASSFILE, never a command line).
+# 2. Read the lease row twice, as the bulig role over the unix socket, on the port in pg-url (password through a private PGPASSFILE, never a command line).
 work="$(private_tmpdir)"
 trap 'rm -rf "$work"' EXIT
 PGPASSFILE="$(pg_passfile "$(cred_path pg-url)" "$work")"
 export PGPASSFILE
+lease_sql="SELECT holder, generation, expires_at > clock_timestamp(), to_char(expires_at, 'YYYY-MM-DD HH24:MI:SS.US') FROM executor_lease"
 lease_row() {
-  "$(pg_bin psql)" -X -q -w -h "$BULIG_PG_HOST" -p "$BULIG_PG_PORT" -U bulig -d bulig -tA -F '|' \
-    -c "SELECT holder, generation, expires_at > clock_timestamp(), to_char(expires_at, 'YYYY-MM-DD HH24:MI:SS.US') FROM executor_lease" 2>&1 || true
+  local out
+  out="$("$(pg_bin psql)" -X -q -w -h "$BULIG_PG_HOST" -p "$BULIG_PG_PORT" -U bulig -d bulig -tA -F '|' -c "$lease_sql" 2>&1 || true)"
+  # A Postgres whose socket rule is peer (not password) refuses root logging in as the bulig role. Ask again as the bulig OS user, which
+  # peer accepts: same role, same query, no password, read only.
+  case "$out" in
+    *"Peer authentication failed"*)
+      out="$(cd / && setpriv --reuid=bulig --regid=bulig --init-groups env -u PGPASSFILE "$(pg_bin psql)" -X -q -w -h "$BULIG_PG_HOST" -p "$BULIG_PG_PORT" -U bulig -d bulig -tA -F '|' -c "$lease_sql" 2>&1 || true)" ;;
+  esac
+  echo "$out"
 }
 row1=""
 for _ in $(seq 1 "$wait_s"); do

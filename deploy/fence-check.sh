@@ -73,6 +73,14 @@ common_args=(--host-addrs "$host_addrs")
 # One probe stream for all sets: the published probes, the ones derived from what this machine is listening on right now, and the extra file.
 # It is handed to the probe on stdin, so the unit never needs to read a file of root's.
 work="$(private_tmpdir)"
+# The kernel's Postgres socket is named in the static probes for the cluster the kit makes (port 5436). A server that runs the record on another
+# port (the port in the kernel's own pg-url) gets the same probes for that socket.
+pg_port="$(pg_url_port "$(cred_path pg-url)")"
+if [ -n "$pg_port" ] && [ "$pg_port" != "$BULIG_PG_PORT" ]; then
+  pg_probes="$work/static-probes"
+  sed "s#/\.s\.PGSQL\.$BULIG_PG_PORT\$#/.s.PGSQL.$pg_port#" "$static_probes" >"$pg_probes"
+  static_probes="$pg_probes"
+fi
 pids=()
 names=()
 # shellcheck disable=SC2329

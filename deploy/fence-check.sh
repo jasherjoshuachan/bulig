@@ -109,7 +109,10 @@ ss -H -ltn >"$work/ss-tcp" 2>/dev/null || die "ss -H -ltn failed, so the listene
 ss -H -xl >"$work/ss-unix" 2>/dev/null || die "ss -H -xl failed, so the unix listeners cannot be read (the fence check never connects to find out)"
 systemctl list-sockets --all --no-legend --plain --no-pager >"$work/sockets" 2>/dev/null || die "systemctl list-sockets failed, so socket-activated targets cannot be told apart (the fence check never connects to find out)"
 { ip -o addr 2>/dev/null || true; } >"$work/ip-addr"
-if ! python3 -I "$probe" derive "$work/ss-tcp" "$work/ss-unix" "$work/ip-addr" >"$work/derived" 2>"$work/derive-notes"; then
+# A DNS forwarder on the gateway address (198.18.74.1:53) is expected where /etc/bulig/resolv.conf says to use it; nowhere else.
+dns_forwarder=0
+if [ -f "$BULIG_CRED_DIR/resolv.conf" ] && [ ! -L "$BULIG_CRED_DIR/resolv.conf" ]; then dns_forwarder=1; fi
+if ! BULIG_DNS_FORWARDER="$dns_forwarder" python3 -I "$probe" derive "$work/ss-tcp" "$work/ss-unix" "$work/ip-addr" >"$work/derived" 2>"$work/derive-notes"; then
   cat "$work/derive-notes" >&2
   die "the probes could not be derived from what this machine listens on (see above)"
 fi

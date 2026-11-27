@@ -341,6 +341,11 @@ chk 127.0.0.1:41006 "$ALL"
 chk "[::1]:41006" "$ALL"
 chk 203.0.113.10:41006 "$WORKERISH"
 if ! grep -qE ' 127\.74\.3\.1:' "$work/derived.txt" && ! grep -qE ' 198\.18\.74\.1:7431$' "$work/derived.txt"; then ok "derived: the kernel's own gateway (127.74.3.1:7431 and 198.18.74.1:7431) is never a deny target"; else bad "the gateway is in the derived list"; fi
+{ cat "$work/d-tcp"; printf 'LISTEN 0 5 198.18.74.1:53 0.0.0.0:*\n'; } >"$work/d-tcp-dns"
+python3 -I "$deploy/fence-probe.py" derive "$work/d-tcp-dns" "$work/d-unix" "$work/d-ip" >"$work/derived-dns.txt"
+if grep -q ' 198\.18\.74\.1:53$' "$work/derived-dns.txt"; then ok "derived: a listener on 198.18.74.1:53 is a deny target when no forwarder is announced"; else bad "198.18.74.1:53 was not denied"; fi
+BULIG_DNS_FORWARDER=1 python3 -I "$deploy/fence-probe.py" derive "$work/d-tcp-dns" "$work/d-unix" "$work/d-ip" >"$work/derived-dns.txt"
+if ! grep -q ' 198\.18\.74\.1:53$' "$work/derived-dns.txt"; then ok "derived: with the DNS forwarder announced, 198.18.74.1:53 is expected, not a leak"; else bad "the announced forwarder is still a deny target"; fi
 chk 198.18.74.1:41012 "$ALL"
 chk 198.18.74.1:41005 ""
 if grep -qx "known worker,cli-worker wildcard-198.18.74.1-41005 tcp 198.18.74.1:41005" "$work/derived.txt" && grep -qx "known worker,cli-worker wildcard-198.18.74.1-41006 tcp 198.18.74.1:41006" "$work/derived.txt"; then ok "derived: every listener-on-all-addresses port on 198.18.74.1 is a known limit for the worker sets (reachable through pasta), and 198.18.74.1 is not taken for a public address of this host"; else bad "198.18.74.1 wildcard lines: $(grep '198.18' "$work/derived.txt")"; fi

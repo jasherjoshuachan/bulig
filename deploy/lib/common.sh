@@ -58,9 +58,14 @@ BULIG_RESOLV_BIND="/run/systemd/resolve/resolv.conf:/etc/resolv.conf"
 # root check. On the server it is never set.
 R="${BULIG_DEPLOY_TEST_ROOT:-}"
 BULIG_CRED_DIR="$R/etc/bulig"
+# resolv.conf override: a root-owned /etc/bulig/resolv.conf (not a link) replaces resolved's upstream list for the release build and one-off
+# commands, and is what the worker unit gets by drop-in. For a server whose resolver is a private address the sandbox must not reach (a VM's
+# gateway is its host machine: every port on it answers), point it at a forwarder on an address the fence already allows, 198.18.74.1.
+if [ -f "$BULIG_CRED_DIR/resolv.conf" ] && [ ! -L "$BULIG_CRED_DIR/resolv.conf" ]; then BULIG_RESOLV_BIND="$BULIG_CRED_DIR/resolv.conf:/etc/resolv.conf"; fi
 # extra_allow: the addresses in the root-owned file /etc/bulig/extra-allow (one IPv4 or IPv6 address per line, "#" comments) that the
 # release build and the one-off commands may reach in addition to the lists above. For a server whose resolver sits on a private address the
-# deny list blocks (a VM's host-side DNS). The units get the same address as a drop-in by hand (IPAddressAllow=). A line that is not a plain
+# deny list blocks. Never the address of a VM's host machine (the Lima gateway 192.168.5.2): IPAddressAllow is per address, not per port, so
+# every port on the host would answer the sandbox. Use a forwarder on 198.18.74.1 and resolv.conf above instead. A line that is not a plain
 # address is refused, so the file cannot widen the fence by a range. Prints the addresses as /32 (/128 for IPv6), space separated.
 extra_allow() {
   local f="$BULIG_CRED_DIR/extra-allow" line out=""

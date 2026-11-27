@@ -133,4 +133,12 @@ rm -f "$work/root/etc/bulig/extra-allow"
 expect_ok "without the file nothing changes" bash "$cli" status
 check "the kernel's allow list is the plain one again" "IPAddressAllow=127.74.3.1/32 198.18.74.1/32"
 
+echo "resolv.conf override"
+printf 'nameserver 198.18.74.1\n' >"$work/root/etc/bulig/resolv.conf"
+expect_ok "a worker command runs with a resolv.conf override" bash "$cli" --as worker --exec true
+check "it resolves names through that file" "BindReadOnlyPaths=$work/root/etc/bulig/resolv.conf:/etc/resolv.conf"
+rm -f "$work/root/etc/bulig/resolv.conf"
+expect_ok "without the file the upstream list is used again" bash "$cli" --as worker --exec true
+check "resolved's list again" "BindReadOnlyPaths=/run/systemd/resolve/resolv.conf:/etc/resolv.conf"
+
 finish

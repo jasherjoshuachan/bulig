@@ -98,7 +98,7 @@ cat >"$stubs/crontab" <<'STUB'
 #!/usr/bin/env bash
 echo "0 3 * * * /usr/local/bin/client-backup"
 STUB
-# the machine's addresses, as `ip -o addr show scope global` prints them on ths-prod-01
+# the machine's addresses, as `ip -o addr show scope global` prints them on bulig-host
 cat >"$stubs/ip" <<'STUB'
 #!/usr/bin/env bash
 case "$*" in

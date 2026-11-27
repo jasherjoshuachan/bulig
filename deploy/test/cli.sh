@@ -7,7 +7,7 @@ set -uo pipefail
 
 stubs="$work/stubs"
 mkdir -p "$stubs"
-# the machine's addresses, as `ip -o addr show scope global` prints them on ths-prod-01
+# the machine's addresses, as `ip -o addr show scope global` prints them on bulig-host
 cat >"$stubs/ip" <<'STUB'
 #!/usr/bin/env bash
 case "$*" in

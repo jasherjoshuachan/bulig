@@ -4,7 +4,7 @@
 # otherwise the same pinned aws-cli image the commitments backup uses.
 
 R2_PREFIX="bulig/postgres"
-# Pinned by digest: the tag 2.27.49 as it was on ths-prod-01 on 19 Oct 2026. A tag can be moved; a digest cannot.
+# Pinned by digest: the tag 2.27.49 as it was on bulig-host on 19 Oct 2026. A tag can be moved; a digest cannot.
 AWSCLI_IMAGE="${AWSCLI_IMAGE:-amazon/aws-cli@sha256:1b7003e3ecb737b7533d8e16a547b4bc36e912508c3532ae51003aad8d0cd41d}"
 
 # load_backup_env: export the R2 settings. In a unit they come from the credential "backup-env" (LoadCredential=), by hand from

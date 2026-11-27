@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Create the two Bulig system users and the root-owned folders the kit uses. Idempotent: a second run changes nothing.
-# Run as root on ths-prod-01, with both Bulig services stopped (it refuses while any process of either user exists).
+# Run as root on bulig-host, with both Bulig services stopped (it refuses while any process of either user exists).
 #
 #   bulig         the kernel (bulig.service). Holds the database URL, the GitHub token, the worker tokens. Never sees the Claude token.
 #   bulig-worker  the worker (bulig-worker.service). Runs Claude Code. Holds the Claude token and its own worker token. Never sees

@@ -456,6 +456,27 @@ rc=0
 BULIG_FENCE_PROBES="$work/fc-clean.txt" bash "$deploy/fence-check.sh" all >"$work/fc.out" 2>&1 || rc=$?
 if [ "$rc" -eq 0 ] && grep -q "fence-check: ok" "$work/fc.out"; then ok "no leak: exit 0"; else bad "clean run rc=$rc: $(cat "$work/fc.out")"; fi
 if [ "$(grep -c '^warn .* gone inconclusive' "$work/fc.out")" = "5" ]; then ok "a target that is not listening shows as inconclusive, per set, and does not pass silently"; else bad "inconclusive count: $(grep -c inconclusive "$work/fc.out")"; fi
+# the Postgres socket probes follow the port in the kernel's own pg-url: the static probes name .s.PGSQL.5436, a kernel on 5432 gets 5432
+# (an allow probe from the kernel set: it must connect, so it only passes when the probe really points at the 5432 socket)
+mkdir -p "$work/pgdir"; ln -sf "$unix_path" "$work/pgdir/.s.PGSQL.5432"
+printf 'allow kernel pg-sock unix %s/.s.PGSQL.5436\n' "$work/pgdir" >"$work/fc-pg.txt"
+printf 'postgres://bulig:pw@%%2Fvar%%2Frun%%2Fpostgresql:5432/bulig' >"$root/etc/bulig/pg-url"
+BULIG_FENCE_PROBES="$work/fc-pg.txt" bash "$deploy/fence-check.sh" kernel >"$work/fc.out" 2>&1 || true
+if grep -q 'ok kernel pg-sock works' "$work/fc.out"; then ok "pg-url on port 5432: the socket probe is rewritten to .s.PGSQL.5432 (the kernel set reached the socket there)"; else bad "pg-url 5432 run: $(cat "$work/fc.out")"; fi
+printf 'postgres://bulig:pw@%%2Fvar%%2Frun%%2Fpostgresql:5436/bulig' >"$root/etc/bulig/pg-url"
+BULIG_FENCE_PROBES="$work/fc-pg.txt" bash "$deploy/fence-check.sh" kernel >"$work/fc.out" 2>&1 || true
+if grep -q 'FAIL kernel pg-sock should work but did not' "$work/fc.out"; then ok "pg-url on port 5436 (the kit's own): the probe is left as written (.s.PGSQL.5436 is not there, so it fails)"; else bad "5436 run changed the probe: $(cat "$work/fc.out")"; fi
+rm -f "$root/etc/bulig/pg-url"
+BULIG_FENCE_PROBES="$work/fc-pg.txt" bash "$deploy/fence-check.sh" kernel >"$work/fc.out" 2>&1 || true
+if grep -q 'FAIL kernel pg-sock should work but did not' "$work/fc.out"; then ok "no pg-url: the probe is left as written"; else bad "no pg-url run changed the probe: $(cat "$work/fc.out")"; fi
+# the DNS forwarder exemption is announced only by /etc/bulig/resolv.conf (a regular file): without it a listener on 198.18.74.1:53 is probed
+printf 'LISTEN 0 5 198.18.74.1:53 0.0.0.0:*\n' >"$log/ss-tcp"
+BULIG_FENCE_PROBES="$work/fc-clean.txt" bash "$deploy/fence-check.sh" kernel >"$work/fc.out" 2>&1 || true
+if grep -q 'listener-198.18.74.1-53' "$work/fc.out"; then ok "no resolv.conf override: a listener on 198.18.74.1:53 gets a deny probe"; else bad "no probe for 198.18.74.1:53: $(cat "$work/fc.out")"; fi
+printf 'nameserver 198.18.74.1\n' >"$root/etc/bulig/resolv.conf"
+BULIG_FENCE_PROBES="$work/fc-clean.txt" bash "$deploy/fence-check.sh" kernel >"$work/fc.out" 2>&1 || true
+if ! grep -q 'listener-198.18.74.1-53' "$work/fc.out"; then ok "with the resolv.conf override: the forwarder's listener is expected, not probed as a leak"; else bad "forwarder still probed: $(cat "$work/fc.out")"; fi
+rm -f "$root/etc/bulig/resolv.conf"; : >"$log/ss-tcp"
 run_for() { grep -- "--unit=bulig-fence-$1-" "$log/runs" | head -1; }
 w="$(run_for worker)"
 case "$w" in *"--uid=bulig-worker"*"-p IPAddressDeny=$DENY $HOSTS "*"-p IPAddressAllow=$WALLOW "*"-p RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK "*"-p InaccessiblePaths=$INACC_W "*"-p BindReadOnlyPaths=$RES "*) ok "worker set: read from the installed unit and its drop-in (uid, deny with the host addresses, its own loopback and the gateway allowed, AF_UNIX and AF_NETLINK, hidden sockets, upstream resolvers)" ;; *) bad "worker run: $w" ;; esac

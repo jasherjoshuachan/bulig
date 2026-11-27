@@ -417,6 +417,8 @@ M = [
     ("extra: set-secret replaces the file even when it is bad", "fence.sh", "lib/common.sh", '  (fence_extra_check "$tmp") || { rm -f "$tmp"; exit 1; }', '  (fence_extra_check "$tmp") || true'),
     ("extra: set-secret leaves a temp file when the file is bad", "fence.sh", "lib/common.sh", '|| { rm -f "$tmp"; exit 1; }', '|| { exit 1; }'),
     ('derive: loopback listeners are skipped', 'fence.sh', 'fence-probe.py', '            if (host, port) not in GATEWAYS and not dns_forwarder:', '            if False:'),
+    ('fence-check: the DNS forwarder is always announced', 'fence.sh', 'fence-check.sh', 'if [ -f "$BULIG_CRED_DIR/resolv.conf" ] && [ ! -L "$BULIG_CRED_DIR/resolv.conf" ]; then dns_forwarder=1; fi', 'dns_forwarder=1'),
+    ('fence-check: the pg-url port is not used for the socket probes', 'fence.sh', 'fence-check.sh', 'if [ -n "$pg_port" ] && [ "$pg_port" != "$BULIG_PG_PORT" ]; then', 'if false; then'),
     ('derive: the DNS forwarder is exempt without being announced', 'fence.sh', 'fence-probe.py', 'dns_forwarder = os.environ.get("BULIG_DNS_FORWARDER") == "1" and', 'dns_forwarder = True or'),
     ('derive: the gateway is denied', 'fence.sh', 'fence-probe.py', '            if (host, port) not in GATEWAYS and not dns_forwarder:', '            if True:'),
     ("derive: private listeners are skipped", "fence.sh", "fence-probe.py", '        elif c in ("private", "tailscale"):\n            add("deny", ALL_SETS, f"listener-', '        elif c in ("nothing",):\n            add("deny", ALL_SETS, f"listener-'),

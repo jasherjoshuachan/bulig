@@ -1,4 +1,6 @@
-# Running Bulig on ths-prod-01 (ADR 0011)
+# Running Bulig on bulig-host (ADR 0011)
+
+`bulig-host` in this file stands for your ssh alias for the server. `deploy/release.sh` takes it from `BULIG_DEPLOY_HOST` and has no default. If you log in as a normal user instead of root, also set `BULIG_DEPLOY_SUDO='sudo -n'` and the root steps run through sudo. The commands below that say `ssh bulig-host '...'` assume a root login; with a normal user put `sudo -n` in front of the remote command, and give rsync `--rsync-path='sudo -n rsync'` (it writes into a root-only folder).
 
 ## The invariant
 
@@ -48,43 +50,43 @@ Stop at the first failure and read the message: every script says what it refuse
 
 1. **Precheck.** The "before" picture. Read-only. The release is not on the server yet, so copy the kit into the root-owned checks folder first (delete `kit/` after step 5, when the release carries the same files):
    ```bash
-   ssh ths-prod-01 'mkdir -p -m 0700 /var/lib/bulig-checks' && rsync -rlz deploy/ ths-prod-01:/var/lib/bulig-checks/kit/ && ssh ths-prod-01 'test -z "$(find /var/lib/bulig-checks/kit ! -user root)" && bash /var/lib/bulig-checks/kit/precheck.sh'
+   ssh bulig-host 'mkdir -p -m 0700 /var/lib/bulig-checks' && rsync -rlz deploy/ bulig-host:/var/lib/bulig-checks/kit/ && ssh bulig-host 'test -z "$(find /var/lib/bulig-checks/kit ! -user root)" && bash /var/lib/bulig-checks/kit/precheck.sh'
    ```
    `-rlz`, not `-az`: `-a` includes `-o`, and rsync running as root on the server would keep the Mac user's id as the owner. Without it every file is created by root. (`--chown=root:root` would say it outright, but the Mac's `rsync` is openrsync and does not have it; the `find` above fails the command if anything on the server is not root's.)
 
 2. **Users and root folders.** Makes the two users with no home, and `/opt/bulig`, `/usr/local/lib/bulig`, `/etc/bulig`, `/var/backups/bulig`, `/var/lib/bulig-checks`. It makes nothing for the users: systemd does that at the first start. It refuses while any process of either user exists, so on a rerun stop the services first (`systemctl stop bulig-worker bulig`).
    ```bash
-   ssh ths-prod-01 'bash /var/lib/bulig-checks/kit/setup-user.sh'
+   ssh bulig-host 'bash /var/lib/bulig-checks/kit/setup-user.sh'
    ```
    Read its tool lists. If `node`, `pnpm`, `git`, `gh` (bulig) or `node`, `git`, `claude` (bulig-worker) shows MISSING, install it under `/usr/local` or `/usr`.
 
 3. **Postgres cluster.** Creates `16 bulig` on 5436 with **no TCP listener** (`listen_addresses = ''`), the role `bulig` and database `bulig`, a second role `bulig_drill` (can create databases and nothing else; used only by the restore drill), and writes the connection URL into `/etc/bulig/pg-url`: `postgres://bulig:<password>@%2Fvar%2Frun%2Fpostgresql:5436/bulig`, which the driver reads as the unix socket folder `/var/run/postgresql`, port 5436. The cluster's logins are three unix-socket rules in `bulig_hba.conf` (postgres by peer, `bulig` and `bulig_drill` by password), and there is no rule for TCP. The two config files are written as root-owned files (`install -o root`, then `mv -T`; a link at the target is refused). It refuses if 5436 is used by anything else, or by something that is not Postgres, and (like step 2) while a Bulig process exists.
    ```bash
-   ssh ths-prod-01 'bash /var/lib/bulig-checks/kit/setup-cluster.sh'
+   ssh bulig-host 'bash /var/lib/bulig-checks/kit/setup-cluster.sh'
    ```
 
 4. **Secrets and settings.** Each value goes in over stdin, so it never shows in a shell history or `ps`.
    - GitHub bot token (from the Mac Keychain):
      ```bash
-     security find-generic-password -s bulig-github-bot -w | ssh ths-prod-01 'bash /var/lib/bulig-checks/kit/set-secret.sh --credential gh-token'
+     security find-generic-password -s bulig-github-bot -w | ssh bulig-host 'bash /var/lib/bulig-checks/kit/set-secret.sh --credential gh-token'
      ```
    - The worker's read-only GitHub token (from the Mac Keychain; fine-grained, read-only Contents on the one sandbox repo). The worker unit loads it, so it must be there before the release in step 5:
      ```bash
-     security find-generic-password -s bulig-worker-read-token -w | ssh ths-prod-01 'bash /var/lib/bulig-checks/kit/set-secret.sh --credential github-read-token'
+     security find-generic-password -s bulig-worker-read-token -w | ssh bulig-host 'bash /var/lib/bulig-checks/kit/set-secret.sh --credential github-read-token'
      ```
    - The VPS worker's token. One command writes the worker's own `worker-token` and its `vps=` line in the kernel's `worker-tokens`:
      ```bash
-     openssl rand -hex 32 | ssh ths-prod-01 'bash /var/lib/bulig-checks/kit/set-secret.sh --worker-token vps'
+     openssl rand -hex 32 | ssh bulig-host 'bash /var/lib/bulig-checks/kit/set-secret.sh --worker-token vps'
      ```
    - Which repositories the worker may work on (not secret; it needs at least one; kernel path under `/var/lib/bulig/repos`, clone under `/var/lib/bulig-worker/work`):
      ```bash
-     echo 'BULIG_WORKER_REPOS=--repo /var/lib/bulig/repos/sandbox=/var/lib/bulig-worker/work/sandbox' | ssh ths-prod-01 'bash /var/lib/bulig-checks/kit/set-secret.sh --worker-env'
+     echo 'BULIG_WORKER_REPOS=--repo /var/lib/bulig/repos/sandbox=/var/lib/bulig-worker/work/sandbox' | ssh bulig-host 'bash /var/lib/bulig-checks/kit/set-secret.sh --worker-env'
      ```
    - The fence's machine-specific probes (required: `fence-check.sh`, and so `health.sh`, fails without them). Fill in `deploy/fence/extra-probes.template` and install it as described under "The extra probes" below.
    - Claude token (Jasher only, interactive). It runs as `bulig-worker` in a transient unit, so systemd makes the home the login settings go to. Like every worker one-off command it runs in the worker's network namespace, and `bulig-cli.sh --as worker` refuses to start when `/run/netns/bulig-worker` is not there. On a host that has had a release with the namespace, it is there. On a fresh host, install and start the two network units from the kit first (`install -m 0644 /var/lib/bulig-checks/kit/systemd/bulig-netns.service /var/lib/bulig-checks/kit/systemd/bulig-pasta.service /etc/systemd/system/ && bash /var/lib/bulig-checks/kit/host-addresses.sh && systemctl start bulig-pasta.service`; `passt` must be installed; the first release takes both units over). Copy the token it prints, then:
      ```bash
-     ssh -t ths-prod-01 'bash /var/lib/bulig-checks/kit/bulig-cli.sh --as worker --tty --exec claude setup-token'
-     pbpaste | ssh ths-prod-01 'bash /var/lib/bulig-checks/kit/set-secret.sh --credential claude-token'
+     ssh -t bulig-host 'bash /var/lib/bulig-checks/kit/bulig-cli.sh --as worker --tty --exec claude setup-token'
+     pbpaste | ssh bulig-host 'bash /var/lib/bulig-checks/kit/set-secret.sh --credential claude-token'
      ```
 
 5. **Release.** From the Mac, inside the bulig checkout, with a ref that contains PR #50:
@@ -102,62 +104,62 @@ Stop at the first failure and read the message: every script says what it refuse
 
 6. **Health.** Run it any time. It checks both services, the gateway-address unit and both addresses on `lo`, the worker's network namespace (`bulig-netns.service` active, `/run/netns/bulig-worker` there), pasta (`bulig-pasta.service` active, and the namespace has a global address, which pasta copies in when it starts), reads the lease twice, 11 seconds apart, and then runs the fence check (`fence-check.sh`, see "What each unit can reach"): a probe from inside each unit's network and socket properties that must not reach other tenants' services and must still reach DNS, GitHub and (for the worker) the gateway. It also warns when the host's addresses changed or a new service listens on every address. `health.sh --no-fence` skips the probes.
    ```bash
-   ssh ths-prod-01 '/usr/local/lib/bulig/current/health.sh'
-   ssh ths-prod-01 'systemctl show bulig.service bulig-worker.service -p Id -p User -p MemoryMax -p CPUQuotaPerSecUSec -p TasksMax -p StateDirectory'
+   ssh bulig-host '/usr/local/lib/bulig/current/health.sh'
+   ssh bulig-host 'systemctl show bulig.service bulig-worker.service -p Id -p User -p MemoryMax -p CPUQuotaPerSecUSec -p TasksMax -p StateDirectory'
    ```
 
 7. **Repos.** The kernel and the worker each make their own clone, as their own user, inside their own folder (`git clone` makes the missing parent folders as that user; root makes none). The sandbox repo is private, so each user first gets a git credential helper in its own global git config, written by that user (`git config --global` runs as the user in a transient unit, so the file lands in the user's own folder; root writes nothing there). The helper is `git-credential-bulig-read`, a root-owned script in the release. On every `git clone` and `git fetch` to `https://github.com` it reads the token from the unit's `$CREDENTIALS_DIRECTORY` at that moment and hands it to git. The token is never written into a git config, a remote URL, an argument, the environment or a log. The worker's helper reads `github-read-token`, the kernel's reads `gh-token`, and each is only ever in its own unit:
    ```bash
-   ssh ths-prod-01 '/usr/local/lib/bulig/current/bulig-cli.sh --as worker --exec git config --global credential.https://github.com.helper "/usr/local/lib/bulig/current/git-credential-bulig-read github-read-token"'
-   ssh ths-prod-01 '/usr/local/lib/bulig/current/bulig-cli.sh --as kernel --exec git config --global credential.https://github.com.helper "/usr/local/lib/bulig/current/git-credential-bulig-read gh-token"'
-   ssh ths-prod-01 '/usr/local/lib/bulig/current/bulig-cli.sh --as kernel --exec git clone https://github.com/<owner>/sandbox /var/lib/bulig/repos/sandbox'
-   ssh ths-prod-01 '/usr/local/lib/bulig/current/bulig-cli.sh --as worker --exec git clone https://github.com/<owner>/sandbox /var/lib/bulig-worker/work/sandbox'
-   ssh ths-prod-01 'systemctl restart bulig-worker'
+   ssh bulig-host '/usr/local/lib/bulig/current/bulig-cli.sh --as worker --exec git config --global credential.https://github.com.helper "/usr/local/lib/bulig/current/git-credential-bulig-read github-read-token"'
+   ssh bulig-host '/usr/local/lib/bulig/current/bulig-cli.sh --as kernel --exec git config --global credential.https://github.com.helper "/usr/local/lib/bulig/current/git-credential-bulig-read gh-token"'
+   ssh bulig-host '/usr/local/lib/bulig/current/bulig-cli.sh --as kernel --exec git clone https://github.com/<owner>/sandbox /var/lib/bulig/repos/sandbox'
+   ssh bulig-host '/usr/local/lib/bulig/current/bulig-cli.sh --as worker --exec git clone https://github.com/<owner>/sandbox /var/lib/bulig-worker/work/sandbox'
+   ssh bulig-host 'systemctl restart bulig-worker'
    ```
    The worker's own `git fetch origin` (it runs with the worker's global git config) then works the same way. A public repo needs no helper.
 
 8. **Copy over the old record** (PR-E, `bulig migrate sqlite-to-postgres`). Dry run first, then the real copy. The SQLite file goes in through `bulig-cli.sh --exec`, as the `bulig` user, into the kernel's own state folder, over a pipe. **Never `scp` or `rsync` it into `/var/lib/bulig`**: root would be writing inside the user's folder, which is the one thing this kit does not do. Stop the kernel first (only one writer), run the command in a capped transient unit, start the kernel again, run `health.sh`:
    ```bash
-   ssh ths-prod-01 'systemctl stop bulig.service'
-   ssh ths-prod-01 '/usr/local/lib/bulig/current/bulig-cli.sh --as kernel --exec sh -c "cat > /var/lib/bulig/state/import.sqlite"' < <path of the Mac's SQLite file>
-   ssh ths-prod-01 '/usr/local/lib/bulig/current/bulig-cli.sh migrate sqlite-to-postgres --from /var/lib/bulig/state/import.sqlite --to-credential pg-url --dry-run'
-   ssh ths-prod-01 '/usr/local/lib/bulig/current/bulig-cli.sh migrate sqlite-to-postgres --from /var/lib/bulig/state/import.sqlite --to-credential pg-url'
+   ssh bulig-host 'systemctl stop bulig.service'
+   ssh bulig-host '/usr/local/lib/bulig/current/bulig-cli.sh --as kernel --exec sh -c "cat > /var/lib/bulig/state/import.sqlite"' < <path of the Mac's SQLite file>
+   ssh bulig-host '/usr/local/lib/bulig/current/bulig-cli.sh migrate sqlite-to-postgres --from /var/lib/bulig/state/import.sqlite --to-credential pg-url --dry-run'
+   ssh bulig-host '/usr/local/lib/bulig/current/bulig-cli.sh migrate sqlite-to-postgres --from /var/lib/bulig/state/import.sqlite --to-credential pg-url'
    ```
    `--to-credential pg-url` reads the connection string from the one-off unit's `$CREDENTIALS_DIRECTORY/pg-url` (`bulig-cli.sh --as kernel` loads it), so the URL and its password never go into an environment variable or an argument. The copy goes only into an empty record: on a database that already holds rows it refuses with exit 2 and writes nothing (the Cutover below makes a fresh one). After the real copy, remove the file again (`bulig-cli.sh --exec rm /var/lib/bulig/state/import.sqlite`) and start the kernel. `bulig-cli.sh` runs as user `bulig` with the kernel's credentials.
 
 9. **Synthetic jobs.** One on the VPS worker, one on the Mac worker over Tailscale. Exactly one PR each, on the sandbox repo. Jobs run through the two services; one-off commands go through `bulig-cli.sh`. For the Mac worker, add its token (`set-secret.sh --worker-token mac`), let that one peer in with its Tailscale address (the kernel allows no Tailscale peer until you do, and then exactly one /32), add the VPS's own Tailscale address (`tailscale ip -4` on the server) next to `127.74.3.1` in `listen` in `/etc/bulig/config.json` (root edit), and restart `bulig.service`:
     ```bash
-    ssh ths-prod-01 'bash /usr/local/lib/bulig/current/set-mac-worker.sh <the Mac'"'"'s 100.x address>'
-    ssh ths-prod-01 'systemctl restart bulig.service'
+    ssh bulig-host 'bash /usr/local/lib/bulig/current/set-mac-worker.sh <the Mac'"'"'s 100.x address>'
+    ssh bulig-host 'systemctl restart bulig.service'
     ```
     `set-mac-worker.sh` writes a root-owned drop-in, `/etc/systemd/system/bulig.service.d/20-mac-worker.conf`, with `IPAddressAllow=<that address>/32`; `--remove` takes it away again. Only an IPv4 address in 100.64.0.0/10 is accepted.
 
 10. **Backup.** Fill the R2 settings, one name at a time, then run one backup by hand and look for the `bulig-backup: ok` line:
     ```bash
-    printf '%s' "$R2_ENDPOINT" | ssh ths-prod-01 'bash /usr/local/lib/bulig/current/set-secret.sh --backup-key R2_ENDPOINT'
+    printf '%s' "$R2_ENDPOINT" | ssh bulig-host 'bash /usr/local/lib/bulig/current/set-secret.sh --backup-key R2_ENDPOINT'
     ```
     (repeat for `R2_BUCKET`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION`; names in `backup.env.example`)
     ```bash
-    ssh ths-prod-01 'systemctl start bulig-backup.service && journalctl -u bulig-backup.service -n 5 --no-pager'
-    ssh ths-prod-01 'systemctl enable --now bulig-backup.timer bulig-restore-drill.timer'
+    ssh bulig-host 'systemctl start bulig-backup.service && journalctl -u bulig-backup.service -n 5 --no-pager'
+    ssh bulig-host 'systemctl enable --now bulig-backup.timer bulig-restore-drill.timer'
     ```
     **R2 key (Jasher):** the first run can use the shared bucket key that already exists, but it should be replaced with an R2 token limited to the `bulig/` prefix of the bucket. Only Jasher can create it (Cloudflare dashboard). Restore is safe either way: the drill restores only an object whose sha256 is in the root-owned local index (`/var/backups/bulig/index`), and restores it with `pg_restore` as a role that owns only its scratch database, so a swapped or planted object in R2 is refused or harmless. The R2 key reaches the aws-cli container on stdin, never in its arguments or environment.
 
 11. **Restore drill.** Takes the newest entry of the local index, downloads it, checks the sha256, restores it into a scratch database in the bulig cluster as the `bulig_drill` role, compares tables and row counts with the live database, logs the time, drops the scratch database. It fails if the newest backup is more than 48 hours old. Look for `bulig-restore-drill: ok ... restore_seconds=N`.
     ```bash
-    ssh ths-prod-01 'systemctl start bulig-restore-drill.service && journalctl -u bulig-restore-drill.service -n 5 --no-pager'
+    ssh bulig-host 'systemctl start bulig-restore-drill.service && journalctl -u bulig-restore-drill.service -n 5 --no-pager'
     ```
 
 12. **Postcheck.** The "after" picture. It must say the snapshot matches (apart from Bulig's own things, and anything it lists as `info` or `warn`). With no arguments it compares against the newest `release-<sha>.before.snapshot` (the one the last release took just before it changed anything), or `precheck.snapshot` when no release has taken one; the first line names the file. `--against <file>` picks another one. The precheck is a day or more old by now, and other tenants' normal work since then (new services, drop-ins, timers, listeners) would fail a comparison with it; the release snapshot covers only what changed since that release began.
     ```bash
-    ssh ths-prod-01 '/usr/local/lib/bulig/current/postcheck.sh'
-    ssh ths-prod-01 '/usr/local/lib/bulig/current/postcheck.sh --against /var/lib/bulig-checks/precheck.snapshot'
+    ssh bulig-host '/usr/local/lib/bulig/current/postcheck.sh'
+    ssh bulig-host '/usr/local/lib/bulig/current/postcheck.sh --against /var/lib/bulig-checks/precheck.snapshot'
     ```
     Transient units and template instances come and go all the time and are reported, not compared: a `run-u*.service` or `run-p*.service` (made by `systemd-run`) whose line changed in any way, and a template instance (`name@instance.service`) that is in one snapshot and not the other, is an `info` line, or a `warn` line when it is `failed` now. The instance rule is fail-closed: it applies only when systemd has the unit loaded now, its `TriggeredBy` has no `.socket`, and there is no `<template>.socket` (the `Accept=yes` kind) or `<instance>.socket`. A socket-activated instance, or one systemd no longer knows (most instances that went away), still fails, because a connection starting another tenant's service is exactly what the postcheck is for (20 Oct 2026). A template instance that is in both and changed state still fails, and so do template and instance unit files (other than the transient ones). Bulig's own units are never in a snapshot and never count as churn.
     Two more kinds of churn happen on every run and are reported, not compared. First, the run state of a service a timer starts (it is TriggeredBy a `.timer`, a timer in the snapshot starts it, or it is a oneshot with a `.timer` of the same name): "activating" mid-run or "inactive dead" after is an `info` line, and a `failed` one is a `warn` line that names the unit. Read every `warn`: that service's own run failed, which is not Bulig's doing but is still a real failure for its owner. The unit file, its enabled state and the timer itself are still compared. Second, per-session agent containers come and go next to a long-lived one from the same image: a new container from an image that was already running at the precheck is an `info` line, and so is a container that is gone or stopped while its image still runs in another container. A new image, a container whose image no longer runs in any container, or a known container on a new image still fails. Anything else that differs fails. A diff of other unrelated services that started or stopped on their own needs a human read: check it is not Bulig's doing before calling it noise. If it is a stock OS job that runs on every Ubuntu host, add the pattern to `SNAPSHOT_NOISE` in `lib/snapshot.sh`; if it names something particular to this host, put it in the host's ignore list below instead (the repository is public). The comparison reads the snapshot format as it is, so a precheck taken by an older kit still compares.
     Two more kinds of other tenants' churn are reported, not compared (24 Oct 2026: a release failed its postcheck twice for changes that were not Bulig's). First, **short-lived loopback listeners**: a local server that opens a runner on a random loopback port while it works (and closes it after) adds or drops a listener line. Each snapshot records the kernel's ephemeral range (`net.ipv4.ip_local_port_range`) and, in its own section, the uid that owns each listener (`ss -ltnpe`; the listener section itself reads as before). A listener that appeared or went away is an `info` line only when all of these hold: its address is loopback (`127.x.x.x` or `[::1]`) and not Bulig's (`127.74.x.x`); its port is in the ephemeral range, and both snapshots show the same range, starting at 1024 or above; its process is named; its uid is known and is not root, not `bulig` or `bulig-worker`, and not in systemd's dynamic-user range (61184 to 65519, where the build runs); and a listener of that same process and the same uid, on a port outside the range, is in both snapshots with that uid in both. A change on a fixed port, on any address that is not loopback, of a process with no lasting fixed-port listener of its uid, of one of Bulig's users, or with a range or owners section that changed or is missing (a before snapshot from an older kit, an unreadable `/proc`) still fails. Matching on the uid, not only the process name, is what keeps a Bulig `node` listener from passing next to another tenant's `node` (review of #73). Second, **the host's ignore list**, `/etc/bulig/postcheck-ignore.txt`: units another tenant or the OS starts on its own (the OS's daily apt job can wake a bus-activated daemon in the same second as a release). It is written on the server and never committed: one service name per line (`name.service`, no patterns), `#` starts a comment. The run state of a listed unit is an `info` line (a `warn` when it is `failed` now), but only when no socket can start it, by the same fail-closed test as the instance rule: loaded now, no `.socket` in its `TriggeredBy`, no `<name>.socket`. So a listed unit that a connection can start (the 20 Oct 2026 case) still fails, and so does one systemd no longer knows. Its unit file and enabled state are still compared. The file is used only when it is a plain file (not a link) that can be read, it and `/etc/bulig` are owned by root and not writable by their group or by others (0755 or stricter), and every line is one service name that is not Bulig's; otherwise a `warn` line says why and nothing in it is ignored. No file means nothing is ignored. List a unit only after its journal shows who started it (`journalctl -u <unit> -b`, and the job that ran in the same second), never to make a diff go away. To write it (root, 0600):
     ```bash
-    ssh ths-prod-01 'install -o root -g root -m 0600 /dev/stdin /etc/bulig/postcheck-ignore.txt' < postcheck-ignore.txt
+    ssh bulig-host 'install -o root -g root -m 0600 /dev/stdin /etc/bulig/postcheck-ignore.txt' < postcheck-ignore.txt
     ```
     The removal check in "Remove Bulig completely" runs after `/etc/bulig` is gone, so there nothing is ignored.
 
@@ -197,7 +199,7 @@ The published probes and the derived ones need no names, but the operator knows 
 2. On the server, list what else is there: `ss -ltnp` (every TCP listener: one `tcp <ADDRESS>:<PORT>` line for each you do not want a Bulig unit to reach) and `ss -xlp | grep '@'` (abstract sockets: one `abstract <NAME>` line for each that is not Bulig's, name without the `@`). Give each line a short name of your own.
 3. Replace every `<...>` placeholder; install it:
    ```bash
-   ssh ths-prod-01 '/usr/local/lib/bulig/current/set-secret.sh --fence-extra-probes' < filled-in-file
+   ssh bulig-host '/usr/local/lib/bulig/current/set-secret.sh --fence-extra-probes' < filled-in-file
    ```
    `set-secret.sh` refuses a file with a placeholder left, an unknown set, kind or expectation, or no probe at all, and writes it root-owned, mode 0600.
 4. Delete the scratch file.
@@ -219,7 +221,7 @@ Unit files being right is not the same as the machine enforcing them. `fence-che
 - The kernel sets have `AF_UNIX` in the host's namespace, so other tenants' abstract sockets are listed there as *known limits*: reported from the properties and ss, never tested by connecting, never failing. For the same reason a *deny* probe for an abstract socket (or for a socket path that `InaccessiblePaths` does not hide) in a set that has `AF_UNIX` is reported as a known limit and not run: nothing would stop it, so running it would be a real connection. The one exception is an abstract socket in a worker set **after the netns guard passed**: there the host's abstract sockets do not exist, so the connection can only reach the namespace's own (and must fail).
 - The worker's `AF_UNIX` and `AF_NETLINK` were added on 21 Oct 2026 with Jasher's yes, for Claude Code's sandbox; the build still has neither. If something else turns out to need a family, the check will say which probe failed; do not reopen the family list without Jasher.
 
-## Footprint on ths-prod-01
+## Footprint on bulig-host
 
 Everything this kit adds or changes (nothing else is touched):
 
@@ -255,7 +257,7 @@ The VPS record already holds rows (the earlier copy in step 8, the synthetic job
 
 1. **Backup first.** One backup by hand; look for `bulig-backup: ok`:
    ```bash
-   ssh ths-prod-01 'systemctl start bulig-backup.service && journalctl -u bulig-backup.service -n 5 --no-pager'
+   ssh bulig-host 'systemctl start bulig-backup.service && journalctl -u bulig-backup.service -n 5 --no-pager'
    ```
 2. **Save the Mac's job list, then stop the Mac**, then take a consistent snapshot of its SQLite file (outside the repository). `bulig status` only reads, so it runs while serve is up. Nothing in the list may be `running`; if a job is, wait for it to finish or park, and save the list again:
    ```bash
@@ -265,32 +267,32 @@ The VPS record already holds rows (the earlier copy in step 8, the synthetic job
    ```
 3. **Stop the units and the timers** on the server, so nothing writes or reads the record while it moves:
    ```bash
-   ssh ths-prod-01 'systemctl stop bulig-worker bulig bulig-backup.timer bulig-restore-drill.timer'
+   ssh bulig-host 'systemctl stop bulig-worker bulig bulig-backup.timer bulig-restore-drill.timer'
    ```
 4. **Set the old record aside and make an empty one**, as the `postgres` superuser over the socket (the same statements `setup-cluster.sh` uses):
    ```bash
-   ssh ths-prod-01 "runuser -u postgres -- psql -X -h /var/run/postgresql -p 5436 -d postgres -v ON_ERROR_STOP=1 -c 'ALTER DATABASE bulig RENAME TO bulig_precut' -c 'CREATE DATABASE bulig OWNER bulig' -c 'REVOKE CONNECT ON DATABASE bulig FROM PUBLIC'"
+   ssh bulig-host "runuser -u postgres -- psql -X -h /var/run/postgresql -p 5436 -d postgres -v ON_ERROR_STOP=1 -c 'ALTER DATABASE bulig RENAME TO bulig_precut' -c 'CREATE DATABASE bulig OWNER bulig' -c 'REVOKE CONNECT ON DATABASE bulig FROM PUBLIC'"
    ```
 5. **Copy the snapshot in**, as in step 8: pipe it in, dry run, real copy, remove the file. Both runs must end with every table `same`:
    ```bash
-   ssh ths-prod-01 '/usr/local/lib/bulig/current/bulig-cli.sh --as kernel --exec sh -c "cat > /var/lib/bulig/state/import.sqlite"' < <snapshot path>
-   ssh ths-prod-01 '/usr/local/lib/bulig/current/bulig-cli.sh migrate sqlite-to-postgres --from /var/lib/bulig/state/import.sqlite --to-credential pg-url --dry-run'
-   ssh ths-prod-01 '/usr/local/lib/bulig/current/bulig-cli.sh migrate sqlite-to-postgres --from /var/lib/bulig/state/import.sqlite --to-credential pg-url'
-   ssh ths-prod-01 '/usr/local/lib/bulig/current/bulig-cli.sh --as kernel --exec rm /var/lib/bulig/state/import.sqlite'
+   ssh bulig-host '/usr/local/lib/bulig/current/bulig-cli.sh --as kernel --exec sh -c "cat > /var/lib/bulig/state/import.sqlite"' < <snapshot path>
+   ssh bulig-host '/usr/local/lib/bulig/current/bulig-cli.sh migrate sqlite-to-postgres --from /var/lib/bulig/state/import.sqlite --to-credential pg-url --dry-run'
+   ssh bulig-host '/usr/local/lib/bulig/current/bulig-cli.sh migrate sqlite-to-postgres --from /var/lib/bulig/state/import.sqlite --to-credential pg-url'
+   ssh bulig-host '/usr/local/lib/bulig/current/bulig-cli.sh --as kernel --exec rm /var/lib/bulig/state/import.sqlite'
    ```
 6. **Put the bot token on the server** as a credential for the kernel only. The release already carries the wiring: `telegram-token` is a known name in `lib/common.sh`, and `bulig.service` has `LoadCredential=telegram-token:/etc/bulig/telegram-token` with `SetCredential=telegram-token:none` as the default while the file is missing (the worker unit never holds it). channel-telegram reads the token from `$CREDENTIALS_DIRECTORY/telegram-token` (no environment variable; a value of `none` counts as no token, so the plugin stops at start by name instead of sending it to Telegram). It prints the length, never the value:
    ```bash
-   security find-generic-password -s bulig-telegram-bot -w | ssh ths-prod-01 'bash /usr/local/lib/bulig/current/set-secret.sh --credential telegram-token'
+   security find-generic-password -s bulig-telegram-bot -w | ssh bulig-host 'bash /usr/local/lib/bulig/current/set-secret.sh --credential telegram-token'
    ```
 7. **Turn the channel on.** In `/etc/bulig/config.json` (root) add `"channel-telegram"` to `enabled`, add its grants and its `pluginConfig` block (`allowedChatIds`, `allowedUserIds`, `repos`; copy the shape from `bulig.config.example.json`). Leave out `tokenCredential` (the default name is `telegram-token`); the example's `tokenEnv` can stay, the credential wins over it.
 8. **Start** the units and the timers, then run `health.sh`. If the journal says `channel-telegram: the bot token is not set`, the file from step 6 is missing or empty (the unit got the `none` default).
    ```bash
-   ssh ths-prod-01 'systemctl start bulig bulig-worker && systemctl start bulig-backup.timer bulig-restore-drill.timer'
-   ssh ths-prod-01 '/usr/local/lib/bulig/current/health.sh'
+   ssh bulig-host 'systemctl start bulig bulig-worker && systemctl start bulig-backup.timer bulig-restore-drill.timer'
+   ssh bulig-host '/usr/local/lib/bulig/current/health.sh'
    ```
 9. **Check the record.** `status` on the server must print the same list as the file saved in step 2 (no output from `diff`). Then send a message to the bot and watch `journalctl -u bulig -f`.
    ```bash
-   ssh ths-prod-01 '/usr/local/lib/bulig/current/bulig-cli.sh status' | diff <mac jobs file> -
+   ssh bulig-host '/usr/local/lib/bulig/current/bulig-cli.sh status' | diff <mac jobs file> -
    ```
 10. **Keep `bulig_precut`** until the next backup and the next restore drill both pass on the new record (`bulig-backup: ok`, `bulig-restore-drill: ok`). Drop it only with Jasher's yes: `runuser -u postgres -- psql -X -h /var/run/postgresql -p 5436 -d postgres -c 'DROP DATABASE bulig_precut'`.
 
@@ -300,7 +302,7 @@ To undo: stop the units, remove `channel-telegram` from `enabled`, and start the
 
 - **A bad release.** `release-remote.sh` already rolls back by itself when the health check fails (links, units). To go back by hand:
   ```bash
-  ssh ths-prod-01 'ls -1t /opt/bulig/releases'
+  ssh bulig-host 'ls -1t /opt/bulig/releases'
   bash deploy/release.sh <older-sha>
   ```
 - **Stop Bulig, leave everything else alone.** `systemctl stop bulig-worker bulig`. The cluster keeps running. Jobs resume on the next start.

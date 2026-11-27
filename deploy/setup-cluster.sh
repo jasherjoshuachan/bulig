@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Create the Postgres 16 cluster "bulig" on port 5436, its own role and database, and write the connection URL into the root-only file /etc/bulig/pg-url.
-# Idempotent. Never touches cluster 16/main or any other port. Run as root on ths-prod-01 after setup-user.sh, with both Bulig services stopped
+# Idempotent. Never touches cluster 16/main or any other port. Run as root on bulig-host after setup-user.sh, with both Bulig services stopped
 # (a new password means a restart anyway, and a setup script never runs next to the users it sets up).
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

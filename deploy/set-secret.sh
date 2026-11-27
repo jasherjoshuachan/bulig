@@ -3,15 +3,15 @@
 # It writes only to fixed files under /etc/bulig (root's) and refuses anything else: there is no path argument.
 #   one secret, one root-only file (loaded by systemd LoadCredential= into the unit that needs it):
 #     set-secret.sh --credential <pg-url|gh-token|worker-tokens|claude-token|worker-token|github-read-token|drill-pw|telegram-token> < value
-#     security find-generic-password -s <item> -w | ssh ths-prod-01 '/usr/local/lib/bulig/current/set-secret.sh --credential gh-token'
+#     security find-generic-password -s <item> -w | ssh bulig-host '/usr/local/lib/bulig/current/set-secret.sh --credential gh-token'
 #     (github-read-token is the worker's read-only token for its own clone; Keychain item bulig-worker-read-token on the Mac)
 #     (telegram-token is the kernel's Telegram bot token, set at cutover; Keychain item bulig-telegram-bot on the Mac)
 #   one worker's token (a line "id=token" in worker-tokens, which the kernel reads; for the id "vps" also the worker's own worker-token):
-#     openssl rand -hex 32 | ssh ths-prod-01 '/usr/local/lib/bulig/current/set-secret.sh --worker-token vps'
+#     openssl rand -hex 32 | ssh bulig-host '/usr/local/lib/bulig/current/set-secret.sh --worker-token vps'
 #   the worker's repositories (not secret; /etc/bulig/worker.env, read by bulig-worker.service; at least one is needed):
-#     echo 'BULIG_WORKER_REPOS=--repo /var/lib/bulig/repos/sandbox=/var/lib/bulig-worker/work/sandbox' | ssh ths-prod-01 '/usr/local/lib/bulig/current/set-secret.sh --worker-env'
+#     echo 'BULIG_WORKER_REPOS=--repo /var/lib/bulig/repos/sandbox=/var/lib/bulig-worker/work/sandbox' | ssh bulig-host '/usr/local/lib/bulig/current/set-secret.sh --worker-env'
 #   the machine-specific fence probes (/etc/bulig/fence-extra-probes.txt, root 0600; filled in from fence/extra-probes.template, see the RUNBOOK):
-#     ssh ths-prod-01 '/usr/local/lib/bulig/current/set-secret.sh --fence-extra-probes' < filled-in-file
+#     ssh bulig-host '/usr/local/lib/bulig/current/set-secret.sh --fence-extra-probes' < filled-in-file
 #   one R2 setting in /etc/bulig/backup.env (used only by the backup units):
 #     set-secret.sh --backup-key <R2_ENDPOINT|R2_BUCKET|AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|...> < value
 set -euo pipefail

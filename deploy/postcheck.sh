@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The "after" picture: compare ths-prod-01 to a "before" snapshot and fail on any difference in what the snapshot covers (see lib/snapshot.sh),
+# The "after" picture: compare bulig-host to a "before" snapshot and fail on any difference in what the snapshot covers (see lib/snapshot.sh),
 # apart from Bulig's own users, units, cluster and folders. Read-only except for temp files in /var/lib/bulig-checks.
 # Not compared, only reported (see snapshot_compare in lib/snapshot.sh): the run state of services a timer starts, transient systemd-run units,
 # template instances that came or went (a "failed" one of any of those is a warn line that names it), containers that come and go while

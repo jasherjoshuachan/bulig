@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Release a git ref of Bulig to ths-prod-01. Run from the Mac, inside the bulig checkout:
+# Release a git ref of Bulig to bulig-host. Run from the Mac, inside the bulig checkout:
 #   bash deploy/release.sh [ref]          (default: HEAD)
 # What happens:
 #   1. `git archive <sha>` is streamed over ssh into a fresh root-owned folder on the server, /var/lib/bulig-checks/incoming.XXXXXX
@@ -12,7 +12,12 @@
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-HOST="${BULIG_DEPLOY_HOST:-ths-prod-01}"
+# The server, as your ssh alias (nothing is assumed: a hard-coded host name outlives the host). Set it per run or in your shell:
+#   BULIG_DEPLOY_HOST=<alias> bash deploy/release.sh
+# BULIG_DEPLOY_SUDO is for a server you log in to as a normal user: BULIG_DEPLOY_SUDO='sudo -n' runs the root steps through sudo.
+# Left empty (the default) the ssh login must already be root.
+HOST="${BULIG_DEPLOY_HOST:?release: set BULIG_DEPLOY_HOST to your ssh alias for the server, e.g. BULIG_DEPLOY_HOST=myserver bash deploy/release.sh}"
+SUDO="${BULIG_DEPLOY_SUDO:-}"
 KEEP="${BULIG_KEEP_RELEASES:-5}"
 ref="${1:-HEAD}"
 
@@ -27,13 +32,15 @@ ssh "$HOST" "test -d /opt/bulig/releases && test -d /usr/local/lib/bulig && test
 
 echo "==> stream the archive to $HOST"
 # One private folder per run (mktemp -d makes it 0700, root's, nobody else's). tar --no-same-owner: whatever the archive says, root owns it.
-incoming="$(git archive --format=tar "$sha" | ssh "$HOST" 'set -e; d=$(mktemp -d /var/lib/bulig-checks/incoming.XXXXXX); umask 022; tar -x --no-same-owner -f - -C "$d"; echo "$d"')"
+remote_unpack='set -e; d=$(mktemp -d /var/lib/bulig-checks/incoming.XXXXXX); umask 022; tar -x --no-same-owner -f - -C "$d"; echo "$d"'
+# shellcheck disable=SC2029 # $SUDO is meant to expand here: it is the operator's own setting
+incoming="$(git archive --format=tar "$sha" | ssh "$HOST" "$SUDO bash -c $(printf '%q' "$remote_unpack")")"
 [[ "$incoming" =~ ^/var/lib/bulig-checks/incoming\.[A-Za-z0-9]{6}$ ]] || { echo "release: odd answer from $HOST: $incoming" >&2; exit 1; }
 
 echo "==> install, swap, restart, check (on $HOST)"
 set +e
-# shellcheck disable=SC2029 # $incoming, $short and $KEEP are meant to expand here: they were checked above
-ssh "$HOST" bash "$incoming/deploy/release-remote.sh" "$short" "$KEEP"
+# shellcheck disable=SC2029,SC2086 # $incoming, $short and $KEEP are meant to expand here (checked above); $SUDO is words on purpose
+ssh "$HOST" $SUDO bash "$incoming/deploy/release-remote.sh" "$short" "$KEEP"
 rc=$?
 set -e
 if [ "$rc" -eq 3 ]; then echo "release: refused, $short is already live on $HOST" >&2; exit 3; fi

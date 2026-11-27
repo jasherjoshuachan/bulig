@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Take the "before" picture of ths-prod-01, so postcheck.sh can prove Bulig changed nothing that is not Bulig's.
+# Take the "before" picture of bulig-host, so postcheck.sh can prove Bulig changed nothing that is not Bulig's.
 # Read-only except for one file: /var/lib/bulig-checks/precheck.snapshot (Bulig's own folder). No arguments, no other path.
 # Run as root, before setup-user.sh (it makes the root-owned /var/lib/bulig-checks if it is not there). Every release later takes its own
 # "before" picture (release-<sha>.before.snapshot, lib/snapshot.sh); this one stays as the baseline for removing Bulig.

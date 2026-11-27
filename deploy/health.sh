@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Is Bulig healthy on this host? Run as root on ths-prod-01. Exit 0 only if all of these hold:
+# Is Bulig healthy on this host? Run as root on bulig-host. Exit 0 only if all of these hold:
 #   1. bulig.service and bulig-worker.service are active, and so is what the worker's network stands on: the gateway addresses on lo
 #      (127.74.3.1 and 198.18.74.1, bulig-loopback.service), the worker's network namespace (/run/netns/bulig-worker, bulig-netns.service) and
 #      pasta (bulig-pasta.service), which has given the namespace an address of its own

@@ -334,7 +334,10 @@ def derive(ss_tcp, ss_unix, ip_addr):
                 wild_v6.add(port)
         elif c in ("loopback", "benchmark"):
             # (another listener on a gateway address is a deny target too: the sets that allow that address FAIL on it from their properties)
-            if (host, port) not in GATEWAYS:
+            # (the one other expected listener: the DNS forwarder a server with a private resolver runs on the gateway address, 198.18.74.1:53,
+            # announced by fence-check.sh when /etc/bulig/resolv.conf exists. Whether names resolve through it is the dns-lookup allow probe.)
+            dns_forwarder = os.environ.get("BULIG_DNS_FORWARDER") == "1" and (host, port) == (NETNS_GATEWAY, "53")
+            if (host, port) not in GATEWAYS and not dns_forwarder:
                 add("deny", ALL_SETS, f"listener-{host}-{port}", "tcp", hp(host, port))
         elif c in ("private", "tailscale"):
             add("deny", ALL_SETS, f"listener-{host}-{port}", "tcp", hp(host, port))

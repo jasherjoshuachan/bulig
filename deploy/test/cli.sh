@@ -119,5 +119,26 @@ absent "and no pipe" "^--pipe$"
 expect_fail_msg "an unknown role is refused" "--as must be kernel or worker" bash "$cli" --as root status
 expect_fail_msg "no command is refused" "usage: bulig-cli.sh" bash "$cli"
 
-finish
+echo "extra-allow: an address a server's resolver needs"
+printf '# the VM resolver\n192.168.5.2   # lima\n\n' >"$work/root/etc/bulig/extra-allow"
+expect_ok "a kernel command runs with an extra-allow file" bash "$cli" status
+check "the kernel's one-off commands may also reach that address" "IPAddressAllow=127.74.3.1/32 198.18.74.1/32 192.168.5.2/32"
+expect_ok "a worker command runs with it" bash "$cli" --as worker --exec true
+check "so may the worker's one-off commands" "IPAddressAllow=127.0.0.0/8 ::1/128 198.18.74.1/32 192.168.5.2/32"
+printf '10.0.0.0/8\n' >"$work/root/etc/bulig/extra-allow"
+expect_fail_msg "a range in extra-allow is refused (only plain addresses)" "is not a plain IP address" bash "$cli" status
+printf 'resolver.example\n' >"$work/root/etc/bulig/extra-allow"
+expect_fail_msg "a name in extra-allow is refused" "is not a plain IP address" bash "$cli" status
+rm -f "$work/root/etc/bulig/extra-allow"
+expect_ok "without the file nothing changes" bash "$cli" status
+check "the kernel's allow list is the plain one again" "IPAddressAllow=127.74.3.1/32 198.18.74.1/32"
 
+echo "resolv.conf override"
+printf 'nameserver 198.18.74.1\n' >"$work/root/etc/bulig/resolv.conf"
+expect_ok "a worker command runs with a resolv.conf override" bash "$cli" --as worker --exec true
+check "it resolves names through that file" "BindReadOnlyPaths=$work/root/etc/bulig/resolv.conf:/etc/resolv.conf"
+rm -f "$work/root/etc/bulig/resolv.conf"
+expect_ok "without the file the upstream list is used again" bash "$cli" --as worker --exec true
+check "resolved's list again" "BindReadOnlyPaths=/run/systemd/resolve/resolv.conf:/etc/resolv.conf"
+
+finish

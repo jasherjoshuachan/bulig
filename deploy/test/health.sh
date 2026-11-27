@@ -16,7 +16,7 @@ export BULIG_DEPLOY_TEST_ROOT="$root"
 
 cat >"$stubs/pg_lsclusters" <<'STUB'
 #!/usr/bin/env bash
-echo "16 bulig 5436 online postgres /x /y"
+echo "${STUB_CLUSTERS:-16 bulig 5436 online postgres /x /y}"
 STUB
 cat >"$stubs/systemctl" <<'STUB'
 #!/usr/bin/env bash
@@ -33,9 +33,16 @@ exit 0
 STUB
 cat >"$stubs/psql" <<'STUB'
 #!/usr/bin/env bash
+if [ -n "${STUB_PEER_ONLY:-}" ] && [ -z "${STUB_VIA_SETPRIV:-}" ]; then echo 'psql: error: connection to server on socket "/var/run/postgresql/.s.PGSQL.5432" failed: FATAL:  Peer authentication failed for user "bulig"'; exit 2; fi
 n="$(cat "$STUB_LOG/psql-n" 2>/dev/null || echo 0)"
 echo $((n + 1)) >"$STUB_LOG/psql-n"
 if [ $((n % 2)) -eq 0 ]; then echo "kernel-1|3|t|2026-10-19 10:00:00.000001"; else echo "kernel-1|3|t|2026-10-19 10:00:10.000002"; fi
+STUB
+cat >"$stubs/setpriv" <<'STUB'
+#!/usr/bin/env bash
+echo "setpriv $*" >>"$STUB_LOG/setpriv"
+while [ "${1:-}" != "${1#--}" ] && [ -n "${1:-}" ]; do shift; done
+STUB_VIA_SETPRIV=1 exec "$@"
 STUB
 cat >"$stubs/ss" <<'STUB'
 #!/usr/bin/env bash
@@ -98,6 +105,23 @@ if grep -q "^fence-check all --no-late$" "$log/fence" && grep -q "^fence-check w
 if [ "$(wc -l <"$log/fence" | tr -d ' ')" = "2" ]; then ok "and only those two calls"; else bad "fence call count"; fi
 if ! grep -q "^warn" "$work/out"; then ok "no warnings when the drop-in matches the machine and no new listener appeared"; else bad "unexpected warnings: $(grep '^warn' "$work/out")"; fi
 if grep -q "ok    the fence holds" "$work/out"; then ok "and says so"; else bad "output: $(cat "$work/out")"; fi
+
+echo "the database is the one the kernel's pg-url names"
+printf 'postgres://bulig:pw@%%2Fvar%%2Frun%%2Fpostgresql:5432/bulig' >"$root/etc/bulig/pg-url"
+echo 0 >"$log/psql-n"
+expect_ok "a kernel on Postgres 18 port 5432 passes when that cluster is online" env STUB_CLUSTERS="18 main 5432 online postgres /x /y" bash "$h" --wait 1 --no-fence
+if grep -q "^ok    cluster 18 main online on port 5432" "$work/out"; then ok "and says which cluster it checked"; else bad "output: $(cat "$work/out")"; fi
+echo 0 >"$log/psql-n"
+expect_fail_msg "a pg-url port with no online cluster fails, even though 16 bulig is up on 5436" "is not online on port 5432" env STUB_CLUSTERS="16 bulig 5436 online postgres /x /y" bash "$h" --wait 1 --no-fence
+echo 0 >"$log/psql-n"
+expect_fail_msg "a cluster that is down on the pg-url port fails" "is not online on port 5432" env STUB_CLUSTERS="18 main 5432 down postgres /x /y" bash "$h" --wait 1 --no-fence
+echo 0 >"$log/psql-n"; : >"$log/setpriv"
+expect_ok "a peer-only socket is read as the bulig OS user" env STUB_PEER_ONLY=1 STUB_CLUSTERS="18 main 5432 online postgres /x /y" bash "$h" --wait 1 --no-fence
+if grep -q "^setpriv --reuid=bulig --regid=bulig --init-groups" "$log/setpriv"; then ok "through setpriv, as bulig"; else bad "setpriv log: $(cat "$log/setpriv")"; fi
+echo 0 >"$log/psql-n"; : >"$log/setpriv"
+expect_ok "a password socket is not retried as another user" env STUB_CLUSTERS="18 main 5432 online postgres /x /y" bash "$h" --wait 1 --no-fence
+if [ ! -s "$log/setpriv" ]; then ok "setpriv is not called"; else bad "setpriv called: $(cat "$log/setpriv")"; fi
+printf 'postgres://bulig:pw@%%2Fvar%%2Frun%%2Fpostgresql:5436/bulig' >"$root/etc/bulig/pg-url"
 
 echo "the fence fails health"
 : >"$log/fence"

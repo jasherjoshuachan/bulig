@@ -73,6 +73,14 @@ common_args=(--host-addrs "$host_addrs")
 # One probe stream for all sets: the published probes, the ones derived from what this machine is listening on right now, and the extra file.
 # It is handed to the probe on stdin, so the unit never needs to read a file of root's.
 work="$(private_tmpdir)"
+# The kernel's Postgres socket is named in the static probes for the cluster the kit makes (port 5436). A server that runs the record on another
+# port (the port in the kernel's own pg-url) gets the same probes for that socket.
+pg_port="$(pg_url_port "$(cred_path pg-url)")"
+if [ -n "$pg_port" ] && [ "$pg_port" != "$BULIG_PG_PORT" ]; then
+  pg_probes="$work/static-probes"
+  sed "s#/\.s\.PGSQL\.$BULIG_PG_PORT\$#/.s.PGSQL.$pg_port#" "$static_probes" >"$pg_probes"
+  static_probes="$pg_probes"
+fi
 pids=()
 names=()
 # shellcheck disable=SC2329
@@ -101,7 +109,10 @@ ss -H -ltn >"$work/ss-tcp" 2>/dev/null || die "ss -H -ltn failed, so the listene
 ss -H -xl >"$work/ss-unix" 2>/dev/null || die "ss -H -xl failed, so the unix listeners cannot be read (the fence check never connects to find out)"
 systemctl list-sockets --all --no-legend --plain --no-pager >"$work/sockets" 2>/dev/null || die "systemctl list-sockets failed, so socket-activated targets cannot be told apart (the fence check never connects to find out)"
 { ip -o addr 2>/dev/null || true; } >"$work/ip-addr"
-if ! python3 -I "$probe" derive "$work/ss-tcp" "$work/ss-unix" "$work/ip-addr" >"$work/derived" 2>"$work/derive-notes"; then
+# A DNS forwarder on the gateway address (198.18.74.1:53) is expected where /etc/bulig/resolv.conf says to use it; nowhere else.
+dns_forwarder=0
+if [ -f "$BULIG_CRED_DIR/resolv.conf" ] && [ ! -L "$BULIG_CRED_DIR/resolv.conf" ]; then dns_forwarder=1; fi
+if ! BULIG_DNS_FORWARDER="$dns_forwarder" python3 -I "$probe" derive "$work/ss-tcp" "$work/ss-unix" "$work/ip-addr" >"$work/derived" 2>"$work/derive-notes"; then
   cat "$work/derive-notes" >&2
   die "the probes could not be derived from what this machine listens on (see above)"
 fi

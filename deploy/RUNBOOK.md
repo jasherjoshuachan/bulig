@@ -358,3 +358,14 @@ Everything above was checked as text, with `systemd-analyze verify` (which reads
 - With no `aws` CLI the R2 calls go through a docker container (image pinned by digest) fed by stdin and stdout: no host mount, and the R2 key travels on stdin, never in docker's arguments or environment.
 - Passfiles and downloads live in a 0700 folder under `/var/lib/bulig-checks` (root's), never in the host's `/tmp`, also when you run a script by hand.
 - Everything uses a Postgres connection with an explicit host (the socket folder `/var/run/postgresql`) and port, and passwords travel in a private PGPASSFILE (host field `localhost`, which is how libpq looks up a socket), never on a command line (any user on this host can read other processes' arguments).
+
+## A server whose resolver is a private address
+
+The worker, the release build and one-off commands may not reach private addresses (`IPAddressDeny=`), and `IPAddressAllow=` works per address, not per port. On a VM the resolver is usually the VM's gateway, which is the host machine: allowing it would let the sandbox reach every port on that machine (checked 27 Nov 2026: ssh and local services answered). So do not allow the gateway. Run a forwarder on an address the fence already allows instead:
+
+1. Two small root units (`socat`, UDP and TCP, `bind=198.18.74.1`, port 53, target the VM's resolver, `IPAddressDeny=any` with only those two addresses allowed, `After=bulig-loopback.service`).
+2. `/etc/bulig/resolv.conf` (root, not a link): `nameserver 198.18.74.1`. The release build and one-off commands use it in place of resolved's list, and `fence-check.sh` then expects the forwarder's listener. Give the worker unit the same file with a drop-in: `BindReadOnlyPaths=` (empty, to reset) then `BindReadOnlyPaths=/etc/bulig/resolv.conf:/etc/resolv.conf`.
+3. `/etc/bulig/extra-allow` (root, one plain address per line): `198.18.74.1`, so the release build (which otherwise allows nothing) can reach the forwarder.
+
+`health.sh` must pass with the fence afterwards: from inside the worker's namespace, names resolve and no port on the gateway answers.
+
